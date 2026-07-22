@@ -332,6 +332,11 @@ def decode(data: bytes) -> str:
         fail(f"configuration is not UTF-8: {exc}")
 
 
+def write_backup_chunk(descriptor: int, data: memoryview) -> int:
+    """Single write seam used by deterministic short-write fault tests."""
+    return os.write(descriptor, data)
+
+
 def create_backup(snapshot: Snapshot, directory: Path) -> Path:
     if not directory.is_absolute() or directory == Path("/"):
         fail("backup directory must be a specific absolute path")
@@ -342,15 +347,53 @@ def create_backup(snapshot: Snapshot, directory: Path) -> Path:
         fail("backup destination must not grant group/other access")
     name = f"maddy.conf.{int(time.time())}.{snapshot.sha256[:12]}.bak"
     target = directory / name
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
     descriptor = os.open(target, flags, 0o600)
     try:
-        os.write(descriptor, snapshot.data)
+        remaining = memoryview(snapshot.data)
+        while remaining:
+            written = write_backup_chunk(descriptor, remaining)
+            if written <= 0:
+                fail("backup write made no progress")
+            remaining = remaining[written:]
         os.fsync(descriptor)
         owner = 0 if os.geteuid() == 0 else snapshot.uid
         group = 0 if os.geteuid() == 0 else snapshot.gid
         os.fchown(descriptor, owner, group)
-    finally:
+        os.fsync(descriptor)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_size != len(snapshot.data)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            fail("backup metadata read-back failed")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        readback = b""
+        while len(readback) <= MAX_CONFIG_BYTES:
+            chunk = os.read(
+                descriptor,
+                min(128 * 1024, MAX_CONFIG_BYTES + 1 - len(readback)),
+            )
+            if not chunk:
+                break
+            readback += chunk
+        if (
+            len(readback) != len(snapshot.data)
+            or hashlib.sha256(readback).digest() != hashlib.sha256(snapshot.data).digest()
+        ):
+            fail("backup content read-back failed")
+    except BaseException:
+        os.close(descriptor)
+        target.unlink(missing_ok=True)
+        directory_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        raise
+    else:
         os.close(descriptor)
     directory_fd = os.open(directory, os.O_RDONLY)
     try:

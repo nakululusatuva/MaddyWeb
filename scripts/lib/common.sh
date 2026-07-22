@@ -6,8 +6,8 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly MADDYWEB_MIN_MADDY_VERSION="0.8.2"
-readonly MADDYWEB_MAX_MADDY_VERSION="0.9.5"
+readonly MADDYWEB_SUPPORTED_MADDY_RELEASES="0.8.2,0.9.0,0.9.1,0.9.2,0.9.3,0.9.4,0.9.5"
+readonly MADDYWEB_MADDY_082_HELP_SHA256="e60d7cdaae4721367e291f78faf0b75a0689d1fceafea1a904f6707b43e9f708"
 readonly MADDYWEB_APPROVAL_ROOT="/run/maddyweb-approval"
 
 log() {
@@ -85,11 +85,10 @@ extract_maddy_version() {
 
 version_in_supported_range() {
     local version=${1:?version is required}
-    require_command sort
-    local first last
-    first=$(printf '%s\n%s\n' "$MADDYWEB_MIN_MADDY_VERSION" "$version" | sort -V | head -n 1)
-    last=$(printf '%s\n%s\n' "$MADDYWEB_MAX_MADDY_VERSION" "$version" | sort -V | tail -n 1)
-    [[ "$first" == "$MADDYWEB_MIN_MADDY_VERSION" && "$last" == "$MADDYWEB_MAX_MADDY_VERSION" ]]
+    case "$version" in
+        0.8.2|0.9.0|0.9.1|0.9.2|0.9.3|0.9.4|0.9.5) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 assert_supported_maddy() {
@@ -99,7 +98,8 @@ assert_supported_maddy() {
     local output version
     output=$("$binary" version 2>&1) || die "Maddy version command failed"
     version=$(extract_maddy_version "$output")
-    version_in_supported_range "$version" || die "unsupported Maddy version $version; supported range is $MADDYWEB_MIN_MADDY_VERSION-$MADDYWEB_MAX_MADDY_VERSION"
+    version_in_supported_range "$version" \
+        || die "unsupported Maddy version $version; supported official releases are $MADDYWEB_SUPPORTED_MADDY_RELEASES"
     printf '%s\n' "$version"
 }
 
@@ -135,7 +135,12 @@ assert_maddy_082_help_profile() {
         done
         combined+="$argv_text"$'\x1e'"$output"$'\x1f'
     done
-    printf '%s' "$combined" | sha256_file /dev/stdin
+    local fingerprint
+    fingerprint=$(printf '%s' "$combined" | sha256_file /dev/stdin) \
+        || die "cannot calculate the Maddy 0.8.2 help fingerprint"
+    [[ "$fingerprint" == "$MADDYWEB_MADDY_082_HELP_SHA256" ]] \
+        || die "Maddy 0.8.2 help fingerprint does not match the verified release"
+    printf '%s\n' "$fingerprint"
 }
 
 assert_private_file_mode() {

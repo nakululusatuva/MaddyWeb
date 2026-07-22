@@ -104,10 +104,11 @@ submission_version=""
 container_before=""
 if [[ "$remove_submission" == true ]]; then
     case "$maddy_mode" in native|docker) ;; *) die "managed removal requires --maddy-mode native or docker" ;; esac
-    require_regular_file "$maddy_config" "host Maddy config"
     require_absolute_path "$submission_backup_dir" "submission backup directory"
-    "$release/bin/python" "$SCRIPT_DIR/manage-submission.py" --action check-remove --config "$maddy_config" >/dev/null
     if [[ "$maddy_mode" == native ]]; then
+        require_regular_file "$maddy_config" "host Maddy config"
+        "$release/bin/python" "$SCRIPT_DIR/manage-submission.py" \
+            --action check-remove --config "$maddy_config" >/dev/null
         [[ -n "$maddy_binary" && -z "$container" ]] || die "native managed removal requires --maddy-binary and no container"
         submission_version=$(assert_supported_maddy "$maddy_binary")
     else
@@ -115,6 +116,14 @@ if [[ "$remove_submission" == true ]]; then
         require_absolute_path "$docker_binary" "Docker binary"
         container_before=$("$release/bin/python" "$SCRIPT_DIR/check-maddy-container.py" \
             --docker "$docker_binary" --container "$container" --host-config "$maddy_config")
+        rollback_config_kind=$("$release/bin/python" -c \
+            'import json,sys; print(json.loads(sys.argv[1])["config_kind"])' \
+            "$container_before")
+        [[ "$rollback_config_kind" == bind ]] \
+            || die "combined rollback only supports a host-bind Maddy config; remove named-volume Submission separately"
+        require_regular_file "$maddy_config" "host Maddy config"
+        "$release/bin/python" "$SCRIPT_DIR/manage-submission.py" \
+            --action check-remove --config "$maddy_config" >/dev/null
         version_output=$("$docker_binary" exec "$container" /bin/maddy version 2>&1) || die "container Maddy version failed"
         submission_version=$(extract_maddy_version "$version_output")
         version_in_supported_range "$submission_version" || die "unsupported container Maddy version"

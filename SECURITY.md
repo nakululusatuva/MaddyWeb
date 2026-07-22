@@ -83,6 +83,13 @@ process explicitly cannot see it. Container name, image ID, mounts, port binding
 network mode are verified before and after a change. Temporary backup containers have no network, drop capabilities,
 use a read-only root filesystem, and mount the target `/data` read-only.
 
+Managed Submission also supports a Docker local named volume, but does not accept a volume name, mount
+path, or remote Docker context. Dry-run performs only fixed read-only reads inside the full container ID; the container is paused only
+after approval consumption and acquisition of the transaction-wide flock. The write helper uses the existing immutable Maddy image
+ID, no network, a read-only root filesystem, and minimal `DAC_OVERRIDE` and `CHOWN`; the target is always
+`/data/maddy.conf`. Content hash, owner and mode, unique attachment, and container ID are read back before and after the operation;
+if state cannot be classified as original or candidate, the container remains stopped and the situation is handled as an incident.
+
 ## Maddy and certificate security
 
 Only the seven exact Maddy releases in the compatibility matrix are supported. Prereleases, development builds, unknown patch versions,
@@ -90,6 +97,11 @@ and CLI help fingerprint changes disable write capability. Version `0.8.2` does 
 invocation; listener changes require an explicit short restart through `--allow-downtime`. Maddy
 `0.9.0+` uses `verify-config` and SIGUSR2 reload; LDAP writes are enabled only on
 `0.9.3+`.
+
+For `0.8.2`-`0.9.2`, every Maddy write reparses the effective configuration. `auth.ldap`,
+`table.ldap`, LDAP in a composite provider, `import`, line continuation, and dynamic macros outside a validated
+identity or domain context all degrade Maddy functionality to read-only. Old Docker releases allow only the two official
+identity environment assignments; any macro structure that can compose a hidden `{env:...}` is also read-only.
 
 Certificate dry-run and renewal apply only to configured certificate names. The workflow may run `nginx -t` as a read-only check,
 but never writes `/etc/nginx` or reloads or restarts Nginx. Certbot commands and ordinary Maddy

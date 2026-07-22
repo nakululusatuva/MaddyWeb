@@ -128,6 +128,59 @@ def test_cli_add_remove_preserves_mode_and_creates_private_backups(tmp_path: Pat
     assert stat.S_IMODE(config.stat().st_mode) == 0o640
 
 
+def test_backup_write_all_handles_short_writes_and_reads_back_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "maddy.conf"
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir(mode=0o700)
+    original = FIXTURE.read_bytes()
+    config.write_bytes(original)
+    real_write = EDITOR.write_backup_chunk
+    writes = 0
+
+    def short_write(descriptor: int, data) -> int:
+        nonlocal writes
+        writes += 1
+        chunk = data[: max(1, len(data) // 3)]
+        return real_write(descriptor, chunk)
+
+    monkeypatch.setattr(EDITOR, "write_backup_chunk", short_write)
+    with EDITOR.locked_snapshot(config) as snapshot:
+        backup = EDITOR.create_backup(snapshot, backup_dir)
+    assert writes > 1
+    assert backup.read_bytes() == FIXTURE.read_bytes()
+    assert stat.S_IMODE(backup.stat().st_mode) == 0o600
+
+
+def test_backup_disk_full_removes_partial_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "maddy.conf"
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir(mode=0o700)
+    original = FIXTURE.read_bytes()
+    config.write_bytes(original)
+    real_write = EDITOR.write_backup_chunk
+    calls = 0
+
+    def disk_full(descriptor: int, data) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return real_write(descriptor, data[:32])
+        raise OSError(28, "simulated disk full")
+
+    monkeypatch.setattr(EDITOR, "write_backup_chunk", disk_full)
+    with (
+        EDITOR.locked_snapshot(config) as snapshot,
+        pytest.raises(OSError, match="simulated disk full"),
+    ):
+        EDITOR.create_backup(snapshot, backup_dir)
+    assert config.read_bytes() == original
+    assert list(backup_dir.iterdir()) == []
+
+
 def test_symlink_hardlink_and_oversize_are_rejected(tmp_path: Path) -> None:
     real = tmp_path / "real.conf"
     real.write_bytes(FIXTURE.read_bytes())

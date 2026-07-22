@@ -95,9 +95,9 @@ reloads again.
 
 ### Docker Maddy
 
-Docker Maddy's `/data` must come from a host bind directory, and the host configuration file must be
-the `maddy.conf` in that directory. `--maddy-config` deliberately takes the host path because
-the editor performs atomic replacement on the host:
+Docker Maddy may mount `/data` from a host bind directory or local named volume.
+In bind mode, the host configuration file must be the `maddy.conf` inside that directory, so
+`--maddy-config` takes the host path:
 
 ```console
 HOST=$(hostname)
@@ -115,6 +115,34 @@ APPROVAL=$(sudo bash scripts/authorize-production.sh --action submission-add)
 sudo bash scripts/configure-submission.sh <same reviewed arguments> \
   --approval-file "$APPROVAL" --apply
 ```
+
+Named-volume mode does not accept a volume name or an internal daemon path such as `/var/lib/docker/volumes/...`.
+The volume is derived only from the verified container's unique `/data` mount; the argument must be the exact
+container contract path:
+
+```console
+bash scripts/configure-submission.sh \
+  --action add --environment production --host "$(hostname)" --mode docker \
+  --maddy-config /data/maddy.conf \
+  --docker-binary /usr/bin/docker --container maddy \
+  --python /opt/maddyweb/current/bin/python
+```
+
+The dry run executes only fixed, read-only commands against the verified full container ID:
+`stat/readlink/sha256sum/cat`. Metadata and hashes must match before and after; it does not pause, invoke `docker run`,
+or write the volume. After consuming approval, apply takes
+a non-waiting root flock on `/run/lock/maddyweb-submission.lock`, then pauses the same full ID.
+Atomic replacement uses a one-shot helper from that container's exact immutable image ID: no network,
+read-only root filesystem, fixed script, only the target volume mounted, and only the capabilities needed to read `0600` files and preserve
+the owner, `DAC_OVERRIDE` and `CHOWN`. The target is fixed at `/data/maddy.conf`; same-directory rename preserves
+the original owner and mode. Special bits, group or world writability, symlinks, hardlinks, a shared volume,
+or a non-local or non-default Docker daemon all fail closed.
+
+If the helper receipt is lost or later verification or reload fails, the tool rereads the hash while paused or stopped.
+A candidate hash is restored to original, an original hash is treated as never written, and an unknown hash remains paused or stopped
+while reporting `CRITICAL`; it never continues with unknown configuration. On `0.9.0+`, after unpausing the same full ID,
+it runs `verify-config` and sends SIGUSR2 only after success. `0.8.2` requires `--allow-downtime` and a short restart.
+Even if a bad candidate makes the container exit, it restores through that ID's stopped volume, starts it, and reads it back.
 
 Again, `0.8.2` requires `--allow-downtime`. The tool prohibits every Docker publish rule for port 1587,
 verifies unchanged container ID, mounts, ports, and restart policy, and after reload or restart
@@ -240,6 +268,11 @@ The tool atomically switches the symlink, restarts Web and helper, and runs smok
 To also remove managed Submission under the same approval, explicitly add
 `--remove-managed-submission` and the mode, configuration, and container options. `0.8.2` again requires
 `--allow-downtime`.
+
+The combined release-rollback-and-remove entry point accepts only native or Docker bind-mounted configuration.
+For a Docker named volume, first use the separate `configure-submission.sh --action remove` transaction above
+with `submission-remove` approval and verify it, then run release rollback separately.
+Never pass an internal daemon volume path to the rollback command as though it were a host configuration path.
 
 After a candidate release or smoke failure, the tool reports successful restoration only if the previous symlink, unit states, and release
 smoke result all read back successfully, along with optional Submission configuration, reload, port 1587 listener, and Docker identity.

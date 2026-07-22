@@ -583,3 +583,136 @@ def test_security_workflow_keeps_only_upstream_maddy_scan_informational() -> Non
     assert 'exit-code: "0"' in maddy_scan
     assert "Summarize informational Maddy image scan" in maddy_scan
     assert "Repository, Python dependency, source, secret, configuration" in maddy_scan
+
+
+def test_named_volume_submission_is_identity_bound_and_has_no_volume_argument() -> None:
+    checker = (ROOT / "scripts/check-maddy-container.py").read_text(encoding="utf-8")
+    volume_tool = (ROOT / "scripts/docker-volume-config.py").read_text(encoding="utf-8")
+    configure = (ROOT / "scripts/configure-submission.sh").read_text(encoding="utf-8")
+
+    assert 'str(args.host_config) != "/data/maddy.conf"' in checker
+    assert 'data_mount.get("Source") != mountpoint' in checker
+    assert 'data_mount.get("Source") != mountpoint' in volume_tool
+    assert "named volume must be referenced only by the selected Maddy container" in checker
+    assert "named volume must be referenced only by the selected Maddy container" in volume_tool
+    assert "--volume" not in volume_tool
+    assert "--docker-data-volume" not in configure
+    assert "expected_container_id: str" in volume_tool
+    assert "container_id != expected_container_id" in volume_tool
+    assert '"config_kind", "config_source", "volume_name", "volume_sha256"' in configure
+
+
+def test_named_volume_dry_run_uses_only_fixed_read_only_execs() -> None:
+    volume_tool = (ROOT / "scripts/docker-volume-config.py").read_text(encoding="utf-8")
+    running_export = volume_tool[
+        volume_tool.index("def run_running_export") : volume_tool.index("def run_helper_export")
+    ]
+    dispatcher = volume_tool[
+        volume_tool.index("def run_export(") : volume_tool.index("def write_snapshot")
+    ]
+
+    assert '"exec", "--user", "0:0", container_id' in volume_tool
+    for executable in ("/bin/stat", "/usr/bin/readlink", "/usr/bin/sha256sum", "/bin/cat"):
+        assert executable in running_export
+    assert "docker_run_base" not in running_export
+    assert 'if required_state == "running":\n        return run_running_export' in dispatcher
+    assert "return run_helper_export" in dispatcher
+
+
+def test_named_volume_replace_has_minimal_helper_caps_and_three_state_recovery() -> None:
+    volume_tool = (ROOT / "scripts/docker-volume-config.py").read_text(encoding="utf-8")
+    helper = (ROOT / "scripts/docker-volume-config-helper.sh").read_text(encoding="utf-8")
+    configure = (ROOT / "scripts/configure-submission.sh").read_text(encoding="utf-8")
+
+    replace = volume_tool[volume_tool.index("def run_replace") : volume_tool.index("def main")]
+    assert '"--cap-drop",\n        "ALL"' in volume_tool
+    assert replace.count('"--cap-add"') == 2
+    assert '"CHOWN"' in replace
+    assert '"DAC_OVERRIDE"' in replace
+    assert '"FOWNER"' not in replace
+    assert '"--network",\n        "none"' in volume_tool
+    assert '"--read-only"' in volume_tool
+    assert "--volumes-from" not in volume_tool
+    assert 'mv -f -- "$temporary" "$config"' in helper
+    assert "configuration changed during replacement" in helper
+    assert "replacement ownership or mode read-back failed" in helper
+    assert "configuration mode must not contain special bits" in helper
+    assert "configuration mode must not be group/world writable" in helper
+
+    assert "rollback_needed=true" in configure
+    assert '== "$candidate_hash"' in configure
+    assert '== "$original_hash"' in configure
+    assert "automatic configuration restoration failed" in configure
+    assert "rollback_state=stopped" in configure
+    assert "rollback_state=paused" in configure
+    assert "submission_lock=/run/lock/maddyweb-submission.lock" in configure
+    assert 'flock -n "$submission_lock_fd"' in configure
+
+
+def test_named_volume_docker_daemon_and_legacy_downtime_are_fail_closed() -> None:
+    checker = (ROOT / "scripts/check-maddy-container.py").read_text(encoding="utf-8")
+    volume_tool = (ROOT / "scripts/docker-volume-config.py").read_text(encoding="utf-8")
+    configure = (ROOT / "scripts/configure-submission.sh").read_text(encoding="utf-8")
+
+    for source in (checker, volume_tool):
+        assert 'os.environ.get("DOCKER_HOST")' in source
+        assert 'os.environ.get("DOCKER_CONTEXT")' in source
+        assert 'endpoint != "unix:///var/run/docker.sock"' in source
+    assert "paused_value is True" in checker
+    assert "Maddy container must be running and unpaused" in checker
+    assert '"stopped": (False, False)' in volume_tool
+    assert '"paused": (True, True)' in volume_tool
+    assert '"0.8.2" && "$apply" == true && "$allow_downtime" != true' in configure
+    assert 'restart --time 10 "$container_id"' in configure
+
+
+def test_named_volume_helper_cleanup_is_proven_and_not_global() -> None:
+    volume_tool = (ROOT / "scripts/docker-volume-config.py").read_text(encoding="utf-8")
+    integration = (ROOT / "tests/integration/test-named-volume-submission.sh").read_text(
+        encoding="utf-8"
+    )
+
+    cleanup = volume_tool[
+        volume_tool.index("def cleanup_helper") : volume_tool.index("def parse_exported_config")
+    ]
+    assert '"rm", "--force", name' in cleanup
+    assert '"container",' in cleanup
+    assert 'f"name=^/{name}$"' in cleanup
+    assert "maximum=1024" in cleanup
+    assert '"inspect", name' not in cleanup
+    assert "helper still exists after cleanup" in cleanup
+    assert "label=io.maddyweb.purpose=submission-volume-config" not in integration
+    assert '--filter "volume=$volume"' in integration
+
+
+def test_named_volume_helper_cleanup_fails_if_absence_query_cannot_complete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    volume_tool = runpy.run_path(str(ROOT / "scripts/docker-volume-config.py"))
+    cleanup = volume_tool["cleanup_helper"]
+    error_type = volume_tool["VolumeConfigError"]
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **kwargs):
+        calls.append(argv)
+        if argv[1:3] == ["rm", "--force"]:
+            return subprocess.CompletedProcess(argv, 1, b"", b"daemon unavailable")
+        raise error_type("fixed Docker operation failed")
+
+    monkeypatch.setitem(cleanup.__globals__, "run", fake_run)
+    with pytest.raises(error_type, match="fixed Docker operation failed"):
+        cleanup(Path("/usr/bin/docker"), "maddyweb-submission-replace-deadbeef")
+
+    assert calls[0][1:3] == ["rm", "--force"]
+    assert calls[1][1:4] == ["container", "ls", "--all"]
+
+
+def test_combined_release_rollback_explicitly_rejects_named_volume_submission() -> None:
+    rollback = (ROOT / "scripts/rollback.sh").read_text(encoding="utf-8")
+
+    assert 'json.loads(sys.argv[1])["config_kind"]' in rollback
+    assert '[[ "$rollback_config_kind" == bind ]]' in rollback
+    assert "remove named-volume Submission separately" in rollback
+    rejection = rollback.index('[[ "$rollback_config_kind" == bind ]]')
+    editor = rollback.index('--action check-remove --config "$maddy_config"', rejection)
+    assert rejection < editor

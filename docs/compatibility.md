@@ -17,6 +17,12 @@ releases fail closed until their digest, CLI profile, and real integration tests
 | 0.9.4 | Yes | SIGUSR2 | Yes | Yes | Same as above |
 | 0.9.5 | Yes | SIGUSR2 | Yes | Yes | Same as above |
 
+Support for `0.8.2`-`0.9.2` requires a static, decidable authentication configuration. The Web service reparses it before every write.
+If it finds `auth.ldap`, `table.ldap`, an LDAP composite provider, `import`, a line continuation,
+unclassified macro syntax, or a structure that can compose an environment placeholder, only diagnostics and independent certificate functionality remain.
+Exact adapters cover the two official Docker assignments, `MADDY_HOSTNAME` and `MADDY_DOMAIN`, and validated domain uses;
+other dynamic authentication configurations are not admitted by guesswork.
+
 All seven releases provide account, credential, APPENDLIMIT, mailbox,
 message, and certificate-file management capabilities verified against locked CLI profiles. TLS reload is a baseline capability, but endpoint changes on `0.8.2`
 cannot rely on USR2, so the deployment tool explicitly uses the restart path.
@@ -62,6 +68,11 @@ The WSL/container fixture provides:
 - Fixed local SQLite configuration and a temporary self-signed certificate valid for one day;
 - No production credentials, production network routes, or SSH;
 - An EXIT trap that removes containers, volumes, networks, and temporary certificates.
+
+A separate Docker named-volume Submission transaction test uses the locked `0.8.2` image to cover read-only planning while running,
+preservation of a non-root `0600` owner and mode, atomic replacement while paused or stopped, and stale
+hashes, exclusive attachment, the fixed local Docker context, `--allow-downtime`, and concurrent flock behavior,
+plus restoration of the original hash after a listener fault and read-back of running and unpaused state.
 
 Run the matrix with:
 

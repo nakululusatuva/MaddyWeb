@@ -43,6 +43,11 @@ Docker SMTP does not publish a host port. The helper always runs
 `docker exec -i <configured-container> /usr/bin/nc 127.0.0.1 1587` inside the container's own
 network namespace to connect to the loopback Submission endpoint.
 
+Docker `/data` supports both bind mounts and exclusive local named volumes. Named-volume
+configuration editing neither reads nor guesses Docker daemon internal paths. Dry-run is read-only; apply uses a one-shot
+helper with no network to atomically replace the fixed `/data/maddy.conf` in the same directory, with the full container
+ID, content hash, owner and mode, and failure rollback gates protecting the transaction.
+
 ## Development
 
 ```console

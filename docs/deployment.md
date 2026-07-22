@@ -39,8 +39,10 @@ Only Maddy runs in the existing container; the MaddyWeb Web process and helper r
 - `/data/maddy.conf` is valid configuration;
 - an executable `/usr/bin/nc` always exists inside the container;
 - port `1587` is not exposed with `-p` or `--publish`;
-- when the operations script must edit Submission, `/data` must come from a host bind directory,
-  so the host's `maddy.conf` can be replaced atomically.
+- when the operations script must edit Submission, `/data` is either a host bind directory or a local named volume
+  referenced only by this Maddy container and without driver options. In named-volume mode,
+  the configuration location is fixed at `/data/maddy.conf`; a volume name or internal Docker daemon
+  path is not accepted as input.
 
 The management Submission endpoint listens only on `127.0.0.1:1587` inside the container. The helper uses the fixed
 `docker exec -i <container> /usr/bin/nc 127.0.0.1 1587` command to transport SMTP inside the container network

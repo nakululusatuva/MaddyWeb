@@ -11,13 +11,15 @@ usage() {
     cat <<'EOF'
 Usage: configure-submission.sh --action add|remove \
   --environment development|production --host HOST --mode native|docker \
-  --maddy-config /absolute/host/maddy.conf [mode options] [--apply]
+  --maddy-config /absolute/config/path [mode options] [--apply]
 
 Native options:
   --maddy-binary /absolute/maddy
 
 Docker options:
   --docker-binary /absolute/docker --container maddy
+  For a bind mount, --maddy-config is the host maddy.conf. For a named volume,
+  it must be exactly /data/maddy.conf; the volume name is never caller-supplied.
 
 Common options:
   --python /absolute/python3.14
@@ -69,8 +71,6 @@ case "$action" in add|remove) ;; *) die "--action must be add or remove" ;; esac
 case "$environment" in development|production) ;; *) die "--environment must be development or production" ;; esac
 case "$mode" in native|docker) ;; *) die "--mode must be native or docker" ;; esac
 [[ -n "$target_host" && "$target_host" == "$(hostname)" ]] || die "--host must exactly match $(hostname)"
-require_regular_file "$maddy_config" "Maddy config"
-assert_private_file_mode "$maddy_config"
 require_absolute_path "$python_binary" "Python binary"
 [[ -x "$python_binary" ]] || die "Python is not executable"
 "$python_binary" -c 'import sys; raise SystemExit(sys.implementation.name != "cpython" or sys.version_info[:2] != (3, 14))' \
@@ -79,6 +79,8 @@ require_absolute_path "$backup_dir" "backup directory"
 require_command ss
 
 if [[ "$mode" == "native" ]]; then
+    require_regular_file "$maddy_config" "Maddy config"
+    assert_private_file_mode "$maddy_config"
     [[ -n "$maddy_binary" ]] || die "native mode requires --maddy-binary"
     maddy_version=$(assert_supported_maddy "$maddy_binary")
     [[ -z "$container" ]] || die "--container is invalid in native mode"
@@ -95,13 +97,25 @@ else
     [[ -x "$docker_binary" ]] || die "Docker binary is not executable"
     container_before=$("$python_binary" "$SCRIPT_DIR/check-maddy-container.py" \
         --docker "$docker_binary" --container "$container" --host-config "$maddy_config")
-    version_output=$("$docker_binary" exec "$container" /bin/maddy version 2>&1) || die "container Maddy version failed"
+    config_kind=$("$python_binary" -c \
+        'import json,sys; print(json.loads(sys.argv[1])["config_kind"])' "$container_before")
+    container_id=$("$python_binary" -c \
+        'import json,sys; print(json.loads(sys.argv[1])["id"])' "$container_before")
+    [[ "$config_kind" == bind || "$config_kind" == volume ]] \
+        || die "container inspection returned an invalid configuration kind"
+    [[ "$container_id" =~ ^[0-9a-f]{64}$ ]] \
+        || die "container inspection returned an invalid container ID"
+    if [[ "$config_kind" == bind ]]; then
+        require_regular_file "$maddy_config" "Maddy config"
+        assert_private_file_mode "$maddy_config"
+    fi
+    version_output=$("$docker_binary" exec "$container_id" /bin/maddy version 2>&1) || die "container Maddy version failed"
     maddy_version=$(extract_maddy_version "$version_output")
     version_in_supported_range "$maddy_version" || die "unsupported Maddy version: $maddy_version"
     if [[ "$maddy_version" == "0.8.2" ]]; then
-        help_fingerprint=$(assert_maddy_082_help_profile "$docker_binary" exec "$container" /bin/maddy)
+        help_fingerprint=$(assert_maddy_082_help_profile "$docker_binary" exec "$container_id" /bin/maddy)
     else
-        "$docker_binary" exec "$container" /bin/maddy -config /data/maddy.conf verify-config >/dev/null 2>&1 \
+        "$docker_binary" exec "$container_id" /bin/maddy -config /data/maddy.conf verify-config >/dev/null 2>&1 \
             || die "current container Maddy config does not verify"
         help_fingerprint=not-applicable
     fi
@@ -111,8 +125,32 @@ if [[ "$maddy_version" == "0.8.2" && "$apply" == true && "$allow_downtime" != tr
     die "Maddy 0.8.2 endpoint changes require --allow-downtime and a short restart"
 fi
 
+staging_dir=""
+planned_config="$maddy_config"
+planned_hash=""
+cleanup_staging() {
+    if [[ -n "$staging_dir" && -d "$staging_dir" ]]; then
+        rm -f -- "$staging_dir"/*.conf
+        rmdir -- "$staging_dir"
+    fi
+}
+if [[ "$mode" == docker && "$config_kind" == volume ]]; then
+    require_command mktemp
+    staging_dir=$(mktemp -d /tmp/maddyweb-submission.XXXXXXXX)
+    chmod 0700 -- "$staging_dir"
+    trap cleanup_staging EXIT
+    planned_config="$staging_dir/planned.conf"
+    plan_report=$("$python_binary" "$SCRIPT_DIR/docker-volume-config.py" \
+        --docker "$docker_binary" --container "$container_id" \
+        --expected-container-id "$container_id" --state running \
+        --action export --output "$planned_config")
+    planned_hash=$("$python_binary" -c \
+        'import json,sys; print(json.loads(sys.argv[1])["sha256"])' "$plan_report")
+    [[ "$planned_hash" =~ ^[0-9a-f]{64}$ ]] || die "named-volume plan hash is invalid"
+fi
+
 "$python_binary" "$SCRIPT_DIR/manage-submission.py" \
-    --action "check-$action" --config "$maddy_config" >/dev/null
+    --action "check-$action" --config "$planned_config" >/dev/null
 
 host_listener_count=$(ss -H -ltn 'sport = :1587' 2>/dev/null | wc -l)
 if [[ "$mode" == "native" ]]; then
@@ -128,8 +166,8 @@ else
     [[ "$host_listener_count" -eq 0 ]] || die "Docker mode must not publish host port 1587"
 fi
 
-printf 'environment=%s\nhost=%s\nmode=%s\naction=%s\nmaddy=%s\nconfig=%s\nbackup_dir=%s\nlegacy_help_fingerprint=%s\ndowntime_required=%s\n' \
-    "$environment" "$target_host" "$mode" "$action" "$maddy_version" "$maddy_config" "$backup_dir" "$help_fingerprint" \
+printf 'environment=%s\nhost=%s\nmode=%s\nconfig_kind=%s\naction=%s\nmaddy=%s\nconfig=%s\nbackup_dir=%s\nlegacy_help_fingerprint=%s\ndowntime_required=%s\n' \
+    "$environment" "$target_host" "$mode" "${config_kind:-native}" "$action" "$maddy_version" "$maddy_config" "$backup_dir" "$help_fingerprint" \
     "$([[ "$maddy_version" == "0.8.2" ]] && printf true || printf false)"
 
 if [[ "$apply" != true ]]; then
@@ -143,6 +181,22 @@ if [[ "$environment" == "production" ]]; then
 elif [[ -n "$approval_file" ]]; then
     die "approval files are accepted only for production"
 fi
+require_command flock
+submission_lock=/run/lock/maddyweb-submission.lock
+if [[ -e "$submission_lock" || -L "$submission_lock" ]]; then
+    [[ -d "$submission_lock" && ! -L "$submission_lock" ]] \
+        || die "Submission transaction lock must be a real directory"
+    [[ "$(stat -c '%u:%g:%a' "$submission_lock")" == "0:0:700" ]] \
+        || die "Submission transaction lock metadata is unsafe"
+else
+    install -d -o root -g root -m 0700 -- "$submission_lock"
+fi
+# Open and lock the verified directory itself, avoiding symlink-following file
+# redirection.  The descriptor remains held through health gates and any EXIT
+# rollback; a concurrent apply fails immediately rather than waiting.
+exec {submission_lock_fd}<"$submission_lock"
+flock -n "$submission_lock_fd" \
+    || die "another MaddyWeb Submission transaction is already active"
 install -d -o root -g root -m 0700 -- "$backup_dir"
 
 if [[ "$mode" == "native" ]]; then
@@ -159,8 +213,91 @@ fi
 
 backup_path=""
 candidate_hash=""
+original_hash=""
 rollback_needed=false
 edit_attempted=false
+container_stopped=false
+editor_config="$maddy_config"
+
+container_snapshot_matches() {
+    local after=$1
+    "$python_binary" -c 'import json, sys
+before, after = map(json.loads, sys.argv[1:])
+keys = ("id", "mounts_sha256", "ports_sha256", "restart_policy_sha256",
+        "config_kind", "config_source", "volume_name", "volume_sha256")
+raise SystemExit(any(before.get(key) != after.get(key) for key in keys))' \
+        "$container_before" "$after"
+}
+
+named_volume_snapshot() {
+    "$python_binary" "$SCRIPT_DIR/check-maddy-container.py" \
+        --docker "$docker_binary" --container "$container_id" --host-config "$maddy_config"
+}
+
+pause_named_volume() {
+    [[ "$mode" == docker && "${config_kind:-}" == volume ]] || return 0
+    local before_pause current_state running_state paused_state current_id
+    current_state=$("$docker_binary" inspect --format \
+        '{{.Id}} {{.State.Running}} {{.State.Paused}}' "$container_id")
+    current_id=${current_state%% *}
+    [[ "$current_id" == "$container_id" ]] || die "selected Maddy container ID changed"
+    running_state=$(printf '%s\n' "$current_state" | awk '{print $2}')
+    paused_state=${current_state##* }
+    if [[ "$running_state" != true ]]; then
+        [[ "$paused_state" == false ]] || die "stopped container reported an invalid paused state"
+        container_stopped=true
+        return 0
+    fi
+    container_stopped=false
+    if [[ "$paused_state" == true ]]; then
+        return 0
+    fi
+    before_pause=$(named_volume_snapshot)
+    container_snapshot_matches "$before_pause" || die "container identity changed before pause"
+    "$docker_binary" pause "$container_id" >/dev/null
+    paused_state=$("$docker_binary" inspect --format '{{.State.Paused}}' "$container_id")
+    [[ "$paused_state" == true ]] || die "selected Maddy container did not enter paused state"
+}
+
+unpause_named_volume() {
+    [[ "$mode" == docker && "${config_kind:-}" == volume ]] || return 0
+    local after_unpause current_state running_state paused_state current_id
+    current_state=$("$docker_binary" inspect --format \
+        '{{.Id}} {{.State.Running}} {{.State.Paused}}' "$container_id")
+    current_id=${current_state%% *}
+    [[ "$current_id" == "$container_id" ]] || die "selected Maddy container ID changed"
+    running_state=$(printf '%s\n' "$current_state" | awk '{print $2}')
+    paused_state=${current_state##* }
+    [[ "$running_state" == true ]] || die "selected Maddy container is stopped"
+    if [[ "$paused_state" == true ]]; then
+        "$docker_binary" unpause "$container_id" >/dev/null
+    fi
+    container_stopped=false
+    after_unpause=$(named_volume_snapshot)
+    container_snapshot_matches "$after_unpause" || die "container identity changed while unpausing"
+    paused_state=$("$docker_binary" inspect --format '{{.State.Paused}}' "$container_id")
+    [[ "$paused_state" == false ]] || die "selected Maddy container remained paused"
+}
+
+ensure_named_volume_unpaused() {
+    [[ "$mode" == docker && "${config_kind:-}" == volume ]] || return 0
+    local state current_id running_state paused_state after
+    state=$("$docker_binary" inspect --format \
+        '{{.Id}} {{.State.Running}} {{.State.Paused}}' "$container_id" 2>/dev/null) \
+        || return 1
+    current_id=${state%% *}
+    [[ "$current_id" == "$container_id" ]] || return 1
+    running_state=$(printf '%s\n' "$state" | awk '{print $2}')
+    paused_state=${state##* }
+    if [[ "$running_state" == true && "$paused_state" == true ]]; then
+        "$docker_binary" unpause "$container_id" >/dev/null || return 1
+    elif [[ "$running_state" != true ]]; then
+        "$docker_binary" start "$container_id" >/dev/null || return 1
+    fi
+    container_stopped=false
+    after=$(named_volume_snapshot) || return 1
+    container_snapshot_matches "$after"
+}
 
 reload_or_restart() {
     if [[ "$mode" == "native" ]]; then
@@ -170,10 +307,19 @@ reload_or_restart() {
             systemctl kill --kill-who=main --signal=SIGUSR2 maddy.service
         fi
     else
-        if [[ "$maddy_version" == "0.8.2" ]]; then
-            "$docker_binary" restart --time 10 "$container" >/dev/null
+        local started_from_stopped=false
+        if [[ "${config_kind:-}" == volume && "$container_stopped" == true ]]; then
+            "$docker_binary" start "$container_id" >/dev/null
+            container_stopped=false
+            started_from_stopped=true
         else
-            "$docker_binary" kill --signal=SIGUSR2 "$container" >/dev/null
+            unpause_named_volume
+        fi
+        if [[ "$started_from_stopped" == true ]]; then return 0; fi
+        if [[ "$maddy_version" == "0.8.2" ]]; then
+            "$docker_binary" restart --time 10 "$container_id" >/dev/null
+        else
+            "$docker_binary" kill --signal=SIGUSR2 "$container_id" >/dev/null
         fi
     fi
 }
@@ -184,17 +330,17 @@ config_verify() {
     fi
     if [[ "$mode" == "native" ]]; then
         "$maddy_binary" -config "$maddy_config" verify-config >/dev/null 2>&1
+    elif [[ "${config_kind:-}" == volume ]]; then
+        # A fresh helper lacks the selected container's exact environment and
+        # auxiliary mounts.  Unpause the unchanged main process, then validate
+        # through the reviewed full container ID before signalling reload.
+        if [[ "$container_stopped" == true ]]; then return 0; fi
+        unpause_named_volume
+        "$docker_binary" exec "$container_id" /bin/maddy \
+            -config /data/maddy.conf verify-config >/dev/null 2>&1
     else
-        "$docker_binary" exec "$container" /bin/maddy -config /data/maddy.conf verify-config >/dev/null 2>&1
+        "$docker_binary" exec "$container_id" /bin/maddy -config /data/maddy.conf verify-config >/dev/null 2>&1
     fi
-}
-
-container_snapshot_matches() {
-    local after=$1
-    "$python_binary" -c 'import json, sys
-before, after = map(json.loads, sys.argv[1:])
-keys = ("id", "mounts_sha256", "ports_sha256", "restart_policy_sha256", "config_source")
-raise SystemExit(any(before.get(key) != after.get(key) for key in keys))' "$container_before" "$after"
 }
 
 managed_listener_gate() {
@@ -209,13 +355,13 @@ managed_listener_gate() {
         fi
     else
         local table found=false
-        table=$("$docker_binary" exec "$container" /bin/cat /proc/net/tcp 2>/dev/null) || return 1
+        table=$("$docker_binary" exec "$container_id" /bin/cat /proc/net/tcp 2>/dev/null) || return 1
         if printf '%s\n' "$table" | awk '$2 == "0100007F:0633" && $4 == "0A" {found=1} END {exit !found}'; then
             found=true
         fi
         if [[ "$expected" == present ]]; then
             [[ "$found" == true ]] || return 1
-            "$docker_binary" exec "$container" /usr/bin/nc -z -w 2 127.0.0.1 1587 \
+            "$docker_binary" exec "$container_id" /usr/bin/nc -z -w 2 127.0.0.1 1587 \
                 >/dev/null 2>&1
         else
             [[ "$found" == false ]]
@@ -235,15 +381,15 @@ health_and_log_gate() {
         local after health logs
         for _ in {1..50}; do
             after=$("$python_binary" "$SCRIPT_DIR/check-maddy-container.py" \
-                --docker "$docker_binary" --container "$container" --host-config "$maddy_config" 2>/dev/null) && break
+                --docker "$docker_binary" --container "$container_id" --host-config "$maddy_config" 2>/dev/null) && break
             sleep 0.2
         done
         [[ -n "${after:-}" ]] || return 1
         container_snapshot_matches "$after" || return 1
         health=$("$python_binary" -c 'import json,sys; print(json.loads(sys.argv[1]).get("health") or "none")' "$after")
         [[ "$health" == none || "$health" == healthy ]] || return 1
-        logs=$("$docker_binary" logs --since "$docker_since" "$container" 2>&1) || return 1
-        version_output=$("$docker_binary" exec "$container" /bin/maddy version 2>&1) || return 1
+        logs=$("$docker_binary" logs --since "$docker_since" "$container_id" 2>&1) || return 1
+        version_output=$("$docker_binary" exec "$container_id" /bin/maddy version 2>&1) || return 1
         [[ "$(extract_maddy_version "$version_output")" == "$maddy_version" ]] || return 1
     fi
     ! printf '%s\n' "$logs" | grep -Eiq 'app\.Run failed|reload[^[:alnum:]]*(failed|error)|"level":"(error|fatal)"|(^|[^[:alpha:]])fatal([^[:alpha:]]|$)'
@@ -253,7 +399,48 @@ rollback_candidate() {
     log "restoring the exact pre-change Maddy configuration"
     local status=0 restored=false reloaded=false expected_listener
     local restored_pid restored_snapshot restored_health restored_version_output restored_version
-    if "$python_binary" "$SCRIPT_DIR/manage-submission.py" \
+    local rollback_view rollback_report current_hash rollback_state
+    if [[ "$mode" == docker && "${config_kind:-}" == volume ]]; then
+        if pause_named_volume; then
+            if [[ "$container_stopped" == true ]]; then
+                rollback_state=stopped
+            else
+                rollback_state=paused
+            fi
+            rollback_view="$staging_dir/rollback-current.conf"
+            rm -f -- "$rollback_view"
+            if rollback_report=$("$python_binary" "$SCRIPT_DIR/docker-volume-config.py" \
+                --docker "$docker_binary" --container "$container_id" \
+                --expected-container-id "$container_id" --state "$rollback_state" \
+                --action export --output "$rollback_view"); then
+                current_hash=$("$python_binary" -c \
+                    'import json,sys; print(json.loads(sys.argv[1])["sha256"])' \
+                    "$rollback_report") || status=1
+                if [[ "${current_hash:-}" == "$candidate_hash" ]]; then
+                    if "$python_binary" "$SCRIPT_DIR/docker-volume-config.py" \
+                        --docker "$docker_binary" --container "$container_id" \
+                        --expected-container-id "$container_id" --state "$rollback_state" \
+                        --action replace --candidate "$backup_path" \
+                        --expected-current-sha256 "$candidate_hash" \
+                        --expected-candidate-sha256 "$original_hash" >/dev/null; then
+                        restored=true
+                    else
+                        status=1
+                    fi
+                elif [[ "${current_hash:-}" == "$original_hash" ]]; then
+                    # The helper failed before its atomic rename.  Read-back
+                    # proves there is nothing to restore.
+                    restored=true
+                else
+                    status=1
+                fi
+            else
+                status=1
+            fi
+        else
+            status=1
+        fi
+    elif "$python_binary" "$SCRIPT_DIR/manage-submission.py" \
         --action restore --config "$maddy_config" --backup "$backup_path" \
         --expected-current-sha256 "$candidate_hash" >/dev/null; then
         restored=true
@@ -282,7 +469,7 @@ rollback_candidate() {
             fi
         else
             restored_snapshot=$("$python_binary" "$SCRIPT_DIR/check-maddy-container.py" \
-                --docker "$docker_binary" --container "$container" \
+                --docker "$docker_binary" --container "$container_id" \
                 --host-config "$maddy_config" 2>/dev/null) || status=1
             if [[ -n "${restored_snapshot:-}" ]]; then
                 container_snapshot_matches "$restored_snapshot" || status=1
@@ -293,7 +480,7 @@ rollback_candidate() {
                     || status=1
             fi
             restored_version_output=$(
-                "$docker_binary" exec "$container" /bin/maddy version 2>&1
+                "$docker_binary" exec "$container_id" /bin/maddy version 2>&1
             ) || status=1
             if [[ -n "${restored_version_output:-}" ]]; then
                 restored_version=$(extract_maddy_version "$restored_version_output") || status=1
@@ -312,28 +499,71 @@ rollback_candidate() {
 
 on_error() {
     local status=$?
+    local restoration_failed=false
     trap - ERR EXIT INT TERM
     if [[ "$rollback_needed" == true ]]; then
         (( status != 0 )) || status=1
-        rollback_candidate || log "CRITICAL: automatic configuration restoration failed"
+        if ! rollback_candidate; then
+            restoration_failed=true
+            log "CRITICAL: automatic configuration restoration failed; leave the named-volume container paused if possible"
+        fi
     elif [[ "$edit_attempted" == true ]]; then
         (( status != 0 )) || status=1
         log "CRITICAL: Submission editor exited before a restorable backup/hash was confirmed"
     fi
+    if [[ "$restoration_failed" != true ]] && ! ensure_named_volume_unpaused; then
+        (( status != 0 )) || status=1
+        log "CRITICAL: selected Maddy container could not be safely unpaused and revalidated"
+    fi
+    cleanup_staging || {
+        (( status != 0 )) || status=1
+        log "CRITICAL: private Submission staging cleanup failed"
+    }
     exit "$status"
 }
 trap on_error EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-edit_attempted=true
+if [[ "$mode" == docker && "${config_kind:-}" == volume ]]; then
+    pause_named_volume
+    editor_config="$staging_dir/apply.conf"
+    apply_report=$("$python_binary" "$SCRIPT_DIR/docker-volume-config.py" \
+        --docker "$docker_binary" --container "$container_id" \
+        --expected-container-id "$container_id" --state paused \
+        --action export --output "$editor_config")
+    apply_hash=$("$python_binary" -c \
+        'import json,sys; print(json.loads(sys.argv[1])["sha256"])' "$apply_report")
+    [[ "$apply_hash" == "$planned_hash" ]] \
+        || die "named-volume configuration changed after the reviewed dry-run"
+else
+    edit_attempted=true
+fi
+
 edit_report=$("$python_binary" "$SCRIPT_DIR/manage-submission.py" \
-    --action "$action" --config "$maddy_config" --backup-dir "$backup_dir")
+    --action "$action" --config "$editor_config" --backup-dir "$backup_dir")
 backup_path=$("$python_binary" -c 'import json,sys; print(json.loads(sys.argv[1])["backup"])' "$edit_report")
 candidate_hash=$("$python_binary" -c 'import json,sys; print(json.loads(sys.argv[1])["after_sha256"])' "$edit_report")
-rollback_needed=true
+original_hash=$("$python_binary" -c 'import json,sys; print(json.loads(sys.argv[1])["before_sha256"])' "$edit_report")
 require_regular_file "$backup_path" "Maddy configuration backup"
 [[ "$candidate_hash" =~ ^[0-9a-f]{64}$ ]] || die "editor returned an invalid candidate hash"
+[[ "$original_hash" =~ ^[0-9a-f]{64}$ ]] || die "editor returned an invalid original hash"
+
+if [[ "$mode" == docker && "${config_kind:-}" == volume ]]; then
+    # The helper may complete its atomic rename but lose its acknowledgement.
+    # Arm three-state recovery before invoking it, then distinguish original,
+    # candidate, and unknown content by a fresh paused export.
+    edit_attempted=true
+    rollback_needed=true
+    "$python_binary" "$SCRIPT_DIR/docker-volume-config.py" \
+        --docker "$docker_binary" --container "$container_id" \
+        --expected-container-id "$container_id" --state paused \
+        --action replace --candidate "$editor_config" \
+        --expected-current-sha256 "$original_hash" \
+        --expected-candidate-sha256 "$candidate_hash" >/dev/null
+else
+    rollback_needed=true
+fi
 
 config_verify
 reload_or_restart
@@ -345,6 +575,8 @@ else
 fi
 rollback_needed=false
 edit_attempted=false
+ensure_named_volume_unpaused
+cleanup_staging
 trap - EXIT INT TERM
 
 log "managed Submission action completed: $action"

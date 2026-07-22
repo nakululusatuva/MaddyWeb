@@ -104,6 +104,10 @@ def test_semver_and_release_gate() -> None:
         require_supported_version(SemVer.parse("0.9.5-rc.1"))
     with pytest.raises(UnsupportedVersion):
         require_supported_version(SemVer.parse("0.9.6"))
+    with pytest.raises(UnsupportedVersion):
+        require_supported_version(SemVer.parse("0.8.2+local"))
+    with pytest.raises(UnsupportedVersion):
+        require_supported_version(SemVer.parse("0.9.5+vendor.1"))
 
 
 @pytest.mark.parametrize("installed", ["0.8.1", "0.8.3", "0.9.6"])
@@ -659,15 +663,20 @@ class HelpRunner:
         extra_option: bool = False,
         verify_config: bool = False,
         version: str = "0.9.5",
+        config_text: str | None = None,
     ) -> None:
         self.extra_option = extra_option
         self.verify_config = verify_config
         self.version = version
+        self.config_text = config_text
         self.calls: list[tuple[str, ...]] = []
 
     def run(self, argv: Sequence[str], **_kwargs: Any) -> CommandResult:
         argv = tuple(argv)
         self.calls.append(argv)
+        if argv[-2:] == ("/bin/cat", "/data/maddy.conf"):
+            assert self.config_text is not None
+            return CommandResult(argv, 0, self.config_text.encode(), b"", 0.001)
         suffix = argv[argv.index("-config") + 2 :] if "-config" in argv else argv[1:]
         if suffix == ("version",):
             text = f"{self.version} linux/amd64 go1.24\n"
@@ -728,8 +737,18 @@ def test_extra_help_option_disables_writes() -> None:
     (
         "auth.ldap local_authdb {\n}\n",
         '"auth.ldap" local_authdb {\n}\n',
+        "table.ldap ldap_users {\n  urls ldap://127.0.0.1\n}\n"
+        "auth.pass_table local_authdb {\n  table &ldap_users\n}\n",
         "imap tcp://127.0.0.1:143 {\n  auth ldap\n}\n",
         'imap tcp://127.0.0.1:143 {\n  "auth" "ldap"\n}\n',
+        "auth.plain_separate local_authdb {\n  pass ldap {}\n}\n",
+        "auth.plain_separate local_authdb {\n  user ldap {}\n}\n",
+        "$(part) = ld\n$(backend) = $(part)ap\n"
+        "auth.plain_separate local_authdb {\n  pass $(backend) {}\n}\n",
+        "$(backend) = ldap\ntable.chain chain {\n  optional_step $(backend) {}\n}\n",
+        "$(p@) = ld\n$(b@) = $(p@)ap\nauth.plain_separate local_authdb {\n  pass $(b@) {}\n}\n",
+        "$(9) = ld\n$(backend) = $(9)ap\n"
+        "auth.plain_separate local_authdb {\n  pass $(backend) {}\n}\n",
     ),
 )
 def test_legacy_ldap_config_disables_writes(tmp_path: Path, declaration: str) -> None:
@@ -790,6 +809,166 @@ def test_legacy_dynamic_auth_backend_is_read_only(tmp_path: Path, contents: str)
         runner=HelpRunner(version="0.8.2"),
     )
     assert service.startup_safety_status()["reason"] == "LegacyLDAPUnsafe"
+
+
+def _legacy_docker_service(config_text: str) -> MaddyService:
+    return MaddyService(
+        MaddyTarget(
+            mode="docker",
+            maddy_executable="/bin/maddy",
+            config_path="/data/maddy.conf",
+            container="maddy-test",
+            service_user=None,
+        ),
+        runner=HelpRunner(version="0.8.2", config_text=config_text),
+        version=SemVer.parse("0.8.2"),
+    )
+
+
+def test_legacy_official_docker_identity_env_assignments_allow_writes() -> None:
+    config_text = """$(hostname) = {env:MADDY_HOSTNAME}
+$(primary_domain) = {env:MADDY_DOMAIN}
+auth.pass_table local_authdb {}
+"""
+
+    assert _legacy_docker_service(config_text).startup_safety_status()["writes_enabled"] is True
+
+
+def test_legacy_docker_dynamic_auth_backend_is_read_only() -> None:
+    service = _legacy_docker_service(
+        """$(hostname) = {env:MADDY_HOSTNAME}
+auth {env:BACKEND} {}
+"""
+    )
+
+    assert service.startup_safety_status()["reason"] == "LegacyLDAPUnsafe"
+
+
+@pytest.mark.parametrize(
+    "auth_config",
+    (
+        "auth $(hostname) {}\n",
+        "auth.pass_table $(primary_domain) {}\n",
+        "$(backend) = $(hostname)\nauth $(backend) {}\n",
+        "auth.plain_separate local_authdb {\n  pass $(hostname) {}\n}\n",
+        "auth.plain_separate local_authdb {\n  user $(primary_domain) {}\n}\n",
+        "auth.plain_separate local_authdb {\n  table $(hostname) {}\n}\n",
+        "auth.plain_separate local_authdb {\n  auth_map $(primary_domain) {}\n}\n",
+        "$(hostname) local_authdb {}\n",
+        "$(backend) = $(hostname)\n$(backend) local_authdb {}\n",
+    ),
+)
+def test_legacy_docker_identity_env_macros_cannot_select_auth(auth_config: str) -> None:
+    service = _legacy_docker_service(
+        """$(hostname) = {env:MADDY_HOSTNAME}
+$(primary_domain) = {env:MADDY_DOMAIN}
+"""
+        + auth_config
+    )
+
+    assert service.startup_safety_status()["reason"] == "LegacyLDAPUnsafe"
+
+
+def test_legacy_docker_identity_env_macros_remain_available_outside_auth() -> None:
+    service = _legacy_docker_service(
+        """$(hostname) = {env:MADDY_HOSTNAME}
+$(primary_domain) = {env:MADDY_DOMAIN}
+$(local_domains) = $(primary_domain)
+hostname $(hostname)
+tls file /etc/maddy/certs/$(hostname)/fullchain.pem /etc/maddy/certs/$(hostname)/privkey.pem
+table.chain local_rewrites {
+  optional_step regexp "(.+)\\+(.+)@(.+)" "$1@$3"
+  optional_step static {
+    entry postmaster postmaster@$(primary_domain)
+  }
+}
+smtp tcp://127.0.0.1:25 {
+  source $(local_domains) {
+    destination postmaster $(primary_domain) {}
+    dkim $(primary_domain) $(local_domains) default
+  }
+  auth &local_authdb
+}
+target.queue remote_queue {
+  autogenerated_msg_domain $(primary_domain)
+}
+"""
+    )
+
+    assert service.startup_safety_status()["writes_enabled"] is True
+
+
+def test_current_native_official_static_macro_contexts_allow_writes(tmp_path: Path) -> None:
+    config = tmp_path / "maddy.conf"
+    config.write_text(
+        """$(hostname) = mx.example.test
+$(primary_domain) = example.test
+$(local_domains) = $(primary_domain)
+hostname $(hostname)
+tls file /etc/maddy/certs/$(hostname)/fullchain.pem /etc/maddy/certs/$(hostname)/privkey.pem
+smtp tcp://127.0.0.1:25 {
+  source $(local_domains) {
+    destination postmaster $(primary_domain) {}
+  }
+}
+""",
+        encoding="utf-8",
+    )
+    service = MaddyService(
+        MaddyTarget(mode="native", config_path=str(config), service_user=None),
+        runner=HelpRunner(version="0.9.5", verify_config=True),
+    )
+
+    assert service.startup_safety_status()["writes_enabled"] is True
+
+
+@pytest.mark.parametrize(
+    "contents",
+    (
+        '"$(hostname)" = {env:MADDY_HOSTNAME}\n',
+        '$(hostname) = "{env:MADDY_HOSTNAME}"\n',
+        "$(hostname) = {env:MADDY_HOSTNAME} # trailing comment\n",
+        "$(hostname) = {env:MADDY_HOSTNAME} auth.pass_table local_authdb {}\n",
+        "imap tcp://127.0.0.1:143 {\n  $(hostname) = {env:MADDY_HOSTNAME}\n}\n",
+        "$(hostname) = {env:MADDY_DOMAIN}\n",
+        "$(hostname) = {env:MADDY_HOSTNAME}{env:AUTH_BACKEND}\n",
+        '$(prefix) = "{env"\n$(backend) = "$(prefix):AUTH_BACKEND}"\nauth $(backend) {}\n',
+        '$(left) = "{"\n$(middle) = "env:"\n$(right) = "}"\n'
+        '$(backend) = "$(left)$(middle)AUTH_BACKEND$(right)"\n'
+        "auth $(backend) {}\n",
+        "$(middle) = env:\nhostname {$(middle)MADDY_HOSTNAME}\n",
+    ),
+)
+def test_legacy_docker_env_allowlist_rejects_ambiguous_or_mixed_lines(contents: str) -> None:
+    assert _legacy_docker_service(contents).startup_safety_status()["writes_enabled"] is False
+
+
+@pytest.mark.parametrize(
+    "contents",
+    (
+        "$(hostname) = {env:MADDY_HOSTNAME}\nauth \\\n$(hostname) {}\n",
+        "auth \\\nldap local_authdb {}\n",
+    ),
+)
+def test_legacy_line_continuations_are_fail_closed(contents: str) -> None:
+    status = _legacy_docker_service(contents).startup_safety_status()
+
+    assert status["writes_enabled"] is False
+    assert status["reason"] == "RuntimeConfigUnsafe"
+
+
+@pytest.mark.parametrize(
+    "contents",
+    (
+        "\ufeffauth.ldap local_authdb {}\n",
+        "\ufefftable.ldap ldap_users {}\nauth.pass_table local_authdb { table &ldap_users }\n",
+    ),
+)
+def test_legacy_bom_is_fail_closed(contents: str) -> None:
+    status = _legacy_docker_service(contents).startup_safety_status()
+
+    assert status["writes_enabled"] is False
+    assert status["reason"] == "RuntimeConfigUnsafe"
 
 
 def test_current_native_env_or_import_config_is_read_only(tmp_path: Path) -> None:
