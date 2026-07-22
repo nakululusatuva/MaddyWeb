@@ -1,5 +1,4 @@
-# ruff: noqa: RUF001
-"""aiohttp application factory and the unprivileged Chinese administration UI."""
+"""aiohttp application factory and the unprivileged English administration UI."""
 
 from __future__ import annotations
 
