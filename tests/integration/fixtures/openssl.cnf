@@ -1,0 +1,13 @@
+[req]
+distinguished_name = dn
+x509_extensions = extensions
+prompt = no
+
+[dn]
+CN = mx.example.invalid
+
+[extensions]
+subjectAltName = DNS:mx.example.invalid
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth

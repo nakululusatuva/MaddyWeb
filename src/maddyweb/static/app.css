@@ -1,0 +1,104 @@
+:root {
+  color-scheme: light;
+  font-family: Inter, "Noto Sans SC", "Microsoft YaHei", system-ui, sans-serif;
+  color: #172033;
+  background: #f4f6fa;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100vh; }
+a { color: #1858a8; }
+button, input, textarea { font: inherit; }
+button {
+  border: 0;
+  border-radius: .5rem;
+  padding: .65rem 1rem;
+  color: #fff;
+  background: #1858a8;
+  cursor: pointer;
+}
+button:hover { background: #104782; }
+button.danger { background: #a12532; }
+button.danger:hover { background: #811a25; }
+
+.skip-link { position: absolute; left: -9999px; }
+.skip-link:focus { left: 1rem; top: 1rem; z-index: 10; background: #fff; padding: .5rem; }
+.site-header {
+  display: flex;
+  align-items: center;
+  gap: 2rem;
+  padding: .8rem max(1rem, calc((100% - 1120px) / 2));
+  color: #fff;
+  background: #142846;
+}
+.brand { color: #fff; font-weight: 800; font-size: 1.25rem; text-decoration: none; }
+.site-header nav { display: flex; gap: 1rem; flex-wrap: wrap; }
+.site-header nav a { color: #e9f1ff; text-decoration: none; }
+.container { width: min(1120px, calc(100% - 2rem)); margin: 1.5rem auto 3rem; }
+footer { padding: 1.5rem; text-align: center; color: #5e687a; }
+
+.panel, .card, .notice {
+  border: 1px solid #dce1ea;
+  border-radius: .7rem;
+  background: #fff;
+  box-shadow: 0 1px 3px rgb(23 32 51 / 8%);
+}
+.panel { margin: 1rem 0; padding: 1.1rem; }
+.panel h2 { margin-top: 0; }
+.card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 1rem; }
+.card { display: grid; gap: .4rem; padding: 1.25rem; color: inherit; text-decoration: none; }
+.card:hover { border-color: #1858a8; }
+.card span, .muted { color: #657086; }
+
+.notice { margin: 1rem 0; padding: .9rem 1rem; border-left-width: .35rem; }
+.notice-success { border-left-color: #258451; }
+.notice-warning { border-left-color: #c27800; }
+.notice-error { border-left-color: #ad2937; }
+.notice-info { border-left-color: #2869b8; }
+
+.stack-form { display: grid; gap: 1rem; }
+.stack-form label { display: grid; gap: .35rem; font-weight: 650; }
+.stack-form input, .stack-form textarea, .rich-editor {
+  width: 100%;
+  border: 1px solid #aeb8c8;
+  border-radius: .45rem;
+  padding: .65rem .75rem;
+  color: #172033;
+  background: #fff;
+}
+.stack-form input:focus, .stack-form textarea:focus, .rich-editor:focus {
+  outline: 3px solid #bcd8fa;
+  border-color: #1858a8;
+}
+.form-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+fieldset { margin: 0; border: 1px solid #cbd2de; border-radius: .5rem; }
+.editor-toolbar { display: flex; gap: .4rem; margin-bottom: .5rem; }
+.editor-toolbar button { padding: .35rem .65rem; color: #172033; background: #e9edf4; }
+.rich-editor { min-height: 12rem; overflow-wrap: anywhere; }
+.rich-editor img { max-width: 100%; height: auto; }
+
+.table-scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; }
+th, td { padding: .7rem; border-bottom: 1px solid #e0e4eb; text-align: left; }
+th { color: #465268; }
+tr.unread { font-weight: 700; }
+.empty { padding: 2rem; text-align: center; color: #657086; }
+.actions form { margin: 0; }
+.folder-nav { display: flex; gap: .4rem; }
+.folder-nav a { padding: .55rem .8rem; border-radius: .45rem; text-decoration: none; }
+.folder-nav a[aria-current="page"] { color: #fff; background: #1858a8; }
+.pagination { display: flex; justify-content: space-between; gap: 1rem; margin-top: 1rem; }
+.mail-detail dl { display: grid; grid-template-columns: max-content 1fr; gap: .35rem 1rem; }
+.mail-detail dt { font-weight: 700; }
+.mail-detail dd { margin: 0; overflow-wrap: anywhere; }
+.plain-mail { white-space: pre-wrap; overflow-wrap: anywhere; }
+.mail-frame { width: 100%; min-height: 28rem; margin-top: 1rem; border: 1px solid #dce1ea; }
+.attachment-list { padding-left: 1.2rem; }
+.danger-zone { margin-top: 1rem; }
+code { overflow-wrap: anywhere; }
+
+@media (max-width: 680px) {
+  .site-header { align-items: flex-start; flex-direction: column; gap: .65rem; }
+  .form-columns { grid-template-columns: 1fr; }
+  .mail-detail dl { grid-template-columns: 1fr; }
+}

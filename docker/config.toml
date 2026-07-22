@@ -1,0 +1,43 @@
+[server]
+listen = "127.0.0.1:8787"
+allowed_hosts = ["127.0.0.1", "localhost"]
+concurrency = 8
+backlog = 16
+keepalive_seconds = 5
+request_body_timeout_seconds = 15
+max_upload_bytes = 20971520
+page_size = 50
+temp_dir = "/var/tmp/maddyweb"
+
+[maddy]
+mode = "docker"
+container = "maddy"
+binary = "/usr/bin/maddy"
+config_path = "/data/maddy.conf"
+data_dir = "/data"
+service_user = "maddy"
+helper_socket = "/run/maddyweb/helper.sock"
+submission_host = "127.0.0.1"
+submission_port = 1587
+command_timeout_seconds = 15
+
+[certificates]
+enabled = false
+names = []
+certbot_binary = "/usr/bin/certbot"
+openssl_binary = "/usr/bin/openssl"
+nginx_binary = "/usr/sbin/nginx"
+renewal_dir = "/etc/letsencrypt/renewal"
+live_dir = "/etc/letsencrypt/live"
+timer_unit = "certbot-renew.timer"
+command_timeout_seconds = 300
+deployed_cert_path = "/data/certs/fullchain.pem"
+deployed_key_path = "/data/certs/privkey.pem"
+
+[security]
+session_key_file = "/var/lib/maddyweb/session.key"
+csrf_ttl_seconds = 900
+cookie_name = "__Host-maddyweb"
+
+[logging]
+level = "INFO"

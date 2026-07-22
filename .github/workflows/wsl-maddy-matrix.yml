@@ -1,0 +1,43 @@
+name: WSL Maddy compatibility matrix
+
+on:
+  workflow_dispatch:
+    inputs:
+      distro:
+        description: Pre-provisioned WSL distribution name
+        required: true
+        default: Ubuntu
+        type: string
+      allow_image_pull:
+        description: Explicitly allow pulling only digest-locked GHCR images
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  matrix:
+    # This deliberately targets an isolated, non-production runner with
+    # CPython 3.14 already installed inside WSL. It must have no production
+    # credentials or production network route.
+    runs-on: [self-hosted, windows, x64, maddy-wsl-matrix]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Run isolated WSL matrix
+        shell: pwsh
+        env:
+          WSL_DISTRO: ${{ inputs.distro }}
+          ALLOW_IMAGE_PULL: ${{ inputs.allow_image_pull }}
+        run: |
+          $Arguments = @{
+            Distro = $env:WSL_DISTRO
+            Mode = 'Container'
+            ReportPath = (Join-Path $env:RUNNER_TEMP 'maddy-wsl-report.json')
+          }
+          if ($env:ALLOW_IMAGE_PULL -eq 'true') {
+            $Arguments.AllowImagePull = $true
+          }
+          ./tests/integration/maddy-wsl-matrix.ps1 @Arguments

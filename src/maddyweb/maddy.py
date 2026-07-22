@@ -1,0 +1,2186 @@
+"""Fail-closed, shell-free access to the supported Maddy administration CLI.
+
+The CLI is an administrative interface, not an RPC API.  This module therefore
+keeps every command shape in code, validates every positional value, caps all
+input/output, and refuses Maddy releases that have not been explicitly tested.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import os
+import re
+import signal
+import subprocess
+import threading
+import time
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import suppress
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import StrEnum
+from functools import total_ordering
+from itertools import pairwise
+from pathlib import Path, PurePosixPath
+from typing import Any, BinaryIO, Protocol, Self
+
+_SEMVER_RE = re.compile(
+    r"\A(?:v)?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+    r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
+    r"(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?\Z"
+)
+_CONTAINER_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+_BLOCK_RE = re.compile(r"\A[A-Za-z_][A-Za-z0-9_.-]{0,127}\Z")
+_SEQSET_RE = re.compile(
+    r"\A(?:[1-9]\d*|\*)(?::(?:[1-9]\d*|\*))?"
+    r"(?:,(?:[1-9]\d*|\*)(?::(?:[1-9]\d*|\*))?)*\Z"
+)
+_KEYWORD_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
+_SYSTEM_FLAGS = frozenset({"\\Answered", "\\Flagged", "\\Deleted", "\\Seen", "\\Draft"})
+_SPECIAL_USES = frozenset({"archive", "drafts", "junk", "sent", "trash"})
+
+DEFAULT_TIMEOUT_SECONDS = 15.0
+DEFAULT_MAX_OUTPUT_BYTES = 8 * 1024 * 1024
+DEFAULT_MAX_INPUT_BYTES = 32 * 1024 * 1024
+MAX_MESSAGE_LIST_OUTPUT_BYTES = 4 * 1024 * 1024
+MAX_MESSAGE_OUTPUT_LINE_CHARS = 64 * 1024
+MAX_IMAP_UID = (1 << 32) - 1
+
+
+class MaddyError(RuntimeError):
+    """Base class for safe-to-classify Maddy failures."""
+
+
+class StaleMessageCursor(MaddyError):
+    """A mailbox changed while resolving a stable UID continuation."""
+
+
+class VersionParseError(MaddyError):
+    """The output of ``maddy version`` did not start with a SemVer."""
+
+
+class UnsupportedVersion(MaddyError):
+    """The detected Maddy build is outside the tested release set."""
+
+
+class UnsupportedCapability(MaddyError):
+    """The detected release does not implement a requested capability."""
+
+
+class CapabilityFingerprintError(MaddyError):
+    """The installed CLI help does not match the tested command contract."""
+
+
+class LegacyLDAPUnsafe(MaddyError):
+    """A pre-0.9.3 build uses LDAP and is unsafe for administrative writes."""
+
+
+class RuntimeConfigUnsafe(MaddyError):
+    """The helper cannot prove its CLI sees the service's effective config."""
+
+
+class InvalidMaddyArgument(ValueError):
+    """A caller supplied a value that is unsafe as a CLI positional argument."""
+
+
+class CommandLaunchError(MaddyError):
+    """The fixed executable could not be started."""
+
+
+class CommandTimeout(MaddyError):
+    """A child process exceeded its configured deadline."""
+
+
+class CommandOutputLimit(MaddyError):
+    """A child process exceeded the combined stdout/stderr limit."""
+
+
+class CommandInputError(MaddyError):
+    """A trusted input stream did not match its declared length."""
+
+
+class CommandFailed(MaddyError):
+    """A Maddy command returned a non-zero status without exposing its stderr."""
+
+    def __init__(self, result: CommandResult, *, reported_failure: bool = False) -> None:
+        self.result = result
+        self.reported_failure = reported_failure
+        if reported_failure:
+            message = "Maddy reported an application failure"
+        else:
+            message = f"Maddy command failed with exit status {result.returncode}"
+        super().__init__(message)
+
+
+class PartialOperationError(MaddyError):
+    """A multi-command operation was only partly applied."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        completed: Sequence[str],
+        rollback_succeeded: bool | None = None,
+    ) -> None:
+        self.completed = tuple(completed)
+        self.rollback_succeeded = rollback_succeeded
+        super().__init__(message)
+
+
+@total_ordering
+@dataclass(frozen=True, slots=True)
+class SemVer:
+    """A small SemVer 2.0 value with precedence ordering."""
+
+    major: int
+    minor: int
+    patch: int
+    prerelease: tuple[str, ...] = ()
+    build: tuple[str, ...] = field(default=(), compare=False)
+
+    @classmethod
+    def parse(cls, value: str) -> Self:
+        match = _SEMVER_RE.fullmatch(value.strip())
+        if match is None:
+            raise VersionParseError("Maddy version is not valid SemVer")
+        prerelease = tuple(match.group(4).split(".")) if match.group(4) else ()
+        for identifier in prerelease:
+            if identifier.isdigit() and len(identifier) > 1 and identifier.startswith("0"):
+                raise VersionParseError("numeric prerelease identifiers cannot have leading zeroes")
+        build = tuple(match.group(5).split(".")) if match.group(5) else ()
+        return cls(int(match.group(1)), int(match.group(2)), int(match.group(3)), prerelease, build)
+
+    @classmethod
+    def from_maddy_output(cls, output: str | bytes) -> Self:
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        first_line = output.splitlines()[0].strip() if output.splitlines() else ""
+        tokens = first_line.split()
+        if tokens and tokens[0].lower() == "maddy":
+            tokens = tokens[1:]
+        if not tokens:
+            raise VersionParseError("Maddy version output is empty")
+        # Only the first build-info token is considered.  In particular, this
+        # avoids accidentally accepting the later Go runtime token.
+        return cls.parse(tokens[0])
+
+    def __str__(self) -> str:
+        value = f"{self.major}.{self.minor}.{self.patch}"
+        if self.prerelease:
+            value += "-" + ".".join(self.prerelease)
+        if self.build:
+            value += "+" + ".".join(self.build)
+        return value
+
+    def __lt__(self, other: object) -> bool:
+        if not isinstance(other, SemVer):
+            return NotImplemented
+        own_core = (self.major, self.minor, self.patch)
+        other_core = (other.major, other.minor, other.patch)
+        if own_core != other_core:
+            return own_core < other_core
+        if not self.prerelease:
+            return bool(other.prerelease)
+        if not other.prerelease:
+            return True
+        for own, theirs in zip(self.prerelease, other.prerelease, strict=False):
+            if own == theirs:
+                continue
+            own_numeric = own.isdigit()
+            their_numeric = theirs.isdigit()
+            if own_numeric and their_numeric:
+                return int(own) < int(theirs)
+            if own_numeric != their_numeric:
+                return own_numeric
+            return own < theirs
+        return len(self.prerelease) < len(other.prerelease)
+
+
+MIN_SUPPORTED_VERSION = SemVer.parse("0.8.2")
+MAX_SUPPORTED_VERSION = SemVer.parse("0.9.5")
+TESTED_RELEASES = frozenset(
+    SemVer.parse(value) for value in ("0.8.2", "0.9.0", "0.9.1", "0.9.2", "0.9.3", "0.9.4", "0.9.5")
+)
+
+
+class Capability(StrEnum):
+    DIAGNOSTICS = "diagnostics"
+    VERIFY_CONFIG = "verify_config"
+    ACCOUNT_ADMIN = "account_admin"
+    MAILBOX_ADMIN = "mailbox_admin"
+    MESSAGE_ADMIN = "message_admin"
+    CERTIFICATE_FILE_ADMIN = "certificate_file_admin"
+    TLS_RELOAD = "tls_reload"
+    ZERO_DOWNTIME_RELOAD = "zero_downtime_reload"
+    LDAP_AUTH_SAFE = "ldap_auth_safe"
+    EXPLICIT_CLI_LIFECYCLE = "explicit_cli_lifecycle"
+
+
+@dataclass(frozen=True, slots=True)
+class CliFingerprint:
+    """Digest of validated CLI help plus the signatures that were observed."""
+
+    sha256: str
+    signatures: tuple[str, ...]
+
+
+_BASE_CAPABILITIES = frozenset(
+    {
+        Capability.DIAGNOSTICS,
+        Capability.ACCOUNT_ADMIN,
+        Capability.MAILBOX_ADMIN,
+        Capability.MESSAGE_ADMIN,
+        Capability.CERTIFICATE_FILE_ADMIN,
+        Capability.TLS_RELOAD,
+    }
+)
+
+
+def require_supported_version(version: SemVer, *, known_release: bool = True) -> SemVer:
+    """Reject prereleases, out-of-range versions and, by default, unknown releases."""
+
+    if version.prerelease:
+        raise UnsupportedVersion(f"prerelease Maddy build {version} is not supported")
+    if not MIN_SUPPORTED_VERSION <= version <= MAX_SUPPORTED_VERSION:
+        raise UnsupportedVersion(
+            f"Maddy {version} is outside {MIN_SUPPORTED_VERSION}..{MAX_SUPPORTED_VERSION}"
+        )
+    if known_release and version not in TESTED_RELEASES:
+        raise UnsupportedVersion(f"Maddy {version} is not a tested upstream release")
+    return version
+
+
+def capabilities_for(version: SemVer) -> frozenset[Capability]:
+    require_supported_version(version)
+    capabilities = set(_BASE_CAPABILITIES)
+    if version >= SemVer.parse("0.9.0"):
+        capabilities.add(Capability.ZERO_DOWNTIME_RELOAD)
+        capabilities.add(Capability.VERIFY_CONFIG)
+    if version >= SemVer.parse("0.9.3"):
+        capabilities.add(Capability.LDAP_AUTH_SAFE)
+    if version >= SemVer.parse("0.9.4"):
+        capabilities.add(Capability.EXPLICIT_CLI_LIFECYCLE)
+    return frozenset(capabilities)
+
+
+class DeploymentMode(StrEnum):
+    NATIVE = "native"
+    DOCKER = "docker"
+
+
+def _fixed_token(value: str, field_name: str) -> str:
+    if not value or len(value) > 4096 or any(ord(char) < 0x20 for char in value):
+        raise InvalidMaddyArgument(f"invalid fixed {field_name}")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class MaddyTarget:
+    """Trusted deployment settings used to construct immutable command prefixes."""
+
+    mode: DeploymentMode | str
+    maddy_executable: str = "/usr/bin/maddy"
+    config_path: str | None = None
+    container: str | None = None
+    docker_executable: str = "/usr/bin/docker"
+    service_user: str | None = "maddy"
+    systemctl_executable: str = "/usr/bin/systemctl"
+    systemd_unit: str = "maddy.service"
+
+    def __post_init__(self) -> None:
+        try:
+            mode = self.mode if isinstance(self.mode, DeploymentMode) else DeploymentMode(self.mode)
+        except ValueError as exc:
+            raise InvalidMaddyArgument("deployment mode must be native or docker") from exc
+        object.__setattr__(self, "mode", mode)
+        _fixed_token(self.maddy_executable, "Maddy executable")
+        _fixed_token(self.docker_executable, "Docker executable")
+        _fixed_token(self.systemctl_executable, "systemctl executable")
+        if not all(
+            PurePosixPath(executable).is_absolute()
+            for executable in (
+                self.maddy_executable,
+                self.docker_executable,
+                self.systemctl_executable,
+            )
+        ):
+            raise InvalidMaddyArgument("all privileged executables must use absolute paths")
+        if self.docker_executable != "/usr/bin/docker":
+            raise InvalidMaddyArgument("Docker executable is not the fixed allow-listed path")
+        if self.systemctl_executable != "/usr/bin/systemctl":
+            raise InvalidMaddyArgument("systemctl executable is not the fixed allow-listed path")
+        if self.config_path is not None:
+            _fixed_token(self.config_path, "configuration path")
+        if mode is DeploymentMode.DOCKER:
+            if self.container is None or _CONTAINER_RE.fullmatch(self.container) is None:
+                raise InvalidMaddyArgument("invalid Docker container name")
+        elif self.container is not None:
+            raise InvalidMaddyArgument("native targets cannot specify a Docker container")
+        if not re.fullmatch(r"[A-Za-z0-9_.@-]{1,128}", self.systemd_unit):
+            raise InvalidMaddyArgument("invalid systemd unit")
+        if self.service_user is not None and not re.fullmatch(
+            r"[a-z_][a-z0-9_-]{0,31}", self.service_user
+        ):
+            raise InvalidMaddyArgument("invalid service user")
+
+    @classmethod
+    def from_config(cls, config: Any) -> Self:
+        """Adapt the public config object without importing ``config.py``."""
+
+        mode = DeploymentMode(str(config.mode))
+        if mode is DeploymentMode.DOCKER:
+            # Do not rely on the image ENTRYPOINT: docker exec bypasses it.  Use
+            # the paths present in the supported official images explicitly.
+            return cls(
+                mode=mode,
+                container=str(config.container),
+                maddy_executable="/bin/maddy",
+                config_path="/data/maddy.conf",
+                service_user=None,
+            )
+        return cls(
+            mode=mode,
+            maddy_executable=str(config.binary),
+            config_path=str(config.config_path),
+            service_user=str(config.service_user),
+        )
+
+    def argv(
+        self,
+        suffix: Sequence[str],
+        *,
+        has_stdin: bool = False,
+        use_config: bool = True,
+    ) -> tuple[str, ...]:
+        if not suffix:
+            raise InvalidMaddyArgument("empty Maddy command")
+        checked_suffix = tuple(_fixed_token(str(item), "command argument") for item in suffix)
+        inner = [self.maddy_executable]
+        if use_config and self.config_path is not None:
+            inner.extend(("-config", self.config_path))
+        inner.extend(checked_suffix)
+        if self.mode is DeploymentMode.NATIVE:
+            return tuple(inner)
+        outer = [self.docker_executable, "exec"]
+        if has_stdin:
+            outer.append("-i")
+        outer.extend((str(self.container), *inner))
+        return tuple(outer)
+
+    def reload_argv(self) -> tuple[str, ...]:
+        if self.mode is DeploymentMode.DOCKER:
+            return (self.docker_executable, "kill", "--signal=USR2", str(self.container))
+        return (self.systemctl_executable, "reload", self.systemd_unit)
+
+    def config_read_argv(self) -> tuple[str, ...]:
+        """Return a fixed Docker argv for reading the effective in-container config."""
+
+        if self.mode is not DeploymentMode.DOCKER or self.config_path is None:
+            raise InvalidMaddyArgument("config_read_argv is only valid for Docker targets")
+        return (
+            self.docker_executable,
+            "exec",
+            str(self.container),
+            "/bin/cat",
+            self.config_path,
+        )
+
+    @property
+    def run_as_user(self) -> str | None:
+        return self.service_user if self.mode is DeploymentMode.NATIVE else None
+
+
+@dataclass(frozen=True, slots=True)
+class CommandResult:
+    argv: tuple[str, ...]
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+    duration_seconds: float
+    streamed_stdout_bytes: int = 0
+
+    @property
+    def stdout_text(self) -> str:
+        return self.stdout.decode("utf-8", errors="replace")
+
+    @property
+    def stderr_text(self) -> str:
+        return self.stderr.decode("utf-8", errors="replace")
+
+
+AuditCallback = Callable[[str, str], None] | Callable[..., None]
+
+
+def _default_audit(action: str, *, outcome: str, fields: Mapping[str, Any]) -> None:
+    try:
+        from .audit import record
+
+        record(action, outcome=outcome, fields=fields)
+    except ImportError, RuntimeError:
+        # Audit setup must not make command construction import-order dependent.
+        return
+
+
+class Runner(Protocol):
+    def run(
+        self,
+        argv: Sequence[str],
+        *,
+        input_data: bytes | None = None,
+        input_stream: BinaryIO | None = None,
+        input_length: int | None = None,
+        output_sink: BinaryIO | None = None,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
+        max_input_bytes: int = DEFAULT_MAX_INPUT_BYTES,
+        run_as_user: str | None = None,
+    ) -> CommandResult: ...
+
+
+class SubprocessRunner:
+    """Run a fixed argv without a shell, with deadlines and bounded pipes."""
+
+    def __init__(self, audit: Callable[..., None] = _default_audit) -> None:
+        self._audit = audit
+
+    @staticmethod
+    def _terminate(process: subprocess.Popen[bytes]) -> None:
+        try:
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except ProcessLookupError, PermissionError, OSError:
+            with suppress(OSError):
+                process.kill()
+
+    def run(
+        self,
+        argv: Sequence[str],
+        *,
+        input_data: bytes | None = None,
+        input_stream: BinaryIO | None = None,
+        input_length: int | None = None,
+        output_sink: BinaryIO | None = None,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
+        max_input_bytes: int = DEFAULT_MAX_INPUT_BYTES,
+        run_as_user: str | None = None,
+    ) -> CommandResult:
+        fixed_argv = tuple(_fixed_token(str(item), "process argument") for item in argv)
+        if not fixed_argv:
+            raise CommandLaunchError("cannot run an empty argv")
+        if timeout <= 0 or max_output_bytes <= 0 or max_input_bytes <= 0:
+            raise ValueError("process limits must be positive")
+        if input_data is not None and input_stream is not None:
+            raise InvalidMaddyArgument("command input cannot be both bytes and a stream")
+        if input_data is not None and len(input_data) > max_input_bytes:
+            raise InvalidMaddyArgument("command input exceeds its configured limit")
+        if input_stream is not None and (
+            type(input_length) is not int or input_length < 0 or input_length > max_input_bytes
+        ):
+            raise InvalidMaddyArgument("stream input has an invalid declared length")
+        if input_stream is None and input_length is not None:
+            raise InvalidMaddyArgument("input_length requires input_stream")
+
+        # The helper runs as root, so inheriting LD_*, PYTHON*, Docker context,
+        # proxy or shell environment variables would turn configuration into a
+        # code-execution primitive.  Every child receives a minimal fixed env.
+        env = {
+            "LANG": "C",
+            "LC_ALL": "C",
+            "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+        }
+        kwargs: dict[str, Any] = {
+            "stdin": (
+                subprocess.PIPE
+                if input_data is not None or input_stream is not None
+                else subprocess.DEVNULL
+            ),
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "shell": False,
+            "env": env,
+        }
+        if os.name == "posix":
+            kwargs["start_new_session"] = True
+            if run_as_user is not None:
+                try:
+                    import pwd
+
+                    account = pwd.getpwnam(run_as_user)
+                except (ImportError, KeyError) as exc:
+                    raise CommandLaunchError("service account could not be resolved") from exc
+                kwargs["user"] = account.pw_uid
+                kwargs["group"] = account.pw_gid
+                kwargs["extra_groups"] = ()
+
+        started = time.monotonic()
+        try:
+            process = subprocess.Popen(fixed_argv, **kwargs)  # noqa: S603
+        except (OSError, ValueError) as exc:
+            self._audit(
+                "privileged.command",
+                outcome="launch_error",
+                fields={"executable": Path(fixed_argv[0]).name, "argc": len(fixed_argv)},
+            )
+            raise CommandLaunchError("fixed executable could not be started") from exc
+
+        buffers = {"stdout": bytearray(), "stderr": bytearray()}
+        output_counts = {"stdout": 0, "stderr": 0}
+        lock = threading.Lock()
+        exceeded = threading.Event()
+        input_invalid = threading.Event()
+        sink_failed = threading.Event()
+
+        def write_output_sink(data: bytes) -> None:
+            sink = output_sink
+            if sink is None:
+                raise RuntimeError("command output sink is unavailable")
+            written = sink.write(data)
+            if written is not None and written != len(data):
+                raise OSError("command output sink accepted only a partial write")
+
+        def reader(name: str, stream: Any) -> None:
+            try:
+                while chunk := stream.read(64 * 1024):
+                    with lock:
+                        used = output_counts["stdout"] + output_counts["stderr"]
+                        remaining = max_output_bytes - used
+                        if remaining <= 0 or len(chunk) > remaining:
+                            if remaining > 0:
+                                accepted = chunk[:remaining]
+                                if name == "stdout" and output_sink is not None:
+                                    write_output_sink(accepted)
+                                    probe_remaining = 64 * 1024 - len(buffers[name])
+                                    if probe_remaining > 0:
+                                        buffers[name].extend(accepted[:probe_remaining])
+                                else:
+                                    buffers[name].extend(accepted)
+                                output_counts[name] += len(accepted)
+                            exceeded.set()
+                        else:
+                            if name == "stdout" and output_sink is not None:
+                                write_output_sink(chunk)
+                                probe_remaining = 64 * 1024 - len(buffers[name])
+                                if probe_remaining > 0:
+                                    buffers[name].extend(chunk[:probe_remaining])
+                            else:
+                                buffers[name].extend(chunk)
+                            output_counts[name] += len(chunk)
+                    if exceeded.is_set():
+                        self._terminate(process)
+                        return
+            except Exception:
+                sink_failed.set()
+                self._terminate(process)
+            finally:
+                stream.close()
+
+        readers = [
+            threading.Thread(target=reader, args=("stdout", process.stdout), daemon=True),
+            threading.Thread(target=reader, args=("stderr", process.stderr), daemon=True),
+        ]
+        for thread in readers:
+            thread.start()
+
+        writer: threading.Thread | None = None
+        if input_data is not None or input_stream is not None:
+
+            def write_input() -> None:
+                try:
+                    stdin = process.stdin
+                    if stdin is None:
+                        input_invalid.set()
+                        self._terminate(process)
+                        return
+                    if input_data is not None:
+                        stdin.write(input_data)
+                    else:
+                        source = input_stream
+                        remaining_length = input_length
+                        if source is None or remaining_length is None:
+                            input_invalid.set()
+                            self._terminate(process)
+                            return
+                        remaining = remaining_length
+                        while remaining:
+                            requested = min(64 * 1024, remaining)
+                            chunk = source.read(requested)
+                            if not chunk:
+                                input_invalid.set()
+                                self._terminate(process)
+                                return
+                            if not isinstance(chunk, bytes):
+                                input_invalid.set()
+                                self._terminate(process)
+                                return
+                            if len(chunk) > requested:
+                                input_invalid.set()
+                                self._terminate(process)
+                                return
+                            stdin.write(chunk)
+                            remaining -= len(chunk)
+                        if source.read(1):
+                            input_invalid.set()
+                            self._terminate(process)
+                            return
+                    stdin.flush()
+                except Exception:
+                    input_invalid.set()
+                    self._terminate(process)
+                finally:
+                    if process.stdin is not None:
+                        with suppress(BrokenPipeError, OSError):
+                            process.stdin.close()
+
+            writer = threading.Thread(target=write_input, daemon=True)
+            writer.start()
+
+        try:
+            returncode = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            self._terminate(process)
+            process.wait()
+            for thread in readers:
+                thread.join(timeout=1)
+            self._audit(
+                "privileged.command",
+                outcome="timeout",
+                fields={"executable": Path(fixed_argv[0]).name, "argc": len(fixed_argv)},
+            )
+            raise CommandTimeout("fixed command exceeded its deadline") from exc
+        finally:
+            if writer is not None:
+                writer.join(timeout=1)
+
+        for thread in readers:
+            thread.join(timeout=1)
+            if thread.is_alive():
+                sink_failed.set()
+        if output_sink is not None:
+            try:
+                output_sink.flush()
+            except (OSError, ValueError) as exc:
+                raise CommandOutputLimit("command output sink failed") from exc
+        if input_invalid.is_set():
+            raise CommandInputError("command input stream does not match its declared length")
+        if sink_failed.is_set():
+            raise CommandOutputLimit("command output sink failed")
+        duration = time.monotonic() - started
+        if exceeded.is_set():
+            self._audit(
+                "privileged.command",
+                outcome="output_limit",
+                fields={"executable": Path(fixed_argv[0]).name, "argc": len(fixed_argv)},
+            )
+            raise CommandOutputLimit("fixed command exceeded its output limit")
+
+        result = CommandResult(
+            argv=fixed_argv,
+            returncode=returncode,
+            stdout=bytes(buffers["stdout"]),
+            stderr=bytes(buffers["stderr"]),
+            duration_seconds=duration,
+            streamed_stdout_bytes=output_counts["stdout"] if output_sink is not None else 0,
+        )
+        self._audit(
+            "privileged.command",
+            outcome="ok" if returncode == 0 else "failed",
+            fields={
+                "executable": Path(fixed_argv[0]).name,
+                "argc": len(fixed_argv),
+                "returncode": returncode,
+                "stdin_bytes": (
+                    len(input_data)
+                    if input_data is not None
+                    else (input_length if input_stream is not None else 0)
+                ),
+                "stdout_bytes": output_counts["stdout"],
+                "stderr_bytes": len(result.stderr),
+                "duration_ms": round(duration * 1000),
+            },
+        )
+        return result
+
+
+def _safe_positional(value: str, field_name: str, *, max_length: int = 512) -> str:
+    if not value or len(value) > max_length:
+        raise InvalidMaddyArgument(f"invalid {field_name}")
+    if value.startswith("-") or any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+        raise InvalidMaddyArgument(f"invalid {field_name}")
+    return value
+
+
+def _safe_block(value: str, field_name: str) -> str:
+    if _BLOCK_RE.fullmatch(value) is None:
+        raise InvalidMaddyArgument(f"invalid {field_name}")
+    return value
+
+
+def _safe_seqset(value: str) -> str:
+    if _SEQSET_RE.fullmatch(value) is None:
+        raise InvalidMaddyArgument("invalid IMAP UID set")
+    return value
+
+
+def _safe_uid(value: str) -> str:
+    if not value.isascii() or not value.isdecimal() or value.startswith("0") or len(value) > 10:
+        raise InvalidMaddyArgument("invalid single IMAP UID")
+    uid = int(value)
+    if not 1 <= uid <= (1 << 32) - 1:
+        raise InvalidMaddyArgument("invalid single IMAP UID")
+    return str(uid)
+
+
+def _safe_flag(value: str) -> str:
+    if value not in _SYSTEM_FLAGS and _KEYWORD_RE.fullmatch(value) is None:
+        raise InvalidMaddyArgument("invalid IMAP flag")
+    return value
+
+
+def _config_tokens_and_text(config_text: str) -> tuple[tuple[str, ...], str]:
+    """Return decoded config tokens and text with comments removed.
+
+    Maddy accepts a quoted directive token (for example ``"auth.ldap"``).
+    Escaped or unterminated directive tokens are deliberately rejected because
+    guessing at Maddy's lexer would make a fail-closed write gate bypassable.
+    """
+
+    tokens: list[str] = []
+    uncommented_lines: list[str] = []
+    for raw_line in config_text.splitlines():
+        clean: list[str] = []
+        quoted = False
+        escaped = False
+        for character in raw_line:
+            if escaped:
+                clean.append(character)
+                escaped = False
+                continue
+            if quoted and character == "\\":
+                clean.append(character)
+                escaped = True
+                continue
+            if character == '"':
+                quoted = not quoted
+                clean.append(character)
+                continue
+            if character == "#" and not quoted:
+                break
+            clean.append(character)
+        if quoted or escaped:
+            raise RuntimeConfigUnsafe("Maddy config contains an ambiguous quoted line")
+        line = "".join(clean)
+        uncommented_lines.append(line)
+        index = 0
+        while index < len(line):
+            if line[index].isspace():
+                index += 1
+                continue
+            if line[index] in "{}":
+                tokens.append(line[index])
+                index += 1
+                continue
+            if line[index] == "'":
+                raise RuntimeConfigUnsafe("Maddy config contains an unsupported token quote")
+            if line[index] == '"':
+                closing = index + 1
+                while closing < len(line) and line[closing] != '"':
+                    if line[closing] == "\\":
+                        raise RuntimeConfigUnsafe("Maddy config contains an escaped quoted token")
+                    closing += 1
+                if closing >= len(line):
+                    raise RuntimeConfigUnsafe("Maddy config contains an unterminated token")
+                if closing + 1 < len(line) and not (
+                    line[closing + 1].isspace() or line[closing + 1] in "{}"
+                ):
+                    raise RuntimeConfigUnsafe("Maddy config contains an ambiguous quoted token")
+                tokens.append(line[index + 1 : closing])
+                index = closing + 1
+                continue
+            end = index + 1
+            while end < len(line) and not line[end].isspace() and line[end] not in "{}":
+                end += 1
+            tokens.append(line[index:end])
+            index = end
+    return tuple(tokens), "\n".join(uncommented_lines)
+
+
+def _password_input(password: str) -> bytes:
+    if (
+        not password
+        or len(password) > 1024
+        or "\n" in password
+        or "\r" in password
+        or "\0" in password
+    ):
+        raise InvalidMaddyArgument("password is empty, too long, or contains a line break")
+    return password.encode("utf-8") + b"\n"
+
+
+def _parse_flags(value: str) -> list[str]:
+    value = value.strip()
+    if not (value.startswith("[") and value.endswith("]")):
+        return []
+    return [item for item in value[1:-1].split() if item]
+
+
+def _strict_flags(value: str) -> list[str]:
+    flags = _parse_flags(value)
+    if not value.strip().startswith("[") or not value.strip().endswith("]"):
+        raise CapabilityFingerprintError("Maddy flag output does not match a tested profile")
+    if any(any(ord(character) < 0x20 for character in flag) for flag in flags):
+        raise CapabilityFingerprintError("Maddy flag output contains invalid characters")
+    return flags
+
+
+def _strict_output_integer(
+    value: str,
+    field: str,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    """Parse a bounded CLI integer without exposing Python's huge-int parser."""
+
+    candidate = value.strip()
+    digits = candidate[1:] if candidate.startswith("-") else candidate
+    if not digits or len(digits) > 20 or not digits.isascii() or not digits.isdecimal():
+        raise CapabilityFingerprintError(f"Maddy {field} is not a tested integer")
+    parsed = int(candidate)
+    if not minimum <= parsed <= maximum:
+        raise CapabilityFingerprintError(f"Maddy {field} is outside its tested range")
+    return parsed
+
+
+def parse_message_list(output: str | bytes) -> list[dict[str, Any]]:
+    """Parse both compact and ``--full`` output used by Maddy 0.8.2..0.9.5."""
+
+    if isinstance(output, bytes):
+        if len(output) > MAX_MESSAGE_LIST_OUTPUT_BYTES:
+            raise CapabilityFingerprintError("Maddy message output exceeds the tested limit")
+        try:
+            output = output.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise CapabilityFingerprintError("Maddy message output is not UTF-8") from exc
+    else:
+        try:
+            encoded_size = len(output.encode("utf-8", errors="strict"))
+        except UnicodeEncodeError as exc:
+            raise CapabilityFingerprintError("Maddy message output is not valid Unicode") from exc
+        if encoded_size > MAX_MESSAGE_LIST_OUTPUT_BYTES:
+            raise CapabilityFingerprintError("Maddy message output exceeds the tested limit")
+    if any(len(line) > MAX_MESSAGE_OUTPUT_LINE_CHARS for line in output.splitlines()):
+        raise CapabilityFingerprintError("Maddy message output contains an oversized line")
+    records: list[dict[str, Any]] = []
+    if not output.strip():
+        return records
+    if "- Server meta-data:" not in output:
+        lines = [line for line in output.splitlines() if line.strip()]
+        index = 0
+        while index < len(lines):
+            match = re.match(r"^UID ([1-9]\d*): (.*?) - (.*)$", lines[index])
+            if match is None:
+                raise CapabilityFingerprintError(
+                    "compact Maddy message output does not match a tested profile"
+                )
+            record: dict[str, Any] = {
+                "uid": _strict_output_integer(
+                    match.group(1),
+                    "message UID",
+                    minimum=1,
+                    maximum=MAX_IMAP_UID,
+                ),
+                "from": match.group(2),
+                "subject": match.group(3),
+            }
+            if index + 1 < len(lines):
+                details = lines[index + 1].strip()
+                flag_text, separator, date_text = details.partition(", ")
+                if separator:
+                    record["flags"] = _strict_flags(flag_text)
+                    record["date"] = date_text
+                    index += 1
+                elif not details.startswith("UID "):
+                    raise CapabilityFingerprintError(
+                        "compact Maddy message detail does not match a tested profile"
+                    )
+            records.append(record)
+            index += 1
+        return records
+
+    if output.lstrip().startswith("- Server meta-data:") is False:
+        raise CapabilityFingerprintError("full Maddy message output has an unexpected prefix")
+    blocks = output.split("- Server meta-data:")[1:]
+    if not blocks:
+        raise CapabilityFingerprintError("full Maddy message output is empty")
+    for block in blocks:
+        metadata_text, marker, envelope_text = block.partition("- Envelope:")
+        if not marker:
+            raise CapabilityFingerprintError("full Maddy message block has no envelope")
+        record = {"flags": []}
+        for line in metadata_text.splitlines():
+            key, separator, value = line.partition(":")
+            if not separator:
+                if line.strip():
+                    raise CapabilityFingerprintError("full Maddy metadata line is malformed")
+                continue
+            key = key.strip().lower()
+            value = value.strip()
+            if key == "uid":
+                record["uid"] = _strict_output_integer(
+                    value,
+                    "message UID",
+                    minimum=1,
+                    maximum=MAX_IMAP_UID,
+                )
+            elif key == "sequence number":
+                record["sequence_number"] = _strict_output_integer(
+                    value,
+                    "message sequence number",
+                    minimum=1,
+                    maximum=MAX_IMAP_UID,
+                )
+            elif key == "flags":
+                record["flags"] = _strict_flags(value)
+            elif key == "body size":
+                record["body_size"] = _strict_output_integer(
+                    value,
+                    "message body size",
+                    minimum=0,
+                    maximum=(1 << 63) - 1,
+                )
+            elif key == "internal date":
+                unix, _, human = value.partition(" ")
+                record["internal_date_unix"] = _strict_output_integer(
+                    unix,
+                    "message internal date",
+                    minimum=-(1 << 63),
+                    maximum=(1 << 63) - 1,
+                )
+                record["internal_date"] = human or value
+        envelope_keys = {
+            "from": "from",
+            "to": "to",
+            "cc": "cc",
+            "bcc": "bcc",
+            "in-reply-to": "in_reply_to",
+            "message-id": "message_id",
+            "subject": "subject",
+        }
+        for line in envelope_text.splitlines():
+            key, separator, value = line.partition(":")
+            if not separator:
+                if line.strip():
+                    raise CapabilityFingerprintError("full Maddy envelope line is malformed")
+                continue
+            normalized = key.strip().lower()
+            value = value.strip()
+            if normalized == "date":
+                unix, _, human = value.partition(" ")
+                record["date_unix"] = _strict_output_integer(
+                    unix,
+                    "envelope date",
+                    minimum=-(1 << 63),
+                    maximum=(1 << 63) - 1,
+                )
+                record["date"] = human or value
+            elif normalized in envelope_keys:
+                record[envelope_keys[normalized]] = value
+        uid = record.get("uid")
+        if not isinstance(uid, int) or not 1 <= uid <= (1 << 32) - 1:
+            raise CapabilityFingerprintError("full Maddy message block has no valid UID")
+        records.append(record)
+    return records
+
+
+class MaddyService:
+    """Typed allow-list over Maddy's supported administrative subcommands."""
+
+    def __init__(
+        self,
+        target: MaddyTarget,
+        *,
+        runner: Runner | None = None,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        auth_block: str = "local_authdb",
+        storage_block: str = "local_mailboxes",
+        version: SemVer | None = None,
+        cli_fingerprint: CliFingerprint | None = None,
+    ) -> None:
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        self.target = target
+        self.runner = runner or SubprocessRunner()
+        self.timeout = timeout
+        self.auth_block = _safe_block(auth_block, "authentication block")
+        self.storage_block = _safe_block(storage_block, "storage block")
+        self._installed_version = version
+        self._installed_version_error: VersionParseError | None = None
+        self._version: SemVer | None = None
+        if version is not None:
+            # Preserve an unsupported parsed version for read-only diagnostics.
+            # Every business operation still goes through ``probe_version``.
+            with suppress(UnsupportedVersion):
+                self._version = require_supported_version(version)
+        self._cli_fingerprint = cli_fingerprint
+        self._legacy_config_checked = False
+        self._legacy_config_has_ldap = False
+        self._legacy_config_has_import = False
+        self._runtime_config_has_env = False
+        self._output_contract_failure: str | None = None
+        self._lock = threading.RLock()
+
+    @classmethod
+    def from_config(cls, config: Any, *, runner: Runner | None = None) -> Self:
+        return cls(
+            MaddyTarget.from_config(config),
+            runner=runner,
+            timeout=float(config.command_timeout_seconds),
+        )
+
+    def _invoke(
+        self,
+        suffix: Sequence[str],
+        *,
+        input_data: bytes | None = None,
+        input_stream: BinaryIO | None = None,
+        input_length: int | None = None,
+        output_sink: BinaryIO | None = None,
+        use_config: bool = True,
+        max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
+        as_service_user: bool = True,
+    ) -> CommandResult:
+        has_stdin = input_data is not None or input_stream is not None
+        argv = self.target.argv(suffix, has_stdin=has_stdin, use_config=use_config)
+        run_options: dict[str, Any] = {
+            "input_data": input_data,
+            "timeout": self.timeout,
+            "max_output_bytes": max_output_bytes,
+            "run_as_user": self.target.run_as_user if as_service_user else None,
+        }
+        if input_stream is not None:
+            run_options["input_stream"] = input_stream
+            run_options["input_length"] = input_length
+        if output_sink is not None:
+            run_options["output_sink"] = output_sink
+        result = self.runner.run(argv, **run_options)
+        if result.returncode != 0:
+            raise CommandFailed(result)
+        if self._reported_application_failure(result):
+            # Maddy 0.8.x can log app.Run failed yet still exit zero.  Treat the
+            # structured failure record as authoritative and fail closed.
+            raise CommandFailed(result, reported_failure=True)
+        return result
+
+    @staticmethod
+    def _reported_application_failure(result: CommandResult) -> bool:
+        for raw_stream in (result.stdout, result.stderr):
+            if b"app.Run failed" in raw_stream:
+                return True
+            for raw_line in raw_stream.splitlines():
+                line = raw_line.strip()
+                if not (line.startswith(b"{") and line.endswith(b"}")):
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError, UnicodeDecodeError:
+                    continue
+                if not isinstance(event, dict) or "reason" not in event:
+                    continue
+                level = str(event.get("level", "")).lower()
+                message = str(event.get("msg", event.get("message", ""))).lower()
+                if level in {"error", "fatal"} or "failed" in message:
+                    return True
+        return False
+
+    def probe_installed_version(self, *, refresh: bool = False) -> SemVer:
+        """Return the parsed installed version without declaring it supported."""
+
+        with self._lock:
+            if not refresh:
+                if self._installed_version is not None:
+                    return self._installed_version
+                if self._installed_version_error is not None:
+                    raise self._installed_version_error
+            result = self._invoke(("version",), use_config=False, max_output_bytes=64 * 1024)
+            try:
+                installed = SemVer.from_maddy_output(result.stdout)
+            except VersionParseError as exc:
+                self._installed_version = None
+                self._installed_version_error = exc
+                self._version = None
+                raise
+            self._installed_version = installed
+            self._installed_version_error = None
+            self._version = None
+            return installed
+
+    def probe_version(self, *, refresh: bool = False) -> SemVer:
+        with self._lock:
+            if self._version is not None and not refresh:
+                return self._version
+            installed = self.probe_installed_version(refresh=refresh)
+            self._version = require_supported_version(installed)
+            return self._version
+
+    def capabilities(self) -> frozenset[Capability]:
+        return capabilities_for(self.probe_version())
+
+    _ADMIN_GROUP_ACTIONS: Mapping[str, frozenset[str]] = {
+        "creds": frozenset({"list", "create", "remove", "password"}),
+        "imap-acct": frozenset({"list", "create", "remove", "appendlimit"}),
+        "imap-mboxes": frozenset({"list", "create", "remove", "rename"}),
+        "imap-msgs": frozenset(
+            {"add", "add-flags", "rem-flags", "set-flags", "remove", "copy", "move", "list", "dump"}
+        ),
+    }
+    # (USAGE positional fragment, exact long-option set excluding --help).
+    # Source inspection and real 0.8.2 execution show this profile is identical
+    # for all seven TESTED_RELEASES.  Mapping each release explicitly prevents a
+    # future in-range but unprofiled version from silently inheriting it.
+    _ACTION_PROFILE: Mapping[tuple[str, str], tuple[str, frozenset[str]]] = {
+        ("creds", "list"): ("", frozenset({"cfg-block"})),
+        ("creds", "create"): (
+            "USERNAME",
+            frozenset({"cfg-block", "password", "hash", "bcrypt-cost"}),
+        ),
+        ("creds", "remove"): ("USERNAME", frozenset({"cfg-block", "yes"})),
+        ("creds", "password"): ("USERNAME", frozenset({"cfg-block", "password"})),
+        ("imap-acct", "list"): ("", frozenset({"cfg-block"})),
+        ("imap-acct", "create"): (
+            "USERNAME",
+            frozenset(
+                {
+                    "cfg-block",
+                    "no-specialuse",
+                    "sent-name",
+                    "trash-name",
+                    "junk-name",
+                    "drafts-name",
+                    "archive-name",
+                }
+            ),
+        ),
+        ("imap-acct", "remove"): ("USERNAME", frozenset({"cfg-block", "yes"})),
+        ("imap-acct", "appendlimit"): (
+            "USERNAME",
+            frozenset({"cfg-block", "value"}),
+        ),
+        ("imap-mboxes", "list"): ("USERNAME", frozenset({"cfg-block", "subscribed"})),
+        ("imap-mboxes", "create"): (
+            "USERNAME NAME",
+            frozenset({"cfg-block", "special"}),
+        ),
+        ("imap-mboxes", "remove"): (
+            "USERNAME MAILBOX",
+            frozenset({"cfg-block", "yes"}),
+        ),
+        ("imap-mboxes", "rename"): (
+            "USERNAME OLDNAME NEWNAME",
+            frozenset({"cfg-block"}),
+        ),
+        ("imap-msgs", "add"): (
+            "USERNAME MAILBOX",
+            frozenset({"cfg-block", "flag", "date"}),
+        ),
+        ("imap-msgs", "add-flags"): (
+            "USERNAME MAILBOX SEQ FLAGS...",
+            frozenset({"cfg-block", "uid"}),
+        ),
+        ("imap-msgs", "rem-flags"): (
+            "USERNAME MAILBOX SEQ FLAGS...",
+            frozenset({"cfg-block", "uid"}),
+        ),
+        ("imap-msgs", "set-flags"): (
+            "USERNAME MAILBOX SEQ FLAGS...",
+            frozenset({"cfg-block", "uid"}),
+        ),
+        ("imap-msgs", "remove"): (
+            "USERNAME MAILBOX SEQSET",
+            frozenset({"cfg-block", "uid", "yes"}),
+        ),
+        ("imap-msgs", "copy"): (
+            "USERNAME SRCMAILBOX SEQSET TGTMAILBOX",
+            frozenset({"cfg-block", "uid"}),
+        ),
+        ("imap-msgs", "move"): (
+            "USERNAME SRCMAILBOX SEQSET TGTMAILBOX",
+            frozenset({"cfg-block", "uid"}),
+        ),
+        ("imap-msgs", "list"): (
+            "USERNAME MAILBOX [SEQSET]",
+            frozenset({"cfg-block", "uid", "full"}),
+        ),
+        ("imap-msgs", "dump"): (
+            "USERNAME MAILBOX SEQ",
+            frozenset({"cfg-block", "uid"}),
+        ),
+    }
+    _PROFILED_RELEASES = frozenset(str(version) for version in TESTED_RELEASES)
+
+    @staticmethod
+    def _help_commands(help_text: str) -> frozenset[str]:
+        marker = "COMMANDS:"
+        if marker not in help_text:
+            raise CapabilityFingerprintError("Maddy CLI help has no COMMANDS section")
+        section = help_text.split(marker, 1)[1]
+        for next_marker in ("OPTIONS:", "GLOBAL OPTIONS:"):
+            if next_marker in section:
+                section = section.split(next_marker, 1)[0]
+        commands: set[str] = set()
+        for line in section.splitlines():
+            match = re.match(r"^\s{2,}([a-z][a-z0-9-]*)(?:,\s*[a-z])?(?:\s{2,}|$)", line)
+            if match and match.group(1) != "help":
+                commands.add(match.group(1))
+        return frozenset(commands)
+
+    @staticmethod
+    def _help_options(help_text: str) -> frozenset[str]:
+        lines = help_text.splitlines()
+        try:
+            start = next(index for index, line in enumerate(lines) if line.strip() == "OPTIONS:")
+        except StopIteration as exc:
+            raise CapabilityFingerprintError("Maddy CLI help has no OPTIONS section") from exc
+        section_lines: list[str] = []
+        for line in lines[start + 1 :]:
+            if line and not line[0].isspace() and line.rstrip().endswith(":"):
+                break
+            section_lines.append(line)
+        options = set(re.findall(r"--([a-z][a-z0-9-]*)", "\n".join(section_lines)))
+        options.discard("help")
+        return frozenset(options)
+
+    def probe_cli_fingerprint(self, *, refresh: bool = False) -> CliFingerprint:
+        """Validate the actual help contract before permitting any CLI write."""
+
+        with self._lock:
+            if self._cli_fingerprint is not None and not refresh:
+                return self._cli_fingerprint
+            version = self.probe_version()
+            if str(version) not in self._PROFILED_RELEASES:
+                raise CapabilityFingerprintError("Maddy release has no locked CLI profile")
+            normalized_profile: list[str] = []
+            signatures: list[str] = []
+            top_result = self._invoke(("--help",), max_output_bytes=512 * 1024)
+            top_help = (top_result.stdout + top_result.stderr).decode("utf-8", errors="replace")
+            top_commands = self._help_commands(top_help)
+            missing_groups = set(self._ADMIN_GROUP_ACTIONS) - set(top_commands)
+            has_verify_config = "verify-config" in top_commands
+            expects_verify_config = version >= SemVer.parse("0.9.0")
+            if missing_groups or has_verify_config is not expects_verify_config:
+                raise CapabilityFingerprintError("top-level Maddy CLI profile does not match")
+            normalized_profile.append(
+                "top:"
+                + ",".join(
+                    sorted(
+                        set(self._ADMIN_GROUP_ACTIONS)
+                        | ({"verify-config"} if has_verify_config else set())
+                    )
+                )
+            )
+            signatures.append("--help")
+
+            for group, expected_actions in self._ADMIN_GROUP_ACTIONS.items():
+                result = self._invoke((group, "--help"), max_output_bytes=512 * 1024)
+                help_text = (result.stdout + result.stderr).decode("utf-8", errors="replace")
+                if self._help_commands(help_text) != expected_actions:
+                    raise CapabilityFingerprintError(f"{group} command set does not match")
+                normalized_profile.append(f"{group}:" + ",".join(sorted(expected_actions)))
+                signatures.append(f"{group} --help")
+
+            for suffix, (usage_fragment, expected_options) in self._ACTION_PROFILE.items():
+                result = self._invoke((*suffix, "--help"), max_output_bytes=512 * 1024)
+                help_text = (result.stdout + result.stderr).decode("utf-8", errors="replace")
+                normalized_help = " ".join(help_text.split())
+                if usage_fragment and usage_fragment not in normalized_help:
+                    raise CapabilityFingerprintError(
+                        f"{' '.join(suffix)} USAGE signature does not match"
+                    )
+                observed_options = self._help_options(help_text)
+                if observed_options != expected_options:
+                    raise CapabilityFingerprintError(
+                        f"{' '.join(suffix)} option set does not match"
+                    )
+                normalized_profile.append(
+                    f"{' '.join(suffix)}|{usage_fragment}|{','.join(sorted(observed_options))}"
+                )
+                signatures.append(f"{' '.join(suffix)} --help")
+            digest = hashlib.sha256("\n".join(normalized_profile).encode("utf-8")).hexdigest()
+            self._cli_fingerprint = CliFingerprint(digest, tuple(signatures))
+            return self._cli_fingerprint
+
+    def _read_effective_config(self) -> str:
+        path_text = self.target.config_path
+        if path_text is None:
+            raise LegacyLDAPUnsafe("effective Maddy config path is not fixed")
+        if self.target.mode is DeploymentMode.NATIVE:
+            path = Path(path_text)
+            try:
+                size = path.stat().st_size
+                if size <= 0 or size > 2 * 1024 * 1024:
+                    raise LegacyLDAPUnsafe("effective Maddy config has an invalid size")
+                data = path.read_bytes()
+            except OSError as exc:
+                raise LegacyLDAPUnsafe("effective Maddy config cannot be read") from exc
+            if len(data) != size:
+                raise LegacyLDAPUnsafe("effective Maddy config changed while being read")
+        else:
+            result = self.runner.run(
+                self.target.config_read_argv(),
+                timeout=self.timeout,
+                max_output_bytes=2 * 1024 * 1024,
+                run_as_user=None,
+            )
+            if result.returncode != 0 or self._reported_application_failure(result):
+                raise LegacyLDAPUnsafe("effective Maddy config cannot be read")
+            data = result.stdout
+        return data.decode("utf-8", errors="replace")
+
+    def _ensure_legacy_auth_safe(self, version: SemVer) -> None:
+        legacy = version < SemVer.parse("0.9.3")
+        if not legacy and self.target.mode is DeploymentMode.DOCKER:
+            return
+        with self._lock:
+            if not self._legacy_config_checked:
+                config_text = self._read_effective_config()
+                tokens, uncommented = _config_tokens_and_text(config_text)
+                self._legacy_config_has_ldap = "auth.ldap" in tokens or any(
+                    left == "auth" and right == "ldap" for left, right in pairwise(tokens)
+                )
+                self._legacy_config_has_import = "import" in tokens
+                self._runtime_config_has_env = "{env:" in uncommented
+                self._legacy_config_checked = True
+            if legacy and self._legacy_config_has_ldap:
+                raise LegacyLDAPUnsafe("Maddy versions before 0.9.3 are unsafe with auth.ldap")
+            if legacy and self._legacy_config_has_import:
+                raise LegacyLDAPUnsafe(
+                    "Maddy versions before 0.9.3 require an import-free config for writes"
+                )
+            if legacy and self._runtime_config_has_env:
+                raise LegacyLDAPUnsafe(
+                    "Maddy versions before 0.9.3 require env-free auth config for writes"
+                )
+            if self.target.mode is DeploymentMode.NATIVE and self._runtime_config_has_env:
+                raise RuntimeConfigUnsafe(
+                    "native Maddy configs using env substitutions are read-only"
+                )
+            if self.target.mode is DeploymentMode.NATIVE and self._legacy_config_has_import:
+                raise RuntimeConfigUnsafe(
+                    "native Maddy configs using imports are read-only without service env parity"
+                )
+
+    def startup_safety_status(self) -> dict[str, Any]:
+        """Eagerly probe version, help contract and legacy LDAP write safety."""
+
+        version = self.probe_version()
+        if self._output_contract_failure is not None:
+            return {
+                "version": str(version),
+                "writes_enabled": False,
+                "reason": "CapabilityFingerprintError",
+            }
+        try:
+            fingerprint = self.probe_cli_fingerprint()
+            self._ensure_legacy_auth_safe(version)
+        except (CapabilityFingerprintError, LegacyLDAPUnsafe, RuntimeConfigUnsafe) as exc:
+            return {
+                "version": str(version),
+                "writes_enabled": False,
+                "reason": type(exc).__name__,
+            }
+        return {
+            "version": str(version),
+            "writes_enabled": True,
+            "cli_fingerprint": fingerprint.sha256,
+        }
+
+    def require_write_safety(self, capability: Capability) -> SemVer:
+        """Re-probe every mutable-operation gate immediately before use."""
+
+        with self._lock:
+            version = self.probe_version(refresh=True)
+            if self._output_contract_failure is not None:
+                raise CapabilityFingerprintError(
+                    "a Maddy runtime output no longer matches the tested adapter"
+                )
+            if capability not in capabilities_for(version):
+                raise UnsupportedCapability(f"Maddy {version} does not support {capability.value}")
+            if version < SemVer.parse("0.9.3") or self.target.mode is DeploymentMode.NATIVE:
+                # The effective configuration can change without restarting
+                # the helper.  Re-read it for every legacy write so LDAP can
+                # never remain allowed because of a stale startup cache.
+                self._legacy_config_checked = False
+            self._ensure_legacy_auth_safe(version)
+            self.probe_cli_fingerprint(refresh=True)
+            return version
+
+    def _require(self, capability: Capability, *, write: bool = False) -> SemVer:
+        if write:
+            return self.require_write_safety(capability)
+        version = self.probe_version()
+        if capability not in capabilities_for(version):
+            raise UnsupportedCapability(f"Maddy {version} does not support {capability.value}")
+        return version
+
+    def version_info(self) -> dict[str, Any]:
+        try:
+            installed = self.probe_installed_version()
+        except VersionParseError:
+            return {
+                "version": "unknown",
+                "mode": self.target.mode.value,
+                "capabilities": [],
+                "writes_enabled": False,
+                "cli_fingerprint": None,
+                "write_block_reason": "VersionParseError",
+            }
+        try:
+            version = require_supported_version(installed)
+        except UnsupportedVersion:
+            return {
+                "version": str(installed),
+                "mode": self.target.mode.value,
+                "capabilities": [],
+                "writes_enabled": False,
+                "cli_fingerprint": None,
+                "write_block_reason": "UnsupportedVersion",
+            }
+        safety = self.startup_safety_status()
+        return {
+            "version": str(version),
+            "mode": self.target.mode.value,
+            "capabilities": sorted(capability.value for capability in capabilities_for(version)),
+            "writes_enabled": safety["writes_enabled"],
+            "cli_fingerprint": safety.get("cli_fingerprint"),
+            "write_block_reason": safety.get("reason"),
+        }
+
+    def verify_config(self) -> str:
+        self._require(Capability.VERIFY_CONFIG)
+        result = self._invoke(("verify-config",), max_output_bytes=256 * 1024)
+        return (result.stdout + result.stderr).decode("utf-8", errors="replace").strip()
+
+    def _credentials(
+        self,
+        action: str,
+        *args: str,
+        input_data: bytes | None = None,
+        write: bool | None = None,
+    ) -> CommandResult:
+        if write is None:
+            write = action != "list"
+        self._require(Capability.ACCOUNT_ADMIN, write=write)
+        return self._invoke(
+            ("creds", action, "--cfg-block", self.auth_block, *args),
+            input_data=input_data,
+        )
+
+    def _imap_accounts(
+        self,
+        action: str,
+        *args: str,
+        write: bool | None = None,
+    ) -> CommandResult:
+        if write is None:
+            write = action not in {"list"}
+        self._require(Capability.ACCOUNT_ADMIN, write=write)
+        return self._invoke(("imap-acct", action, "--cfg-block", self.storage_block, *args))
+
+    def _fail_output_contract(self, message: str) -> None:
+        self._output_contract_failure = message
+        raise CapabilityFingerprintError(message)
+
+    def _account_lines(self, result: CommandResult, *, empty_marker: str) -> list[str]:
+        try:
+            text = result.stdout.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            self._fail_output_contract("Maddy account output is not UTF-8")
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if len(lines) == 1 and lines[0].casefold() == empty_marker.casefold():
+            return []
+        if any(
+            len(line) > 254
+            or line.startswith("-")
+            or any(character.isspace() or ord(character) < 0x20 for character in line)
+            for line in lines
+        ):
+            self._fail_output_contract("Maddy account output does not match a tested profile")
+        return lines
+
+    def list_credentials(self) -> list[str]:
+        return self._account_lines(self._credentials("list"), empty_marker="No users.")
+
+    def list_imap_accounts(self) -> list[str]:
+        return self._account_lines(self._imap_accounts("list"), empty_marker="No users.")
+
+    def list_accounts(self, *, include_append_limits: bool = True) -> list[dict[str, Any]]:
+        if type(include_append_limits) is not bool:
+            raise InvalidMaddyArgument("include_append_limits must be a boolean")
+        credentials = set(self.list_credentials())
+        mailboxes = set(self.list_imap_accounts())
+        accounts: list[dict[str, Any]] = []
+        for username in sorted(credentials | mailboxes, key=str.casefold):
+            account: dict[str, Any] = {
+                "id": username,
+                "address": username,
+                "username": username,
+                "has_credentials": username in credentials,
+                "has_mailbox": username in mailboxes,
+            }
+            if username in mailboxes and include_append_limits:
+                try:
+                    account["append_limit"] = self.get_append_limit(username)
+                except MaddyError:
+                    account["append_limit"] = None
+                    account["append_limit_error"] = True
+            else:
+                account["append_limit"] = None
+            accounts.append(account)
+        return accounts
+
+    def _compensate_account_creation(
+        self,
+        username: str,
+        *,
+        credential_baseline: frozenset[str],
+        mailbox_baseline: frozenset[str],
+    ) -> tuple[tuple[str, ...], bool]:
+        """Remove only resources newly observed after a failed account create.
+
+        A CLI timeout is not evidence that the command had no effect.  Read
+        operations are therefore retried once, while mutable cleanup commands
+        are issued at most once and their outcome is decided exclusively by a
+        final read-back.  This also handles a cleanup command that times out
+        after successfully deleting its target.
+        """
+
+        def observe(list_resource: Callable[[], list[str]]) -> bool | None:
+            for _attempt in range(2):
+                try:
+                    return username in list_resource()
+                except MaddyError:
+                    continue
+            return None
+
+        credential_was_present = username in credential_baseline
+        mailbox_was_present = username in mailbox_baseline
+        credential_is_present = observe(self.list_credentials)
+        mailbox_is_present = observe(self.list_imap_accounts)
+
+        credential_was_created = not credential_was_present and credential_is_present is True
+        mailbox_was_created = not mailbox_was_present and mailbox_is_present is True
+
+        # Remove the mailbox first so credentials remain available until its
+        # destructive cleanup command has been attempted.
+        if mailbox_was_created:
+            # A timeout may still mean the delete took effect.  The final
+            # read-back below, rather than the exception, is authoritative.
+            with suppress(MaddyError):
+                self._imap_accounts("remove", "-y", username)
+        if credential_was_created:
+            with suppress(MaddyError):
+                self._credentials("remove", "-y", username)
+
+        final_credential_is_present = observe(self.list_credentials)
+        final_mailbox_is_present = observe(self.list_imap_accounts)
+
+        # If the initial observation was unavailable, retain evidence of a
+        # newly present resource discovered during verification.  It was not
+        # safe to delete without the earlier read-back, so rollback must fail.
+        credential_was_created = credential_was_created or (
+            not credential_was_present and final_credential_is_present is True
+        )
+        mailbox_was_created = mailbox_was_created or (
+            not mailbox_was_present and final_mailbox_is_present is True
+        )
+        completed = tuple(
+            name
+            for name, was_created in (
+                ("credentials.create", credential_was_created),
+                ("mailbox.create", mailbox_was_created),
+            )
+            if was_created
+        )
+        rollback_succeeded = (
+            final_credential_is_present is not None
+            and final_mailbox_is_present is not None
+            and final_credential_is_present == credential_was_present
+            and final_mailbox_is_present == mailbox_was_present
+        )
+        return completed, rollback_succeeded
+
+    def create_account(self, username: str, password: str) -> dict[str, Any]:
+        username = _safe_positional(username, "username", max_length=254)
+        password_data = _password_input(password)
+        with self._lock:
+            credential_baseline = frozenset(self.list_credentials())
+            mailbox_baseline = frozenset(self.list_imap_accounts())
+            try:
+                self._credentials("create", username, input_data=password_data)
+                self._imap_accounts("create", username)
+                if (
+                    username not in self.list_credentials()
+                    or username not in self.list_imap_accounts()
+                ):
+                    raise MaddyError("account write-back verification failed")
+            except MaddyError as exc:
+                completed, rollback_succeeded = self._compensate_account_creation(
+                    username,
+                    credential_baseline=credential_baseline,
+                    mailbox_baseline=mailbox_baseline,
+                )
+                if not completed and rollback_succeeded:
+                    raise
+                message = (
+                    "account creation failed; newly created resources were rolled back"
+                    if rollback_succeeded
+                    else "account creation failed and rollback could not be verified"
+                )
+                raise PartialOperationError(
+                    message,
+                    completed=completed,
+                    rollback_succeeded=rollback_succeeded,
+                ) from exc
+        return {"username": username, "has_credentials": True, "has_mailbox": True}
+
+    def change_password(self, username: str, password: str) -> None:
+        username = _safe_positional(username, "username", max_length=254)
+        self._credentials("password", username, input_data=_password_input(password))
+        # The CLI cannot read password hashes or perform an authentication
+        # round-trip.  The strongest non-secret read-back it offers is that the
+        # credential row still exists.
+        if username not in self.list_credentials():
+            raise MaddyError("password write-back verification failed")
+
+    def disable_credentials(self, username: str) -> None:
+        username = _safe_positional(username, "username", max_length=254)
+        self._credentials("remove", "-y", username, write=True)
+        if username in self.list_credentials():
+            raise MaddyError("credential disable read-back verification failed")
+
+    def delete_imap_account(self, username: str) -> None:
+        username = _safe_positional(username, "username", max_length=254)
+        self._imap_accounts("remove", "-y", username, write=True)
+        if username in self.list_imap_accounts():
+            raise MaddyError("IMAP account deletion read-back verification failed")
+
+    def delete_account(self, username: str) -> None:
+        """Compatibility method; callers should expose the two stages separately."""
+
+        username = _safe_positional(username, "username", max_length=254)
+        with self._lock:
+            self.disable_credentials(username)
+            try:
+                self.delete_imap_account(username)
+            except MaddyError as exc:
+                raise PartialOperationError(
+                    "credentials were removed but mailbox deletion failed",
+                    completed=("credentials.remove",),
+                ) from exc
+
+    def get_append_limit(self, username: str) -> int | None:
+        username = _safe_positional(username, "username", max_length=254)
+        result = self._imap_accounts("appendlimit", username, write=False)
+        value = result.stdout_text.strip()
+        if not value or value.lower() in {"none", "unlimited", "no limit"}:
+            return None
+        if not value.isdecimal():
+            raise MaddyError("Maddy returned an invalid APPENDLIMIT")
+        return int(value)
+
+    def set_append_limit(self, username: str, value: int) -> int | None:
+        username = _safe_positional(username, "username", max_length=254)
+        if type(value) is not int or not 0 <= value <= 4 * 1024**3:
+            raise InvalidMaddyArgument("APPENDLIMIT must be between 0 and 4 GiB")
+        self._imap_accounts("appendlimit", "--value", str(value), username, write=True)
+        observed = self.get_append_limit(username)
+        expected = None if value == 0 else value
+        if observed != expected:
+            raise MaddyError("APPENDLIMIT write-back verification failed")
+        return expected
+
+    def list_mailboxes(
+        self, username: str, *, subscribed_only: bool = False
+    ) -> list[dict[str, Any]]:
+        self._require(Capability.MAILBOX_ADMIN)
+        username = _safe_positional(username, "username", max_length=254)
+        flags = ("--subscribed",) if subscribed_only else ()
+        result = self._invoke(
+            ("imap-mboxes", "list", "--cfg-block", self.storage_block, *flags, username)
+        )
+        try:
+            text = result.stdout.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            self._fail_output_contract("Maddy mailbox output is not UTF-8")
+        lines = [line for line in text.splitlines() if line.strip()]
+        if len(lines) == 1 and lines[0].strip().casefold() == "no mailboxes.":
+            lines = []
+        mailboxes: list[dict[str, Any]] = []
+        for line in lines:
+            name, separator, attributes = line.partition("\t")
+            if (
+                not name
+                or len(name) > 255
+                or name.startswith("-")
+                or any(ord(character) < 0x20 for character in name)
+                or (separator and not attributes.strip().startswith("["))
+            ):
+                self._fail_output_contract("Maddy mailbox output does not match a tested profile")
+            record: dict[str, Any] = {"name": name}
+            if separator:
+                try:
+                    record["attributes"] = _strict_flags(attributes)
+                except CapabilityFingerprintError as exc:
+                    self._fail_output_contract(str(exc))
+            else:
+                record["attributes"] = []
+            mailboxes.append(record)
+        return mailboxes
+
+    def create_mailbox(self, username: str, mailbox: str, *, special: str | None = None) -> None:
+        self._require(Capability.MAILBOX_ADMIN, write=True)
+        username = _safe_positional(username, "username", max_length=254)
+        mailbox = _safe_positional(mailbox, "mailbox", max_length=255)
+        options: list[str] = []
+        if special is not None:
+            special = special.lower()
+            if special not in _SPECIAL_USES:
+                raise InvalidMaddyArgument("invalid SPECIAL-USE value")
+            options.extend(("--special", special))
+        self._invoke(
+            (
+                "imap-mboxes",
+                "create",
+                "--cfg-block",
+                self.storage_block,
+                *options,
+                username,
+                mailbox,
+            )
+        )
+        if not any(item["name"] == mailbox for item in self.list_mailboxes(username)):
+            raise MaddyError("mailbox creation read-back verification failed")
+
+    def resolve_special_mailbox(self, username: str, special: str) -> str:
+        special = special.lower()
+        if special not in _SPECIAL_USES:
+            raise InvalidMaddyArgument("invalid SPECIAL-USE value")
+        mailboxes = self.list_mailboxes(username)
+        expected_flag = f"\\{special}".lower()
+        matches = [
+            str(mailbox.get("name", ""))
+            for mailbox in mailboxes
+            if expected_flag in {str(flag).lower() for flag in mailbox.get("attributes", ())}
+        ]
+        if not matches:
+            default_name = special.capitalize()
+            matches = [
+                str(mailbox.get("name", ""))
+                for mailbox in mailboxes
+                if str(mailbox.get("name", "")) == default_name
+            ]
+        if len(matches) != 1:
+            raise MaddyError(f"account does not have exactly one {special} mailbox")
+        return _safe_positional(matches[0], f"{special} mailbox", max_length=255)
+
+    def delete_mailbox(self, username: str, mailbox: str) -> None:
+        self._require(Capability.MAILBOX_ADMIN, write=True)
+        username = _safe_positional(username, "username", max_length=254)
+        mailbox = _safe_positional(mailbox, "mailbox", max_length=255)
+        self._invoke(
+            ("imap-mboxes", "remove", "--cfg-block", self.storage_block, "-y", username, mailbox)
+        )
+        if any(item["name"] == mailbox for item in self.list_mailboxes(username)):
+            raise MaddyError("mailbox deletion read-back verification failed")
+
+    def rename_mailbox(self, username: str, old_name: str, new_name: str) -> None:
+        self._require(Capability.MAILBOX_ADMIN, write=True)
+        username = _safe_positional(username, "username", max_length=254)
+        old_name = _safe_positional(old_name, "old mailbox", max_length=255)
+        new_name = _safe_positional(new_name, "new mailbox", max_length=255)
+        self._invoke(
+            (
+                "imap-mboxes",
+                "rename",
+                "--cfg-block",
+                self.storage_block,
+                username,
+                old_name,
+                new_name,
+            )
+        )
+
+        names = {item["name"] for item in self.list_mailboxes(username)}
+        if old_name in names or new_name not in names:
+            raise MaddyError("mailbox rename read-back verification failed")
+
+    def _list_message_set(
+        self,
+        username: str,
+        mailbox: str,
+        *,
+        message_set: str,
+        full: bool,
+        use_uids: bool,
+    ) -> list[dict[str, Any]]:
+        self._require(Capability.MESSAGE_ADMIN)
+        username = _safe_positional(username, "username", max_length=254)
+        mailbox = _safe_positional(mailbox, "mailbox", max_length=255)
+        message_set = _safe_seqset(message_set)
+        options = ["--uid"] if use_uids else []
+        if full:
+            options.append("--full")
+        options.extend(("--cfg-block", self.storage_block))
+        result = self._invoke(
+            ("imap-msgs", "list", *options, username, mailbox, message_set),
+            max_output_bytes=MAX_MESSAGE_LIST_OUTPUT_BYTES,
+        )
+        try:
+            return parse_message_list(result.stdout)
+        except CapabilityFingerprintError as exc:
+            self._fail_output_contract(str(exc))
+
+    def list_messages(
+        self,
+        username: str,
+        mailbox: str,
+        *,
+        uid_set: str = "1:*",
+        full: bool = True,
+    ) -> list[dict[str, Any]]:
+        return self._list_message_set(
+            username,
+            mailbox,
+            message_set=uid_set,
+            full=full,
+            use_uids=True,
+        )
+
+    def list_message_window(
+        self,
+        username: str,
+        mailbox: str,
+        *,
+        limit: int,
+        cursor_uid: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Return at most ``limit + 1`` messages from a stable UID anchor.
+
+        Maddy 0.8.2..0.9.5 has no result-limit option.  First resolve the
+        newest (or supplied) UID to its current sequence number, then request
+        only the bounded sequence-number window ending at that message.  The
+        returned records retain stable UIDs, while UID gaps do not require an
+        unbounded scan.
+        """
+
+        if type(limit) is not int or not 1 <= limit <= 200:
+            raise InvalidMaddyArgument("message page limit must be between 1 and 200")
+        if type(cursor_uid) is not int or not 0 <= cursor_uid <= MAX_IMAP_UID:
+            raise InvalidMaddyArgument("message cursor UID is invalid")
+
+        anchor_set = "*" if cursor_uid == 0 else str(cursor_uid)
+        anchor_records = self._list_message_set(
+            username,
+            mailbox,
+            message_set=anchor_set,
+            full=True,
+            use_uids=True,
+        )
+        if not anchor_records:
+            if cursor_uid == 0:
+                return []
+            raise StaleMessageCursor("message cursor no longer exists")
+        if len(anchor_records) != 1:
+            raise MaddyError("Maddy returned an invalid message cursor result")
+
+        anchor = anchor_records[0]
+        anchor_uid = anchor.get("uid")
+        anchor_sequence = anchor.get("sequence_number")
+        if (
+            type(anchor_uid) is not int
+            or not 1 <= anchor_uid <= MAX_IMAP_UID
+            or type(anchor_sequence) is not int
+            or anchor_sequence <= 0
+        ):
+            raise MaddyError("Maddy omitted required message cursor metadata")
+        if cursor_uid and anchor_uid != cursor_uid:
+            raise StaleMessageCursor("message cursor resolved to a different UID")
+
+        lower_sequence = max(1, anchor_sequence - limit)
+        records = self._list_message_set(
+            username,
+            mailbox,
+            message_set=f"{lower_sequence}:{anchor_sequence}",
+            full=True,
+            use_uids=False,
+        )
+        if len(records) > limit + 1:
+            raise MaddyError("Maddy exceeded the bounded message window")
+
+        seen_uids: set[int] = set()
+        for record in records:
+            uid = record.get("uid")
+            sequence_number = record.get("sequence_number")
+            if (
+                type(uid) is not int
+                or not 1 <= uid <= MAX_IMAP_UID
+                or type(sequence_number) is not int
+                or sequence_number <= 0
+                or uid in seen_uids
+            ):
+                raise MaddyError("Maddy returned invalid message window metadata")
+            seen_uids.add(uid)
+
+        records.sort(key=lambda item: int(item["uid"]), reverse=True)
+        matching_anchor = [record for record in records if record["uid"] == anchor_uid]
+        if (
+            len(matching_anchor) != 1
+            or matching_anchor[0]["sequence_number"] != anchor_sequence
+            or not records
+            or records[0]["uid"] != anchor_uid
+        ):
+            raise StaleMessageCursor("mailbox changed while resolving message cursor")
+        return records
+
+    def dump_message(self, username: str, mailbox: str, uid: int | str) -> bytes:
+        output = io.BytesIO()
+        self.dump_message_to(username, mailbox, uid, output)
+        return output.getvalue()
+
+    def dump_message_to(
+        self,
+        username: str,
+        mailbox: str,
+        uid: int | str,
+        destination: BinaryIO,
+        *,
+        max_bytes: int = DEFAULT_MAX_INPUT_BYTES,
+    ) -> int:
+        self._require(Capability.MESSAGE_ADMIN)
+        username = _safe_positional(username, "username", max_length=254)
+        mailbox = _safe_positional(mailbox, "mailbox", max_length=255)
+        uid_text = str(uid)
+        if not uid_text.isdecimal() or int(uid_text) <= 0:
+            raise InvalidMaddyArgument("UID must be a positive integer")
+        result = self._invoke(
+            (
+                "imap-msgs",
+                "dump",
+                "--cfg-block",
+                self.storage_block,
+                "--uid",
+                username,
+                mailbox,
+                uid_text,
+            ),
+            max_output_bytes=max_bytes,
+            output_sink=destination,
+        )
+        return result.streamed_stdout_bytes
+
+    def append_message(
+        self,
+        username: str,
+        mailbox: str,
+        content: bytes | BinaryIO,
+        *,
+        content_length: int | None = None,
+        flags: Sequence[str] = (),
+        internal_date: str | None = None,
+    ) -> int:
+        self._require(Capability.MESSAGE_ADMIN, write=True)
+        username = _safe_positional(username, "username", max_length=254)
+        mailbox = _safe_positional(mailbox, "mailbox", max_length=255)
+        input_data: bytes | None
+        input_stream: BinaryIO | None
+        if isinstance(content, bytes):
+            if not content or len(content) > DEFAULT_MAX_INPUT_BYTES:
+                raise InvalidMaddyArgument("message is empty or exceeds 32 MiB")
+            input_data = content
+            input_stream = None
+            content_length = None
+        else:
+            if (
+                type(content_length) is not int
+                or content_length <= 0
+                or content_length > DEFAULT_MAX_INPUT_BYTES
+            ):
+                raise InvalidMaddyArgument("streamed message has an invalid declared length")
+            input_data = None
+            input_stream = content
+        options: list[str] = []
+        for flag in flags:
+            options.extend(("--flag", _safe_flag(flag)))
+        if internal_date is not None:
+            try:
+                parsed = datetime.fromisoformat(internal_date.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise InvalidMaddyArgument("internal date must be ISO 8601") from exc
+            if parsed.tzinfo is None:
+                raise InvalidMaddyArgument("internal date must include a timezone")
+            options.extend(("--date", internal_date))
+        result = self._invoke(
+            (
+                "imap-msgs",
+                "add",
+                "--cfg-block",
+                self.storage_block,
+                *options,
+                username,
+                mailbox,
+            ),
+            input_data=input_data,
+            input_stream=input_stream,
+            input_length=content_length,
+        )
+        uid = result.stdout_text.strip()
+        if not uid.isdecimal() or int(uid) <= 0:
+            raise MaddyError("Maddy returned an invalid UID")
+        uid_number = int(uid)
+        if not any(
+            message.get("uid") == uid_number
+            for message in self.list_messages(username, mailbox, uid_set=str(uid_number))
+        ):
+            raise MaddyError("message append read-back verification failed")
+        return uid_number
+
+    def delete_messages(self, username: str, mailbox: str, uid_set: str) -> None:
+        self._message_uid_operation("remove", username, mailbox, uid_set, destructive=True)
+        remaining = self.list_messages(username, mailbox, uid_set=uid_set)
+        if remaining:
+            raise MaddyError("message deletion read-back verification failed")
+
+    def delete_message(self, username: str, mailbox: str, uid: str) -> None:
+        uid = _safe_uid(uid)
+        self._message_uid_operation("remove", username, mailbox, uid, destructive=True)
+        if self.list_messages(username, mailbox, uid_set=uid):
+            raise MaddyError("message deletion read-back verification failed")
+
+    def copy_messages(self, username: str, source: str, uid_set: str, target: str) -> None:
+        self._message_transfer("copy", username, source, uid_set, target)
+
+    def move_messages(self, username: str, source: str, uid_set: str, target: str) -> None:
+        self._message_transfer("move", username, source, uid_set, target)
+
+    def move_message(self, username: str, source: str, uid: str, target: str) -> None:
+        self._message_transfer("move", username, source, _safe_uid(uid), target)
+
+    def _message_transfer(
+        self, action: str, username: str, source: str, uid_set: str, target: str
+    ) -> None:
+        self._require(Capability.MESSAGE_ADMIN, write=True)
+        username = _safe_positional(username, "username", max_length=254)
+        source = _safe_positional(source, "source mailbox", max_length=255)
+        target = _safe_positional(target, "target mailbox", max_length=255)
+        uid_set = _safe_seqset(uid_set)
+        self._invoke(
+            (
+                "imap-msgs",
+                action,
+                "--cfg-block",
+                self.storage_block,
+                "--uid",
+                username,
+                source,
+                uid_set,
+                target,
+            )
+        )
+
+    def _message_uid_operation(
+        self,
+        action: str,
+        username: str,
+        mailbox: str,
+        uid_set: str,
+        *,
+        destructive: bool = False,
+        flags: Sequence[str] = (),
+    ) -> None:
+        self._require(Capability.MESSAGE_ADMIN, write=True)
+        username = _safe_positional(username, "username", max_length=254)
+        mailbox = _safe_positional(mailbox, "mailbox", max_length=255)
+        uid_set = _safe_seqset(uid_set)
+        checked_flags = tuple(_safe_flag(flag) for flag in flags)
+        options = ["--cfg-block", self.storage_block, "--uid"]
+        if destructive:
+            options.append("-y")
+        self._invoke(("imap-msgs", action, *options, username, mailbox, uid_set, *checked_flags))
+
+    def set_message_flags(
+        self, username: str, mailbox: str, uid_set: str, flags: Sequence[str]
+    ) -> None:
+        if not flags:
+            raise InvalidMaddyArgument("at least one flag is required")
+        self._message_uid_operation("set-flags", username, mailbox, uid_set, flags=flags)
+
+    def add_message_flags(
+        self, username: str, mailbox: str, uid_set: str, flags: Sequence[str]
+    ) -> None:
+        if not flags:
+            raise InvalidMaddyArgument("at least one flag is required")
+        self._message_uid_operation("add-flags", username, mailbox, uid_set, flags=flags)
+
+    def remove_message_flags(
+        self, username: str, mailbox: str, uid_set: str, flags: Sequence[str]
+    ) -> None:
+        if not flags:
+            raise InvalidMaddyArgument("at least one flag is required")
+        self._message_uid_operation("rem-flags", username, mailbox, uid_set, flags=flags)
+
+    def reload(self) -> None:
+        # 0.8.2 already handles USR2 for TLS file reload.  The broader
+        # zero-downtime configuration lifecycle remains a separate >=0.9.0
+        # capability.
+        # TLS reload is independent of mutable account/message CLI commands.
+        # It still requires a known version and fixed argv, but must not be
+        # blocked by a legacy LDAP configuration or an unrelated admin-help
+        # fingerprint mismatch.
+        self._require(Capability.TLS_RELOAD)
+        result = self.runner.run(
+            self.target.reload_argv(),
+            timeout=self.timeout,
+            max_output_bytes=256 * 1024,
+            run_as_user=None,
+        )
+        if result.returncode != 0:
+            raise CommandFailed(result)
+
+
+__all__ = [
+    "MAX_IMAP_UID",
+    "MAX_MESSAGE_LIST_OUTPUT_BYTES",
+    "MAX_SUPPORTED_VERSION",
+    "MIN_SUPPORTED_VERSION",
+    "TESTED_RELEASES",
+    "Capability",
+    "CapabilityFingerprintError",
+    "CliFingerprint",
+    "CommandFailed",
+    "CommandInputError",
+    "CommandLaunchError",
+    "CommandOutputLimit",
+    "CommandResult",
+    "CommandTimeout",
+    "DeploymentMode",
+    "InvalidMaddyArgument",
+    "LegacyLDAPUnsafe",
+    "MaddyError",
+    "MaddyService",
+    "MaddyTarget",
+    "PartialOperationError",
+    "RuntimeConfigUnsafe",
+    "SemVer",
+    "StaleMessageCursor",
+    "SubprocessRunner",
+    "UnsupportedCapability",
+    "UnsupportedVersion",
+    "VersionParseError",
+    "capabilities_for",
+    "parse_message_list",
+    "require_supported_version",
+]

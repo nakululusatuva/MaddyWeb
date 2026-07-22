@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling>=1.28,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "maddyweb"
+version = "0.1.0"
+description = "A loopback-only, low-resource administration UI for Maddy Mail Server"
+readme = "README.md"
+requires-python = ">=3.14"
+authors = [{ name = "nakululusatuva", email = "yirainsuen@gmail.com" }]
+dependencies = [
+  "aiohttp==3.14.2",
+  "nh3==0.3.6",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest==9.1.1",
+  "pytest-asyncio==1.3.0",
+]
+browser = [
+  "maddyweb[test]",
+  "playwright==1.61.0",
+]
+dev = [
+  "maddyweb[test]",
+  "ruff==0.15.22",
+]
+
+[project.scripts]
+maddyweb = "maddyweb.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/maddyweb"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "S", "UP", "B", "ASYNC", "C4", "SIM", "RUF"]
+ignore = ["S101"]

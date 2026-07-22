@@ -1,0 +1,55 @@
+[Unit]
+Description=MaddyWeb loopback-only web service
+Documentation=file:/usr/share/doc/maddyweb/README.md
+After=network-online.target maddyweb-helper.socket
+Wants=network-online.target maddyweb-helper.socket
+
+[Service]
+Type=exec
+User=maddyweb
+Group=maddyweb
+Environment=MADDYWEB_CONFIG=/etc/maddyweb/config.toml
+# Bound glibc allocator caches for this single-process, low-memory Web service.
+# Keep these in the unit: they are fixed tuning, not operator configuration.
+Environment=MALLOC_ARENA_MAX=1
+Environment=MALLOC_TRIM_THRESHOLD_=65536
+EnvironmentFile=-/etc/maddyweb/maddyweb.env
+ExecStart=/opt/maddyweb/current/bin/python -I -m maddyweb serve --config ${MADDYWEB_CONFIG}
+Restart=on-failure
+RestartSec=3s
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+UMask=0077
+
+# The web process is intentionally unprivileged and cannot edit Maddy state.
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+IPAddressDeny=any
+IPAddressAllow=localhost
+StateDirectory=maddyweb
+StateDirectoryMode=0750
+ReadWritePaths=/var/tmp/maddyweb
+InaccessiblePaths=-/run/docker.sock -/var/run/docker.sock
+
+[Install]
+WantedBy=multi-user.target

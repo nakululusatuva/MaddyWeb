@@ -1,0 +1,4 @@
+# Type Name     ID GECOS                    Home                 Shell
+g maddyweb      -  -                        -                    -
+u maddyweb      -  "MaddyWeb web service"   /var/lib/maddyweb    /usr/sbin/nologin
+m maddyweb      maddyweb

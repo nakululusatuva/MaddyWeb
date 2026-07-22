@@ -1,0 +1,17 @@
+[Unit]
+Description=MaddyWeb privileged helper socket
+After=systemd-tmpfiles-setup.service
+
+[Socket]
+ListenStream=/run/maddyweb/helper.sock
+FileDescriptorName=helper
+SocketUser=root
+SocketGroup=maddyweb
+SocketMode=0660
+DirectoryMode=0750
+RemoveOnStop=yes
+Accept=no
+Service=maddyweb-helper.service
+
+[Install]
+WantedBy=sockets.target
