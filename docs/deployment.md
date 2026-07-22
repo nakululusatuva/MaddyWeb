@@ -152,6 +152,19 @@ The production artifact manifest must be UTF-8 JSON containing exactly these fou
 }
 ```
 
+When generating a source archive from a Git commit, explicitly use a safe umask and build the wheel from the unpacked
+archive. Do not package directly from a Windows or DrvFS working tree because it can conceal Git
+executable bits or introduce a group-writable mode on Linux:
+
+```console
+git -c tar.umask=0022 archive --format=tar.gz \
+  --prefix="maddyweb-$COMMIT/" -o "$SOURCE_ARCHIVE" "$COMMIT"
+```
+
+After unpacking, confirm that `scripts/*.sh` are `0755`, other source files are `0644`, and no file is
+group- or other-writable. The CI deployment contract tests also verify that these operations scripts in the Git tree
+are all mode `100755`.
+
 `commit` must be a full, 40-character lowercase Git object ID; the artifact must be a single-link
 regular file in the explicit wheelhouse, and its filename and SHA-256 must agree with the manifest and
 `--sha256` argument. `requirements.lock` must also be a regular, non-symlink file;

@@ -5,6 +5,7 @@ import json
 import os
 import re
 import runpy
+import shutil
 import subprocess
 import sys
 from pathlib import Path, PurePosixPath
@@ -20,6 +21,26 @@ CONFIGS = (
     ROOT / "docker/config.toml",
 )
 TESTED_MADDY_RELEASES = ("0.8.2", "0.9.0", "0.9.1", "0.9.2", "0.9.3", "0.9.4", "0.9.5")
+
+
+def test_operational_shell_scripts_are_executable_in_git_tree() -> None:
+    scripts = sorted(path.relative_to(ROOT).as_posix() for path in (ROOT / "scripts").glob("*.sh"))
+    git_binary = shutil.which("git")
+    assert git_binary is not None
+    result = subprocess.run(  # noqa: S603 - fixed git command over repository-owned paths
+        [git_binary, "ls-files", "--stage", "--", *scripts],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    modes = {
+        line.split(maxsplit=1)[1].split("\t", 1)[1]: line.split()[0]
+        for line in result.stdout.splitlines()
+    }
+
+    assert set(modes) == set(scripts)
+    assert set(modes.values()) == {"100755"}
 
 
 def test_smoke_and_performance_gates_match_the_public_health_schema() -> None:
