@@ -22,6 +22,7 @@ def test_safe_defaults_are_loopback_and_small_after_explicit_mode() -> None:
     assert config.server.request_body_timeout_seconds == 15
     assert config.server.max_upload_bytes == 20 * 1024 * 1024
     assert config.maddy.mode == "docker"
+    assert config.certificates.webroot_roots == ()
 
 
 @pytest.mark.parametrize(
@@ -83,6 +84,79 @@ def test_security_relevant_types_and_paths_are_not_coerced(
 def test_enabled_certificates_require_a_nonempty_allowlist() -> None:
     with pytest.raises(ConfigError, match="cannot be empty"):
         _config({"certificates": {"enabled": True}})
+
+
+@pytest.mark.parametrize("unit", ("-evil.timer", "certbot.service", "bad unit.timer"))
+def test_certificate_timer_unit_cannot_be_an_option(unit: str) -> None:
+    with pytest.raises(ConfigError, match="timer_unit"):
+        _config({"certificates": {"timer_unit": unit}})
+
+
+def test_certificate_webroot_roots_are_explicit_and_narrow() -> None:
+    config = _config(
+        {
+            "certificates": {
+                "webroot_roots": ["/var/www/mail", "/srv/www/acme"],
+            }
+        }
+    )
+    assert tuple(map(str, config.certificates.webroot_roots)) == (
+        "/var/www/mail",
+        "/srv/www/acme",
+    )
+
+
+@pytest.mark.parametrize(
+    "roots",
+    (
+        ["relative/path"],
+        ["/home/acme"],
+        ["/var/www/mail", "/var/www/mail"],
+    ),
+)
+def test_certificate_webroot_roots_reject_broad_or_ambiguous_values(
+    roots: list[str],
+) -> None:
+    with pytest.raises(ConfigError, match=r"webroot_roots|absolute"):
+        _config({"certificates": {"webroot_roots": roots}})
+
+
+@pytest.mark.parametrize(
+    ("renewal_dir", "live_dir", "message"),
+    (
+        ("/etc/letsencrypt/profiles", "/etc/letsencrypt/live", "renewal"),
+        ("/etc/renewal", "/etc/live", "forbidden config root"),
+        ("/etc/letsencrypt/renewal", "/srv/acme/live", "config root live"),
+    ),
+)
+def test_certificate_config_and_live_roots_must_match(
+    renewal_dir: str,
+    live_dir: str,
+    message: str,
+) -> None:
+    with pytest.raises(ConfigError, match=message):
+        _config(
+            {
+                "certificates": {
+                    "renewal_dir": renewal_dir,
+                    "live_dir": live_dir,
+                }
+            }
+        )
+
+
+def test_dedicated_custom_certificate_config_root_is_accepted() -> None:
+    config = _config(
+        {
+            "certificates": {
+                "renewal_dir": "/srv/maddyweb/certbot/site/renewal",
+                "live_dir": "/srv/maddyweb/certbot/site/live",
+            }
+        }
+    )
+    assert str(config.certificates.renewal_dir) == (
+        "/srv/maddyweb/certbot/site/renewal"
+    )
 
 
 def test_docker_paths_default_inside_container_data_and_cannot_escape() -> None:

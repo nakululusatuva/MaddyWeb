@@ -241,6 +241,27 @@ def test_example_config_is_accepted_by_application_and_deploy_validator(path: Pa
     )
 
 
+def test_deploy_validator_defaults_missing_webroot_roots_to_read_only(tmp_path: Path) -> None:
+    source = CONFIGS[0].read_text(encoding="utf-8")
+    source = re.sub(r"^webroot_roots = \[\]\n", "", source, flags=re.MULTILINE)
+    candidate = tmp_path / "config.toml"
+    candidate.write_text(source, encoding="utf-8")
+    assert load_config(candidate).certificates.webroot_roots == ()
+    subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            str(ROOT / "scripts/validate-config.py"),
+            "--config",
+            str(candidate),
+            "--expected-maddy-mode",
+            "native",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
 @pytest.mark.parametrize("timeout", (29, 901))
 def test_deploy_validator_rejects_certificate_timeout_outside_range(
     tmp_path: Path,
@@ -390,14 +411,78 @@ def test_docker_helper_does_not_gain_native_host_paths(tmp_path: Path) -> None:
     )
     write_paths = set(write_line.removeprefix("ReadWritePaths=").split())
     assert write_paths == {
-        "-/etc/letsencrypt",
-        "-/var/lib/letsencrypt",
-        "-/var/log/letsencrypt",
         "/var/backups/maddyweb",
         "/run/maddyweb",
     }
     assert "ReadOnlyPaths=" not in helper_drop_in
     assert "ReadWritePaths=" not in helper_drop_in
+
+
+def test_certificate_enabled_helper_gets_only_configured_certificate_write_roots(
+    tmp_path: Path,
+) -> None:
+    source = (ROOT / "docker/config.toml").read_text(encoding="utf-8")
+    source = source.replace("enabled = false", "enabled = true", 1)
+    source = source.replace("names = []", 'names = ["mx.example.invalid"]', 1)
+    source = source.replace(
+        "webroot_roots = []",
+        'webroot_roots = ["/var/www/mail", "/srv/www/acme"]',
+        1,
+    )
+    config = tmp_path / "config.toml"
+    config.write_text(source, encoding="utf-8")
+    output = tmp_path / "output"
+    output.mkdir()
+    subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "-I",
+            str(ROOT / "scripts/render-systemd-sandbox.py"),
+            "--config",
+            str(config),
+            "--output-dir",
+            str(output),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    helper = (output / "SYSTEMD-HELPER-PATHS.conf").read_text(encoding="utf-8")
+    assert helper.splitlines() == [
+        "# Managed by MaddyWeb install.sh; do not edit.",
+        "[Service]",
+        "ReadWritePaths=-/etc/letsencrypt",
+        "ReadWritePaths=-/var/lib/letsencrypt",
+        "ReadWritePaths=-/var/log/letsencrypt",
+        "ReadWritePaths=-/var/www/mail",
+        "ReadWritePaths=-/srv/www/acme",
+    ]
+
+
+def test_certificate_read_only_mode_gets_no_certbot_write_paths(tmp_path: Path) -> None:
+    source = (ROOT / "docker/config.toml").read_text(encoding="utf-8")
+    source = source.replace("enabled = false", "enabled = true", 1)
+    source = source.replace("names = []", 'names = ["mx.example.invalid"]', 1)
+    config = tmp_path / "config.toml"
+    config.write_text(source, encoding="utf-8")
+    output = tmp_path / "output"
+    output.mkdir()
+    subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "-I",
+            str(ROOT / "scripts/render-systemd-sandbox.py"),
+            "--config",
+            str(config),
+            "--output-dir",
+            str(output),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    helper = (output / "SYSTEMD-HELPER-PATHS.conf").read_text(encoding="utf-8")
+    assert "ReadWritePaths=" not in helper
 
 
 def test_nondefault_paths_render_exact_systemd_sandbox_allowlists(tmp_path: Path) -> None:
@@ -408,7 +493,13 @@ def test_nondefault_paths_render_exact_systemd_sandbox_allowlists(tmp_path: Path
         'data_dir = "/var/lib/maddy"': 'data_dir = "/srv/maddy/state"',
         "enabled = false": "enabled = true",
         "names = []": 'names = ["mx.example.invalid"]',
-        'live_dir = "/etc/letsencrypt/live"': 'live_dir = "/srv/acme/live"',
+        'live_dir = "/etc/letsencrypt/live"': (
+            'live_dir = "/srv/maddyweb/certbot/live"'
+        ),
+        'renewal_dir = "/etc/letsencrypt/renewal"': (
+            'renewal_dir = "/srv/maddyweb/certbot/renewal"'
+        ),
+        "webroot_roots = []": 'webroot_roots = ["/srv/www/mail"]',
         'deployed_cert_path = "/etc/maddy/certs/fullchain.pem"': (
             'deployed_cert_path = "/srv/maddy/tls/fullchain.pem"'
         ),
@@ -453,9 +544,11 @@ def test_nondefault_paths_render_exact_systemd_sandbox_allowlists(tmp_path: Path
     helper = (output / "SYSTEMD-HELPER-PATHS.conf").read_text(encoding="utf-8")
     assert "ReadWritePaths=/srv/maddyweb-runtime/spool" in web
     assert "ReadOnlyPaths=/srv/maddy/etc/maddy.conf" in helper
+    assert "ReadWritePaths=-/srv/maddyweb/certbot" in helper
+    assert "ReadWritePaths=-/srv/www/mail" in helper
     assert "ReadWritePaths=/srv/maddy/state" in helper
     assert helper.count("ReadWritePaths=/srv/maddy/tls") == 1
-    assert "ReadOnlyPaths=/srv/acme/live" in helper
+    assert "ReadOnlyPaths=/srv/maddyweb/certbot/live" not in helper
     assert "/run/docker.sock" not in web + helper
 
 
@@ -529,9 +622,6 @@ def test_systemd_privilege_boundary() -> None:
     )
     helper_write_paths = set(helper_write_line.removeprefix("ReadWritePaths=").split())
     assert helper_write_paths == {
-        "-/etc/letsencrypt",
-        "-/var/lib/letsencrypt",
-        "-/var/log/letsencrypt",
         "/var/backups/maddyweb",
         "/run/maddyweb",
     }

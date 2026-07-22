@@ -57,6 +57,22 @@ def render(config_path: Path) -> tuple[str, str]:
         web = _HEADER + f"ReadWritePaths={web_temp}\n"
 
     helper_lines: list[str] = []
+    if config.certificates.enabled and config.certificates.webroot_roots:
+        config_root = PurePosixPath(config.certificates.renewal_dir).parent
+        helper_lines.append(
+            "ReadWritePaths=-"
+            f"{systemd_path(config_root, 'certificates renewal config root')}"
+        )
+        helper_lines.extend(
+            (
+                "ReadWritePaths=-/var/lib/letsencrypt",
+                "ReadWritePaths=-/var/log/letsencrypt",
+            )
+        )
+        for index, root in enumerate(config.certificates.webroot_roots, start=1):
+            helper_lines.append(
+                f"ReadWritePaths=-{systemd_path(root, f'certificates.webroot_roots[{index}]')}"
+            )
     if config.maddy.mode == "native":
         helper_lines.append(
             f"ReadOnlyPaths={systemd_path(config.maddy.config_path, 'maddy.config_path')}"
@@ -70,10 +86,6 @@ def render(config_path: Path) -> tuple[str, str]:
                 config.certificates.deployed_key_path,
             ):
                 helper_lines.append(f"ReadWritePaths={parent}")
-            helper_lines.append(
-                "ReadOnlyPaths="
-                f"{systemd_path(config.certificates.live_dir, 'certificates.live_dir')}"
-            )
     helper = _HEADER + "\n".join(helper_lines) + ("\n" if helper_lines else "")
     return web, helper
 

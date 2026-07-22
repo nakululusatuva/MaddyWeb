@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -135,6 +136,8 @@ class CertRunner:
         self.active = True
         self.nginx_ok = True
         self.on_renew: Any = None
+        self.on_dry_run: Any = None
+        self.certbot_version = b"certbot 4.0\n"
 
     def run(self, argv: Sequence[str], **_kwargs: Any) -> CommandResult:
         argv = tuple(argv)
@@ -153,10 +156,12 @@ class CertRunner:
             self.enabled = self.active = False
         elif argv[1:] == ("-t",):
             returncode = 0 if self.nginx_ok else 1
-        elif "renew" in argv and "--dry-run" not in argv and self.on_renew is not None:
+        elif "renew" in argv and "--dry-run" in argv and self.on_dry_run is not None:
+            self.on_dry_run()
+        elif "renew" in argv and self.on_renew is not None:
             self.on_renew()
         elif argv[1:] == ("--version",):
-            stdout = b"certbot 4.0\n"
+            stdout = self.certbot_version
         return CommandResult(argv, returncode, stdout, b"", 0.001)
 
 
@@ -170,18 +175,44 @@ def make_manager(
     runner = runner or CertRunner()
     name = "mx.example.test"
     live = tmp_path / "live"
+    renewal = tmp_path / "letsencrypt" / "renewal"
     source = live / name
     deployed = tmp_path / "deployed"
+    webroot = tmp_path / "webroot"
     source.mkdir(parents=True)
     deployed.mkdir()
+    renewal.mkdir(parents=True)
+    webroot.mkdir()
     (source / "fullchain.pem").write_bytes(CERTIFICATE_1)
     (source / "privkey.pem").write_bytes(PRIVATE_KEY_1)
     (deployed / "fullchain.pem").write_bytes(CERTIFICATE_1)
     (deployed / "privkey.pem").write_bytes(PRIVATE_KEY_1)
     os.chmod(source / "privkey.pem", 0o600)
     os.chmod(deployed / "privkey.pem", 0o600)
+    (renewal / f"{name}.conf").write_text(
+        "\n".join(
+            (
+                "version = 5.5.0",
+                f"archive_dir = {renewal.parent / 'archive' / name}",
+                f"cert = {source / 'cert.pem'}",
+                f"chain = {source / 'chain.pem'}",
+                f"fullchain = {source / 'fullchain.pem'}",
+                f"privkey = {source / 'privkey.pem'}",
+                "[renewalparams]",
+                "account = fixture-account",
+                "authenticator = webroot",
+                "installer = None",
+                "server = https://acme-v02.api.letsencrypt.org/directory",
+                f"webroot_path = {webroot}",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
     manager = CertificateManager(
         allowed_names=(name,),
+        renewal_dir=renewal,
+        webroot_roots=(tmp_path,),
         live_dir=live,
         deployed_certificate_path=deployed / "fullchain.pem",
         deployed_private_key_path=deployed / "privkey.pem",
@@ -203,10 +234,19 @@ def test_status_has_timer_and_source_deployed_fingerprint(tmp_path: Path) -> Non
     assert status["fingerprints_match"] is True
     assert status["timer"]["enabled"] is True
     assert status["timer"]["active"] is True
+    assert status["automation_safe"] is True
+    assert status["timer_enable_safe"] is False
     assert status["source"]["sha256_fingerprint"] == status["deployed"]["sha256_fingerprint"]
     with pytest.raises(UnknownCertificate):
         manager.status("attacker.example")
     assert not hasattr(manager, "install_pem")
+
+
+def test_deployment_status_never_launches_certbot_or_systemctl(tmp_path: Path) -> None:
+    manager, runner, _source, _deployed = make_manager(tmp_path)
+    report = manager.deployment_status("mx.example.test")
+    assert report["fingerprints_match"] is True
+    assert runner.calls == []
 
 
 def test_status_detects_a_mismatched_deployed_private_key(tmp_path: Path) -> None:
@@ -217,24 +257,38 @@ def test_status_detects_a_mismatched_deployed_private_key(tmp_path: Path) -> Non
     assert status["fingerprints_match"] is False
 
 
-def test_timer_enable_disable_is_fixed_and_verified(tmp_path: Path) -> None:
+def test_timer_disable_is_fixed_and_enable_requires_managed_service(tmp_path: Path) -> None:
     manager, runner, _source, _deployed = make_manager(tmp_path)
     disabled = manager.set_timer_enabled(False)
     assert disabled["enabled"] is False and disabled["active"] is False
-    assert runner.calls[0] == ("/usr/bin/systemctl", "disable", "--now", "certbot-renew.timer")
-    enabled = manager.set_timer_enabled(True)
-    assert enabled["enabled"] is True and enabled["active"] is True
+    assert runner.calls[0] == (
+        "/usr/bin/systemctl",
+        "disable",
+        "--now",
+        "--",
+        "certbot-renew.timer",
+    )
+    runner.calls.clear()
+    with pytest.raises(CertificateCommandError, match="managed MaddyWeb renewal service"):
+        manager.set_timer_enabled(True)
+    assert runner.calls == []
 
 
 def test_dry_run_has_nginx_checks_and_no_force(tmp_path: Path) -> None:
     manager, runner, _source, _deployed = make_manager(tmp_path)
     manager.dry_run("mx.example.test")
-    assert runner.calls[:3] == [
+    assert runner.calls[:4] == [
+        ("/usr/bin/certbot", "--version"),
         ("/usr/sbin/nginx", "-t"),
         (
             "/usr/bin/certbot",
+            "--config",
+            "/dev/null",
+            "--config-dir",
+            str(manager.renewal_dir.parent),
             "renew",
             "--dry-run",
+            "--no-directory-hooks",
             "--cert-name",
             "mx.example.test",
             "--non-interactive",
@@ -244,12 +298,349 @@ def test_dry_run_has_nginx_checks_and_no_force(tmp_path: Path) -> None:
     assert all("--force-renewal" not in call for call in runner.calls)
 
 
+def test_real_renew_ignores_ambient_config_and_directory_hooks(tmp_path: Path) -> None:
+    manager, runner, _source, _deployed = make_manager(
+        tmp_path,
+        reload_callback=lambda: None,
+    )
+    manager.renew("mx.example.test")
+    certbot_calls = [call for call in runner.calls if call[0] == "/usr/bin/certbot"]
+    assert certbot_calls == [
+        ("/usr/bin/certbot", "--version"),
+        (
+            "/usr/bin/certbot",
+            "--config",
+            "/dev/null",
+            "--config-dir",
+            str(manager.renewal_dir.parent),
+            "renew",
+            "--no-directory-hooks",
+            "--cert-name",
+            "mx.example.test",
+            "--non-interactive",
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("authenticator", "installer"),
+    [
+        ("nginx", "nginx"),
+        ("standalone", "None"),
+        ("manual", "None"),
+        ("dns-cloudflare", "None"),
+        ("webroot", "nginx"),
+    ],
+)
+def test_unsafe_renewal_plugin_blocks_all_certificate_writes_before_commands(
+    tmp_path: Path,
+    authenticator: str,
+    installer: str,
+) -> None:
+    manager, runner, _source, _deployed = make_manager(tmp_path)
+    renewal = manager.renewal_dir / "mx.example.test.conf"
+    document = renewal.read_text(encoding="utf-8")
+    document = document.replace("authenticator = webroot", f"authenticator = {authenticator}")
+    document = document.replace("installer = None", f"installer = {installer}")
+    renewal.write_text(document, encoding="utf-8")
+
+    with pytest.raises(CertificateCommandError):
+        manager.dry_run("mx.example.test")
+    with pytest.raises(CertificateCommandError):
+        manager.renew("mx.example.test")
+    with pytest.raises(CertificateCommandError):
+        manager.set_timer_enabled(True)
+    assert runner.calls == []
+
+    disabled = manager.set_timer_enabled(False)
+    assert disabled["enabled"] is False
+    assert runner.calls[0] == (
+        "/usr/bin/systemctl",
+        "disable",
+        "--now",
+        "--",
+        "certbot-renew.timer",
+    )
+
+
+def test_legacy_configurator_cannot_replace_an_explicit_authenticator(tmp_path: Path) -> None:
+    manager, runner, _source, _deployed = make_manager(tmp_path)
+    renewal = manager.renewal_dir / "mx.example.test.conf"
+    document = renewal.read_text(encoding="utf-8")
+    document = document.replace(
+        "authenticator = webroot",
+        "configurator = webroot",
+    )
+    renewal.write_text(document, encoding="utf-8")
+    with pytest.raises(CertificateCommandError, match="authenticator"):
+        manager.dry_run("mx.example.test")
+    assert runner.calls == []
+
+
+def test_webroot_outside_fixed_systemd_write_roots_is_rejected(tmp_path: Path) -> None:
+    manager, runner, _source, _deployed = make_manager(tmp_path)
+    manager.webroot_roots = (tmp_path / "different-root",)
+    with pytest.raises(CertificateCommandError, match="webroot"):
+        manager.dry_run("mx.example.test")
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        "pre_hook",
+        "post-hook",
+        "renew_hook",
+        "deploy-hook",
+        "manual_auth_hook",
+        "manual-cleanup-hook",
+        "run_deploy_hooks",
+    ],
+)
+def test_renewal_hooks_are_rejected_before_commands(tmp_path: Path, option: str) -> None:
+    manager, runner, _source, _deployed = make_manager(tmp_path)
+    renewal = manager.renewal_dir / "mx.example.test.conf"
+    with renewal.open("a", encoding="utf-8") as stream:
+        stream.write(f"{option} = /bin/false\n")
+    with pytest.raises(CertificateCommandError, match="unsupported"):
+        manager.dry_run("mx.example.test")
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize(
+    ("section", "option"),
+    (
+        ("lineage", "renew_before_expiry = 3650 days"),
+        ("lineage", "unknown_lineage_option = value"),
+        ("renewalparams", "unknown_future_option = value"),
+    ),
+)
+def test_unknown_renewal_options_are_rejected_before_commands(
+    tmp_path: Path,
+    section: str,
+    option: str,
+) -> None:
+    manager, runner, _source, _deployed = make_manager(tmp_path)
+    renewal = manager.renewal_dir / "mx.example.test.conf"
+    document = renewal.read_text(encoding="utf-8")
+    if section == "lineage":
+        document = document.replace("[renewalparams]", f"{option}\n[renewalparams]")
+    else:
+        document = f"{document.rstrip()}\n{option}\n"
+    renewal.write_text(document, encoding="utf-8")
+    with pytest.raises(CertificateCommandError, match="unsupported"):
+        manager.dry_run("mx.example.test")
+    assert runner.calls == []
+
+
+def test_partial_name_renewal_is_rejected_before_commands(tmp_path: Path) -> None:
+    manager, runner, _source, _deployed = make_manager(tmp_path)
+    renewal = manager.renewal_dir / "mx.example.test.conf"
+    with renewal.open("a", encoding="utf-8") as stream:
+        stream.write("allow_subset_of_names = True\n")
+    with pytest.raises(CertificateCommandError, match="partial-name"):
+        manager.dry_run("mx.example.test")
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize("version", ("0.99.0", "5.7.1", "6.0.0", "latest"))
+def test_unsupported_lineage_versions_are_rejected_before_commands(
+    tmp_path: Path,
+    version: str,
+) -> None:
+    manager, runner, _source, _deployed = make_manager(tmp_path)
+    renewal = manager.renewal_dir / "mx.example.test.conf"
+    document = renewal.read_text(encoding="utf-8").replace(
+        "version = 5.5.0",
+        f"version = {version}",
+    )
+    renewal.write_text(document, encoding="utf-8")
+    with pytest.raises(CertificateCommandError, match="lineage version"):
+        manager.dry_run("mx.example.test")
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize(
+    "runtime_output",
+    (b"certbot 5.7.1\n", b"certbot 6.0.0\n", b"unexpected 5.5.0\n", b"certbot \xff\n"),
+)
+def test_unsupported_runtime_version_blocks_writes(
+    tmp_path: Path,
+    runtime_output: bytes,
+) -> None:
+    manager, runner, _source, _deployed = make_manager(tmp_path)
+    runner.certbot_version = runtime_output
+    with pytest.raises(CertificateCommandError, match="runtime version"):
+        manager.dry_run("mx.example.test")
+    assert runner.calls == [("/usr/bin/certbot", "--version")]
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "\0",
+        "  continued = value\n",
+        "authenticator = webroot\n",
+    ],
+)
+def test_ambiguous_renewal_document_is_rejected(tmp_path: Path, suffix: str) -> None:
+    manager, runner, _source, _deployed = make_manager(tmp_path)
+    renewal = manager.renewal_dir / "mx.example.test.conf"
+    with renewal.open("a", encoding="utf-8") as stream:
+        stream.write(suffix)
+    with pytest.raises(CertificateCommandError):
+        manager.dry_run("mx.example.test")
+    assert runner.calls == []
+
+
+def test_certbot_configobj_webroot_map_shape_is_accepted(tmp_path: Path) -> None:
+    manager, runner, _source, _deployed = make_manager(tmp_path)
+    renewal = manager.renewal_dir / "mx.example.test.conf"
+    document = renewal.read_text(encoding="utf-8")
+    document = document.replace(
+        "authenticator = webroot",
+        "authenticator = webroot\nconfigurator = None",
+    )
+    webroot_line = next(line for line in document.splitlines() if line.startswith("webroot_path"))
+    webroot = webroot_line.partition("=")[2].strip()
+    document = document.replace(
+        webroot_line,
+        f"webroot_path = {webroot},\n[[webroot_map]]\nmx.example.test = {webroot}",
+    )
+    renewal.write_text(document, encoding="utf-8")
+    manager.dry_run("mx.example.test")
+    assert any("--dry-run" in call for call in runner.calls)
+
+
+def test_invalid_webroot_map_identifier_is_rejected_before_commands(tmp_path: Path) -> None:
+    manager, runner, _source, _deployed = make_manager(tmp_path)
+    renewal = manager.renewal_dir / "mx.example.test.conf"
+    document = renewal.read_text(encoding="utf-8")
+    webroot_line = next(line for line in document.splitlines() if line.startswith("webroot_path"))
+    webroot = webroot_line.partition("=")[2].strip()
+    document = document.replace(
+        webroot_line,
+        f"webroot_path = None\n[[webroot_map]]\n../escape = {webroot}",
+    )
+    renewal.write_text(document, encoding="utf-8")
+    with pytest.raises(CertificateCommandError, match="identifier"):
+        manager.dry_run("mx.example.test")
+    assert runner.calls == []
+
+
+def test_dry_run_rejects_webroot_map_key_changes(tmp_path: Path) -> None:
+    manager, runner, _source, _deployed = make_manager(tmp_path)
+    renewal = manager.renewal_dir / "mx.example.test.conf"
+    document = renewal.read_text(encoding="utf-8")
+    webroot_line = next(line for line in document.splitlines() if line.startswith("webroot_path"))
+    webroot = webroot_line.partition("=")[2].strip()
+    document = document.replace(
+        webroot_line,
+        f"webroot_path = None\n[[webroot_map]]\nmx.example.test = {webroot}",
+    )
+    renewal.write_text(document, encoding="utf-8")
+
+    def change_map_key() -> None:
+        current = renewal.read_text(encoding="utf-8")
+        renewal.write_text(
+            current.replace("mx.example.test =", "other.example.test ="),
+            encoding="utf-8",
+        )
+
+    runner.on_dry_run = change_map_key
+    with pytest.raises(CertificateCommandError, match="changed the renewal profile"):
+        manager.dry_run("mx.example.test")
+    assert sum("--dry-run" in call for call in runner.calls) == 1
+
+
+def test_none_webroot_fallback_is_accepted_with_a_safe_map(tmp_path: Path) -> None:
+    manager, runner, _source, _deployed = make_manager(tmp_path)
+    renewal = manager.renewal_dir / "mx.example.test.conf"
+    document = renewal.read_text(encoding="utf-8")
+    webroot_line = next(line for line in document.splitlines() if line.startswith("webroot_path"))
+    webroot = webroot_line.partition("=")[2].strip()
+    document = document.replace(
+        webroot_line,
+        f"webroot_path = None\n[[webroot_map]]\nmx.example.test = {webroot}",
+    )
+    renewal.write_text(document, encoding="utf-8")
+    manager.dry_run("mx.example.test")
+    assert any("--dry-run" in call for call in runner.calls)
+
+
+def test_certbot_ari_section_and_atomic_update_are_accepted(tmp_path: Path) -> None:
+    manager, runner, _source, _deployed = make_manager(
+        tmp_path,
+        reload_callback=lambda: None,
+    )
+    renewal = manager.renewal_dir / "mx.example.test.conf"
+
+    def add_ari_state() -> None:
+        with renewal.open("a", encoding="utf-8") as stream:
+            stream.write(
+                "[acme_renewal_info]\n"
+                "ari_retry_after = 2030-01-02T03:04:05\n"
+            )
+
+    runner.on_renew = add_ari_state
+    result = manager.renew("mx.example.test")
+    assert result["renewal_result"] == "not_due"
+    assert manager._renewal_is_safe("mx.example.test") is True
+
+
+def test_unknown_or_invalid_ari_state_is_rejected(tmp_path: Path) -> None:
+    manager, runner, _source, _deployed = make_manager(tmp_path)
+    renewal = manager.renewal_dir / "mx.example.test.conf"
+    with renewal.open("a", encoding="utf-8") as stream:
+        stream.write("[acme_renewal_info]\nunknown = value\n")
+    with pytest.raises(CertificateCommandError, match="ARI"):
+        manager.dry_run("mx.example.test")
+    assert runner.calls == []
+
+
+def test_symlinked_or_hardlinked_renewal_document_is_rejected(tmp_path: Path) -> None:
+    manager, runner, _source, _deployed = make_manager(tmp_path)
+    renewal = manager.renewal_dir / "mx.example.test.conf"
+    original = renewal.with_suffix(".original")
+    renewal.rename(original)
+    renewal.symlink_to(original)
+    with pytest.raises(CertificateCommandError, match="metadata"):
+        manager.dry_run("mx.example.test")
+    renewal.unlink()
+    os.link(original, renewal)
+    with pytest.raises(CertificateCommandError, match="metadata"):
+        manager.dry_run("mx.example.test")
+    assert runner.calls == []
+
+
+def test_timer_enable_is_rejected_even_with_a_safe_lineage(tmp_path: Path) -> None:
+    manager, runner, _source, _deployed = make_manager(tmp_path)
+    with pytest.raises(CertificateCommandError, match="managed MaddyWeb renewal service"):
+        manager.set_timer_enabled(True)
+    assert runner.calls == []
+
+
+def test_default_cli_ini_blocks_direct_operations_before_commands(tmp_path: Path) -> None:
+    manager, runner, _source, _deployed = make_manager(tmp_path)
+    cli_config = manager.renewal_dir.parent / "cli.ini"
+    cli_config.write_text("pre-hook = /bin/false\n", encoding="utf-8")
+    assert manager._renewal_is_safe("mx.example.test") is False
+    with pytest.raises(CertificateCommandError, match="default CLI configuration"):
+        manager.dry_run("mx.example.test")
+    with pytest.raises(CertificateCommandError, match="default CLI configuration"):
+        manager.renew("mx.example.test")
+    assert runner.calls == []
+
+
 def test_nginx_failure_stops_before_certbot(tmp_path: Path) -> None:
     manager, runner, _source, _deployed = make_manager(tmp_path)
     runner.nginx_ok = False
     with pytest.raises(CertificateCommandError):
         manager.renew("mx.example.test")
-    assert runner.calls == [("/usr/sbin/nginx", "-t")]
+    assert runner.calls == [
+        ("/usr/bin/certbot", "--version"),
+        ("/usr/sbin/nginx", "-t"),
+    ]
 
 
 def test_not_due_reloads_to_repair_an_ambiguous_prior_reload(tmp_path: Path) -> None:
@@ -263,6 +654,33 @@ def test_not_due_reloads_to_repair_an_ambiguous_prior_reload(tmp_path: Path) -> 
     assert result["renewal_result"] == "not_due"
     assert reloaded == [True]
     assert (deployed / "fullchain.pem").stat().st_mtime_ns == before
+
+
+def test_renew_rejects_a_changed_dns_name_set_before_deployment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reloaded: list[bool] = []
+    manager, _runner, _source, _deployed = make_manager(
+        tmp_path,
+        reload_callback=lambda: reloaded.append(True),
+    )
+    original = CertificateManager._source_status
+    reads = 0
+
+    def changed_names(self: CertificateManager, name: str):
+        nonlocal reads
+        status = original(self, name)
+        if self is manager:
+            reads += 1
+            if reads >= 2:
+                return replace(status, dns_names=("other.example.test",))
+        return status
+
+    monkeypatch.setattr(CertificateManager, "_source_status", changed_names)
+    with pytest.raises(CertificateCommandError, match="subject names changed"):
+        manager.renew("mx.example.test")
+    assert reloaded == []
 
 
 def test_not_due_synchronizes_a_stale_deployed_copy(tmp_path: Path) -> None:
@@ -360,8 +778,9 @@ def test_docker_deployment_paths_fail_closed_without_fixed_hooks(tmp_path: Path)
         manager.renew("mx.example.test")
 
     assert runner.calls == [
-        ("/usr/bin/systemctl", "is-enabled", "certbot-renew.timer"),
-        ("/usr/bin/systemctl", "is-active", "certbot-renew.timer"),
+        ("/usr/bin/certbot", "--version"),
+        ("/usr/bin/systemctl", "is-enabled", "--", "certbot-renew.timer"),
+        ("/usr/bin/systemctl", "is-active", "--", "certbot-renew.timer"),
     ]
     assert (deployed / "fullchain.pem").read_bytes() == original_certificate
     assert reloaded == []

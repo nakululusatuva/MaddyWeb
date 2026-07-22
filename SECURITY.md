@@ -15,9 +15,10 @@ does not accept arbitrary commands, paths, container names, or shell text.
 The installer generates a managed systemd path drop-in from validated configuration. The Web service's `PrivateTmp` provides
 writable `/tmp` and `/var/tmp` mounts that are isolated from the host and cleaned when the service stops. When `server.temp_dir` is outside those
 private mounts, the drop-in grants write access only to that exact directory. The native helper receives only read access to Maddy
-read access to Maddy configuration, write access to the data directory and certificate deployment target parents, and Certbot
-`live_dir` read access. The Docker helper receives no additional host-path or Docker-socket
-relaxation from configuration, and the Web process still explicitly cannot see the Docker socket.
+configuration and write access to the data directory and the parent of each certificate deployment target. Only explicit
+`webroot_roots` configuration grants the helper additional write access to the Certbot configuration root and those exact webroots,
+supporting atomic updates to `archive`, `live`, and `renewal` and HTTP-01 challenges. The Docker
+helper does not receive Docker socket permission, and the Web process still explicitly cannot see the Docker socket.
 
 ## Credentials and secrets
 
@@ -105,9 +106,29 @@ identity or domain context all degrade Maddy functionality to read-only. Old Doc
 identity environment assignments; any macro structure that can compose a hidden `{env:...}` is also read-only.
 
 Certificate dry-run and renewal apply only to configured certificate names. The workflow may run `nginx -t` as a read-only check,
-but never writes `/etc/nginx` or reloads or restarts Nginx. Certbot commands and ordinary Maddy
+but never writes `/etc/nginx` or reloads or restarts Nginx. Every operation safely reparses the Certbot
+renewal profile and permits only a root-owned `webroot` lineage that other users cannot write,
+with `installer = none` and no configured hooks. The `nginx`, `standalone`, `manual`, and DNS authenticators
+are rejected before any external command runs. Direct invocations explicitly use `/dev/null` as the CLI configuration and
+specify `--no-directory-hooks`. Because Certbot still merges default configuration files, the system, configuration-root, and root
+XDG `cli.ini` files must all be absent, or writes degrade to read-only. After an actual renewal, the helper
+deploys the certificate itself and reads the Maddy certificate back. Certbot commands and ordinary Maddy
 commands use separate timeouts. The example `certificates.command_timeout_seconds` is 300,
 with an accepted range of 30..900 seconds.
+
+A webroot is allowed only below `/var/www` or `/srv/www`; the path and its ancestors must be canonical and trusted,
+and group and other users cannot write them. The managed helper drop-in adds
+`ReadWritePaths` only for each exact root in `certificates.webroot_roots`, making an HTTP-01 challenge
+visible to host Nginx without opening adjacent paths. The default `[]` grants no webroot write access, so certificate
+writes fail closed. Renewal files use a strict section/key/value allow-list; unknown keys,
+`allow_subset_of_names = True`, and an active `renew_before_expiry` all make the lineage read-only. Both the version recorded in the file and the
+actual Certbot runtime probed before every write must be in the `1.0.0`-`5.7.0` range. Future patch, minor, and major
+versions require another audit before write access is restored.
+
+The Web interface does not re-enable an external Certbot timer. An external unit enumerates lineages outside the allow-list
+and may inherit unknown drop-ins, environment, or hooks, so the fixed argv of a single operation cannot constrain it. Until a dedicated
+managed renewal service exists, the Web interface permits only status inspection or timer disable; enable always fails
+closed.
 
 Only when `certificates.enabled = true` does the installer place a
 Certbot deploy hook with a managed marker at `/etc/letsencrypt/renewal-hooks/deploy/maddyweb`;
@@ -118,6 +139,8 @@ a name in `certificates.names` and the exact safe `certificates.live_dir/<name>`
 the hook then reuses the existing atomic deployment, Maddy reload, and post-deployment fingerprint read-back. It never initiates
 renewal or issuance, never forces renewal, and never modifies or reloads Nginx. A hook failure exits nonzero; an
 unmanaged file with the same name is never overwritten or deleted, and disabling certificate management removes only a file with the correct managed marker.
+For another legitimate lineage under the same canonical `live_dir` that is outside the MaddyWeb allow-list, the global
+directory hook is explicitly a successful no-op; malformed, escaping, or untrusted directory paths still fail closed.
 
 ## Data recovery limitations
 

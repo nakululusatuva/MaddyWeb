@@ -28,6 +28,8 @@ certbot_binary = "/usr/bin/certbot"
 openssl_binary = "/usr/bin/openssl"
 nginx_binary = "/usr/sbin/nginx"
 renewal_dir = "/etc/letsencrypt/renewal"
+# Empty is fail-closed. Add only the exact canonical HTTP-01 root after review.
+webroot_roots = []
 live_dir = "/etc/letsencrypt/live"
 timer_unit = "certbot-renew.timer"
 command_timeout_seconds = 300

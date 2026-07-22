@@ -14,7 +14,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Self
 
 _CONTAINER_RE = re.compile(r"\A[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}\Z")
-_UNIT_RE = re.compile(r"\A[a-zA-Z0-9_.@-]+\.timer\Z")
+_UNIT_RE = re.compile(r"\A[a-zA-Z0-9][a-zA-Z0-9_.@-]*\.timer\Z")
 _CERT_RE = re.compile(r"\A[a-zA-Z0-9][a-zA-Z0-9_.-]{0,252}\Z")
 _SECTIONS = {"server", "maddy", "certificates", "security", "logging"}
 _DEFAULT_TEMP_DIR = PurePosixPath("/var/tmp/maddyweb")  # noqa: S108 - private state
@@ -29,6 +29,10 @@ _DEFAULT_OPENSSL_BINARY = PurePosixPath("/usr/bin/openssl")
 _DEFAULT_NGINX_BINARY = PurePosixPath("/usr/bin/nginx")
 _DEFAULT_RENEWAL_DIR = PurePosixPath("/etc/letsencrypt/renewal")
 _DEFAULT_LIVE_DIR = PurePosixPath("/etc/letsencrypt/live")
+_CUSTOM_CERTBOT_CONFIG_ROOTS = (
+    PurePosixPath("/var/lib/maddyweb/certbot"),
+    PurePosixPath("/srv/maddyweb/certbot"),
+)
 _DEFAULT_DEPLOYED_CERT = PurePosixPath("/data/tls/fullchain.pem")
 _DEFAULT_DEPLOYED_KEY = PurePosixPath("/data/tls/privkey.pem")
 _NATIVE_DEPLOYED_CERT = PurePosixPath("/var/lib/maddy/tls/fullchain.pem")
@@ -321,6 +325,7 @@ class CertificateConfig:
     openssl_binary: PurePosixPath = _DEFAULT_OPENSSL_BINARY
     nginx_binary: PurePosixPath = _DEFAULT_NGINX_BINARY
     renewal_dir: PurePosixPath = _DEFAULT_RENEWAL_DIR
+    webroot_roots: tuple[PurePosixPath, ...] = ()
     live_dir: PurePosixPath = _DEFAULT_LIVE_DIR
     timer_unit: str = "certbot-renew.timer"
     deployed_cert_path: PurePosixPath = _DEFAULT_DEPLOYED_CERT
@@ -348,6 +353,7 @@ class CertificateConfig:
             "openssl_binary",
             "nginx_binary",
             "renewal_dir",
+            "webroot_roots",
             "live_dir",
             "timer_unit",
             "deployed_cert_path",
@@ -374,6 +380,54 @@ class CertificateConfig:
         )
         if not 30.0 <= command_timeout <= 900.0:
             raise ConfigError("certificates.command_timeout_seconds must be between 30 and 900")
+        webroot_roots = tuple(
+            _absolute(value, "certificates.webroot_roots")
+            for value in _strings(
+                raw,
+                "webroot_roots",
+                (),
+                "certificates.webroot_roots",
+            )
+        )
+        if len(set(webroot_roots)) != len(webroot_roots):
+            raise ConfigError("certificates.webroot_roots contains duplicates")
+        permitted_webroot_roots = (PurePosixPath("/var/www"), PurePosixPath("/srv/www"))
+        if any(
+            not any(
+                root == allowed or root.is_relative_to(allowed)
+                for allowed in permitted_webroot_roots
+            )
+            for root in webroot_roots
+        ):
+            raise ConfigError("certificates.webroot_roots must stay below /var/www or /srv/www")
+        renewal_dir = _absolute(
+            _string(
+                raw,
+                "renewal_dir",
+                str(defaults.renewal_dir),
+                "certificates.renewal_dir",
+            ),
+            "certificates.renewal_dir",
+        )
+        if renewal_dir.name != "renewal":
+            raise ConfigError("certificates.renewal_dir must end with /renewal")
+        config_root = renewal_dir.parent
+        if config_root != _DEFAULT_RENEWAL_DIR.parent and not any(
+            config_root == allowed or config_root.is_relative_to(allowed)
+            for allowed in _CUSTOM_CERTBOT_CONFIG_ROOTS
+        ):
+            raise ConfigError("certificates.renewal_dir uses a forbidden config root")
+        live_dir = _absolute(
+            _string(
+                raw,
+                "live_dir",
+                str(defaults.live_dir),
+                "certificates.live_dir",
+            ),
+            "certificates.live_dir",
+        )
+        if live_dir != renewal_dir.parent / "live":
+            raise ConfigError("certificates.live_dir must be the config root live directory")
         return cls(
             enabled=enabled,
             names=names,
@@ -404,24 +458,9 @@ class CertificateConfig:
                 ),
                 "certificates.nginx_binary",
             ),
-            renewal_dir=_absolute(
-                _string(
-                    raw,
-                    "renewal_dir",
-                    str(defaults.renewal_dir),
-                    "certificates.renewal_dir",
-                ),
-                "certificates.renewal_dir",
-            ),
-            live_dir=_absolute(
-                _string(
-                    raw,
-                    "live_dir",
-                    str(defaults.live_dir),
-                    "certificates.live_dir",
-                ),
-                "certificates.live_dir",
-            ),
+            renewal_dir=renewal_dir,
+            webroot_roots=webroot_roots,
+            live_dir=live_dir,
             timer_unit=timer,
             deployed_cert_path=_absolute(
                 _string(

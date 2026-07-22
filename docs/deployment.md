@@ -274,8 +274,14 @@ With `ProtectSystem=strict`, the Web service's managed path drop-in works with
 `server.temp_dir` outside those private mounts receives exact write access. The native helper drop-in makes
 `maddy.config_path` read-only,
 `maddy.data_dir` writable, and the exact parents of deployed certificate and key files writable when enabled.
-writable and `live_dir` read-only. The Docker helper derives no extra host path from configuration and receives no
-Docker socket permissions; the base helper unit also does not expose the native-only `/etc/maddy`
+With an explicit webroot, configuration roots needed for Certbot's atomic `archive`, `live`, and `renewal` updates
+also become writable. Configuration accepts only `/etc/letsencrypt`, or the dedicated
+`/var/lib/maddyweb/certbot` and `/srv/maddyweb/certbot` namespaces. Docker and native
+helpers grant optional write access only to exact roots explicitly listed in `certificates.webroot_roots`;
+each must be under `/var/www` or `/srv/www`, and the empty default leaves certificate writes read-only. The Docker
+helper derives no other host path from configuration and receives no Docker socket permission. The base helper unit
+also does not expose
+the native-only `/etc/maddy`
 or `/var/lib/maddy`; only the managed native drop-in for the configured paths may grant access.
 
 When `certificates.enabled = true`, the installer transactionally installs
@@ -285,6 +291,15 @@ The installer may create missing `renewal-hooks/deploy` parents with safe modes.
 The hook must remain a single-link, non-symlink `root:root 0755` file. An existing same-named file may be
 upgraded only with the MaddyWeb managed marker; an unmanaged file makes enabled installation fail without overwrite.
 When certificate management is disabled, only a managed hook is removed; a same-named unmanaged file remains.
+
+Web-initiated dry runs and renewals do not execute the directory hook, but use `/dev/null` as the explicit
+Certbot CLI configuration and pass `--no-directory-hooks`. The automatically searched system
+and root XDG `cli.ini` files must also be absent. The helper then reuses the same deployment and fingerprint read-back.
+The renewal profile is revalidated before and after execution; only a safe profile that cannot modify Nginx is accepted:
+a `webroot` lineage. Web can inspect or disable an external timer, but cannot re-enable it until a dedicated managed
+renewal service exists, so it cannot execute out-of-allowlist lineages or inherit unit drop-ins.
+Renewal files and the running Certbot are restricted to audited versions `1.0.0` through `5.7.0`; unknown keys or
+later versions hide the dry-run and renew buttons, and the helper write interface independently rejects the operation.
 
 Transaction recovery reads back every symlink and enabled or active state. Any recovery-stage failure reports
 `CRITICAL`, preserves the root-only unit backup, and exits nonzero; it never describes partial recovery as success.

@@ -41,9 +41,9 @@ class ReadOnlyTimerRunner:
     ) -> TimerResult:
         del timeout, max_output_bytes, run_as_user
         command = tuple(argv)
-        if command[-2:] == ("is-enabled", "certbot-renew.timer"):
+        if command[-3:] == ("is-enabled", "--", "certbot-renew.timer"):
             return TimerResult(1, b"disabled\n")
-        if command[-2:] == ("is-active", "certbot-renew.timer"):
+        if command[-3:] == ("is-active", "--", "certbot-renew.timer"):
             return TimerResult(3, b"inactive\n")
         raise RuntimeError("certificate status attempted an unexpected command")
 

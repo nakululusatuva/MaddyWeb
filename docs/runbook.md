@@ -306,12 +306,26 @@ This repository deliberately provides no destructive restore automation because 
 ## Certificate operations
 
 The certificate page permits only names in `certificates.names`. Available operations are status,
-timer enable or disable, Certbot renew dry run, and renew-only-when-due. There is no arbitrary issuance,
+timer disable, Certbot renew dry run, and renew-only-when-due. External timer enable
+fails closed until a dedicated managed renewal service exists. There is no arbitrary issuance,
 revocation, deletion, PEM upload, or private-key export.
 
 The example configuration sets `certificates.command_timeout_seconds` to 300 seconds; the validator accepts
 30..900 seconds. This is separate from `maddy.command_timeout_seconds = 15`, ensuring that a long Certbot
 dry run is not ended early by an ordinary Maddy CLI timeout or Unix helper client.
+
+Keep `certificates.webroot_roots` at its default `[]` until an operator verifies the canonical webroot
+actually used by the lineage. For example, if only `/var/www/mail-acme` serves HTTP-01, configure:
+
+```toml
+[certificates]
+webroot_roots = ["/var/www/mail-acme"]
+```
+
+Each item must be under `/var/www` or `/srv/www`; systemd grants write access only to those exact directories. Do not
+list a wider neighboring site directory for convenience. With an empty list, status, fingerprints, and the timer remain visible, but
+dry-run and renewal are intentionally read-only. Writes require the version in the renewal file and the current Certbot runtime to be
+within `1.0.0` through `5.7.0`. After upgrading outside that range, perform a compatibility audit and tests; do not bypass the gate.
 
 The certificate flow runs read-only `nginx -t` checks before and after renewal, but never writes, reloads, or restarts
 Nginx. After successful renewal it checks that source and deployed certificate fingerprints match, then
@@ -323,7 +337,9 @@ the wrapper invokes the implementation from `/opt/maddyweb/current`; it requires
 `certificates.live_dir/<name>` exactly, and `<name>` must be in the `certificates.names` allowlist.
 Only after validation does it reuse the same atomic deploy and rollback flow, reload Maddy, and read back that
 source and deployed fingerprints match. The hook does not renew or issue certificates, force renewal, write Nginx configuration, or
-reload Nginx.
+reload Nginx. Certbot runs directory hooks for every lineage; another valid certificate under the same canonical
+`live_dir` but outside `certificates.names` is logged as `ignored` and succeeds as a
+no-op without failing its renewal. A malformed, escaping, or untrusted lineage still exits nonzero.
 
 After disabling `certificates.enabled`, another approved installation removes only a hook with the MaddyWeb managed
 marker. A same-named unmanaged hook is never overwritten or removed in either state. Do not manually
@@ -340,7 +356,9 @@ sudo -u maddyweb test -r /etc/maddyweb/config.toml
 ```
 
 Do not delete a live symlink outside the UI or replace a private key to repair state. First restore a verifiable
-Certbot lineage and permissions, then rerun the dry run. Deploy-hook failures in name, lineage, or directory permissions,
+Certbot lineage and permissions, then rerun the dry run. Web certificate writes support only a hook-free `webroot`
+lineage with `installer = none`. A lineage using `nginx`, `standalone`, `manual`, or a DNS
+plugin intentionally makes the page read-only; never modify existing Nginx to pass the check. Deploy-hook failures in name, lineage, permissions,
 atomic deployment, Maddy reload, or fingerprint read-back exit nonzero. Find the first failure in the Certbot
 log and journal; do not delete or bypass the hook just to make renewal appear successful.
 

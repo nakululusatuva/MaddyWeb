@@ -42,6 +42,7 @@ SCHEMA: dict[str, set[str]] = {
         "openssl_binary",
         "nginx_binary",
         "renewal_dir",
+        "webroot_roots",
         "live_dir",
         "timer_unit",
         "command_timeout_seconds",
@@ -51,8 +52,10 @@ SCHEMA: dict[str, set[str]] = {
     "security": {"session_key_file", "csrf_ttl_seconds", "cookie_name"},
     "logging": {"level"},
 }
+OPTIONAL_KEYS: dict[str, set[str]] = {"certificates": {"webroot_roots"}}
 CONTAINER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 SERVICE_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+TIMER_UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@-]*\.timer$")
 SYSTEMD_PATH_COMPONENT_RE = re.compile(r"^[A-Za-z0-9_+.][A-Za-z0-9_.+-]*$")
 
 
@@ -65,7 +68,7 @@ def table(config: dict[str, Any], name: str) -> dict[str, Any]:
     value = config.get(name)
     if not isinstance(value, dict):
         fail(f"[{name}] must be a table")
-    missing = SCHEMA[name] - value.keys()
+    missing = SCHEMA[name] - OPTIONAL_KEYS.get(name, set()) - value.keys()
     unknown = value.keys() - SCHEMA[name]
     if missing:
         fail(f"[{name}] is missing: {', '.join(sorted(missing))}")
@@ -212,10 +215,42 @@ def validate(
         "deployed_key_path",
     ):
         absolute(certificates[field], f"certificates.{field}")
+    renewal_dir = PurePosixPath(str(certificates["renewal_dir"]))
+    live_dir = PurePosixPath(str(certificates["live_dir"]))
+    if renewal_dir.name != "renewal":
+        fail("certificates.renewal_dir must end with /renewal")
+    config_root = renewal_dir.parent
+    custom_config_roots = (
+        PurePosixPath("/var/lib/maddyweb/certbot"),
+        PurePosixPath("/srv/maddyweb/certbot"),
+    )
+    if config_root != PurePosixPath("/etc/letsencrypt") and not any(
+        config_root == allowed or config_root.is_relative_to(allowed)
+        for allowed in custom_config_roots
+    ):
+        fail("certificates.renewal_dir uses a forbidden config root")
+    if live_dir != renewal_dir.parent / "live":
+        fail("certificates.live_dir must be the config root live directory")
+    webroot_roots = string_list(
+        certificates.get("webroot_roots", []),
+        "certificates.webroot_roots",
+    )
+    if len(set(webroot_roots)) != len(webroot_roots):
+        fail("certificates.webroot_roots contains duplicates")
+    permitted_webroots = (PurePosixPath("/var/www"), PurePosixPath("/srv/www"))
+    for index, value in enumerate(webroot_roots):
+        root = PurePosixPath(absolute(value, f"certificates.webroot_roots[{index}]"))
+        if not any(
+            root == allowed or root.is_relative_to(allowed)
+            for allowed in permitted_webroots
+        ):
+            fail("certificates.webroot_roots must stay below /var/www or /srv/www")
     for field in ("deployed_cert_path", "deployed_key_path"):
         if PurePosixPath(str(certificates[field])).parent == PurePosixPath("/"):
             fail(f"certificates.{field} parent must not be the filesystem root")
-    string(certificates["timer_unit"], "certificates.timer_unit")
+    timer_unit = string(certificates["timer_unit"], "certificates.timer_unit")
+    if TIMER_UNIT_RE.fullmatch(timer_unit) is None:
+        fail("certificates.timer_unit is invalid")
     number(
         certificates["command_timeout_seconds"],
         "certificates.command_timeout_seconds",

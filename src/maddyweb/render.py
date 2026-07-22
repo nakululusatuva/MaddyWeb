@@ -405,11 +405,15 @@ def render_certificates(
     if isinstance(status, Mapping):
         certificates = status.get("certificates", ())
         timer_enabled = bool(status.get("timer_enabled", False))
+        timer_active = bool(status.get("timer_active", timer_enabled))
         timer_state = status.get("timer_state", "Enabled" if timer_enabled else "Disabled")
+        timer_enable_safe = bool(status.get("timer_enable_safe", False))
     else:
         certificates = status if isinstance(status, Sequence) else ()
         timer_enabled = False
+        timer_active = False
         timer_state = "Unknown"
+        timer_enable_safe = False
     rows: list[str] = []
     for certificate in certificates:
         name = _record_value(certificate, "name", "domain", "id")
@@ -433,28 +437,46 @@ def render_certificates(
             )
         )
         match_text = "Match" if matches else "Mismatch"
+        automation_safe = bool(_record_value(certificate, "automation_safe", default=False))
+        if automation_safe:
+            actions = (
+                f'<form method="post" action="/certificates/dry-run">{_csrf_field(csrf_token)}'
+                f'<input type="hidden" name="name" value="{_escape(name)}">'
+                '<button type="submit">dry-run</button></form>'
+                f'<form method="post" action="/certificates/renew-if-due">'
+                f"{_csrf_field(csrf_token)}"
+                f'<input type="hidden" name="name" value="{_escape(name)}">'
+                '<button type="submit">Renew if due</button></form>'
+            )
+        else:
+            actions = '<span class="muted">Read-only: Certbot lineage violates policy</span>'
         rows.append(
             "<tr>"
             f"<td>{_escape(name)}</td><td>{_escape(expires)}</td>"
             f"<td><code>{_escape(source_fingerprint)}</code></td>"
             f"<td><code>{_escape(deployed_fingerprint)}</code></td>"
             f'<td>{match_text}</td><td><div class="button-row">'
-            f'<form method="post" action="/certificates/dry-run">{_csrf_field(csrf_token)}'
-            f'<input type="hidden" name="name" value="{_escape(name)}">'
-            '<button type="submit">dry-run</button></form>'
-            f'<form method="post" action="/certificates/renew-if-due">{_csrf_field(csrf_token)}'
-            f'<input type="hidden" name="name" value="{_escape(name)}">'
-            '<button type="submit">Renew if due</button></form></div></td></tr>'
+            f"{actions}</div></td></tr>"
         )
     table_body = "".join(rows) or '<tr><td colspan="6" class="empty">No status</td></tr>'
-    timer_action = "disable" if timer_enabled else "enable"
-    timer_label = "Disable automatic renewal timer" if timer_enabled else "Enable automatic renewal timer"
+    if timer_enabled or timer_active:
+        timer_control = (
+            '<form method="post" action="/certificates/timer">'
+            f'{_csrf_field(csrf_token)}<input type="hidden" name="action" value="disable">'
+            '<button type="submit">Disable automatic renewal timer</button></form>'
+        )
+    elif timer_enable_safe:
+        timer_control = (
+            '<form method="post" action="/certificates/timer">'
+            f'{_csrf_field(csrf_token)}<input type="hidden" name="action" value="enable">'
+            '<button type="submit">Enable automatic renewal timer</button></form>'
+        )
+    else:
+        timer_control = '<p class="muted">Certbot policy prevents web timer activation.</p>'
     body = (
         '<section class="panel"><h2>Renewal timer</h2><p>Current status: '
         f"<strong>{_escape(timer_state)}</strong></p>"
-        '<form method="post" action="/certificates/timer">'
-        f'{_csrf_field(csrf_token)}<input type="hidden" name="action" value="{timer_action}">'
-        f'<button type="submit">{timer_label}</button></form></section>'
+        f"{timer_control}</section>"
         '<section class="panel"><h2>Certificate status</h2><div class="table-scroll"><table>'
         "<thead><tr><th>Name</th><th>Expiration</th><th>Source fingerprint</th>"
         "<th>Deployed fingerprint</th><th>Match</th><th>Actions</th></tr></thead>"

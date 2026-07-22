@@ -31,13 +31,29 @@ because the old release sends unknown subcommands through the implicit server-ru
 
 Passwords pass briefly only through stdin for a required invocation or through the local Unix socket; they never enter command lines,
 environment variables, logs, or audit records. The operational scripts in this repository do not accept password arguments and do not edit or reload
-Nginx; the certificate workflow performs at most the read-only `nginx -t` configuration check.
+Nginx; the certificate workflow may perform only the read-only `nginx -t` configuration check. Before every certificate write, the helper
+reparses the allow-listed lineage and invokes Certbot only when the authenticator is `webroot` and the installer is
+`none`, with no lineage hooks. The `nginx`, `standalone`, and `manual`
+authenticators and DNS plugins all degrade to read-only. Direct invocations always use an empty CLI configuration and
+`--no-directory-hooks`, and require the system and root XDG default `cli.ini` files to be absent, preventing
+ConfigArgParse from merging default configuration or inheriting arbitrary hooks.
+A supported webroot must be a canonical, root-owned directory below `/var/www` or `/srv/www` that
+group and other users cannot write. The managed systemd drop-in grants write access only to exact roots
+explicitly listed in `certificates.webroot_roots`. The default empty list grants no webroot write access, so even when certificate
+status is readable, Certbot write controls remain read-only. Writes additionally require the renewal file and actual runtime
+Certbot to be in the audited `1.0.0`-`5.7.0` range; unknown options and higher versions are always read-only.
 
 When certificate management is enabled, the installer transactionally manages the Certbot deploy hook
 `/etc/letsencrypt/renewal-hooks/deploy/maddyweb`. It accepts only the exact lineage corresponding to an allow-listed name,
 reuses the existing atomic certificate deployment workflow, reloads Maddy, and reads the fingerprint back;
-It never issues certificates, forces renewal, or modifies or reloads Nginx. A hook with the same name that is not managed by MaddyWeb is not
-overwritten or deleted.
+it never issues certificates, forces renewal, or modifies or reloads Nginx. Because a Certbot directory hook is global,
+other certificates under the same canonical live root that are not allow-listed safely become no-ops, avoiding interference with their
+renewal; malformed or escaping paths still fail with a nonzero status. An unmanaged hook with the same name is never overwritten or deleted.
+
+The Web interface can inspect or disable an existing renewal timer, but it does not re-enable an external Certbot timer. An external unit
+may scan lineages outside the allow-list or inherit drop-ins and hooks, so a single invocation's fixed argv cannot constrain it.
+Enable fails closed until a dedicated managed renewal service is implemented. The page still displays certificates, fingerprints, and
+timer status; unsafe lineages do not display dry-run or renewal write controls.
 
 Docker SMTP does not publish a host port. The helper always runs
 `docker exec -i <configured-container> /usr/bin/nc 127.0.0.1 1587` inside the container's own

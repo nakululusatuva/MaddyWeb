@@ -40,7 +40,7 @@ MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
-ReadWritePaths=-/etc/letsencrypt -/var/lib/letsencrypt -/var/log/letsencrypt /var/backups/maddyweb /run/maddyweb
+ReadWritePaths=/var/backups/maddyweb /run/maddyweb
 BindReadOnlyPaths=-/run/docker.sock
 
 [Install]

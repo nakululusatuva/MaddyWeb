@@ -25,6 +25,10 @@ web_denied="$root/web-denied"
 data="$root/maddy-state"
 certificates="$root/maddy-tls"
 helper_denied="$root/helper-denied"
+acme="$root/acme"
+acme_neighbor="$root/acme-neighbor"
+webroot="$root/webroot"
+webroot_neighbor="$root/webroot-neighbor"
 unit_suffix=$(basename -- "$root" | tr -cd 'A-Za-z0-9')
 private_web=$(mktemp -d "/var/tmp/maddyweb-systemd-private-$unit_suffix.XXXXXXXX")
 [[ "$private_web" == "/var/tmp/maddyweb-systemd-private-$unit_suffix."* ]] \
@@ -50,6 +54,11 @@ install -d -o "$web_user" -g "$web_user" -m 0700 -- "$web" "$web_denied"
 chown "$web_user:$web_user" -- "$private_web"
 chmod 0700 -- "$private_web"
 install -d -o root -g root -m 0700 -- "$data" "$certificates" "$helper_denied"
+install -d -o root -g root -m 0700 -- \
+    "$acme/archive/name" "$acme/live/name" "$acme/renewal" "$acme_neighbor" \
+    "$webroot/.well-known/acme-challenge" "$webroot_neighbor"
+touch -- "$acme/archive/name/cert1.pem" "$acme/archive/name/cert2.pem"
+ln -s ../../archive/name/cert1.pem "$acme/live/name/cert.pem"
 
 # PrivateTmp replaces /var/tmp inside the mount namespace.  The application can
 # create its private 0700 spool there without a host path allow-list, and files
@@ -103,4 +112,43 @@ fi
 
 [[ -f "$web/probe" && -f "$data/probe" && -f "$certificates/probe" ]]
 [[ ! -e "$web_denied/probe" && ! -e "$helper_denied/probe" ]]
+
+# Certbot replaces the symlinks below live/ atomically.  The exact configured
+# root must permit that operation without making an adjacent tree writable.
+systemd-run --quiet --wait --collect --pipe \
+    --unit "maddyweb-sandbox-acme-live-$unit_suffix" \
+    --property ProtectSystem=strict \
+    --property "ReadWritePaths=$acme" \
+    /usr/bin/sh -eu -c \
+        'ln -s ../../archive/name/cert2.pem "$1/cert.pem.new"; mv -Tf -- "$1/cert.pem.new" "$1/cert.pem"' \
+        sh "$acme/live/name"
+
+[[ "$(readlink -- "$acme/live/name/cert.pem")" == ../../archive/name/cert2.pem ]]
+
+if systemd-run --quiet --wait --collect --pipe \
+    --unit "maddyweb-sandbox-acme-deny-$unit_suffix" \
+    --property ProtectSystem=strict \
+    --property "ReadWritePaths=$acme" \
+    /usr/bin/touch "$acme_neighbor/probe" >/dev/null 2>&1; then
+    printf 'certificate sandbox unexpectedly wrote to an adjacent tree\n' >&2
+    exit 1
+fi
+
+systemd-run --quiet --wait --collect --pipe \
+    --unit "maddyweb-sandbox-webroot-$unit_suffix" \
+    --property ProtectSystem=strict \
+    --property "ReadWritePaths=$webroot" \
+    /usr/bin/touch "$webroot/.well-known/acme-challenge/probe"
+
+if systemd-run --quiet --wait --collect --pipe \
+    --unit "maddyweb-sandbox-webroot-deny-$unit_suffix" \
+    --property ProtectSystem=strict \
+    --property "ReadWritePaths=$webroot" \
+    /usr/bin/touch "$webroot_neighbor/probe" >/dev/null 2>&1; then
+    printf 'webroot sandbox unexpectedly wrote to an adjacent tree\n' >&2
+    exit 1
+fi
+
+[[ -f "$webroot/.well-known/acme-challenge/probe" ]]
+[[ ! -e "$acme_neighbor/probe" && ! -e "$webroot_neighbor/probe" ]]
 printf 'systemd-sandbox-runtime=ok\n'

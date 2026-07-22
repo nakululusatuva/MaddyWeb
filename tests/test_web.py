@@ -41,6 +41,9 @@ class FakeGateway:
             },
         ]
         self.operations: list[tuple[object, ...]] = []
+        self.certificate_automation_safe = True
+        self.certificate_timer_enabled = True
+        self.certificate_timer_active = True
         self.message_rows: list[dict[str, object]] = [
             {"id": "42", "sender": "sender@example.test", "subject": "Received message"}
         ]
@@ -174,8 +177,10 @@ class FakeGateway:
 
     async def certificate_status(self) -> dict[str, object]:
         return {
-            "timer_enabled": True,
+            "timer_enabled": self.certificate_timer_enabled,
+            "timer_active": self.certificate_timer_active,
             "timer_state": "active",
+            "timer_enable_safe": self.certificate_automation_safe,
             "certificates": [
                 {
                     "name": "mail.example.test",
@@ -183,6 +188,7 @@ class FakeGateway:
                     "source_fingerprint": "AA:BB",
                     "deployed_fingerprint": "AA:BB",
                     "fingerprints_match": True,
+                    "automation_safe": self.certificate_automation_safe,
                 }
             ],
         }
@@ -861,3 +867,36 @@ async def test_certificate_surface_has_no_file_or_delete_operations(
     )
     assert unknown.status == 400
     assert ("certificate_dry_run", "unknown.example.test") not in gateway.operations
+
+
+@pytest.mark.asyncio
+async def test_unsafe_certbot_lineage_is_rendered_read_only(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+    gateway.certificate_automation_safe = False
+    _token, page = await _get_token(client, "/certificates")
+    assert "Read-only: Certbot lineage violates policy" in page
+    assert "/certificates/dry-run" not in page
+    assert "/certificates/renew-if-due" not in page
+    assert 'name="action" value="disable"' in page
+
+
+@pytest.mark.asyncio
+async def test_active_but_disabled_timer_can_still_be_stopped(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+    gateway.certificate_timer_enabled = False
+    gateway.certificate_timer_active = True
+    token, page = await _get_token(client, "/certificates")
+    assert 'name="action" value="disable"' in page
+    assert 'name="action" value="enable"' not in page
+    response = await client.post(
+        "/certificates/timer",
+        data={"_csrf": token, "action": "disable"},
+        headers={"Origin": _origin(client)},
+        allow_redirects=False,
+    )
+    assert response.status == 303
+    assert ("certificate_timer", False) in gateway.operations

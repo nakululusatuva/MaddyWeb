@@ -182,12 +182,7 @@ def _validate_lineage_location(
     certificate_config: Any,
     *,
     owner_uid: int,
-) -> None:
-    if certificate_config.enabled is not True:
-        raise HookError("certificate management is disabled")
-    allowed_names = tuple(certificate_config.names)
-    if name not in allowed_names:
-        raise HookError("renewed certificate name is not allow-listed")
+) -> bool:
     live_dir = Path(certificate_config.live_dir)
     expected = live_dir / name
     if lineage != expected:
@@ -209,6 +204,7 @@ def _validate_lineage_location(
         raise HookError("renewed lineage cannot be resolved safely") from exc
     if resolved_lineage.parent != resolved_live or resolved_lineage != resolved_live / name:
         raise HookError("renewed lineage escapes the configured live directory")
+    return certificate_config.enabled is True and name in tuple(certificate_config.names)
 
 
 def _build_certificate_manager(config: Any) -> Any:
@@ -257,7 +253,7 @@ def _deploy_and_verify(
     manager_factory: Callable[[Any], Any] = _build_certificate_manager,
 ) -> None:
     manager = manager_factory(config)
-    status = getattr(manager, "status", None)
+    status = getattr(manager, "deployment_status", None)
     deploy = getattr(manager, "_deploy_and_reload", None)
     if not callable(status) or not callable(deploy):
         raise HookError("MaddyWeb certificate deployment API is unavailable")
@@ -289,12 +285,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             effective_uid=effective_uid,
         )
         owner_uid = effective_uid if arguments.fixture else 0
-        _validate_lineage_location(
+        managed = _validate_lineage_location(
             lineage,
             name,
             config.certificates,
             owner_uid=owner_uid,
         )
+        if not managed:
+            print(f"maddyweb_certbot_deploy=ignored name={name}")
+            return 0
         _deploy_and_verify(config, name)
     except HookError, OSError, RuntimeError, ValueError:
         print("maddyweb Certbot deploy hook failed closed", file=sys.stderr)

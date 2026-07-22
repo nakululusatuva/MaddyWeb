@@ -77,21 +77,20 @@ def test_lineage_must_be_real_secure_and_allowlisted(tmp_path: Path) -> None:
         names=("mx.example.invalid",),
         live_dir=live_dir,
     )
-    HOOK._validate_lineage_location(
+    assert HOOK._validate_lineage_location(
         lineage,
         "mx.example.invalid",
         config,
         owner_uid=os.geteuid(),
-    )
+    ) is True
 
     config.names = ("other.example.invalid",)
-    with pytest.raises(HOOK.HookError, match="allow-listed"):
-        HOOK._validate_lineage_location(
-            lineage,
-            "mx.example.invalid",
-            config,
-            owner_uid=os.geteuid(),
-        )
+    assert HOOK._validate_lineage_location(
+        lineage,
+        "mx.example.invalid",
+        config,
+        owner_uid=os.geteuid(),
+    ) is False
 
 
 @pytest.mark.skipif(os.name != "posix", reason="symlink ownership is a POSIX contract")
@@ -126,7 +125,12 @@ def test_fixture_config_is_securely_opened_and_strictly_parsed(tmp_path: Path) -
     source = source.replace("names = []", 'names = ["mx.example.invalid"]', 1)
     source = source.replace(
         'live_dir = "/etc/letsencrypt/live"',
-        f'live_dir = "{tmp_path.as_posix()}/live"',
+        'live_dir = "/srv/maddyweb/certbot/hook-fixture/live"',
+        1,
+    )
+    source = source.replace(
+        'renewal_dir = "/etc/letsencrypt/renewal"',
+        'renewal_dir = "/srv/maddyweb/certbot/hook-fixture/renewal"',
         1,
     )
     config_path.write_text(source, encoding="utf-8")
@@ -165,7 +169,7 @@ def test_deploy_uses_existing_transaction_path_and_rechecks_fingerprint() -> Non
     class Manager:
         deployed = False
 
-        def status(self, name: str) -> dict[str, object]:
+        def deployment_status(self, name: str) -> dict[str, object]:
             calls.append(("status", name))
             return _report(deployed_matches=self.deployed)
 
@@ -264,7 +268,9 @@ def stat_mode(path: Path) -> int:
 
 
 def test_deploy_fails_closed_when_private_api_is_missing() -> None:
-    manager = SimpleNamespace(status=lambda _name: _report(deployed_matches=True))
+    manager = SimpleNamespace(
+        deployment_status=lambda _name: _report(deployed_matches=True)
+    )
     with pytest.raises(HOOK.HookError, match="API is unavailable"):
         HOOK._deploy_and_verify(
             object(),
@@ -275,7 +281,7 @@ def test_deploy_fails_closed_when_private_api_is_missing() -> None:
 
 def test_deploy_fails_closed_on_post_deploy_fingerprint_mismatch() -> None:
     class Manager:
-        def status(self, _name: str) -> dict[str, object]:
+        def deployment_status(self, _name: str) -> dict[str, object]:
             return _report(deployed_matches=False)
 
         @staticmethod
@@ -300,6 +306,29 @@ def test_driver_context_cannot_be_switched_by_production_environment(
     assert HOOK.main(["--config", "/etc/maddyweb/config.toml"]) == 1
 
 
+def test_global_hook_ignores_a_valid_unmanaged_lineage(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    lineage = Path("/etc/letsencrypt/live/other.example.invalid")
+    config = SimpleNamespace(certificates=object())
+    monkeypatch.setattr(HOOK, "_effective_uid", lambda: 1000)
+    monkeypatch.setattr(
+        HOOK,
+        "_lineage_from_environment",
+        lambda _environment: (lineage, "other.example.invalid"),
+    )
+    monkeypatch.setattr(HOOK, "_load_secure_config", lambda *_args, **_kwargs: config)
+    monkeypatch.setattr(HOOK, "_validate_lineage_location", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(
+        HOOK,
+        "_deploy_and_verify",
+        lambda *_args, **_kwargs: pytest.fail("unmanaged lineage was deployed"),
+    )
+    assert HOOK.main(["--fixture", "--config", "/fixture/config.toml"]) == 0
+    assert "maddyweb_certbot_deploy=ignored name=other.example.invalid" in capsys.readouterr().out
+
+
 def test_hook_sources_have_fixed_non_shell_deployment_contract() -> None:
     wrapper = WRAPPER.read_text(encoding="utf-8")
     driver = DRIVER.read_text(encoding="utf-8")
@@ -318,6 +347,7 @@ def test_hook_sources_have_fixed_non_shell_deployment_contract() -> None:
     assert 'getattr(manager, "_deploy_and_reload", None)' in driver
     assert "deploy(name)" in driver
     assert "_verify_deployed_report(status(name))" in driver
+    assert 'getattr(manager, "deployment_status", None)' in driver
     assert ".renew(" not in driver
     assert "subprocess" not in driver
     assert "os.system" not in driver

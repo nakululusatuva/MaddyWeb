@@ -21,9 +21,8 @@ grep -Fq 'PrivateTmp=yes' "$ROOT/deploy/systemd/maddyweb.service" || fail "web p
 if grep -Fq 'ReadWritePaths=/var/tmp/maddyweb' "$ROOT/deploy/systemd/maddyweb.service"; then
     fail "web private temp directory must not be a host path allow-list"
 fi
-grep -Eq '^ReadWritePaths=.*(/etc/letsencrypt)' "$ROOT/deploy/systemd/maddyweb-helper.service" || fail "certbot renewal path is not writable"
 helper_write_paths=$(sed -n 's/^ReadWritePaths=//p' "$ROOT/deploy/systemd/maddyweb-helper.service")
-expected_helper_write_paths='-/etc/letsencrypt -/var/lib/letsencrypt -/var/log/letsencrypt /var/backups/maddyweb /run/maddyweb'
+expected_helper_write_paths='/var/backups/maddyweb /run/maddyweb'
 [[ "$helper_write_paths" == "$expected_helper_write_paths" ]] \
     || fail "base helper write allow-list changed or gained native Maddy paths"
 grep -Fq 'd /run/maddyweb         0750 root     maddyweb -' "$ROOT/deploy/systemd/maddyweb.tmpfiles" || fail "helper socket parent ownership changed"

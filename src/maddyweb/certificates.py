@@ -16,13 +16,51 @@ import stat
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol, Self
 
 MAX_CERTIFICATE_BYTES = 2 * 1024 * 1024
 MAX_PRIVATE_KEY_BYTES = 1024 * 1024
+MAX_RENEWAL_CONFIG_BYTES = 256 * 1024
+_EMPTY_CERTBOT_CONFIG = "/dev/null"
+_LINEAGE_OPTIONS = frozenset(
+    {"version", "archive_dir", "cert", "chain", "fullchain", "privkey"}
+)
+_RENEWAL_PARAMETER_OPTIONS = frozenset(
+    {
+        "account",
+        "allow_subset_of_names",
+        "authenticator",
+        "autorenew",
+        "configurator",
+        "elliptic_curve",
+        "installer",
+        "key_type",
+        "manual_public_ip_logging_ok",
+        "must_staple",
+        "preferred_chain",
+        "preferred_profile",
+        "pref_challs",
+        "required_profile",
+        "reuse_key",
+        "rsa_key_size",
+        "server",
+        "webroot_path",
+    }
+)
+_LETS_ENCRYPT_PRODUCTION_SERVER = "https://acme-v02.api.letsencrypt.org/directory"
+_RENEWAL_KEY_RE = re.compile(r"[A-Za-z0-9_.-]+")
+_ACCOUNT_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,256}")
+_CERTBOT_VERSION_RE = re.compile(r"([0-9]+)\.([0-9]+)(?:\.([0-9]+))?")
+_HTTP01_IDENTIFIER_RE = re.compile(
+    r"(?=.{1,253}\Z)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+)
+_PROFILE_NAME_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+_MIN_CERTBOT_VERSION = (1, 0, 0)
+_MAX_CERTBOT_VERSION = (5, 7, 0)
 _CERTIFICATE_RE = re.compile(
     rb"-----BEGIN CERTIFICATE-----\s+[A-Za-z0-9+/=\r\n]+"
     rb"-----END CERTIFICATE-----",
@@ -71,10 +109,12 @@ class CertificateStatus:
     certificate_is_symlink: bool = False
     private_key_is_symlink: bool = False
     error: str | None = None
+    ip_addresses: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
         value["dns_names"] = list(self.dns_names)
+        value["ip_addresses"] = list(self.ip_addresses)
         return value
 
 
@@ -220,6 +260,286 @@ def _bounded_trusted_read(path: Path, maximum: int, description: str) -> bytes:
         os.close(parent_descriptor)
 
 
+def _trusted_file_metadata(path: Path, description: str) -> os.stat_result:
+    try:
+        status = path.lstat()
+    except OSError as exc:
+        raise CertificateCommandError(f"configured {description} is unavailable") from exc
+    trusted_owners = {0, os.geteuid()}
+    if (
+        not stat.S_ISREG(status.st_mode)
+        or status.st_uid not in trusted_owners
+        or stat.S_IMODE(status.st_mode) & 0o022
+        or status.st_nlink != 1
+    ):
+        raise CertificateCommandError(f"configured {description} metadata is unsafe")
+    return status
+
+
+def _trusted_directory_metadata(path: Path, description: str) -> os.stat_result:
+    try:
+        status = path.lstat()
+    except OSError as exc:
+        raise CertificateCommandError(f"configured {description} is unavailable") from exc
+    trusted_owners = {0, os.geteuid()}
+    if (
+        not stat.S_ISDIR(status.st_mode)
+        or status.st_uid not in trusted_owners
+        or stat.S_IMODE(status.st_mode) & 0o022
+    ):
+        raise CertificateCommandError(f"configured {description} metadata is unsafe")
+    descriptor = _open_trusted_parent(path / ".maddyweb-directory-probe")
+    os.close(descriptor)
+    return status
+
+
+def _normalized_option(value: str) -> str:
+    return value.strip().lower().replace("-", "_")
+
+
+def _configobj_list(value: str) -> tuple[str, ...]:
+    cleaned = value.strip()
+    if cleaned.lower() in {"none", "null"}:
+        return ()
+    if any(character in cleaned for character in "'\"\\"):
+        raise CertificateCommandError("Certbot renewal list syntax is unsupported")
+    parts = [part.strip() for part in cleaned.split(",")]
+    if parts and not parts[-1]:
+        parts.pop()
+    if not parts or any(not part for part in parts):
+        raise CertificateCommandError("Certbot renewal list syntax is unsupported")
+    return tuple(parts)
+
+
+def _optional_configobj_value(value: str) -> str:
+    cleaned = value.strip().lower()
+    return "" if cleaned in {"", "none", "null"} else cleaned
+
+
+def _strict_configobj_bool(value: str, description: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized not in {"true", "false"}:
+        raise CertificateCommandError(f"Certbot {description} boolean is invalid")
+    return normalized == "true"
+
+
+def _supported_certbot_version(value: str, description: str) -> tuple[int, int, int]:
+    match = _CERTBOT_VERSION_RE.fullmatch(value.strip())
+    if match is None:
+        raise CertificateCommandError(f"Certbot {description} version is unsupported")
+    version = tuple(int(part or "0") for part in match.groups())
+    if not _MIN_CERTBOT_VERSION <= version <= _MAX_CERTBOT_VERSION:
+        raise CertificateCommandError(f"Certbot {description} version is unsupported")
+    return version  # type: ignore[return-value]
+
+
+@dataclass(frozen=True, slots=True)
+class _RenewalProfile:
+    policy_sha256: str
+
+
+def _parse_renewal_document(
+    raw: bytes,
+) -> tuple[dict[str, str], dict[str, str], dict[str, str], tuple[str, ...]]:
+    try:
+        text = raw.decode("utf-8", errors="strict")
+    except UnicodeError as exc:
+        raise CertificateCommandError("Certbot renewal file is not safely parseable") from exc
+    if "\0" in text:
+        raise CertificateCommandError("Certbot renewal file is not safely parseable")
+    section = "lineage"
+    values: dict[str, dict[str, str]] = {section: {}}
+    webroots: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", ";")):
+            continue
+        if line[0].isspace():
+            raise CertificateCommandError("Certbot renewal continuations are forbidden")
+        if stripped.startswith("[[") and stripped.endswith("]]"):
+            nested = stripped[2:-2].strip().lower()
+            if nested != "webroot_map" or section != "renewalparams":
+                raise CertificateCommandError("Certbot renewal section is unsupported")
+            section = "webroot_map"
+            values.setdefault(section, {})
+            continue
+        if stripped.startswith("[") and stripped.endswith("]"):
+            named = stripped[1:-1].strip().lower()
+            if named not in {"renewalparams", "acme_renewal_info"}:
+                raise CertificateCommandError("Certbot renewal section is unsupported")
+            section = named
+            if section in values:
+                raise CertificateCommandError("Certbot renewal section is duplicated")
+            values[section] = {}
+            continue
+        key_text, separator, value = line.partition("=")
+        key = key_text.strip()
+        if (
+            not separator
+            or not key
+            or (section != "webroot_map" and not _RENEWAL_KEY_RE.fullmatch(key))
+        ):
+            raise CertificateCommandError("Certbot renewal file is not safely parseable")
+        normalized = key.casefold() if section == "webroot_map" else _normalized_option(key)
+        if section != "webroot_map" and key != normalized:
+            raise CertificateCommandError("Certbot renewal option spelling is unsupported")
+        if section == "webroot_map" and _HTTP01_IDENTIFIER_RE.fullmatch(key) is None:
+            raise CertificateCommandError("Certbot webroot map identifier is unsupported")
+        if normalized in values[section]:
+            raise CertificateCommandError("Certbot renewal option is duplicated")
+        cleaned = value.strip()
+        if not cleaned or any(ord(char) < 0x20 or ord(char) == 0x7F for char in cleaned):
+            raise CertificateCommandError("Certbot renewal value is unsafe")
+        values[section][normalized] = cleaned
+        if section == "webroot_map":
+            mapped = _configobj_list(cleaned)
+            if len(mapped) != 1:
+                raise CertificateCommandError("Certbot webroot map value is ambiguous")
+            webroots.extend(mapped)
+    if "renewalparams" not in values:
+        raise CertificateCommandError("Certbot renewal parameters are missing")
+    lineage = values["lineage"]
+    if set(lineage) != _LINEAGE_OPTIONS:
+        raise CertificateCommandError("Certbot renewal lineage options are unsupported")
+    _supported_certbot_version(lineage["version"], "lineage")
+    parameters = values["renewalparams"]
+    if set(parameters) - _RENEWAL_PARAMETER_OPTIONS:
+        raise CertificateCommandError("Certbot renewal parameters are unsupported")
+    acme_renewal_info = values.get("acme_renewal_info", {})
+    if set(acme_renewal_info) - {"ari_retry_after"}:
+        raise CertificateCommandError("Certbot ARI renewal section is unsupported")
+    if retry_after := acme_renewal_info.get("ari_retry_after"):
+        if re.fullmatch(
+            r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+            r"(?:Z|[+-][0-9]{2}:[0-9]{2})?",
+            retry_after,
+        ) is None:
+            raise CertificateCommandError("Certbot ARI retry time is invalid")
+        try:
+            parsed_retry = datetime.fromisoformat(retry_after.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise CertificateCommandError("Certbot ARI retry time is invalid") from exc
+        if len(retry_after) > 64 or not 2000 <= parsed_retry.year <= 2200:
+            raise CertificateCommandError("Certbot ARI retry time is invalid")
+    account = parameters.get("account")
+    if account is not None and _ACCOUNT_ID_RE.fullmatch(account) is None:
+        raise CertificateCommandError("Certbot renewal account is unsupported")
+    key_type = parameters.get("key_type")
+    if key_type is not None and key_type not in {"rsa", "ecdsa"}:
+        raise CertificateCommandError("Certbot renewal key type is unsupported")
+    rsa_key_size = parameters.get("rsa_key_size")
+    if rsa_key_size is not None and rsa_key_size not in {"2048", "3072", "4096"}:
+        raise CertificateCommandError("Certbot renewal RSA key size is unsupported")
+    elliptic_curve = parameters.get("elliptic_curve")
+    if elliptic_curve is not None and elliptic_curve not in {
+        "secp256r1",
+        "secp384r1",
+        "secp521r1",
+    }:
+        raise CertificateCommandError("Certbot renewal elliptic curve is unsupported")
+    if (pref_challs := parameters.get("pref_challs")) and tuple(
+        item.lower() for item in _configobj_list(pref_challs)
+    ) != ("http-01",):
+        raise CertificateCommandError("Certbot renewal challenge type is unsupported")
+    for option in ("must_staple", "reuse_key", "autorenew"):
+        if option in parameters:
+            _strict_configobj_bool(parameters[option], option)
+    if "allow_subset_of_names" in parameters and _strict_configobj_bool(
+        parameters["allow_subset_of_names"], "allow_subset_of_names"
+    ):
+        raise CertificateCommandError("Certbot partial-name renewal is forbidden")
+    manual_logging = _optional_configobj_value(
+        parameters.get("manual_public_ip_logging_ok", "")
+    )
+    if manual_logging and _strict_configobj_bool(
+        parameters["manual_public_ip_logging_ok"], "manual_public_ip_logging_ok"
+    ):
+        raise CertificateCommandError("Certbot manual authenticator state is forbidden")
+    preferred_chain = parameters.get("preferred_chain")
+    if preferred_chain is not None and (
+        len(preferred_chain) > 256 or any(character in preferred_chain for character in "'\"\\")
+    ):
+        raise CertificateCommandError("Certbot preferred chain is unsupported")
+    for option in ("preferred_profile", "required_profile"):
+        value = parameters.get(option)
+        if value is not None and _PROFILE_NAME_RE.fullmatch(value) is None:
+            raise CertificateCommandError("Certbot certificate profile is unsupported")
+    if "webroot_path" in parameters:
+        webroots.extend(_configobj_list(parameters["webroot_path"]))
+    return lineage, parameters, values.get("webroot_map", {}), tuple(webroots)
+
+
+def _safe_renewal_profile(
+    path: Path,
+    *,
+    renewal_dir: Path,
+    live_dir: Path,
+    name: str,
+    allowed_webroot_roots: tuple[Path, ...],
+) -> _RenewalProfile:
+    before = _trusted_file_metadata(path, "Certbot renewal file")
+    raw = _bounded_trusted_read(
+        path,
+        MAX_RENEWAL_CONFIG_BYTES,
+        "Certbot renewal file",
+    )
+    after = _trusted_file_metadata(path, "Certbot renewal file")
+    compared = (
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_nlink",
+        "st_uid",
+        "st_gid",
+        "st_size",
+        "st_mtime_ns",
+        "st_ctime_ns",
+    )
+    if any(getattr(before, field) != getattr(after, field) for field in compared):
+        raise CertificateCommandError("Certbot renewal file changed while being read")
+    lineage, parameters, webroot_map, webroot_values = _parse_renewal_document(raw)
+    expected_lineage = {
+        "archive_dir": str(renewal_dir.parent / "archive" / name),
+        "cert": str(live_dir / name / "cert.pem"),
+        "chain": str(live_dir / name / "chain.pem"),
+        "fullchain": str(live_dir / name / "fullchain.pem"),
+        "privkey": str(live_dir / name / "privkey.pem"),
+    }
+    if any(lineage.get(key) != value for key, value in expected_lineage.items()):
+        raise CertificateCommandError("Certbot renewal lineage paths are unsafe")
+    authenticator = _optional_configobj_value(parameters.get("authenticator", ""))
+    configurator = _optional_configobj_value(parameters.get("configurator", ""))
+    if authenticator != "webroot":
+        raise CertificateCommandError("Certbot renewal authenticator is not Web-safe")
+    if configurator not in {"", "webroot"}:
+        raise CertificateCommandError("Certbot renewal authenticator is ambiguous")
+    installer = _optional_configobj_value(parameters.get("installer", ""))
+    if installer:
+        raise CertificateCommandError("Certbot renewal installer is not Web-safe")
+    if parameters.get("server") != _LETS_ENCRYPT_PRODUCTION_SERVER:
+        raise CertificateCommandError("Certbot renewal server is not allow-listed")
+    if not webroot_values:
+        raise CertificateCommandError("Certbot renewal webroot is missing")
+    for value in webroot_values:
+        webroot = Path(value)
+        if not webroot.is_absolute() or webroot.resolve(strict=True) != webroot:
+            raise CertificateCommandError("Certbot renewal webroot is unsafe")
+        _trusted_directory_metadata(webroot, "Certbot renewal webroot")
+        if not any(
+            webroot == root or root in webroot.parents for root in allowed_webroot_roots
+        ):
+            raise CertificateCommandError("Certbot renewal webroot is unsafe")
+    policy = repr(
+        (
+            tuple(sorted(lineage.items())),
+            tuple(sorted(parameters.items())),
+            tuple(sorted(webroot_map.items())),
+            tuple(webroot_values),
+        )
+    ).encode("utf-8")
+    return _RenewalProfile(policy_sha256=hashlib.sha256(policy).hexdigest())
+
+
 def _first_certificate(certificate_pem: bytes) -> bytes:
     match = _CERTIFICATE_RE.search(certificate_pem)
     if match is None:
@@ -313,6 +633,11 @@ def _inspect(name: str, certificate_path: Path, private_key_path: Path) -> Certi
             dns_names=tuple(
                 str(value) for kind, value in decoded.get("subjectAltName", ()) if kind == "DNS"
             ),
+            ip_addresses=tuple(
+                str(value)
+                for kind, value in decoded.get("subjectAltName", ())
+                if kind == "IP Address"
+            ),
         )
     except (CertificateError, ssl.SSLError, UnicodeError, ValueError, OSError) as exc:
         return CertificateStatus(
@@ -329,6 +654,8 @@ class CertificateManager:
     live_dir: Path
     deployed_certificate_path: Path
     deployed_private_key_path: Path
+    renewal_dir: Path = Path("/etc/letsencrypt/renewal")
+    webroot_roots: tuple[Path, ...] = ()
     timer_unit: str = "certbot-renew.timer"
     runner: ExternalRunner | None = None
     certbot_executable: str = "/usr/bin/certbot"
@@ -342,6 +669,11 @@ class CertificateManager:
     owner_gid: int | None = None
     command_timeout: float = 120.0
     audit: Callable[..., None] = _default_audit
+    _cached_certbot_version: tuple[int, int, int] | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         if len(set(self.allowed_names)) != len(self.allowed_names):
@@ -351,15 +683,21 @@ class CertificateManager:
             for name in self.allowed_names
         ):
             raise ValueError("certificate allow-list contains an invalid name")
-        if re.fullmatch(r"[A-Za-z0-9_.@-]+\.timer", self.timer_unit) is None:
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.@-]*\.timer", self.timer_unit) is None:
             raise ValueError("invalid certificate timer unit")
+        if self.renewal_dir.name != "renewal":
+            raise ValueError("certificate renewal directory must end with /renewal")
         for path in (
+            self.renewal_dir,
             self.live_dir,
             self.deployed_certificate_path,
             self.deployed_private_key_path,
+            *self.webroot_roots,
         ):
             if not path.is_absolute():
                 raise ValueError("certificate paths must be absolute")
+        if len(set(self.webroot_roots)) != len(self.webroot_roots):
+            raise ValueError("certificate webroot roots must be unique")
         for executable in (
             self.certbot_executable,
             self.nginx_executable,
@@ -388,6 +726,8 @@ class CertificateManager:
     ) -> Self:
         return cls(
             allowed_names=tuple(config.names),
+            renewal_dir=Path(config.renewal_dir),
+            webroot_roots=tuple(Path(value) for value in config.webroot_roots),
             live_dir=Path(config.live_dir),
             deployed_certificate_path=Path(config.deployed_cert_path),
             deployed_private_key_path=Path(config.deployed_key_path),
@@ -408,6 +748,95 @@ class CertificateManager:
         if name not in self.allowed_names:
             raise UnknownCertificate("certificate name is not allow-listed")
         return name
+
+    def _safe_renewal_profile(
+        self,
+        name: str,
+        *,
+        verify_runtime: bool = True,
+        fresh_runtime: bool = False,
+    ) -> _RenewalProfile:
+        name = self._allow(name)
+        self._assert_no_ambient_cli_config()
+        profile = _safe_renewal_profile(
+            self.renewal_dir / f"{name}.conf",
+            renewal_dir=self.renewal_dir,
+            live_dir=self.live_dir,
+            name=name,
+            allowed_webroot_roots=self.webroot_roots,
+        )
+        if verify_runtime:
+            self._assert_supported_certbot(fresh=fresh_runtime)
+        return profile
+
+    def _assert_supported_certbot(self, *, fresh: bool = False) -> tuple[int, int, int]:
+        if not fresh and self._cached_certbot_version is not None:
+            return self._cached_certbot_version
+        result = self._run((self.certbot_executable, "--version"))
+        try:
+            output = (result.stdout + result.stderr).decode("ascii", errors="strict").strip()
+        except UnicodeError as exc:
+            raise CertificateCommandError("Certbot runtime version is unsupported") from exc
+        prefix = "certbot "
+        if not output.startswith(prefix):
+            raise CertificateCommandError("Certbot runtime version is unsupported")
+        version = _supported_certbot_version(output.removeprefix(prefix), "runtime")
+        self._cached_certbot_version = version
+        return version
+
+    def _assert_no_ambient_cli_config(self) -> None:
+        try:
+            import pwd
+
+            user_home = Path(pwd.getpwuid(os.geteuid()).pw_dir)
+        except (ImportError, KeyError):
+            user_home = Path.home()
+        candidates = {
+            Path("/etc/letsencrypt/cli.ini"),
+            self.renewal_dir.parent / "cli.ini",
+            user_home / ".config" / "letsencrypt" / "cli.ini",
+        }
+        for candidate in candidates:
+            try:
+                candidate.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise CertificateCommandError(
+                    "Certbot default CLI configuration cannot be inspected"
+                ) from exc
+            raise CertificateCommandError("Certbot default CLI configuration is forbidden")
+
+    def _renewal_is_safe(self, name: str) -> bool:
+        try:
+            self._safe_renewal_profile(name)
+        except Exception:
+            return False
+        return True
+
+    def _timer_enable_is_safe(self) -> bool:
+        return False
+
+    def _renew_argv(self, name: str, *, dry_run: bool) -> tuple[str, ...]:
+        arguments = [
+            self.certbot_executable,
+            "--config",
+            _EMPTY_CERTBOT_CONFIG,
+            "--config-dir",
+            str(self.renewal_dir.parent),
+            "renew",
+        ]
+        if dry_run:
+            arguments.append("--dry-run")
+        arguments.extend(
+            (
+                "--no-directory-hooks",
+                "--cert-name",
+                name,
+                "--non-interactive",
+            )
+        )
+        return tuple(arguments)
 
     def _run(self, argv: Sequence[str], *, allow_nonzero: bool = False) -> Any:
         if self.runner is None:
@@ -432,11 +861,11 @@ class CertificateManager:
                 "active_state": "unknown",
             }
         enabled_result = self._run(
-            (self.systemctl_executable, "is-enabled", self.timer_unit),
+            (self.systemctl_executable, "is-enabled", "--", self.timer_unit),
             allow_nonzero=True,
         )
         active_result = self._run(
-            (self.systemctl_executable, "is-active", self.timer_unit),
+            (self.systemctl_executable, "is-active", "--", self.timer_unit),
             allow_nonzero=True,
         )
         enabled_text = enabled_result.stdout.decode("utf-8", errors="replace").strip()
@@ -482,7 +911,10 @@ class CertificateManager:
             return status
         return _inspect("deployed", self.deployed_certificate_path, self.deployed_private_key_path)
 
-    def status(self, name: str) -> CertificateReport:
+    def deployment_status(self, name: str) -> CertificateReport:
+        """Return source/deployed state without launching Certbot or systemctl."""
+
+        name = self._allow(name)
         source = self._source_status(name)
         deployed = self._deployed_status()
         fingerprints_match = bool(
@@ -497,6 +929,16 @@ class CertificateManager:
                 "source": source.to_dict(),
                 "deployed": deployed.to_dict(),
                 "fingerprints_match": fingerprints_match,
+            }
+        )
+        return report
+
+    def status(self, name: str) -> CertificateReport:
+        report = self.deployment_status(name)
+        report.update(
+            {
+                "automation_safe": self._renewal_is_safe(name),
+                "timer_enable_safe": self._timer_enable_is_safe(),
                 "timer": self._timer_status(),
             }
         )
@@ -505,6 +947,7 @@ class CertificateManager:
     def list_certificates(self) -> list[dict[str, Any]]:
         timer = self._timer_status()
         deployed = self._deployed_status()
+        timer_enable_safe = self._timer_enable_is_safe()
         records: list[dict[str, Any]] = []
         for name in self.allowed_names:
             source = self._source_status(name)
@@ -518,6 +961,8 @@ class CertificateManager:
                         and deployed.sha256_fingerprint
                         and source.sha256_fingerprint == deployed.sha256_fingerprint
                     ),
+                    "automation_safe": self._renewal_is_safe(name),
+                    "timer_enable_safe": timer_enable_safe,
                     "timer": timer,
                 }
             )
@@ -527,7 +972,7 @@ class CertificateManager:
         """Return a fixed, path-free readiness summary for the Web gateway."""
 
         try:
-            self._run((self.certbot_executable, "--version"))
+            self._assert_supported_certbot(fresh=True)
             certbot_available = True
         except Exception:
             certbot_available = False
@@ -559,8 +1004,12 @@ class CertificateManager:
     def set_timer_enabled(self, enabled: bool) -> dict[str, Any]:
         if type(enabled) is not bool:
             raise ValueError("enabled must be a boolean")
+        if enabled:
+            raise CertificateCommandError(
+                "timer enable requires a managed MaddyWeb renewal service"
+            )
         action = "enable" if enabled else "disable"
-        self._run((self.systemctl_executable, action, "--now", self.timer_unit))
+        self._run((self.systemctl_executable, action, "--now", "--", self.timer_unit))
         status = self._timer_status()
         if status["enabled"] is not enabled or status["active"] is not enabled:
             raise CertificateCommandError("certificate timer read-back verification failed")
@@ -572,17 +1021,12 @@ class CertificateManager:
 
     def dry_run(self, name: str) -> dict[str, Any]:
         name = self._allow(name)
+        before = self._safe_renewal_profile(name, fresh_runtime=True)
         self._nginx_test()
-        self._run(
-            (
-                self.certbot_executable,
-                "renew",
-                "--dry-run",
-                "--cert-name",
-                name,
-                "--non-interactive",
-            )
-        )
+        self._run(self._renew_argv(name, dry_run=True))
+        after = self._safe_renewal_profile(name, verify_runtime=False)
+        if after.policy_sha256 != before.policy_sha256:
+            raise CertificateCommandError("Certbot dry-run changed the renewal profile")
         self._nginx_test()
         self.audit("certificates.renew_dry_run", outcome="ok", fields={"name": name})
         return self.status(name)
@@ -595,23 +1039,23 @@ class CertificateManager:
             raise CertificateCommandError(
                 "Docker certificate renewal requires fixed deployment and status hooks"
             )
+        self._safe_renewal_profile(name, fresh_runtime=True)
         before = self._source_status(name)
         if before.error is not None or before.sha256_fingerprint is None:
             raise CertificateCommandError("source certificate is invalid before renewal")
         self._nginx_test()
-        self._run(
-            (
-                self.certbot_executable,
-                "renew",
-                "--cert-name",
-                name,
-                "--non-interactive",
-            )
-        )
+        self._run(self._renew_argv(name, dry_run=False))
+        self._safe_renewal_profile(name, verify_runtime=False)
         self._nginx_test()
         after = self._source_status(name)
         if after.error is not None or after.sha256_fingerprint is None:
             raise CertificateCommandError("source certificate is invalid after renewal")
+        if (
+            not before.dns_names
+            or set(after.dns_names) != set(before.dns_names)
+            or set(after.ip_addresses) != set(before.ip_addresses)
+        ):
+            raise CertificateCommandError("renewed certificate subject names changed unexpectedly")
         source_changed = after.sha256_fingerprint != before.sha256_fingerprint
         current = self.status(name)
         synchronized = not current["fingerprints_match"]

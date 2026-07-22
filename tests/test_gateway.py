@@ -668,7 +668,9 @@ async def test_certificate_status_flattens_source_and_deployed_fingerprints() ->
                             "certificate_path": "/must/not/reach/browser.crt",
                         },
                         "fingerprints_match": True,
-                        "timer": {"enabled": True, "active_state": "active"},
+                        "automation_safe": True,
+                        "timer_enable_safe": True,
+                        "timer": {"enabled": True, "active": True, "active_state": "active"},
                     }
                 ],
             )
@@ -682,3 +684,36 @@ async def test_certificate_status_flattens_source_and_deployed_fingerprints() ->
     assert record["deployed_fingerprint"] == "AA:BB"
     assert "path" not in repr(record)
     assert result["timer_enabled"] is True
+    assert result["timer_active"] is True
+    assert result["timer_enable_safe"] is True
+    assert record["automation_safe"] is True
+
+
+@pytest.mark.asyncio
+async def test_certificate_status_preserves_active_timer_when_disabled() -> None:
+    client = FakeClient(
+        {
+            "certificates.list": Response.success(
+                "template",
+                [
+                    {
+                        "name": "mx.example.test",
+                        "source": {},
+                        "deployed": {},
+                        "timer_enable_safe": False,
+                        "timer": {
+                            "enabled": False,
+                            "active": True,
+                            "active_state": "active",
+                        },
+                    }
+                ],
+            )
+        }
+    )
+    gateway = gateway_with(client, certificates=True)
+    result = await gateway.certificate_status()
+    assert isinstance(result, dict)
+    assert result["timer_enabled"] is False
+    assert result["timer_active"] is True
+    assert result["timer_state"] == "active"

@@ -538,10 +538,16 @@ class HelperGateway:
 
     async def certificate_status(self) -> object:
         if not self._config.certificates.enabled:
-            return {"certificates": (), "timer_enabled": False, "timer_state": "disabled"}
+            return {
+                "certificates": (),
+                "timer_enabled": False,
+                "timer_active": False,
+                "timer_state": "disabled",
+            }
         records = _sequence(await self._call("certificates.list"), "certificates.list")
         normalized_records: list[dict[str, object]] = []
         timer: Mapping[str, Any] = {}
+        timer_enable_safe = bool(records)
         for value in records:
             record = _mapping(value, "certificates.list item")
             source = record.get("source")
@@ -559,12 +565,16 @@ class HelperGateway:
                     "source_fingerprint": source_record.get("sha256_fingerprint", ""),
                     "deployed_fingerprint": deployed_record.get("sha256_fingerprint", ""),
                     "fingerprints_match": record.get("fingerprints_match") is True,
+                    "automation_safe": record.get("automation_safe") is True,
                 }
             )
+            timer_enable_safe = timer_enable_safe and record.get("timer_enable_safe") is True
         return {
             "certificates": normalized_records,
             "timer_enabled": timer.get("enabled") is True,
+            "timer_active": timer.get("active") is True,
             "timer_state": str(timer.get("active_state", "unknown")),
+            "timer_enable_safe": timer_enable_safe,
         }
 
     async def set_certificate_timer(self, enabled: bool) -> None:
