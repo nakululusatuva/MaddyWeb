@@ -26,10 +26,17 @@ data="$root/maddy-state"
 certificates="$root/maddy-tls"
 helper_denied="$root/helper-denied"
 unit_suffix=$(basename -- "$root" | tr -cd 'A-Za-z0-9')
+private_web=$(mktemp -d "/var/tmp/maddyweb-systemd-private-$unit_suffix.XXXXXXXX")
+[[ "$private_web" == "/var/tmp/maddyweb-systemd-private-$unit_suffix."* ]] \
+    || { printf 'unsafe private temp fixture path\n' >&2; exit 1; }
 
 cleanup() {
     local status=$?
     trap - EXIT INT TERM
+    if [[ -d "$private_web" && ! -L "$private_web" \
+        && "$private_web" == "/var/tmp/maddyweb-systemd-private-$unit_suffix."* ]]; then
+        rmdir -- "$private_web" || status=1
+    fi
     if [[ -d "$root" && ! -L "$root" && "$root" == /srv/maddyweb-systemd-sandbox.* ]]; then
         rm -rf -- "$root"
     fi
@@ -40,10 +47,27 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 install -d -o "$web_user" -g "$web_user" -m 0700 -- "$web" "$web_denied"
+chown "$web_user:$web_user" -- "$private_web"
+chmod 0700 -- "$private_web"
 install -d -o root -g root -m 0700 -- "$data" "$certificates" "$helper_denied"
+
+# PrivateTmp replaces /var/tmp inside the mount namespace.  The application can
+# create its private 0700 spool there without a host path allow-list, and files
+# created inside the service must not appear in the host directory.
+systemd-run --quiet --wait --collect --pipe \
+    --unit "maddyweb-sandbox-private-tmp-$unit_suffix" \
+    --property PrivateTmp=yes \
+    --property ProtectSystem=strict \
+    --uid="$web_user" --gid="$web_user" \
+    /usr/bin/sh -eu -c \
+        'mkdir -p -m 0700 -- "$1"; touch -- "$1/probe"; test -f "$1/probe"' \
+        sh "$private_web"
+
+[[ -d "$private_web" && ! -e "$private_web/probe" ]]
 
 systemd-run --quiet --wait --collect --pipe \
     --unit "maddyweb-sandbox-web-$unit_suffix" \
+    --property PrivateTmp=yes \
     --property ProtectSystem=strict \
     --property "ReadWritePaths=$web" \
     --uid="$web_user" --gid="$web_user" \
@@ -51,6 +75,7 @@ systemd-run --quiet --wait --collect --pipe \
 
 if systemd-run --quiet --wait --collect --pipe \
     --unit "maddyweb-sandbox-web-deny-$unit_suffix" \
+    --property PrivateTmp=yes \
     --property ProtectSystem=strict \
     --property "ReadWritePaths=$web" \
     --uid="$web_user" --gid="$web_user" \

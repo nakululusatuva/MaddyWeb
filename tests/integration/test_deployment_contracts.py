@@ -194,6 +194,31 @@ def test_deploy_validator_rejects_systemd_path_injection(
     assert "server.temp_dir" in result.stderr
 
 
+@pytest.mark.parametrize("config", CONFIGS)
+def test_private_temp_paths_do_not_render_host_write_allowlists(
+    tmp_path: Path,
+    config: Path,
+) -> None:
+    output = tmp_path / "output"
+    output.mkdir()
+    subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "-I",
+            str(ROOT / "scripts/render-systemd-sandbox.py"),
+            "--config",
+            str(config),
+            "--output-dir",
+            str(output),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    web = (output / "SYSTEMD-WEB-PATHS.conf").read_text(encoding="utf-8")
+    assert "ReadWritePaths=" not in web
+
+
 def test_nondefault_paths_render_exact_systemd_sandbox_allowlists(tmp_path: Path) -> None:
     source = CONFIGS[0].read_text(encoding="utf-8")
     replacements = {
@@ -307,7 +332,8 @@ def test_systemd_privilege_boundary() -> None:
     assert "python -I -m maddyweb serve" in web
     assert "IPAddressDeny=any" in web
     assert "IPAddressAllow=localhost" in web
-    assert "ReadWritePaths=/var/tmp/maddyweb" in web
+    assert "PrivateTmp=yes" in web
+    assert "ReadWritePaths=/var/tmp/maddyweb" not in web
     assert "Environment=MALLOC_ARENA_MAX=1" in web
     assert "Environment=MALLOC_TRIM_THRESHOLD_=65536" in web
     env_example = (ROOT / "deploy/systemd/maddyweb.env.example").read_text(encoding="utf-8")

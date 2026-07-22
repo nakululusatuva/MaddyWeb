@@ -45,7 +45,16 @@ def _parents(*values: object) -> tuple[str, ...]:
 def render(config_path: Path) -> tuple[str, str]:
     config = load_config(config_path)
     web_temp = systemd_path(config.server.temp_dir, "server.temp_dir")
-    web = _HEADER + f"ReadWritePaths={web_temp}\n"
+    temp_path = PurePosixPath(web_temp)
+    private_roots = (PurePosixPath("/tmp"), PurePosixPath("/var/tmp"))  # noqa: S108
+    # PrivateTmp replaces both roots with isolated writable mounts before path
+    # allow-lists are applied.  Referring to a not-yet-created child there as a
+    # required ReadWritePaths source makes systemd fail with 226/NAMESPACE.
+    # Paths elsewhere still retain the strict, required leaf allow-list.
+    if any(temp_path.is_relative_to(root) for root in private_roots):
+        web = _HEADER
+    else:
+        web = _HEADER + f"ReadWritePaths={web_temp}\n"
 
     helper_lines: list[str] = []
     if config.maddy.mode == "native":

@@ -12,11 +12,12 @@ while allowing only loopback networking. Socket activation starts the root helpe
 `0660 root:maddyweb` socket, and the protocol uses strict length, field, and operation allow-lists. The helper
 does not accept arbitrary commands, paths, container names, or shell text.
 
-The installer generates a managed systemd path drop-in from validated configuration. The Web process receives only its exact
-write access to `server.temp_dir`; the native helper receives only read access to Maddy configuration and write access to the data
-directory and certificate deployment target parents, plus read access to the Certbot `live_dir`.
-The Docker helper receives no additional host-path or Docker-socket relaxation from configuration, and the Web process still explicitly
-cannot see the Docker socket.
+The installer generates a managed systemd path drop-in from validated configuration. The Web service's `PrivateTmp` provides
+writable `/tmp` and `/var/tmp` mounts that are isolated from the host and cleaned when the service stops. When `server.temp_dir` is outside those
+private mounts, the drop-in grants write access only to that exact directory. The native helper receives only read access to Maddy
+read access to Maddy configuration, write access to the data directory and certificate deployment target parents, and Certbot
+`live_dir` read access. The Docker helper receives no additional host-path or Docker-socket
+relaxation from configuration, and the Web process still explicitly cannot see the Docker socket.
 
 ## Credentials and secrets
 

@@ -36,9 +36,10 @@ RSS, PSS, and p95 on the target host.
 Inspect units with `systemctl cat maddyweb.service maddyweb-helper.service`: the Web and helper
 ExecStart entries must contain `python -I -m maddyweb`; the helper must not have `EnvironmentFile=`. Both
 services must contain the managed `20-maddyweb-paths.conf`. The Web drop-in may grant only the configured
-the exact temporary directory; the native helper may expose only configuration, data, and enabled certificate paths. The Docker helper
-must contain no configuration-derived host path or relaxed Docker socket access. Do not edit the drop-in manually; after changing configuration,
-repeat the full dry run and approved installation. If `/etc/maddyweb`, `config.toml`, or
+exact temporary directory outside private `/tmp` and `/var/tmp`; these `PrivateTmp` mounts are
+writable but isolated from the host. A native helper may expose only configuration, data, and enabled certificate paths. The Docker
+the helper must contain no configuration-derived host path or relaxed Docker socket access. Do not edit the drop-in manually;
+After changing configuration, repeat the full dry run and approved installation. If `/etc/maddyweb`, `config.toml`, or
 `maddyweb.env` violates the deployment contract for owner, mode, or link count, do not blindly bypass it with chmod.
 First investigate a possible unauthorized replacement, then restore from trusted configuration.
 

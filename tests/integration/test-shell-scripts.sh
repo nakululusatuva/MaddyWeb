@@ -17,7 +17,10 @@ done < <(find "$ROOT/scripts" "$ROOT/tests/integration" -type f -name '*.sh' -pr
 grep -Fq 'ListenStream=/run/maddyweb/helper.sock' "$ROOT/deploy/systemd/maddyweb-helper.socket" || fail "helper socket path changed"
 grep -Fq 'SocketMode=0660' "$ROOT/deploy/systemd/maddyweb-helper.socket" || fail "helper socket mode changed"
 grep -Eq '^RestrictAddressFamilies=.*AF_UNIX.*AF_INET' "$ROOT/deploy/systemd/maddyweb-helper.service" || fail "helper cannot reach loopback submission"
-grep -Fq 'ReadWritePaths=/var/tmp/maddyweb' "$ROOT/deploy/systemd/maddyweb.service" || fail "web temp directory is not allowlisted"
+grep -Fq 'PrivateTmp=yes' "$ROOT/deploy/systemd/maddyweb.service" || fail "web private temp isolation is disabled"
+if grep -Fq 'ReadWritePaths=/var/tmp/maddyweb' "$ROOT/deploy/systemd/maddyweb.service"; then
+    fail "web private temp directory must not be a host path allow-list"
+fi
 grep -Eq '^ReadWritePaths=.*(/etc/letsencrypt)' "$ROOT/deploy/systemd/maddyweb-helper.service" || fail "certbot renewal path is not writable"
 grep -Fq 'd /run/maddyweb         0750 root     maddyweb -' "$ROOT/deploy/systemd/maddyweb.tmpfiles" || fail "helper socket parent ownership changed"
 grep -Fq 'd /run/maddyweb-approval 0700 root     root     -' "$ROOT/deploy/systemd/maddyweb.tmpfiles" || fail "approval directory is not isolated"

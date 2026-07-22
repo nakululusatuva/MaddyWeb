@@ -48,7 +48,8 @@ IPAddressDeny=any
 IPAddressAllow=localhost
 StateDirectory=maddyweb
 StateDirectoryMode=0750
-ReadWritePaths=/var/tmp/maddyweb
+# PrivateTmp supplies isolated writable /tmp and /var/tmp mounts.  The managed
+# path drop-in adds a strict allow-list only when temp_dir is outside them.
 InaccessiblePaths=-/run/docker.sock -/var/run/docker.sock
 
 [Install]

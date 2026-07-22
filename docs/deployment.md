@@ -269,8 +269,9 @@ The installer:
 The installer also generates these managed systemd path drop-ins from validated configuration:
 `/etc/systemd/system/maddyweb.service.d/20-maddyweb-paths.conf` and
 `/etc/systemd/system/maddyweb-helper.service.d/20-maddyweb-paths.conf`.
-managed systemd path drop-ins. With `ProtectSystem=strict`, the Web drop-in
-makes only the exact `server.temp_dir` writable; the native helper drop-in makes
+With `ProtectSystem=strict`, the Web service's managed path drop-in works with
+`PrivateTmp`, which provides writable `/tmp` and `/var/tmp` mounts isolated from the host. Only a
+`server.temp_dir` outside those private mounts receives exact write access. The native helper drop-in makes
 `maddy.config_path` read-only,
 `maddy.data_dir` writable, and the exact parents of deployed certificate and key files writable when enabled.
 writable and `live_dir` read-only. The Docker helper derives no extra host path from configuration and receives no
