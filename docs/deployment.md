@@ -275,7 +275,8 @@ With `ProtectSystem=strict`, the Web service's managed path drop-in works with
 `maddy.config_path` read-only,
 `maddy.data_dir` writable, and the exact parents of deployed certificate and key files writable when enabled.
 writable and `live_dir` read-only. The Docker helper derives no extra host path from configuration and receives no
-Docker socket permissions.
+Docker socket permissions; the base helper unit also does not expose the native-only `/etc/maddy`
+or `/var/lib/maddy`; only the managed native drop-in for the configured paths may grant access.
 
 When `certificates.enabled = true`, the installer transactionally installs
 `/etc/letsencrypt/renewal-hooks/deploy/maddyweb`, whose wrapper always calls the implementation in the current release.

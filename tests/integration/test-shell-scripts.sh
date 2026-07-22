@@ -22,6 +22,10 @@ if grep -Fq 'ReadWritePaths=/var/tmp/maddyweb' "$ROOT/deploy/systemd/maddyweb.se
     fail "web private temp directory must not be a host path allow-list"
 fi
 grep -Eq '^ReadWritePaths=.*(/etc/letsencrypt)' "$ROOT/deploy/systemd/maddyweb-helper.service" || fail "certbot renewal path is not writable"
+helper_write_paths=$(sed -n 's/^ReadWritePaths=//p' "$ROOT/deploy/systemd/maddyweb-helper.service")
+expected_helper_write_paths='-/etc/letsencrypt -/var/lib/letsencrypt -/var/log/letsencrypt /var/backups/maddyweb /run/maddyweb'
+[[ "$helper_write_paths" == "$expected_helper_write_paths" ]] \
+    || fail "base helper write allow-list changed or gained native Maddy paths"
 grep -Fq 'd /run/maddyweb         0750 root     maddyweb -' "$ROOT/deploy/systemd/maddyweb.tmpfiles" || fail "helper socket parent ownership changed"
 grep -Fq 'd /run/maddyweb-approval 0700 root     root     -' "$ROOT/deploy/systemd/maddyweb.tmpfiles" || fail "approval directory is not isolated"
 grep -Fq 'MADDYWEB_APPROVAL_ROOT="/run/maddyweb-approval"' "$ROOT/scripts/lib/common.sh" || fail "approval root is not isolated"

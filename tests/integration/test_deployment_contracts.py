@@ -94,6 +94,116 @@ def test_smoke_waits_for_the_loopback_listener(monkeypatch: pytest.MonkeyPatch) 
     assert calls == 2
 
 
+def test_smoke_bounds_each_listener_probe_by_remaining_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    smoke = runpy.run_path(str(ROOT / "scripts/smoke-test.py"))
+    times = iter((10.0, 10.25))
+    observed_timeout: float | None = None
+
+    def fake_run(*_args: object, **kwargs: object) -> SimpleNamespace:
+        nonlocal observed_timeout
+        observed_timeout = float(kwargs["timeout"])
+        return SimpleNamespace(stdout="LISTEN 0 16 127.0.0.1:8787 0.0.0.0:*\n")
+
+    monkeypatch.setattr(smoke["time"], "monotonic", lambda: next(times))
+    monkeypatch.setattr(smoke["subprocess"], "run", fake_run)
+    smoke["assert_loopback_listener"](1.0)
+    assert observed_timeout == pytest.approx(0.75)
+
+
+def test_smoke_listener_deadline_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    smoke = runpy.run_path(str(ROOT / "scripts/smoke-test.py"))
+    times = iter((10.0, 10.0, 11.0))
+    monkeypatch.setattr(smoke["time"], "monotonic", lambda: next(times))
+    monkeypatch.setattr(
+        smoke["subprocess"],
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(stdout=""),
+    )
+    with pytest.raises(SystemExit):
+        smoke["assert_loopback_listener"](1.0)
+
+
+@pytest.mark.parametrize("listener", ("0.0.0.0:8787", "[::]:8787"))
+def test_smoke_rejects_public_listener_without_grace(
+    monkeypatch: pytest.MonkeyPatch,
+    listener: str,
+) -> None:
+    smoke = runpy.run_path(str(ROOT / "scripts/smoke-test.py"))
+    slept = False
+
+    def fake_sleep(_seconds: float) -> None:
+        nonlocal slept
+        slept = True
+
+    monkeypatch.setattr(
+        smoke["subprocess"],
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            stdout=f"LISTEN 0 16 {listener} 0.0.0.0:*\n"
+        ),
+    )
+    monkeypatch.setattr(smoke["time"], "sleep", fake_sleep)
+    with pytest.raises(SystemExit):
+        smoke["assert_loopback_listener"](20.0)
+    assert slept is False
+
+
+def test_smoke_uses_separate_startup_and_operation_timeouts(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    smoke = runpy.run_path(str(ROOT / "scripts/smoke-test.py"))
+    main_globals = smoke["main"].__globals__
+    calls: dict[str, float] = {}
+    payload = {
+        "status": "ok",
+        "version": "0.1.0",
+        "maddy_version": "0.9.5",
+        "maddy_write_enabled": True,
+        "storage_available": True,
+        "certbot_available": False,
+        "certificate_management_enabled": False,
+    }
+
+    monkeypatch.setitem(
+        main_globals,
+        "assert_loopback_listener",
+        lambda timeout: calls.__setitem__("listener", timeout),
+    )
+    monkeypatch.setitem(
+        main_globals,
+        "assert_helper_socket",
+        lambda _path, timeout: calls.__setitem__("socket", timeout),
+    )
+
+    def fake_health(_url: str, timeout: float) -> dict[str, object]:
+        calls["health"] = timeout
+        return payload
+
+    monkeypatch.setitem(main_globals, "get_health", fake_health)
+    monkeypatch.setattr(sys, "argv", ["smoke-test.py"])
+    smoke["main"]()
+    capsys.readouterr()
+    assert calls == {"listener": 20.0, "socket": 3.0, "health": 3.0}
+
+
+@pytest.mark.parametrize("startup_timeout", (0, 30.1))
+def test_smoke_rejects_invalid_startup_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    startup_timeout: float,
+) -> None:
+    smoke = runpy.run_path(str(ROOT / "scripts/smoke-test.py"))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["smoke-test.py", "--startup-timeout-seconds", str(startup_timeout)],
+    )
+    with pytest.raises(SystemExit):
+        smoke["main"]()
+
+
 @pytest.mark.parametrize("path", CONFIGS)
 def test_example_config_is_accepted_by_application_and_deploy_validator(path: Path) -> None:
     config = load_config(path)
@@ -241,6 +351,40 @@ def test_private_temp_paths_do_not_render_host_write_allowlists(
     assert "ReadWritePaths=" not in web
 
 
+def test_docker_helper_does_not_gain_native_host_paths(tmp_path: Path) -> None:
+    output = tmp_path / "output"
+    output.mkdir()
+    subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "-I",
+            str(ROOT / "scripts/render-systemd-sandbox.py"),
+            "--config",
+            str(ROOT / "docker/config.toml"),
+            "--output-dir",
+            str(output),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    helper_drop_in = (output / "SYSTEMD-HELPER-PATHS.conf").read_text(encoding="utf-8")
+    helper_base = (ROOT / "deploy/systemd/maddyweb-helper.service").read_text(encoding="utf-8")
+    write_line = next(
+        line for line in helper_base.splitlines() if line.startswith("ReadWritePaths=")
+    )
+    write_paths = set(write_line.removeprefix("ReadWritePaths=").split())
+    assert write_paths == {
+        "-/etc/letsencrypt",
+        "-/var/lib/letsencrypt",
+        "-/var/log/letsencrypt",
+        "/var/backups/maddyweb",
+        "/run/maddyweb",
+    }
+    assert "ReadOnlyPaths=" not in helper_drop_in
+    assert "ReadWritePaths=" not in helper_drop_in
+
+
 def test_nondefault_paths_render_exact_systemd_sandbox_allowlists(tmp_path: Path) -> None:
     source = CONFIGS[0].read_text(encoding="utf-8")
     replacements = {
@@ -365,7 +509,17 @@ def test_systemd_privilege_boundary() -> None:
     assert "python -I -m maddyweb helper" in helper
     assert "EnvironmentFile=" not in helper
     assert "RestrictAddressFamilies=AF_UNIX AF_INET" in helper
-    assert "/etc/letsencrypt" in helper
+    helper_write_line = next(
+        line for line in helper.splitlines() if line.startswith("ReadWritePaths=")
+    )
+    helper_write_paths = set(helper_write_line.removeprefix("ReadWritePaths=").split())
+    assert helper_write_paths == {
+        "-/etc/letsencrypt",
+        "-/var/lib/letsencrypt",
+        "-/var/log/letsencrypt",
+        "/var/backups/maddyweb",
+        "/run/maddyweb",
+    }
     assert "ListenStream=/run/maddyweb/helper.sock" in socket
     assert "SocketUser=root" in socket
     assert "SocketGroup=maddyweb" in socket

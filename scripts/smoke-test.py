@@ -41,13 +41,16 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 def assert_loopback_listener(timeout: float) -> None:
     deadline = time.monotonic() + timeout
     while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            fail("no listener found on port 8787")
         try:
             result = subprocess.run(
                 ["/usr/bin/ss", "-H", "-ltn", "sport = :8787"],
                 check=True,
                 capture_output=True,
                 text=True,
-                timeout=5,
+                timeout=min(5.0, remaining),
             )
         except (FileNotFoundError, subprocess.SubprocessError) as exc:
             fail(f"cannot inspect listeners with ss: {exc}")
@@ -146,6 +149,7 @@ def main() -> None:
     parser.add_argument("--url", default="http://127.0.0.1:8787/healthz")
     parser.add_argument("--helper-socket", type=Path, default=Path("/run/maddyweb/helper.sock"))
     parser.add_argument("--timeout-seconds", type=float, default=3.0)
+    parser.add_argument("--startup-timeout-seconds", type=float, default=20.0)
     parser.add_argument("--expected-app-version")
     args = parser.parse_args()
 
@@ -163,8 +167,10 @@ def main() -> None:
         fail("URL must be exactly http://127.0.0.1:8787/healthz")
     if not 0.1 <= args.timeout_seconds <= 30:
         fail("--timeout-seconds must be in 0.1..30")
+    if not 0.1 <= args.startup_timeout_seconds <= 30:
+        fail("--startup-timeout-seconds must be in 0.1..30")
 
-    assert_loopback_listener(args.timeout_seconds)
+    assert_loopback_listener(args.startup_timeout_seconds)
     assert_helper_socket(args.helper_socket, args.timeout_seconds)
     payload = get_health(args.url, args.timeout_seconds)
     assert_health(payload, args.expected_app_version)

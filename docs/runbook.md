@@ -27,6 +27,9 @@ sudo /opt/maddyweb/current/bin/python scripts/performance-test.py \
 Do not treat HTTP 200 from health as sufficient security evidence by itself. Smoke also checks the listener, socket,
 exact JSON schema, supported Maddy version, and write capability. Degraded health returns
 HTTP 503; common causes are an unreachable helper, changed Maddy CLI fingerprint, or unsupported Maddy version.
+By default, smoke waits up to 20 seconds for Web to complete helper preflight and establish the listener; a separate three-second
+operation timeout still applies to the helper socket and HTTP health. `--startup-timeout-seconds` changes only
+the listener and warm-up budget, accepts 0.1..30 seconds, and does not relax backend operation timeouts.
 
 `MALLOC_ARENA_MAX=1` and `MALLOC_TRIM_THRESHOLD_=65536` in the Web unit are fixed
 low-memory allocator tuning, not secrets or operator overrides; do not move them to
@@ -38,7 +41,8 @@ ExecStart entries must contain `python -I -m maddyweb`; the helper must not have
 services must contain the managed `20-maddyweb-paths.conf`. The Web drop-in may grant only the configured
 exact temporary directory outside private `/tmp` and `/var/tmp`; these `PrivateTmp` mounts are
 writable but isolated from the host. A native helper may expose only configuration, data, and enabled certificate paths. The Docker
-the helper must contain no configuration-derived host path or relaxed Docker socket access. Do not edit the drop-in manually;
+helper base unit must not expose `/etc/maddy` or `/var/lib/maddy`, and must contain no configuration-
+derived host path or relaxed Docker socket access. Do not edit drop-ins manually.
 After changing configuration, repeat the full dry run and approved installation. If `/etc/maddyweb`, `config.toml`, or
 `maddyweb.env` violates the deployment contract for owner, mode, or link count, do not blindly bypass it with chmod.
 First investigate a possible unauthorized replacement, then restore from trusted configuration.
