@@ -26,6 +26,8 @@ grep -Fq 'unexpectedly advertises verify-config' "$ROOT/scripts/lib/common.sh" |
 
 # shellcheck disable=SC1091
 source "$ROOT/scripts/lib/common.sh"
+actual_version=$(extract_maddy_version $'0.8.2 linux/amd64 go1.23.12\ndefault config: /data/maddy.conf')
+[[ "$actual_version" == 0.8.2 ]] || fail "real Maddy version output was not parsed"
 version_in_supported_range 0.8.2 || fail "official Maddy 0.8.2 was rejected"
 version_in_supported_range 0.9.5 || fail "official Maddy 0.9.5 was rejected"
 if version_in_supported_range 0.8.3; then

@@ -77,7 +77,7 @@ extract_maddy_version() {
     local output=${1:?version output is required}
     local first_line first_token version
     first_line=${output%%$'\n'*}
-    read -r first_token _ <<< "$first_line"
+    IFS=$' \t' read -r first_token _ <<< "$first_line"
     version=${first_token#v}
     [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "unable to parse Maddy version output"
     printf '%s\n' "$version"
