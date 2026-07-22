@@ -197,7 +197,11 @@ def render_mailbox(
     context_query = urlencode({"account": selected_account, "mailbox": selected_mailbox})
     rows: list[str] = []
     for message in messages:
-        identifier = _record_value(message, "id", "message_id", "uid")
+        # Maddy's full list output contains both an IMAP UID and an RFC
+        # Message-ID.  Only the UID is valid for the administrative CLI and
+        # the numeric /mail routes; the RFC Message-ID must never be used as
+        # a path identifier.
+        identifier = _record_value(message, "uid", "id")
         sender = _record_value(message, "sender", "from_", "from", default="")
         subject = _record_value(message, "subject", default="(No subject)") or "(No subject)"
         date = _record_value(message, "date", "received_at", default="")

@@ -45,7 +45,12 @@ class FakeGateway:
         self.certificate_timer_enabled = True
         self.certificate_timer_active = True
         self.message_rows: list[dict[str, object]] = [
-            {"id": "42", "sender": "sender@example.test", "subject": "Received message"}
+            {
+                "uid": 42,
+                "message_id": "<rfc-message-id@example.test>",
+                "from": "sender@example.test",
+                "subject": "Received message",
+            }
         ]
         self.message_next_offset: int | None = None
         self.message_initial_offset = 42
@@ -392,6 +397,8 @@ async def test_mail_requires_account_and_mailbox_context_and_has_two_delete_leve
     response = await client.get(f"/mail?{context}")
     page = await response.text()
     assert "Received message" in page
+    assert f"/mail/42?{html.escape(context)}" in page
+    assert "rfc-message-id" not in page
     assert ("list_messages", "admin@example.test", "INBOX", 20, 0) in gateway.operations
 
     detail = await client.get(f"/mail/42?{context}")
