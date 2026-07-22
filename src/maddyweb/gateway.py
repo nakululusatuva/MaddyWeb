@@ -9,6 +9,7 @@ small JSON control frame; filesystem paths never cross the privilege boundary.
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import os
 import stat
@@ -30,6 +31,9 @@ from .protocol import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+_HEALTH_CACHE_SECONDS = 10.0
+_ACCOUNT_CACHE_SECONDS = 2.0
 
 
 class HelperCallError(RuntimeError):
@@ -74,6 +78,24 @@ class _HealthCache:
     value: Mapping[str, object] | None = None
 
 
+@dataclass(slots=True)
+class _AccountCache:
+    expires_at: float = 0.0
+    value: tuple[dict[str, Any], ...] | None = None
+
+
+@dataclass(slots=True)
+class _TaskOutcome:
+    value: Any = None
+    error: Exception | None = None
+
+
+@dataclass(slots=True)
+class _AccountFlight:
+    generation: int
+    task: asyncio.Task[_TaskOutcome]
+
+
 class HelperGateway:
     """Implement the web-facing gateway without granting it local privileges."""
 
@@ -89,6 +111,13 @@ class HelperGateway:
         )
         self._health_cache = _HealthCache()
         self._health_lock = asyncio.Lock()
+        self._account_cache = _AccountCache()
+        self._account_flight: _AccountFlight | None = None
+        self._account_read_tasks: set[asyncio.Task[Any]] = set()
+        self._account_generation = 0
+        self._account_mutations_inflight = 0
+        self._account_mutation_tasks: set[asyncio.Task[Any]] = set()
+        self._account_cache_quarantined = False
 
     async def _call(self, operation: str, params: Mapping[str, Any] | None = None) -> Any:
         request = Request.create(operation, params, actor="maddyweb")
@@ -145,13 +174,7 @@ class HelperGateway:
                 # A read of the account indexes checks that both configured
                 # credential and IMAP storage blocks remain available.  Its
                 # contents are deliberately discarded.
-                _sequence(
-                    await self._call(
-                        "accounts.list",
-                        {"include_append_limits": False},
-                    ),
-                    "accounts.list",
-                )
+                await self._fetch_accounts()
                 result["storage_available"] = True
                 result["status"] = "ok"
             except Exception:
@@ -182,44 +205,217 @@ class HelperGateway:
                 elif isinstance(certificate_result, list):
                     result["certificate_management_enabled"] = True
             frozen = dict(result)
-            self._health_cache = _HealthCache(now + 10.0, frozen)
+            self._health_cache = _HealthCache(
+                time.monotonic() + _HEALTH_CACHE_SECONDS,
+                frozen,
+            )
             return frozen
+
+    async def _fetch_accounts(self) -> tuple[dict[str, Any], ...]:
+        return tuple(
+            dict(_mapping(account, "accounts.list item"))
+            for account in _sequence(
+                await self._call(
+                    "accounts.list",
+                    {"include_append_limits": False},
+                ),
+                "accounts.list",
+            )
+        )
+
+    @staticmethod
+    def _copy_accounts(
+        accounts: tuple[dict[str, Any], ...],
+    ) -> tuple[dict[str, Any], ...]:
+        # Helper responses are decoded JSON.  Deep copies prevent an in-process
+        # caller from modifying nested extension fields held by the cache.
+        return copy.deepcopy(accounts)
+
+    @staticmethod
+    def _consume_task_exception(task: asyncio.Task[Any]) -> None:
+        if not task.cancelled():
+            task.exception()
+
+    def _release_account_read_task(self, task: asyncio.Task[Any]) -> None:
+        self._account_read_tasks.discard(task)
+        self._consume_task_exception(task)
+
+    async def _run_account_read(
+        self,
+        generation: int,
+    ) -> _TaskOutcome:
+        task = asyncio.current_task()
+        try:
+            try:
+                accounts = await self._fetch_accounts()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # A successful Task carrying the error prevents Python 3.14's
+                # shield future from logging an expected late exception after
+                # its HTTP waiter was cancelled.
+                return _TaskOutcome(error=exc)
+            if (
+                generation == self._account_generation
+                and self._account_mutations_inflight == 0
+            ):
+                # A successful uncached read after an ambiguous mutation is
+                # authoritative: the single helper serves connections serially.
+                self._account_cache_quarantined = False
+                self._account_cache = _AccountCache(
+                    time.monotonic() + _ACCOUNT_CACHE_SECONDS,
+                    accounts,
+                )
+            return _TaskOutcome(value=accounts)
+        finally:
+            # This transition happens before the Task becomes done.  Callers
+            # can therefore never spin on a completed flight whose scheduled
+            # done callback has not run yet.
+            flight = self._account_flight
+            if flight is not None and flight.task is task:
+                self._account_flight = None
+
+    def _start_account_read(self) -> _AccountFlight:
+        generation = self._account_generation
+        task = asyncio.create_task(self._run_account_read(generation))
+        flight = _AccountFlight(generation, task)
+        self._account_flight = flight
+        self._account_read_tasks.add(task)
+        task.add_done_callback(self._release_account_read_task)
+        return flight
+
+    async def _wait_for_account_mutations(self) -> None:
+        while self._account_mutations_inflight:
+            # The set keeps shielded helper tasks strongly referenced.  Drop
+            # tasks whose wrapper already completed before a delayed callback
+            # could remove them, then wait for every current writer to settle.
+            for task in tuple(self._account_mutation_tasks):
+                if task.done():
+                    self._account_mutation_tasks.discard(task)
+            tasks = tuple(self._account_mutation_tasks)
+            if not tasks:
+                raise RuntimeError("account mutation task tracking was lost")
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in tasks),
+                return_exceptions=True,
+            )
 
     async def list_accounts(self) -> Sequence[object]:
         # APPENDLIMIT has no bulk CLI in supported Maddy releases.  Avoid an
         # N+1 command storm on every account/mail/compose page; setting a limit
         # remains an explicit verified write operation.
-        return _sequence(
-            await self._call("accounts.list", {"include_append_limits": False}),
-            "accounts.list",
-        )
+        while True:
+            if self._account_mutations_inflight:
+                await self._wait_for_account_mutations()
+                continue
+            now = time.monotonic()
+            cached = self._account_cache.value
+            if (
+                self._account_mutations_inflight == 0
+                and not self._account_cache_quarantined
+                and cached is not None
+                and self._account_cache.expires_at > now
+            ):
+                return self._copy_accounts(cached)
+            flight = self._account_flight
+            if flight is None or flight.generation != self._account_generation:
+                flight = self._start_account_read()
+            outcome = await asyncio.shield(flight.task)
+            if outcome.error is not None:
+                raise outcome.error
+            accounts = outcome.value
+            if not isinstance(accounts, tuple):
+                raise RuntimeError("account read completed without a result")
+            # A mutation may have begun while the helper read was in flight.
+            # In that case wait for a post-mutation snapshot instead of
+            # returning or caching the older result.
+            if (
+                flight.generation != self._account_generation
+                or self._account_mutations_inflight != 0
+            ):
+                continue
+            return self._copy_accounts(accounts)
+
+    def _invalidate_accounts(self) -> None:
+        self._account_generation += 1
+        self._account_cache = _AccountCache()
+        # Do not cancel a shared read: its current waiters may still be alive.
+        # Detaching it lets post-mutation readers start a new generation while
+        # the older read wrapper is prevented from clearing the new flight.
+        self._account_flight = None
+
+    def _release_account_mutation_task(self, task: asyncio.Task[Any]) -> None:
+        self._account_mutation_tasks.discard(task)
+        self._consume_task_exception(task)
+
+    async def _run_account_mutation(
+        self,
+        operation: str,
+        params: Mapping[str, Any],
+    ) -> _TaskOutcome:
+        try:
+            return _TaskOutcome(value=await self._call(operation, params))
+        except HelperCallError as exc:
+            # A framed helper error means the serialized operation completed.
+            return _TaskOutcome(error=exc)
+        except asyncio.CancelledError:
+            self._account_cache_quarantined = True
+            raise
+        except Exception as exc:
+            # Transport failures cannot prove when a root-side operation
+            # settled.  Bypass cache until a later serialized read succeeds.
+            self._account_cache_quarantined = True
+            return _TaskOutcome(error=exc)
+        finally:
+            # Update every state predicate before this wrapper Task becomes
+            # done.  No correctness decision depends on done-callback timing.
+            self._account_mutations_inflight -= 1
+            self._invalidate_accounts()
+
+    async def _account_mutation(
+        self,
+        operation: str,
+        params: Mapping[str, Any],
+    ) -> Any:
+        # Shield the actual helper call from HTTP-task cancellation.  Its
+        # wrapper performs the second invalidation only when that call really
+        # settles; transport ambiguity additionally quarantines the cache.
+        self._invalidate_accounts()
+        self._account_mutations_inflight += 1
+        task = asyncio.create_task(self._run_account_mutation(operation, params))
+        self._account_mutation_tasks.add(task)
+        task.add_done_callback(self._release_account_mutation_task)
+        outcome = await asyncio.shield(task)
+        if outcome.error is not None:
+            raise outcome.error
+        return outcome.value
 
     async def create_account(self, username: str, password: str) -> object:
-        return await self._call(
+        return await self._account_mutation(
             "accounts.create",
             {"username": username, "password": password},
         )
 
     async def change_password(self, account_id: str, password: str) -> None:
-        await self._call(
+        await self._account_mutation(
             "accounts.change_password",
             {"username": account_id, "password": password},
         )
 
     async def set_append_limit(self, account_id: str, limit: int) -> None:
-        await self._call(
+        await self._account_mutation(
             "accounts.set_append_limit",
             {"username": account_id, "value": limit},
         )
 
     async def disable_credentials(self, account_id: str) -> None:
-        await self._call(
+        await self._account_mutation(
             "accounts.disable_credentials",
             {"username": account_id, "confirm": True},
         )
 
     async def delete_mailbox(self, account_id: str) -> None:
-        await self._call(
+        await self._account_mutation(
             "accounts.delete_imap_account",
             {"username": account_id, "confirm": True},
         )

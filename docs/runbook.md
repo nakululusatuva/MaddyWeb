@@ -27,9 +27,15 @@ sudo /opt/maddyweb/current/bin/python scripts/performance-test.py \
 Do not treat HTTP 200 from health as sufficient security evidence by itself. Smoke also checks the listener, socket,
 exact JSON schema, supported Maddy version, and write capability. Degraded health returns
 HTTP 503; common causes are an unreachable helper, changed Maddy CLI fingerprint, or unsupported Maddy version.
-By default, smoke waits up to 20 seconds for Web to complete helper preflight and establish the listener; a separate three-second
-operation timeout still applies to the helper socket and HTTP health. `--startup-timeout-seconds` changes only
-the listener and warm-up budget, accepts 0.1..30 seconds, and does not relax backend operation timeouts.
+By default, smoke waits up to 20 seconds for Web to complete helper preflight and establish the listener; helper socket
+connection remains limited to 3 seconds. Cold health on a low-performance Docker host computes the full capability fingerprint with
+a separate bounded 10-second HTTP timeout. `--startup-timeout-seconds` changes only the listener and warm-up
+budget; `--health-timeout-seconds` changes only the strict health response budget. Both accept
+0.1..30 seconds, and neither relaxes the helper socket connection timeout.
+
+The two-second account-page index cache is never used for health, helper write authorization, or pre-send account checks.
+The cache is bypassed during account writes. If the browser cancels a request, the helper call still invalidates it when complete.
+After an uncertain transport result, the cache remains quarantined until a later account read succeeds.
 
 `MALLOC_ARENA_MAX=1` and `MALLOC_TRIM_THRESHOLD_=65536` in the Web unit are fixed
 low-memory allocator tuning, not secrets or operator overrides; do not move them to

@@ -304,6 +304,17 @@ for 400 health requests at concurrency 8. Actual values vary with libc, Python, 
 Both allocator settings are tested unit tuning and deliberately absent from optional `env.example`, preventing
 accidental removal while an operator cleans the environment file.
 
+For account indexes without APPENDLIMIT, Web uses a short, two-second process-local cache measured from read completion,
+and coalesces simultaneous successful or failed page reads with a shared task. Every account write bumps
+a generation and clears the cache before invocation and again when the helper call finishes. Even if the HTTP request is cancelled,
+the background call completes invalidation. A stale read crossing a generation may neither refill nor return; an uncertain transport
+result quarantines the cache until a later serialized account read succeeds. The health storage probe does not use the page cache.
+The helper's pre-send account check and each write's version, configuration, and CLI fingerprint check never use it either.
+
+A cold health check in Docker mode must probe the full Maddy CLI fingerprint, so its duration includes `docker exec` startup
+cost. The smoke test therefore limits listener, helper socket, and health separately to 20, 3, and 10
+seconds. The performance gate remains independent; do not substitute the health timeout budget for p95 acceptance.
+
 The installer does not modify the management Submission block in Maddy configuration; that step needs separate approval. See the
 [operations runbook](runbook.md). For a fresh install, omit `--activate`, configure and validate Submission,
 then enable Web and helper. For an upgrade with a healthy Submission endpoint, add `--activate` after review

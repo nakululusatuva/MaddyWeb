@@ -150,6 +150,7 @@ def main() -> None:
     parser.add_argument("--helper-socket", type=Path, default=Path("/run/maddyweb/helper.sock"))
     parser.add_argument("--timeout-seconds", type=float, default=3.0)
     parser.add_argument("--startup-timeout-seconds", type=float, default=20.0)
+    parser.add_argument("--health-timeout-seconds", type=float, default=10.0)
     parser.add_argument("--expected-app-version")
     args = parser.parse_args()
 
@@ -169,10 +170,12 @@ def main() -> None:
         fail("--timeout-seconds must be in 0.1..30")
     if not 0.1 <= args.startup_timeout_seconds <= 30:
         fail("--startup-timeout-seconds must be in 0.1..30")
+    if not 0.1 <= args.health_timeout_seconds <= 30:
+        fail("--health-timeout-seconds must be in 0.1..30")
 
     assert_loopback_listener(args.startup_timeout_seconds)
     assert_helper_socket(args.helper_socket, args.timeout_seconds)
-    payload = get_health(args.url, args.timeout_seconds)
+    payload = get_health(args.url, args.health_timeout_seconds)
     assert_health(payload, args.expected_app_version)
     print(json.dumps({"status": "ok", "health": payload}, sort_keys=True))
 

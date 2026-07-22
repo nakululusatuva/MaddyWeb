@@ -186,7 +186,7 @@ def test_smoke_uses_separate_startup_and_operation_timeouts(
     monkeypatch.setattr(sys, "argv", ["smoke-test.py"])
     smoke["main"]()
     capsys.readouterr()
-    assert calls == {"listener": 20.0, "socket": 3.0, "health": 3.0}
+    assert calls == {"listener": 20.0, "socket": 3.0, "health": 10.0}
 
 
 @pytest.mark.parametrize("startup_timeout", (0, 30.1))
@@ -199,6 +199,21 @@ def test_smoke_rejects_invalid_startup_timeout(
         sys,
         "argv",
         ["smoke-test.py", "--startup-timeout-seconds", str(startup_timeout)],
+    )
+    with pytest.raises(SystemExit):
+        smoke["main"]()
+
+
+@pytest.mark.parametrize("health_timeout", (0, 30.1))
+def test_smoke_rejects_invalid_health_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    health_timeout: float,
+) -> None:
+    smoke = runpy.run_path(str(ROOT / "scripts/smoke-test.py"))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["smoke-test.py", "--health-timeout-seconds", str(health_timeout)],
     )
     with pytest.raises(SystemExit):
         smoke["main"]()
