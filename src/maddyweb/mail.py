@@ -1,4 +1,3 @@
-# ruff: noqa: RUF001
 """Safe parsing, rendering and construction of Internet mail messages."""
 
 from __future__ import annotations
@@ -321,7 +320,7 @@ def sandboxed_html_document(value: str, *, already_sanitized: bool = False) -> s
 
     safe = value if already_sanitized else sanitize_html_email(value)
     return (
-        '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
+        '<!doctype html><html lang="und"><head><meta charset="utf-8">'
         '<meta name="referrer" content="no-referrer">'
         '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; '
         "base-uri 'none'; form-action 'none'; img-src 'self'; object-src 'none'; "

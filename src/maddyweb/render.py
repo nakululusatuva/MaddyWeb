@@ -1,4 +1,3 @@
-# ruff: noqa: RUF001
 """Small, dependency-free server-side HTML renderer.
 
 Every dynamic value is escaped here.  Sanitized message HTML is never inserted
@@ -44,14 +43,14 @@ def render_page(
     notice: str | None = None,
     notice_kind: str = "info",
 ) -> str:
-    """Render the common Chinese administration shell."""
+    """Render the common English administration shell."""
 
     notice_html = ""
     if notice:
         kind = notice_kind if notice_kind in {"info", "success", "warning", "error"} else "info"
         notice_html = f'<div class="notice notice-{kind}" role="status">{_escape(notice)}</div>'
     return (
-        '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
+        '<!doctype html><html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
         f"<title>{_escape(title)} - MaddyWeb</title>"
         '<link rel="stylesheet" href="/static/app.css">'

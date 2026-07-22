@@ -1,4 +1,3 @@
-# ruff: noqa: RUF001
 """HTTP security primitives for the local administration interface.
 
 The web application deliberately has no CORS mode.  Browser state-changing
