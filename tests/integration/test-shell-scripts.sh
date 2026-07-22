@@ -23,6 +23,8 @@ grep -Fq 'd /run/maddyweb         0750 root     maddyweb -' "$ROOT/deploy/system
 grep -Fq 'd /run/maddyweb-approval 0700 root     root     -' "$ROOT/deploy/systemd/maddyweb.tmpfiles" || fail "approval directory is not isolated"
 grep -Fq 'MADDYWEB_APPROVAL_ROOT="/run/maddyweb-approval"' "$ROOT/scripts/lib/common.sh" || fail "approval root is not isolated"
 grep -Fq 'unexpectedly advertises verify-config' "$ROOT/scripts/lib/common.sh" || fail "0.8.2 verify-config guard is missing"
+grep -Fq "IFS=\$' \t' read -r python_version py_gil_disabled gil_enabled" \
+    "$ROOT/scripts/preflight.sh" || fail "Python diagnostics parser ignores spaces"
 
 # shellcheck disable=SC1091
 source "$ROOT/scripts/lib/common.sh"

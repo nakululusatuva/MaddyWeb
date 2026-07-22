@@ -65,7 +65,7 @@ if is_gil_enabled is None:
     raise SystemExit(1)
 print(".".join(map(str, sys.version_info[:3])), gil_disabled, int(is_gil_enabled()))' \
 ) || die "CPython 3.14 (standard or free-threaded) is required"
-read -r python_version py_gil_disabled gil_enabled <<< "$python_diagnostics"
+IFS=$' \t' read -r python_version py_gil_disabled gil_enabled <<< "$python_diagnostics"
 
 if [[ "$mode" == "container" ]]; then
     [[ "$container" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || die "container name is unsafe"
