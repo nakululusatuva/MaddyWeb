@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
 
 import pytest
 
@@ -70,6 +71,27 @@ def test_smoke_and_performance_gates_match_the_public_health_schema() -> None:
     smoke["assert_health"](payload, None)
     with pytest.raises(SystemExit):
         smoke["assert_health"]({**payload, "storage_available": False}, None)
+
+
+def test_smoke_waits_for_the_loopback_listener(monkeypatch: pytest.MonkeyPatch) -> None:
+    smoke = runpy.run_path(str(ROOT / "scripts/smoke-test.py"))
+    results = iter(
+        (
+            SimpleNamespace(stdout=""),
+            SimpleNamespace(stdout="LISTEN 0 16 127.0.0.1:8787 0.0.0.0:*\n"),
+        )
+    )
+    calls = 0
+
+    def fake_run(*_args: object, **_kwargs: object) -> SimpleNamespace:
+        nonlocal calls
+        calls += 1
+        return next(results)
+
+    monkeypatch.setattr(smoke["subprocess"], "run", fake_run)
+    monkeypatch.setattr(smoke["time"], "sleep", lambda _seconds: None)
+    smoke["assert_loopback_listener"](1.0)
+    assert calls == 2
 
 
 @pytest.mark.parametrize("path", CONFIGS)

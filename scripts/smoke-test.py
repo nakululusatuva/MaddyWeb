@@ -9,6 +9,7 @@ import re
 import socket
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -37,27 +38,33 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def assert_loopback_listener() -> None:
-    try:
-        result = subprocess.run(
-            ["/usr/bin/ss", "-H", "-ltn", "sport = :8787"],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (FileNotFoundError, subprocess.SubprocessError) as exc:
-        fail(f"cannot inspect listeners with ss: {exc}")
-    listeners = []
-    for line in result.stdout.splitlines():
-        fields = line.split()
-        if len(fields) < 4:
-            fail(f"cannot parse ss output: {line!r}")
-        listeners.append(fields[3])
-    if not listeners:
-        fail("no listener found on port 8787")
-    if any(listener != "127.0.0.1:8787" for listener in listeners):
-        fail(f"listener policy violation: {listeners}")
+def assert_loopback_listener(timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            result = subprocess.run(
+                ["/usr/bin/ss", "-H", "-ltn", "sport = :8787"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (FileNotFoundError, subprocess.SubprocessError) as exc:
+            fail(f"cannot inspect listeners with ss: {exc}")
+        listeners = []
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if len(fields) < 4:
+                fail(f"cannot parse ss output: {line!r}")
+            listeners.append(fields[3])
+        if any(listener != "127.0.0.1:8787" for listener in listeners):
+            fail(f"listener policy violation: {listeners}")
+        if listeners:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            fail("no listener found on port 8787")
+        time.sleep(min(0.1, remaining))
 
 
 def assert_helper_socket(path: Path, timeout: float) -> None:
@@ -157,7 +164,7 @@ def main() -> None:
     if not 0.1 <= args.timeout_seconds <= 30:
         fail("--timeout-seconds must be in 0.1..30")
 
-    assert_loopback_listener()
+    assert_loopback_listener(args.timeout_seconds)
     assert_helper_socket(args.helper_socket, args.timeout_seconds)
     payload = get_health(args.url, args.timeout_seconds)
     assert_health(payload, args.expected_app_version)
