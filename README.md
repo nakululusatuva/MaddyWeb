@@ -8,6 +8,18 @@ process from the restricted root helper; the two communicate only through
 The project's primary constraint is "fail closed": when the version, CLI fingerprint, configuration structure, Docker
 topology, or helper health does not match a tested contract, write operations are disabled instead of guessing compatibility.
 
+## Browser architecture
+
+The administration console is a static single-page application: one fixed HTML shell, one local stylesheet,
+and one local vanilla JavaScript application. The Python service does not render UI pages or interpolate
+backend values into HTML. Browser state is loaded through the versioned `/api/v1` JSON API, while raw mail,
+attachments, and sanitized message HTML remain separate streaming or document responses. Sanitized message
+HTML is displayed only in an empty-sandbox iframe with a dedicated restrictive CSP.
+
+The browser fetches its process-bound CSRF token from `/api/v1/session`, serializes every mutation globally,
+and accepts the replacement token only from the response header. Mutations are never retried automatically.
+No frontend dependency, build tool, CDN, remote font, or external image is required.
+
 ## Supported scope
 
 - CPython 3.14, including standard builds and free-threaded `3.14t`.
