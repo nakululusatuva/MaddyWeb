@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#f4f6f9">
+  <meta name="description" content="Private Maddy mail server administration console">
+  <title>MaddyWeb</title>
+  <link rel="stylesheet" href="/static/app.css?v=5">
+  <script src="/static/app.js?v=5" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to main content</a>
+  <header class="app-header">
+    <a class="brand" href="/" data-route>
+      <span class="brand-mark" aria-hidden="true">MW</span>
+      <span class="brand-copy"><strong>MaddyWeb</strong><small>Mail operations console</small></span>
+    </a>
+    <div class="header-actions">
+      <span id="runtime-badge" class="status-pill status-neutral">Connecting</span>
+      <span class="status-pill status-positive">Loopback only</span>
+      <button id="theme-toggle" class="button button-secondary theme-toggle" type="button" aria-label="Use dark theme">
+        <svg class="theme-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+          <circle cx="12" cy="12" r="4"></circle>
+          <path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"></path>
+        </svg>
+        <span data-theme-label>Dark</span>
+      </button>
+    </div>
+  </header>
+
+  <div class="workspace">
+    <aside class="sidebar">
+      <nav class="primary-nav" aria-label="Main navigation">
+        <a class="compose-action" href="/compose" data-route data-section="compose">
+          <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4l11-11-4-4L4 16zM13.5 6.5l4 4"></path></svg>
+          <span>Compose</span>
+        </a>
+        <a class="nav-link" href="/" data-route data-section="overview">
+          <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z"></path></svg>
+          <span>Overview</span>
+        </a>
+        <a class="nav-link" href="/mail" data-route data-section="mail">
+          <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h18v14H3z"></path><path d="m3 6 9 7 9-7"></path></svg>
+          <span>Mail</span>
+        </a>
+        <a class="nav-link" href="/accounts" data-route data-section="accounts">
+          <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"></circle><path d="M4 21c0-4 3.6-7 8-7s8 3 8 7"></path></svg>
+          <span>Accounts</span>
+        </a>
+        <a class="nav-link" href="/certificates" data-route data-section="certificates">
+          <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 5 6v5c0 4.6 2.9 8.5 7 10 4.1-1.5 7-5.4 7-10V6z"></path></svg>
+          <span>Certificates</span>
+        </a>
+      </nav>
+      <div class="sidebar-footer">
+        <span class="status-dot" aria-hidden="true"></span>
+        <div><strong>Private administration</strong><small>Available through the SSH tunnel</small></div>
+      </div>
+    </aside>
+
+    <main id="main" class="app-main" tabindex="-1">
+      <div id="global-alert" class="notice notice-error" role="alert" hidden></div>
+      <div id="loading-status" class="sr-only" role="status" aria-live="polite"></div>
+
+      <section id="overview-view" class="view" data-view="overview" aria-labelledby="overview-title">
+        <div class="page-heading">
+          <div><p class="eyebrow">Private mail control plane</p><h1 id="overview-title">Administration overview</h1><p>Inspect the runtime and open the tools used to operate this Maddy server.</p></div>
+        </div>
+        <div class="stats-grid" aria-label="Service health summary">
+          <article><span>Application</span><strong id="health-application">Loading</strong><small id="health-version">Version pending</small></article>
+          <article><span>Maddy</span><strong id="health-maddy">Loading</strong><small>Compatibility probe</small></article>
+          <article><span>Storage</span><strong id="health-storage">Loading</strong><small>Mailbox operations</small></article>
+          <article><span>Certificates</span><strong id="health-certificates">Loading</strong><small>Certbot management</small></article>
+        </div>
+        <div class="card-grid" aria-label="Administration tools">
+          <a class="action-card" href="/mail" data-route><span class="card-icon" aria-hidden="true">M</span><span><strong>Mailboxes</strong><small>Read and safely manage account mail</small></span></a>
+          <a class="action-card" href="/accounts" data-route><span class="card-icon" aria-hidden="true">A</span><span><strong>Account management</strong><small>Create mailboxes and rotate credentials</small></span></a>
+          <a class="action-card action-card-primary" href="/compose" data-route><span class="card-icon" aria-hidden="true">C</span><span><strong>Compose</strong><small>Submit and archive a new message</small></span></a>
+          <a class="action-card" href="/certificates" data-route><span class="card-icon" aria-hidden="true">T</span><span><strong>TLS certificates</strong><small>Inspect deployment and renewal status</small></span></a>
+        </div>
+      </section>
+
+      <section id="mail-view" class="view" data-view="mail" aria-labelledby="mail-title" hidden>
+        <div class="page-heading"><div><p class="eyebrow">Mailbox operations</p><h1 id="mail-title">Mailboxes</h1><p>Browse messages across enabled local accounts without exposing a public mail interface.</p></div></div>
+        <section class="data-card">
+          <form id="mail-selector" class="card-toolbar mail-selector" action="/mail" method="get">
+            <label><span>Account</span><select id="mail-account" name="account" required><option value="">Select an account</option></select></label>
+            <label><span>Mailbox</span><select id="mail-mailbox" name="mailbox"><option value="">Select a mailbox</option></select></label>
+            <button class="button button-primary" type="submit">Open</button>
+          </form>
+          <div class="table-scroll">
+            <table class="message-table">
+              <thead><tr><th scope="col">Sender</th><th scope="col">Subject</th><th scope="col">Date</th></tr></thead>
+              <tbody id="message-list-body"></tbody>
+            </table>
+          </div>
+          <div id="message-empty" class="empty-state">Select an account and mailbox.</div>
+          <nav class="panel-footer pagination" aria-label="Message pagination">
+            <a id="mail-previous" class="button button-secondary" href="/mail" data-route hidden>Previous</a>
+            <span id="mail-page">Page 1</span>
+            <a id="mail-next" class="button button-secondary" href="/mail" data-route hidden>Next</a>
+          </nav>
+        </section>
+      </section>
+
+      <section id="message-view" class="view" data-view="message" aria-labelledby="message-title" hidden>
+        <div class="page-heading"><div><p class="eyebrow">Message preview</p><h1 id="message-title">Message</h1><p id="message-summary">Loading message metadata.</p></div></div>
+        <nav class="message-toolbar" aria-label="Message actions">
+          <a id="message-back" class="button button-secondary" href="/mail" data-route>Back to mailbox</a>
+          <a id="message-raw" class="button button-secondary" href="#">Download raw .eml</a>
+          <button id="message-trash" class="button button-secondary" type="button">Move to Trash</button>
+          <button id="message-delete" class="button button-danger" type="button">Permanently delete</button>
+        </nav>
+        <article class="data-card message-card">
+          <dl class="message-metadata">
+            <dt>Sender</dt><dd id="message-sender"></dd>
+            <dt>Recipients</dt><dd id="message-recipients"></dd>
+            <dt>Date</dt><dd id="message-date"></dd>
+          </dl>
+          <div id="message-body"></div>
+        </article>
+        <section class="data-card attachment-card"><div class="card-heading"><div><p class="eyebrow">Files</p><h2>Attachments</h2></div></div><ul id="attachment-list" class="attachment-list"></ul></section>
+      </section>
+
+      <section id="compose-view" class="view" data-view="compose" aria-labelledby="compose-title" hidden>
+        <div class="page-heading"><div><p class="eyebrow">Local submission</p><h1 id="compose-title">Compose</h1><p>Send through Maddy and archive only after SMTP acceptance.</p></div></div>
+        <form id="compose-form" class="data-card compose-card" action="/api/v1/send" method="post" enctype="multipart/form-data" autocomplete="off">
+          <label><span>Sender</span><select id="compose-sender" name="sender" required></select></label>
+          <label><span>Sending account password</span><input name="password" type="password" required maxlength="1024" autocomplete="current-password" aria-describedby="sending-password-help"></label>
+          <p id="sending-password-help" class="field-help">Use the selected mailbox password. MaddyWeb never stores it.</p>
+          <fieldset><legend>Recipients</legend><div class="form-columns"><label><span>To</span><input name="to" required maxlength="16384" inputmode="email" placeholder="user@example.com"></label><label><span>CC</span><input name="cc" maxlength="16384" inputmode="email"></label></div><label><span>BCC</span><input name="bcc" maxlength="16384" inputmode="email"></label></fieldset>
+          <label><span>Subject</span><input name="subject" maxlength="4096"></label>
+          <label><span>Plain-text body</span><textarea name="text" maxlength="2097152" required></textarea></label>
+          <fieldset><legend>Rich-text body (optional)</legend>
+            <div class="editor-toolbar" role="toolbar" aria-label="Text formatting">
+              <button class="button button-quiet" type="button" data-editor-command="bold">Bold</button>
+              <button class="button button-quiet" type="button" data-editor-command="italic">Italic</button>
+              <button class="button button-quiet" type="button" data-editor-command="insertUnorderedList">List</button>
+            </div>
+            <div id="rich-editor" class="rich-editor" contenteditable="true" role="textbox" aria-multiline="true" aria-label="Rich-text body"></div>
+          </fieldset>
+          <label><span>Attachments</span><input name="attachments" type="file" multiple></label>
+          <label><span>Inline images (automatic CID)</span><input id="inline-images" name="inline_images" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple></label>
+          <div class="compose-actions"><button id="send-button" class="button button-primary" type="submit">Send message</button><span class="send-progress" data-send-progress role="status" aria-live="polite"></span></div>
+          <p class="field-help">Delivery precedes Sent archival. An archival failure never resends the message.</p>
+        </form>
+      </section>
+
+      <section id="accounts-view" class="view" data-view="accounts" aria-labelledby="accounts-title" hidden>
+        <div class="page-heading"><div><p class="eyebrow">Mailbox directory</p><h1 id="accounts-title">Account management</h1><p>Create mailboxes, rotate credentials, and control APPENDLIMIT.</p></div></div>
+        <div class="split-layout accounts-layout">
+          <section class="data-card"><div class="card-heading"><div><p class="eyebrow">Directory</p><h2>Existing accounts</h2></div></div><div class="table-scroll"><table><thead><tr><th scope="col">Account</th><th scope="col">Status</th><th scope="col">APPENDLIMIT</th><th scope="col">Actions</th></tr></thead><tbody id="accounts-body"></tbody></table></div><div id="accounts-empty" class="empty-state" hidden>No accounts.</div></section>
+          <section class="data-card compact-card"><div class="card-heading"><div><p class="eyebrow">New mailbox</p><h2>Create account</h2></div></div><form id="create-account-form" class="stack-form" autocomplete="off"><label><span>Email account</span><input name="username" type="text" required maxlength="254" autocomplete="username" inputmode="email"></label><label><span>Password</span><input name="password" type="password" required minlength="12" maxlength="256" autocomplete="new-password"></label><button class="button button-primary" type="submit">Create account</button></form></section>
+        </div>
+      </section>
+
+      <section id="certificates-view" class="view" data-view="certificates" aria-labelledby="certificates-title" hidden>
+        <div class="page-heading"><div><p class="eyebrow">Transport security</p><h1 id="certificates-title">TLS certificates</h1><p>Compare deployed fingerprints and control bounded renewal automation.</p></div></div>
+        <section class="data-card compact-card timer-card"><div class="card-heading"><div><p class="eyebrow">Automation</p><h2>Renewal timer</h2></div></div><p>Current status: <strong id="timer-state">Loading</strong></p><button id="timer-action" class="button button-primary" type="button" disabled>Loading</button><p id="timer-policy" class="field-help"></p></section>
+        <section class="data-card"><div class="card-heading"><div><p class="eyebrow">TLS inventory</p><h2>Certificate status</h2></div></div><div class="table-scroll"><table><thead><tr><th scope="col">Name</th><th scope="col">Expiration</th><th scope="col">Source fingerprint</th><th scope="col">Deployed fingerprint</th><th scope="col">Match</th><th scope="col">Actions</th></tr></thead><tbody id="certificates-body"></tbody></table></div><div id="certificates-empty" class="empty-state" hidden>No certificate status.</div></section>
+      </section>
+
+      <section id="not-found-view" class="view" data-view="not-found" aria-labelledby="not-found-title" hidden>
+        <div class="page-heading"><div><p class="eyebrow">Navigation</p><h1 id="not-found-title">Page not found</h1><p>The requested console view does not exist.</p></div></div><a class="button button-primary" href="/" data-route>Return to overview</a>
+      </section>
+    </main>
+  </div>
+
+  <footer class="app-footer"><span>MaddyWeb private administration</span><span>No cross-origin access or public listener.</span></footer>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+  <dialog id="account-dialog">
+    <div class="dialog-card">
+      <div class="dialog-heading"><div><p class="eyebrow">Account controls</p><h2>Manage account</h2><p id="account-dialog-address"></p></div><button class="dialog-close" type="button" data-close-dialog aria-label="Close">&times;</button></div>
+      <form id="change-password-form" class="stack-form"><label><span>New password</span><input name="password" type="password" required minlength="12" maxlength="256" autocomplete="new-password"></label><button class="button button-primary" type="submit">Change password</button></form>
+      <form id="append-limit-form" class="stack-form"><label><span>APPENDLIMIT (bytes; 0 clears it)</span><input name="limit" type="number" min="0" max="4294967296" required></label><button class="button button-secondary" type="submit">Set limit</button></form>
+      <div class="dialog-actions"><button id="disable-credentials" class="button button-secondary" type="button">Disable credentials</button><button id="delete-account" class="button button-danger" type="button">Permanently delete mailbox</button></div>
+    </div>
+  </dialog>
+
+  <dialog id="confirm-dialog">
+    <div class="dialog-card"><div class="dialog-heading"><div><p class="eyebrow">Confirmation</p><h2 id="confirm-title">Confirm action</h2></div><button class="dialog-close" type="button" data-close-dialog aria-label="Close">&times;</button></div><p id="confirm-message"></p><div class="dialog-actions"><button class="button button-secondary" type="button" data-close-dialog>Cancel</button><button id="confirm-action" class="button button-primary" type="button">Confirm</button></div></div>
+  </dialog>
+
+  <dialog id="typed-confirm-dialog">
+    <div class="dialog-card"><div class="dialog-heading"><div><p class="eyebrow">Permanent action</p><h2 id="typed-confirm-title">Confirm permanent deletion</h2></div><button class="dialog-close" type="button" data-close-dialog aria-label="Close">&times;</button></div><p id="typed-confirm-message"></p><label><span id="typed-confirm-label">Confirmation text</span><input id="typed-confirm-input" type="text" autocomplete="off"></label><div class="dialog-actions"><button class="button button-secondary" type="button" data-close-dialog>Cancel</button><button id="typed-confirm-action" class="button button-danger" type="button">Permanently delete</button></div></div>
+  </dialog>
+</body>
+</html>

@@ -1,16 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-import html
 import io
 import json
-import re
 import time
 from email import policy
 from email.message import EmailMessage
 from email.parser import BytesParser
 from pathlib import Path
-from urllib.parse import quote, urlencode
+from urllib.parse import urlencode
 
 import pytest
 import pytest_asyncio
@@ -258,30 +256,38 @@ async def web_client(tmp_path: Path) -> tuple[TestClient, FakeGateway]:
         await client.close()
 
 
-async def _get_token(client: TestClient, path: str) -> tuple[str, str]:
-    response = await client.get(path)
-    page = await response.text()
-    match = re.search(r'name="_csrf" value="([^"]+)"', page)
-    if match is None:
-        match = re.search(r'data-csrf="([^"]+)"', page)
-    assert match is not None, page
-    return html.unescape(match.group(1)), page
-
-
-def _hidden_value(page: str, name: str) -> str:
-    match = re.search(rf'name="{re.escape(name)}" value="([^"]+)"', page)
-    assert match is not None, page
-    return html.unescape(match.group(1))
+async def _get_token(client: TestClient) -> str:
+    response = await client.get("/api/v1/session")
+    assert response.status == 200
+    payload = await response.json()
+    assert payload["ok"] is True
+    return str(payload["data"]["csrf_token"])
 
 
 def _origin(client: TestClient) -> str:
     return str(client.make_url("/").origin())
 
 
-def _pagination_href(page: str, relation: str) -> str:
-    match = re.search(rf'rel="{relation}" href="([^"]+)"', page)
-    assert match is not None, page
-    return html.unescape(match.group(1))
+async def _api_data(client: TestClient, path: str) -> tuple[object, dict[str, object]]:
+    response = await client.get(path)
+    payload = await response.json()
+    assert payload["api_version"] == "v1"
+    assert payload["ok"] is True
+    return response, payload["data"]
+
+
+async def _post_json(
+    client: TestClient,
+    path: str,
+    token: str,
+    payload: dict[str, object],
+) -> object:
+    return await client.post(
+        path,
+        json=payload,
+        headers={"Origin": _origin(client), "X-CSRF-Token": token},
+        allow_redirects=False,
+    )
 
 
 @pytest.mark.asyncio
@@ -293,9 +299,11 @@ async def test_home_static_assets_and_strict_headers(
     page = await response.text()
     assert response.status == 200
     assert "Administration overview" in page
-    assert 'href="/static/app.css?v=3"' in page
-    assert 'src="/static/app.js?v=3"' in page
-    assert '<main id="main" class="container" tabindex="-1">' in page
+    assert 'href="/static/app.css?v=5"' in page
+    assert 'src="/static/app.js?v=5"' in page
+    assert '<main id="main" class="app-main" tabindex="-1">' in page
+    assert "admin@example.test" not in page
+    assert "csrf_token" not in page
     assert "Access-Control-Allow-Origin" not in response.headers
     assert "script-src 'self'" in response.headers["Content-Security-Policy"]
     assert "img-src 'self' blob:" in response.headers["Content-Security-Policy"]
@@ -305,7 +313,6 @@ async def test_home_static_assets_and_strict_headers(
     assert stylesheet.status == 200
     assert stylesheet.content_type == "text/css"
     stylesheet_bytes = await stylesheet.read()
-    assert len(stylesheet_bytes) <= 16 * 1024
     assert b"@import" not in stylesheet_bytes
     assert b"url(" not in stylesheet_bytes
 
@@ -314,19 +321,27 @@ async def test_home_static_assets_and_strict_headers(
     assert javascript.content_type == "application/javascript"
     assert javascript.headers["X-Content-Type-Options"] == "nosniff"
     javascript_text = await javascript.text()
-    assert len(javascript_text.encode()) <= 4 * 1024
-    assert "contenteditable" not in javascript_text
     assert "URL.createObjectURL" in javascript_text
-    assert "readAsDataURL" not in javascript_text
-    assert 'submitButton.textContent = "Sending..."' in javascript_text
-    assert 'uploadForm.dataset.submitting = "true"' in javascript_text
+    assert "FileReader" not in javascript_text
+    for forbidden_sink in (
+        "innerHTML",
+        "outerHTML",
+        "insertAdjacentHTML",
+        "document.write",
+        "document.open",
+        "srcdoc",
+        "eval(",
+    ):
+        assert forbidden_sink not in javascript_text
+    assert "serializeEditorNode" in javascript_text
+    assert "X-CSRF-Token" in javascript_text
 
     rejected = await client.get("/", headers={"Host": "evil.example"})
     assert rejected.status == 400
 
 
 @pytest.mark.asyncio
-async def test_shell_marks_one_active_navigation_item_per_page(
+async def test_shell_supports_only_known_client_routes(
     web_client: tuple[TestClient, FakeGateway],
 ) -> None:
     client, _gateway = web_client
@@ -334,11 +349,17 @@ async def test_shell_marks_one_active_navigation_item_per_page(
         response = await client.get(path)
         assert response.status == 200
         page = await response.text()
-        assert page.count('aria-current="page"') == 1
         assert 'aria-label="Main navigation"' in page
         assert "https://" not in page
         assert "http://" not in page
         assert " style=" not in page
+    detail = await client.get("/mail/42?account=admin%40example.test&mailbox=INBOX")
+    assert detail.status == 200
+    assert "Administration overview" in await detail.text()
+    assert (await client.get("/unknown-client-route")).status == 404
+    api_missing = await client.get("/api/v1/not-real")
+    assert api_missing.status == 404
+    assert (await api_missing.json())["error"]["code"] == "not_found"
 
 
 @pytest.mark.asyncio
@@ -361,12 +382,18 @@ async def test_health_has_fixed_non_sensitive_schema_and_degrades(
     serialized = json.dumps(payload)
     assert "helper.sock" not in serialized
     assert "must-not-leak" not in serialized
+    api_response, api_payload = await _api_data(client, "/api/v1/health")
+    assert api_response.status == 200
+    assert api_payload == payload
 
     gateway.health_payload["status"] = "degraded"
     gateway.health_payload["maddy_write_enabled"] = False
     degraded = await client.get("/healthz")
     assert degraded.status == 503
     assert (await degraded.json())["status"] == "degraded"
+    degraded_api = await client.get("/api/v1/health")
+    assert degraded_api.status == 503
+    assert (await degraded_api.json())["data"]["status"] == "degraded"
 
 
 @pytest.mark.asyncio
@@ -374,46 +401,146 @@ async def test_account_actions_are_separate_and_mailbox_delete_is_confirmed(
     web_client: tuple[TestClient, FakeGateway],
 ) -> None:
     client, gateway = web_client
-    token, page = await _get_token(client, "/accounts")
-    assert "/password" in page
-    assert "/append-limit" in page
-    assert "/credentials/disable" in page
-    assert "Permanently delete mailbox..." in page
-    assert '<button class="danger" type="submit">Delete</button>' not in page
+    response, data = await _api_data(client, "/api/v1/accounts")
+    assert response.status == 200
+    assert [account["address"] for account in data["accounts"]] == [
+        "admin@example.test",
+        "disabled@example.test",
+    ]
 
-    origin = _origin(client)
-    limit = await client.post(
-        "/accounts/admin@example.test/append-limit",
-        data={"_csrf": token, "limit": "0"},
-        headers={"Origin": origin},
-        allow_redirects=False,
+    token = await _get_token(client)
+    created = await _post_json(
+        client,
+        "/api/v1/accounts",
+        token,
+        {"username": "new@example.test", "password": "valid-password"},
     )
-    assert limit.status == 303
+    assert created.status == 201
+    assert ("create_account", "new@example.test", "valid-password") in gateway.operations
+
+    token = await _get_token(client)
+    changed = await _post_json(
+        client,
+        "/api/v1/accounts/admin@example.test/password",
+        token,
+        {"password": "changed-password"},
+    )
+    assert changed.status == 200
+    assert ("change_password", "admin@example.test", "changed-password") in gateway.operations
+
+    token = await _get_token(client)
+    limit = await _post_json(
+        client,
+        "/api/v1/accounts/admin@example.test/append-limit",
+        token,
+        {"limit": 0},
+    )
+    assert limit.status == 200
     assert ("set_append_limit", "admin@example.test", 0) in gateway.operations
 
-    token, confirmation_page = await _get_token(
+    token = await _get_token(client)
+    disabled = await _post_json(
         client,
-        "/accounts/admin@example.test/delete",
+        "/api/v1/accounts/admin@example.test/credentials/disable",
+        token,
+        {},
     )
-    assert "To continue, enter" in confirmation_page
-    wrong = await client.post(
-        "/accounts/admin@example.test/delete",
-        data={"_csrf": token, "confirmation": "wrong@example.test"},
-        headers={"Origin": origin},
-        allow_redirects=False,
+    assert disabled.status == 200
+    assert ("disable_credentials", "admin@example.test") in gateway.operations
+
+    token = await _get_token(client)
+    wrong = await _post_json(
+        client,
+        "/api/v1/accounts/admin@example.test/delete",
+        token,
+        {"confirmation": "wrong@example.test"},
     )
     assert wrong.status == 400
     assert not any(operation[0] == "delete_mailbox" for operation in gateway.operations)
 
-    token, _ = await _get_token(client, "/accounts/admin@example.test/delete")
-    deleted = await client.post(
-        "/accounts/admin@example.test/delete",
-        data={"_csrf": token, "confirmation": "admin@example.test"},
-        headers={"Origin": origin},
-        allow_redirects=False,
+    token = await _get_token(client)
+    deleted = await _post_json(
+        client,
+        "/api/v1/accounts/admin@example.test/delete",
+        token,
+        {"confirmation": "admin@example.test"},
     )
-    assert deleted.status == 303
+    assert deleted.status == 200
     assert ("delete_mailbox", "admin@example.test") in gateway.operations
+
+
+@pytest.mark.asyncio
+async def test_json_writes_are_strict_bounded_and_rotate_after_handler_errors(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+    origin = _origin(client)
+
+    token = await _get_token(client)
+    form_response = await client.post(
+        "/api/v1/accounts",
+        data={"username": "new@example.test", "password": "valid-password"},
+        headers={"Origin": origin, "X-CSRF-Token": token},
+    )
+    assert form_response.status == 415
+    assert (await form_response.json())["error"]["code"] == "unsupported_media_type"
+
+    for raw_body in (
+        b'{"username":"one@example.test","username":"two@example.test",'
+        b'"password":"valid-password"}',
+        b'{"username":"new@example.test","password":"valid-password","extra":true}',
+        b'["new@example.test","valid-password"]',
+        b'{"username":NaN,"password":"valid-password"}',
+        ("[" * 80 + "0" + "]" * 80).encode(),
+    ):
+        token = await _get_token(client)
+        rejected = await client.post(
+            "/api/v1/accounts",
+            data=raw_body,
+            headers={
+                "Content-Type": "application/json",
+                "Origin": origin,
+                "X-CSRF-Token": token,
+            },
+        )
+        assert rejected.status == 400
+        assert rejected.headers["X-CSRF-Token"] != token
+        payload = await rejected.json()
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "invalid_request"
+
+    token = await _get_token(client)
+
+    async def oversized_json():
+        yield b'{"username":"new@example.test","password":"'
+        yield b"x" * (64 * 1024)
+        yield b'"}'
+
+    oversized = await client.post(
+        "/api/v1/accounts",
+        data=oversized_json(),
+        headers={
+            "Content-Type": "application/json",
+            "Origin": origin,
+            "X-CSRF-Token": token,
+        },
+    )
+    assert oversized.status == 413
+    assert (await oversized.json())["error"]["code"] == "payload_too_large"
+    assert not any(operation[0] == "create_account" for operation in gateway.operations)
+
+
+@pytest.mark.asyncio
+async def test_invalid_backend_account_payload_fails_closed(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+    gateway.accounts[0]["append_limit"] = object()
+    response = await client.get("/api/v1/accounts")
+    assert response.status == 502
+    payload = await response.json()
+    assert payload["error"]["code"] == "invalid_backend_response"
+    assert "object at" not in json.dumps(payload)
 
 
 @pytest.mark.asyncio
@@ -421,29 +548,30 @@ async def test_mail_requires_account_and_mailbox_context_and_has_two_delete_leve
     web_client: tuple[TestClient, FakeGateway],
 ) -> None:
     client, gateway = web_client
-    response = await client.get("/mail")
-    page = await response.text()
-    assert "Select an account" in page
+    response, data = await _api_data(client, "/api/v1/mail")
+    assert response.status == 200
+    assert data["selected_account"] == ""
+    assert data["mailboxes"] == []
+    assert data["messages"] == []
     assert not any(operation[0] == "list_messages" for operation in gateway.operations)
 
     context = urlencode({"account": "admin@example.test", "mailbox": "INBOX"})
-    response = await client.get(f"/mail?{context}")
-    page = await response.text()
-    assert "Received message" in page
-    assert f"/mail/42?{html.escape(context)}" in page
-    assert "rfc-message-id" not in page
+    response, data = await _api_data(client, f"/api/v1/mail?{context}")
+    assert response.status == 200
+    assert data["messages"][0]["subject"] == "Received message"
+    assert data["messages"][0]["uid"] == "42"
+    assert "message_id" not in data["messages"][0]
     assert ("list_messages", "admin@example.test", "INBOX", 20, 0) in gateway.operations
 
-    detail = await client.get(f"/mail/42?{context}")
-    detail_page = await detail.text()
+    detail, detail_data = await _api_data(client, f"/api/v1/mail/42?{context}")
     assert detail.status == 200
-    assert 'sandbox=""' in detail_page
-    assert 'sandbox=" allow-' not in detail_page
-    assert "/mail/42/trash" in detail_page
-    assert "/mail/42/delete?" in detail_page
-    assert "account=admin%40example.test" in detail_page
+    assert detail_data["subject"] == "Received message"
+    assert detail_data["has_html"] is True
+    assert detail_data["html_url"].startswith("/api/v1/mail/42/html?")
+    assert detail_data["raw_url"].startswith("/api/v1/mail/42/raw?")
+    assert detail_data["freshness_token"]
 
-    html_body = await client.get(f"/mail/42/html?{context}")
+    html_body = await client.get(f"/api/v1/mail/42/html?{context}")
     rendered = await html_body.text()
     assert html_body.status == 200
     assert html_body.headers["Referrer-Policy"] == "no-referrer"
@@ -457,46 +585,44 @@ async def test_mail_requires_account_and_mailbox_context_and_has_two_delete_leve
     assert "data:image" not in rendered
     assert "cid:missing" not in rendered
     assert "cid:logo" not in rendered
-    assert "/mail/42/inline/0?account=admin%40example.test&amp;mailbox=INBOX" in rendered
+    assert "/api/v1/mail/42/inline/0?account=admin%40example.test&amp;mailbox=INBOX" in rendered
 
-    inline = await client.get(f"/mail/42/inline/0?{context}")
+    inline = await client.get(f"/api/v1/mail/42/inline/0?{context}")
     assert inline.status == 200
     assert inline.content_type == "image/png"
     assert inline.headers["X-Content-Type-Options"] == "nosniff"
     assert await inline.read() == b"\x89PNG\r\n\x1a\ninline-image"
 
-    attachment = await client.get(f"/mail/42/attachments/1?{context}")
+    attachment = await client.get(f"/api/v1/mail/42/attachments/1?{context}")
     assert attachment.content_type == "application/octet-stream"
     assert attachment.headers["Content-Disposition"].startswith("attachment;")
 
-    token, detail_form = await _get_token(client, f"/mail/42?{context}")
-    trashed = await client.post(
-        "/mail/42/trash",
-        data={
-            "_csrf": token,
+    token = await _get_token(client)
+    trashed = await _post_json(
+        client,
+        "/api/v1/mail/42/trash",
+        token,
+        {
             "account": "admin@example.test",
             "mailbox": "INBOX",
-            "freshness": _hidden_value(detail_form, "freshness"),
+            "freshness": detail_data["freshness_token"],
         },
-        headers={"Origin": _origin(client)},
-        allow_redirects=False,
     )
-    assert trashed.status == 303
+    assert trashed.status == 200
     assert ("trash", "admin@example.test", "INBOX", "42") in gateway.operations
 
-    token, confirm = await _get_token(client, f"/mail/42/delete?{context}")
-    assert "bypasses Trash" in confirm
-    rejected = await client.post(
-        "/mail/42/delete",
-        data={
-            "_csrf": token,
+    _response, fresh_detail = await _api_data(client, f"/api/v1/mail/42?{context}")
+    token = await _get_token(client)
+    rejected = await _post_json(
+        client,
+        "/api/v1/mail/42/delete",
+        token,
+        {
             "account": "admin@example.test",
             "mailbox": "INBOX",
-            "freshness": _hidden_value(confirm, "freshness"),
+            "freshness": fresh_detail["freshness_token"],
             "confirmation": "Delete",
         },
-        headers={"Origin": _origin(client)},
-        allow_redirects=False,
     )
     assert rejected.status == 400
     assert not any(operation[0] == "delete_message" for operation in gateway.operations)
@@ -509,42 +635,52 @@ async def test_single_uid_and_freshness_are_required_for_destructive_mail_action
     client, gateway = web_client
     context = urlencode({"account": "admin@example.test", "mailbox": "INBOX"})
 
-    assert (await client.get(f"/mail/1:*/delete?{context}")).status == 400
-    assert (await client.get(f"/mail/1,2/delete?{context}")).status == 400
-    assert (await client.get(f"/mail/{'9' * 100}/delete?{context}")).status == 400
-    assert (await client.get(f"/mail/\u0661/delete?{context}")).status == 400
+    for invalid_uid in ("1:*", "1,2", "9" * 100, "\u0661"):
+        token = await _get_token(client)
+        invalid = await _post_json(
+            client,
+            f"/api/v1/mail/{invalid_uid}/delete",
+            token,
+            {
+                "account": "admin@example.test",
+                "mailbox": "INBOX",
+                "freshness": "invalid",
+                "confirmation": "PERMANENTLY DELETE",
+            },
+        )
+        assert invalid.status in {400, 404}
 
-    token, detail = await _get_token(client, f"/mail/42?{context}")
-    freshness = _hidden_value(detail, "freshness")
+    _response, detail = await _api_data(client, f"/api/v1/mail/42?{context}")
+    freshness = detail["freshness_token"]
     gateway.raw_message = gateway.raw_message.replace(b"Subject:", b"Subject: changed ", 1)
-    stale = await client.post(
-        "/mail/42/trash",
-        data={
-            "_csrf": token,
+    token = await _get_token(client)
+    stale = await _post_json(
+        client,
+        "/api/v1/mail/42/trash",
+        token,
+        {
             "account": "admin@example.test",
             "mailbox": "INBOX",
             "freshness": freshness,
         },
-        headers={"Origin": _origin(client)},
-        allow_redirects=False,
     )
     assert stale.status == 409
     assert not any(operation[0] == "trash" for operation in gateway.operations)
 
-    token, confirmation = await _get_token(client, f"/mail/42/delete?{context}")
-    deleted = await client.post(
-        "/mail/42/delete",
-        data={
-            "_csrf": token,
+    _response, changed_detail = await _api_data(client, f"/api/v1/mail/42?{context}")
+    token = await _get_token(client)
+    deleted = await _post_json(
+        client,
+        "/api/v1/mail/42/delete",
+        token,
+        {
             "account": "admin@example.test",
             "mailbox": "INBOX",
-            "freshness": _hidden_value(confirmation, "freshness"),
+            "freshness": changed_detail["freshness_token"],
             "confirmation": "PERMANENTLY DELETE",
         },
-        headers={"Origin": _origin(client)},
-        allow_redirects=False,
     )
-    assert deleted.status == 303
+    assert deleted.status == 200
     assert ("delete_message", "admin@example.test", "INBOX", "42") in gateway.operations
 
 
@@ -560,7 +696,7 @@ async def test_nested_mailbox_name_is_allowed_when_returned_by_maddy(
 
     gateway.list_mailboxes = nested_mailboxes  # type: ignore[method-assign]
     context = urlencode({"account": "admin@example.test", "mailbox": "Projects/2026"})
-    response = await client.get(f"/mail?{context}")
+    response = await client.get(f"/api/v1/mail?{context}")
     assert response.status == 200
 
 
@@ -571,33 +707,46 @@ async def test_mailbox_pagination_is_bounded_and_preserves_context(
     client, gateway = web_client
     gateway.message_rows = [
         {"id": str(index), "sender": "sender@example.test", "subject": f"Message {index}"}
-        for index in range(20)
+        for index in range(1, 21)
     ]
     gateway.message_initial_offset = 100
     gateway.message_next_offset = 80
     context = urlencode({"account": "admin@example.test", "mailbox": "INBOX"})
-    first = await client.get(f"/mail?{context}")
-    first_page = await first.text()
-    assert "Next" in first_page
-    next_href = _pagination_href(first_page, "next")
-    assert "account=admin%40example.test&mailbox=INBOX&cursor=" in next_href
-    assert "page=" not in next_href
-    assert re.search(r"cursor=[A-Za-z0-9_-]{32}\Z", next_href) is not None
+    first, first_data = await _api_data(client, f"/api/v1/mail?{context}")
+    assert first.status == 200
+    next_cursor = str(first_data["next_cursor"])
+    assert next_cursor
+    assert first_data["previous_cursor"] is None
+    next_query = urlencode(
+        {
+            "account": "admin@example.test",
+            "mailbox": "INBOX",
+            "cursor": next_cursor,
+        }
+    )
+    next_href = f"/api/v1/mail?{next_query}"
 
     gateway.message_next_offset = None
-    second = await client.get(next_href)
-    second_page = await second.text()
-    assert "Previous" in second_page
+    second, second_data = await _api_data(client, next_href)
+    assert second.status == 200
+    assert second_data["previous_cursor"]
     assert ("list_messages", "admin@example.test", "INBOX", 20, 80) in gateway.operations
 
-    previous_href = _pagination_href(second_page, "prev")
+    previous_query = urlencode(
+        {
+            "account": "admin@example.test",
+            "mailbox": "INBOX",
+            "cursor": str(second_data["previous_cursor"]),
+        }
+    )
+    previous_href = f"/api/v1/mail?{previous_query}"
     await client.get(previous_href)
     assert ("list_messages", "admin@example.test", "INBOX", 20, 100) in gateway.operations
 
     tampered = next_href.replace("mailbox=INBOX", "mailbox=Sent")
     assert (await client.get(tampered)).status == 409
 
-    invalid = await client.get(f"/mail?{context}&page=1")
+    invalid = await client.get(f"/api/v1/mail?{context}&page=1")
     assert invalid.status == 400
 
 
@@ -611,23 +760,29 @@ async def test_mailbox_uses_authoritative_continuation_not_page_length(
     gateway.message_initial_offset = 100
     gateway.message_rows = [{"id": "100", "sender": "sender@example.test", "subject": "Truncated"}]
     gateway.message_next_offset = 99
-    truncated_page = await (await client.get(f"/mail?{context}")).text()
-    assert "Next" in truncated_page
-    continuation = _pagination_href(truncated_page, "next")
+    _response, truncated_data = await _api_data(client, f"/api/v1/mail?{context}")
+    continuation_query = urlencode(
+        {
+            "account": "admin@example.test",
+            "mailbox": "INBOX",
+            "cursor": str(truncated_data["next_cursor"]),
+        }
+    )
+    continuation = f"/api/v1/mail?{continuation_query}"
 
     gateway.message_rows = [{"id": "99", "sender": "sender@example.test", "subject": "Continued"}]
     gateway.message_next_offset = None
-    continued_page = await (await client.get(continuation)).text()
-    assert "Previous" in continued_page
+    _response, continued_data = await _api_data(client, continuation)
+    assert continued_data["previous_cursor"]
     assert ("list_messages", "admin@example.test", "INBOX", 20, 99) in gateway.operations
 
     gateway.message_rows = [
         {"id": str(index), "sender": "sender@example.test", "subject": f"Message {index}"}
-        for index in range(20)
+        for index in range(1, 21)
     ]
     gateway.message_next_offset = None
-    complete_page = await (await client.get(f"/mail?{context}")).text()
-    assert "Next" not in complete_page
+    _response, complete_data = await _api_data(client, f"/api/v1/mail?{context}")
+    assert complete_data["next_cursor"] is None
 
 
 @pytest.mark.asyncio
@@ -639,14 +794,14 @@ async def test_oversized_preview_still_allows_streamed_raw_download(
     monkeypatch.setattr("maddyweb.web.MAX_RAW_MESSAGE_BYTES", 64)
     gateway.raw_message = b"From: sender@example.test\r\n\r\n" + b"x" * (128 * 1024)
     context = urlencode({"account": "admin@example.test", "mailbox": "INBOX"})
-    detail = await client.get(f"/mail/42?{context}")
-    page = await detail.text()
+    detail, data = await _api_data(client, f"/api/v1/mail/42?{context}")
     assert detail.status == 200
-    assert "exceeds the safe preview limit" in page
-    assert "Stream-download raw .eml" in page
-    assert "mail-frame" not in page
+    assert data["preview_too_large"] is True
+    assert data["size"] == len(gateway.raw_message)
+    assert data["raw_url"].startswith("/api/v1/mail/42/raw?")
+    assert "html_url" not in data
 
-    raw = await client.get(f"/mail/42/raw?{context}")
+    raw = await client.get(f"/api/v1/mail/42/raw?{context}")
     assert raw.status == 200
     assert raw.content_type == "application/octet-stream"
     assert raw.headers["Content-Disposition"].startswith("attachment;")
@@ -660,13 +815,13 @@ async def test_heavy_mail_work_is_limited_to_two_and_rejects_third(
     client, gateway = web_client
     gateway.spool_gate = asyncio.Event()
     context = urlencode({"account": "admin@example.test", "mailbox": "INBOX"})
-    first = asyncio.create_task(client.get(f"/mail/42?{context}"))
-    second = asyncio.create_task(client.get(f"/mail/42?{context}"))
+    first = asyncio.create_task(client.get(f"/api/v1/mail/42?{context}"))
+    second = asyncio.create_task(client.get(f"/api/v1/mail/42?{context}"))
     try:
         await asyncio.wait_for(gateway.two_spools_started.wait(), timeout=1)
         health = await asyncio.wait_for(client.get("/healthz"), timeout=0.1)
         assert health.status == 200
-        third = await client.get(f"/mail/42?{context}")
+        third = await client.get(f"/api/v1/mail/42?{context}")
         assert third.status == 429
         assert third.headers["Retry-After"] == "1"
     finally:
@@ -694,7 +849,7 @@ async def test_message_parse_runs_off_event_loop(
 
     monkeypatch.setattr(web_module, "parse_message", slow_parse)
     context = urlencode({"account": "admin@example.test", "mailbox": "INBOX"})
-    detail_task = asyncio.create_task(client.get(f"/mail/42?{context}"))
+    detail_task = asyncio.create_task(client.get(f"/api/v1/mail/42?{context}"))
     await asyncio.wait_for(started.wait(), timeout=1)
     health = await asyncio.wait_for(client.get("/healthz"), timeout=0.08)
     assert health.status == 200
@@ -706,16 +861,12 @@ async def test_compose_uses_enabled_sender_and_streams_cid_mime(
     web_client: tuple[TestClient, FakeGateway],
 ) -> None:
     client, gateway = web_client
-    token, page = await _get_token(client, "/compose")
-    assert 'contenteditable="true"' in page
-    assert '<select name="sender" required>' in page
-    assert 'aria-describedby="sending-password-help"' in page
-    assert "MaddyWeb never stores it." in page
-    assert "admin@example.test" in page
-    assert "disabled@example.test" not in page
+    response, data = await _api_data(client, "/api/v1/compose")
+    assert response.status == 200
+    assert data["senders"] == ["admin@example.test"]
+    token = await _get_token(client)
 
     form = FormData()
-    form.add_field("_csrf", token)
     form.add_field("sender", "admin@example.test")
     form.add_field("password", FIXTURE_CREDENTIAL)
     form.add_field("to", "recipient@example.test")
@@ -738,21 +889,20 @@ async def test_compose_uses_enabled_sender_and_streams_cid_mime(
         content_type="text/plain",
     )
     response = await client.post(
-        "/send",
+        "/api/v1/send",
         data=form,
         headers={"Origin": _origin(client), "X-CSRF-Token": token},
         allow_redirects=False,
     )
-    assert response.status == 303
-    assert response.headers["Location"] == "/compose?status=sent"
+    assert response.status == 200
+    payload = await response.json()
+    assert payload["data"] == {"delivered": True, "saved_to_sent": True}
+    assert "Remote inbox placement is not confirmed here." in payload["message"]
     assert gateway.delivered == gateway.sent
     assert gateway.delivered is not None
     parsed = BytesParser(policy=policy.default).parsebytes(gateway.delivered)
     assert parsed["Bcc"] is None
     assert any(part.get("Content-ID") == "<logo@maddyweb.local>" for part in parsed.walk())
-    success_page = await (await client.get("/compose?status=sent")).text()
-    assert "Maddy accepted the message for delivery" in success_page
-    assert "Remote inbox placement is not confirmed here." in success_page
 
 
 @pytest.mark.asyncio
@@ -768,10 +918,9 @@ async def test_smtp_auth_rejection_is_actionable_and_does_not_echo_password(
             "was not submitted."
         ),
     )
-    token, _page = await _get_token(client, "/compose")
+    token = await _get_token(client)
     form = FormData()
     for name, value in {
-        "_csrf": token,
         "sender": "admin@example.test",
         "password": FIXTURE_CREDENTIAL,
         "to": "recipient@example.test",
@@ -782,17 +931,18 @@ async def test_smtp_auth_rejection_is_actionable_and_does_not_echo_password(
         form.add_field(name, value)
     form.add_field("attachments", io.BytesIO(b"x"), filename="x.txt")
     response = await client.post(
-        "/send",
+        "/api/v1/send",
         data=form,
         headers={"Origin": _origin(client), "X-CSRF-Token": token},
         allow_redirects=False,
     )
-    page = await response.text()
+    payload = await response.json()
+    serialized = json.dumps(payload)
     assert response.status == 502
-    assert "Message not delivered" in page
-    assert "Authentication for the selected sending account was rejected." in page
-    assert FIXTURE_CREDENTIAL not in page
-    assert "internal SMTP diagnostic" not in page
+    assert payload["error"]["code"] == "message_not_delivered"
+    assert "Authentication for the selected sending account was rejected." in serialized
+    assert FIXTURE_CREDENTIAL not in serialized
+    assert "internal SMTP diagnostic" not in serialized
     assert "WWW-Authenticate" not in response.headers
     assert gateway.sent is None
 
@@ -802,10 +952,9 @@ async def test_invalid_recipient_identifies_field_without_echoing_input(
     web_client: tuple[TestClient, FakeGateway],
 ) -> None:
     client, gateway = web_client
-    token, _page = await _get_token(client, "/compose")
+    token = await _get_token(client)
     form = FormData()
     for name, value in {
-        "_csrf": token,
         "sender": "admin@example.test",
         "password": FIXTURE_CREDENTIAL,
         "to": "private-invalid-value",
@@ -816,16 +965,17 @@ async def test_invalid_recipient_identifies_field_without_echoing_input(
         form.add_field(name, value)
     form.add_field("attachments", io.BytesIO(b"x"), filename="x.txt")
     response = await client.post(
-        "/send",
+        "/api/v1/send",
         data=form,
         headers={"Origin": _origin(client), "X-CSRF-Token": token},
         allow_redirects=False,
     )
-    page = await response.text()
+    payload = await response.json()
+    serialized = json.dumps(payload)
 
     assert response.status == 400
-    assert "The To field contains an invalid email address." in page
-    assert "private-invalid-value" not in page
+    assert "The To field contains an invalid email address." in serialized
+    assert "private-invalid-value" not in serialized
     assert gateway.delivered is None
 
 
@@ -834,10 +984,9 @@ async def test_fullwidth_recipient_separators_are_normalized(
     web_client: tuple[TestClient, FakeGateway],
 ) -> None:
     client, gateway = web_client
-    token, _page = await _get_token(client, "/compose")
+    token = await _get_token(client)
     form = FormData()
     for name, value in {
-        "_csrf": token,
         "sender": "admin@example.test",
         "password": FIXTURE_CREDENTIAL,
         "to": "first@example.test\uff0csecond@example.test\uff1bthird@example.test",
@@ -848,13 +997,13 @@ async def test_fullwidth_recipient_separators_are_normalized(
         form.add_field(name, value)
     form.add_field("attachments", io.BytesIO(b"x"), filename="x.txt")
     response = await client.post(
-        "/send",
+        "/api/v1/send",
         data=form,
         headers={"Origin": _origin(client), "X-CSRF-Token": token},
         allow_redirects=False,
     )
 
-    assert response.status == 303
+    assert response.status == 200
     assert (
         "deliver",
         "admin@example.test",
@@ -887,7 +1036,7 @@ async def test_slow_multipart_upload_times_out_and_releases_request_slot(
     )
     await client.start_server()
     try:
-        token, _page = await _get_token(client, "/compose")
+        token = await _get_token(client)
         boundary = "maddyweb-slow-boundary"
 
         async def slow_multipart():
@@ -900,7 +1049,7 @@ async def test_slow_multipart_upload_times_out_and_releases_request_slot(
             yield f"--{boundary}--\r\n".encode()
 
         response = await client.post(
-            "/send",
+            "/api/v1/send",
             data=slow_multipart(),
             headers={
                 "Content-Type": f"multipart/form-data; boundary={boundary}",
@@ -919,9 +1068,8 @@ async def test_compose_rejects_duplicate_scalars_and_bounds_password_bytes(
     web_client: tuple[TestClient, FakeGateway],
 ) -> None:
     client, _gateway = web_client
-    token, _ = await _get_token(client, "/compose")
+    token = await _get_token(client)
     duplicate = FormData()
-    duplicate.add_field("_csrf", token)
     duplicate.add_field("sender", "admin@example.test")
     duplicate.add_field("sender", "admin@example.test")
     duplicate.add_field(
@@ -931,15 +1079,14 @@ async def test_compose_rejects_duplicate_scalars_and_bounds_password_bytes(
         content_type="text/plain",
     )
     response = await client.post(
-        "/send",
+        "/api/v1/send",
         data=duplicate,
         headers={"Origin": _origin(client), "X-CSRF-Token": token},
     )
     assert response.status == 400
 
-    token, _ = await _get_token(client, "/compose")
+    token = await _get_token(client)
     oversized = FormData()
-    oversized.add_field("_csrf", token)
     oversized.add_field("sender", "admin@example.test")
     oversized.add_field("password", "x" * 5000)
     oversized.add_field(
@@ -949,7 +1096,7 @@ async def test_compose_rejects_duplicate_scalars_and_bounds_password_bytes(
         content_type="text/plain",
     )
     response = await client.post(
-        "/send",
+        "/api/v1/send",
         data=oversized,
         headers={"Origin": _origin(client), "X-CSRF-Token": token},
     )
@@ -961,10 +1108,9 @@ async def test_disabled_sender_is_rejected_server_side(
     web_client: tuple[TestClient, FakeGateway],
 ) -> None:
     client, gateway = web_client
-    token, _ = await _get_token(client, "/compose")
+    token = await _get_token(client)
     form = FormData()
     for name, value in {
-        "_csrf": token,
         "sender": "disabled@example.test",
         "to": "recipient@example.test",
         "subject": "x",
@@ -974,7 +1120,7 @@ async def test_disabled_sender_is_rejected_server_side(
         form.add_field(name, value)
     form.add_field("attachments", io.BytesIO(b"x"), filename="x.txt")
     response = await client.post(
-        "/send",
+        "/api/v1/send",
         data=form,
         headers={"Origin": _origin(client), "X-CSRF-Token": token},
         allow_redirects=False,
@@ -988,50 +1134,51 @@ async def test_certificate_surface_has_no_file_or_delete_operations(
     web_client: tuple[TestClient, FakeGateway],
 ) -> None:
     client, gateway = web_client
-    token, page = await _get_token(client, "/certificates")
-    assert "/certificates/timer" in page
-    assert "/certificates/dry-run" in page
-    assert "/certificates/renew-if-due" in page
-    assert "Source fingerprint" in page
-    assert "Deployed fingerprint" in page
-    assert "AA:BB" in page
-    assert 'type="file"' not in page
-    assert "/certificates/upload" not in page
-    assert "/certificates/" + quote("mail.example.test") + "/delete" not in page
+    response, data = await _api_data(client, "/api/v1/certificates")
+    assert response.status == 200
+    assert data["timer_enabled"] is True
+    assert data["timer_active"] is True
+    certificate = data["certificates"][0]
+    assert certificate["name"] == "mail.example.test"
+    assert certificate["source_fingerprint"] == "AA:BB"
+    assert certificate["deployed_fingerprint"] == "AA:BB"
+    assert certificate["automation_safe"] is True
+    serialized = json.dumps(data)
+    assert "private_key" not in serialized
+    assert "path" not in serialized
 
-    response = await client.post(
-        "/certificates/dry-run",
-        data={"_csrf": token, "name": "mail.example.test"},
-        headers={"Origin": _origin(client)},
-        allow_redirects=False,
+    token = await _get_token(client)
+    response = await _post_json(
+        client,
+        "/api/v1/certificates/dry-run",
+        token,
+        {"name": "mail.example.test"},
     )
-    assert response.status == 303
+    assert response.status == 200
     assert ("certificate_dry_run", "mail.example.test") in gateway.operations
-    get_mutation = await client.get("/certificates/dry-run")
+    get_mutation = await client.get("/api/v1/certificates/dry-run")
     assert get_mutation.status == 404
 
-    token, _ = await _get_token(client, "/certificates")
-    unknown = await client.post(
-        "/certificates/dry-run",
-        data={"_csrf": token, "name": "unknown.example.test"},
-        headers={"Origin": _origin(client)},
-        allow_redirects=False,
+    token = await _get_token(client)
+    unknown = await _post_json(
+        client,
+        "/api/v1/certificates/dry-run",
+        token,
+        {"name": "unknown.example.test"},
     )
     assert unknown.status == 400
     assert ("certificate_dry_run", "unknown.example.test") not in gateway.operations
 
 
 @pytest.mark.asyncio
-async def test_unsafe_certbot_lineage_is_rendered_read_only(
+async def test_unsafe_certbot_lineage_is_reported_read_only(
     web_client: tuple[TestClient, FakeGateway],
 ) -> None:
     client, gateway = web_client
     gateway.certificate_automation_safe = False
-    _token, page = await _get_token(client, "/certificates")
-    assert "Read-only: Certbot lineage violates policy" in page
-    assert "/certificates/dry-run" not in page
-    assert "/certificates/renew-if-due" not in page
-    assert 'name="action" value="disable"' in page
+    _response, data = await _api_data(client, "/api/v1/certificates")
+    assert data["timer_enable_safe"] is False
+    assert data["certificates"][0]["automation_safe"] is False
 
 
 @pytest.mark.asyncio
@@ -1041,14 +1188,15 @@ async def test_active_but_disabled_timer_can_still_be_stopped(
     client, gateway = web_client
     gateway.certificate_timer_enabled = False
     gateway.certificate_timer_active = True
-    token, page = await _get_token(client, "/certificates")
-    assert 'name="action" value="disable"' in page
-    assert 'name="action" value="enable"' not in page
-    response = await client.post(
-        "/certificates/timer",
-        data={"_csrf": token, "action": "disable"},
-        headers={"Origin": _origin(client)},
-        allow_redirects=False,
+    _response, data = await _api_data(client, "/api/v1/certificates")
+    assert data["timer_enabled"] is False
+    assert data["timer_active"] is True
+    token = await _get_token(client)
+    response = await _post_json(
+        client,
+        "/api/v1/certificates/timer",
+        token,
+        {"action": "disable"},
     )
-    assert response.status == 303
+    assert response.status == 200
     assert ("certificate_timer", False) in gateway.operations

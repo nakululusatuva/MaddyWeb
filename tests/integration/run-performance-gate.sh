@@ -35,7 +35,7 @@ if [[ "$ready" != true ]]; then
 fi
 
 # Initialize the request path, then measure the specified idle-service budget
-# before loading the lazy HTML sanitizer and generating the larger page working
+# before loading the lazy email sanitizer and generating the larger API working
 # set.  A separate post-workload ceiling below catches unbounded retention.
 .venv/bin/python scripts/performance-test.py \
     --requests 8 --concurrency 1 --warmup 1 --max-p95-ms 500
@@ -54,13 +54,13 @@ awk '
     --url http://127.0.0.1:8787/ \
     --requests 200 --concurrency 8 --max-p95-ms 500
 .venv/bin/python scripts/performance-test.py \
-    --url http://127.0.0.1:8787/accounts \
+    --url http://127.0.0.1:8787/api/v1/accounts \
     --requests 200 --concurrency 8 --max-p95-ms 500
 .venv/bin/python scripts/performance-test.py \
-    --url 'http://127.0.0.1:8787/mail?account=user00%40example.test&mailbox=INBOX' \
+    --url 'http://127.0.0.1:8787/api/v1/mail?account=user00%40example.test&mailbox=INBOX' \
     --requests 200 --concurrency 8 --max-p95-ms 500
 .venv/bin/python scripts/performance-test.py \
-    --url 'http://127.0.0.1:8787/mail/42?account=user00%40example.test&mailbox=INBOX' \
+    --url 'http://127.0.0.1:8787/api/v1/mail/42?account=user00%40example.test&mailbox=INBOX' \
     --requests 100 --concurrency 8 --max-p95-ms 500
 
 awk '

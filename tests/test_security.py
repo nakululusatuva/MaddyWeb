@@ -169,7 +169,9 @@ async def test_successful_write_consumes_nonce_and_rotates_cookie(
         headers={"Origin": origin},
     )
     assert response.status == 200
-    assert _cookie(security_client) != old_token
+    replacement = _cookie(security_client)
+    assert replacement != old_token
+    assert response.headers["X-CSRF-Token"] == replacement
 
     replay = await security_client.post(
         "/write",
@@ -193,7 +195,9 @@ async def test_failed_write_consumes_nonce_and_rotates_cookie(
         headers={"Origin": origin},
     )
     assert failed.status == 400
-    assert _cookie(security_client) != old_token
+    replacement = _cookie(security_client)
+    assert replacement != old_token
+    assert failed.headers["X-CSRF-Token"] == replacement
 
     replay = await security_client.post(
         "/write",

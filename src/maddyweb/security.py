@@ -11,9 +11,10 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import json
 import secrets
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Final
 from urllib.parse import urlsplit
@@ -36,10 +37,97 @@ DEFAULT_CSP: Final = (
 )
 
 _CSRF_REQUEST_KEY: Final = web.RequestKey("maddyweb.csrf_token", str)
+_API_ERROR_CODES: Final = {
+    400: "invalid_request",
+    401: "unauthorized",
+    403: "forbidden",
+    404: "not_found",
+    405: "method_not_allowed",
+    408: "request_timeout",
+    409: "conflict",
+    413: "payload_too_large",
+    415: "unsupported_media_type",
+    422: "unprocessable_entity",
+    429: "too_many_requests",
+    500: "internal_error",
+    502: "backend_failure",
+    503: "service_unavailable",
+}
+_API_ERROR_MESSAGES: Final = {
+    400: "The request is invalid.",
+    401: "Authentication is required.",
+    403: "The request is forbidden.",
+    404: "The endpoint does not exist.",
+    405: "This request method is not supported.",
+    408: "Timed out while reading the request.",
+    409: "The request conflicts with current state.",
+    413: "The request body is too large.",
+    415: "The request content type is not supported.",
+    422: "The request could not be processed.",
+    429: "The server is busy; try again later.",
+    500: "The request failed unexpectedly.",
+    502: "A backend service failed.",
+    503: "The service is temporarily unavailable.",
+}
+_FORWARDED_ERROR_HEADERS: Final = frozenset({"allow", "retry-after"})
 
 
 def _contains_forbidden_header_characters(value: str) -> bool:
     return any(ord(char) < 0x20 or ord(char) == 0x7F for char in value)
+
+
+def _is_api_path(path: str) -> bool:
+    return path.startswith("/api/")
+
+
+def _safe_error_message(value: object, *, status: int) -> str:
+    fallback = _API_ERROR_MESSAGES.get(status, "The request failed.")
+    if not isinstance(value, str):
+        return fallback
+    value = value.strip()
+    if not value or len(value) > 512 or _contains_forbidden_header_characters(value):
+        return fallback
+    try:
+        value.encode("utf-8", "strict")
+    except UnicodeEncodeError:
+        return fallback
+    return value
+
+
+def _error_response(
+    request: web.Request,
+    *,
+    status: int,
+    code: str,
+    message: str,
+    headers: Mapping[str, str] | None = None,
+) -> web.Response:
+    if _is_api_path(request.path):
+        body = json.dumps(
+            {
+                "api_version": "v1",
+                "ok": False,
+                "error": {
+                    "code": code,
+                    "message": _safe_error_message(message, status=status),
+                },
+            },
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        response = web.Response(
+            status=status,
+            body=body,
+            content_type="application/json",
+        )
+    else:
+        response = web.Response(status=status, text=message)
+    if headers is not None:
+        for name, value in headers.items():
+            if name.lower() in _FORWARDED_ERROR_HEADERS:
+                response.headers[name] = value
+    return response
 
 
 def normalize_authority(value: str) -> tuple[str, int | None]:
@@ -259,10 +347,12 @@ async def _submitted_csrf_token(
     request: web.Request,
     *,
     timeout_seconds: float,
-    read_form_body: bool,
 ) -> str | None:
-    header_token = request.headers.get("X-CSRF-Token")
-    if header_token and not read_form_body:
+    header_tokens = request.headers.getall("X-CSRF-Token", [])
+    if len(header_tokens) > 1:
+        return None
+    header_token = header_tokens[0] if header_tokens else None
+    if header_token:
         return header_token
     if request.content_type == "application/x-www-form-urlencoded":
         try:
@@ -270,14 +360,12 @@ async def _submitted_csrf_token(
                 form = await request.post()
         except TimeoutError as exc:
             raise web.HTTPRequestTimeout(text="Timed out while reading the request body.") from exc
-        form_token = form.get("_csrf")
-        if header_token:
-            return header_token
-        if isinstance(form_token, str):
-            return form_token
+        form_tokens = form.getall("_csrf", [])
+        if len(form_tokens) == 1 and isinstance(form_tokens[0], str):
+            return form_tokens[0]
     # Multipart bodies can contain tens of MiB.  They are streamed exactly once
     # by the route into the configured private spool, so multipart submissions
-    # must present the DOM token in this same-origin header (app.js does so).
+    # must present the current session token in this same-origin header.
     return None
 
 
@@ -303,9 +391,20 @@ def _apply_security_headers(response: web.StreamResponse) -> None:
             del response.headers[name]
 
 
-def _http_exception_response(exc: web.HTTPException) -> web.Response:
+def _http_exception_response(
+    request: web.Request,
+    exc: web.HTTPException,
+) -> web.Response:
     """Convert an aiohttp control-flow exception without returning the exception."""
 
+    if _is_api_path(request.path):
+        return _error_response(
+            request,
+            status=exc.status,
+            code=_API_ERROR_CODES.get(exc.status, "request_failed"),
+            message=_safe_error_message(exc.text, status=exc.status),
+            headers=exc.headers,
+        )
     return web.Response(
         status=exc.status,
         reason=exc.reason,
@@ -389,7 +488,12 @@ def security_middleware(config: SecurityConfig) -> web.middleware:
     async def middleware(request: web.Request, handler: web.RequestHandler) -> web.StreamResponse:
         hosts = request.headers.getall("Host", [])
         if len(hosts) != 1 or not host_is_allowed(hosts[0], config.allowed_hosts):
-            response: web.StreamResponse = web.Response(status=400, text="Invalid Host header.")
+            response: web.StreamResponse = _error_response(
+                request,
+                status=400,
+                code="invalid_host",
+                message="Invalid Host header.",
+            )
             _apply_security_headers(response)
             return response
 
@@ -410,57 +514,100 @@ def security_middleware(config: SecurityConfig) -> web.middleware:
             verified_cookie = None
             request[_CSRF_REQUEST_KEY] = new_csrf_token(csrf_key)
 
-        if request.method == "OPTIONS":
-            response = web.Response(
+        if request.method not in SAFE_METHODS and request.method != "POST":
+            response = _error_response(
+                request,
                 status=405,
-                text="This request method is not supported.",
+                code="method_not_allowed",
+                message="This request method is not supported.",
                 headers={"Allow": "GET, HEAD, POST"},
             )
             _apply_security_headers(response)
             return response
 
         if request.method not in SAFE_METHODS:
-            origin = request.headers.get("Origin")
-            referer = request.headers.get("Referer")
-            if origin is not None:
+            origins = request.headers.getall("Origin", [])
+            referers = request.headers.getall("Referer", [])
+            if len(origins) > 1 or len(referers) > 1:
+                same_origin = False
+            elif origins:
+                origin = origins[0]
                 same_origin = origin_is_allowed(origin, request, config)
             else:
-                same_origin = referer is not None and referer_is_allowed(
-                    referer,
+                same_origin = bool(referers) and referer_is_allowed(
+                    referers[0],
                     request,
                     config,
                 )
-            if not same_origin or request.headers.get("Sec-Fetch-Site") == "cross-site":
-                response = web.Response(status=403, text="Cross-site request rejected.")
+            fetch_sites = request.headers.getall("Sec-Fetch-Site", [])
+            if (
+                not same_origin
+                or len(fetch_sites) > 1
+                or (fetch_sites and fetch_sites[0] == "cross-site")
+            ):
+                response = _error_response(
+                    request,
+                    status=403,
+                    code="cross_site_rejected",
+                    message="Cross-site request rejected.",
+                )
                 _apply_security_headers(response)
                 return response
             # A request without an authentic process-bound cookie can never
             # pass CSRF validation.  Reject it before reading a potentially
             # unbounded slow request body.
             if cookie_token is None or verified_cookie is None:
-                response = web.Response(status=403, text="CSRF check failed; refresh.")
+                response = _error_response(
+                    request,
+                    status=403,
+                    code="csrf_failed",
+                    message="CSRF check failed; refresh.",
+                )
                 _apply_security_headers(response)
                 return response
-            send_upload = request.path == "/send"
+            send_upload = request.path == "/api/v1/send"
+            api_json_write = _is_api_path(request.path) and not send_upload
             required_content_type = (
-                "multipart/form-data" if send_upload else "application/x-www-form-urlencoded"
+                "multipart/form-data"
+                if send_upload
+                else ("application/json" if api_json_write else "application/x-www-form-urlencoded")
             )
-            if request.content_type != required_content_type:
-                response = web.Response(status=415, text="Unsupported form format for this write.")
+            content_type_headers = request.headers.getall("Content-Type", [])
+            if len(content_type_headers) != 1 or request.content_type != required_content_type:
+                response = _error_response(
+                    request,
+                    status=415,
+                    code="unsupported_media_type",
+                    message="Unsupported content type for this write.",
+                )
                 _apply_security_headers(response)
                 return response
-            submitted = await _submitted_csrf_token(
-                request,
-                timeout_seconds=config.request_body_timeout_seconds,
-                read_form_body=not send_upload,
-            )
+            try:
+                submitted = await _submitted_csrf_token(
+                    request,
+                    timeout_seconds=config.request_body_timeout_seconds,
+                )
+            except web.HTTPException as exc:
+                response = _http_exception_response(request, exc)
+                _apply_security_headers(response)
+                return response
             if submitted is None or not hmac.compare_digest(cookie_token, submitted):
-                response = web.Response(status=403, text="CSRF check failed; refresh.")
+                response = _error_response(
+                    request,
+                    status=403,
+                    code="csrf_failed",
+                    message="CSRF check failed; refresh.",
+                )
                 _apply_security_headers(response)
                 return response
             nonce = verified_cookie[0]
             if not await nonces.reserve(nonce):
-                response = web.Response(status=403, text="CSRF token reused; refresh.")
+                response = _error_response(
+                    request,
+                    status=403,
+                    code="csrf_reused",
+                    message="CSRF token reused; refresh.",
+                )
                 _apply_security_headers(response)
                 return response
         else:
@@ -469,7 +616,7 @@ def security_middleware(config: SecurityConfig) -> web.middleware:
         try:
             response = await handler(request)
         except web.HTTPException as exc:
-            response = _http_exception_response(exc)
+            response = _http_exception_response(request, exc)
         except BaseException:
             if nonce is not None:
                 # Once a write request has passed validation and entered its
@@ -486,6 +633,7 @@ def security_middleware(config: SecurityConfig) -> web.middleware:
             replacement = new_csrf_token(csrf_key)
             request[_CSRF_REQUEST_KEY] = replacement
             set_csrf_cookie(response, replacement)
+            response.headers["X-CSRF-Token"] = replacement
         elif cookie_token is None and request.method in SAFE_METHODS:
             set_csrf_cookie(response, request[_CSRF_REQUEST_KEY])
         return response
@@ -530,9 +678,11 @@ def bounded_concurrency_middleware(
         try:
             await limiter.acquire()
         except TimeoutError:
-            response = web.Response(
+            response = _error_response(
+                request,
                 status=429,
-                text="The server is busy; try again later.",
+                code="too_many_requests",
+                message="The server is busy; try again later.",
                 headers={"Retry-After": "1"},
             )
             _apply_security_headers(response)

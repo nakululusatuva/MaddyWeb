@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded, read-only performance gate for fixed loopback application pages."""
+"""Bounded, read-only performance gate for fixed loopback application targets."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import Never
 
 MAX_HEALTH_BODY = 4096
-MAX_HTML_BODY = 512 * 1024
+MAX_RESPONSE_BODY = 512 * 1024
 HEALTH_FIELDS = {
     "status",
     "version",
@@ -28,11 +28,17 @@ HEALTH_FIELDS = {
     "certbot_available",
     "certificate_management_enabled",
 }
-HTML_TARGETS = {
-    ("/", ""): b"Administration overview",
-    ("/accounts", ""): b"Account management",
-    ("/mail", "account=user00%40example.test&mailbox=INBOX"): b"Performance message",
-    ("/mail/42", "account=user00%40example.test&mailbox=INBOX"): b"Performance fixture",
+TARGETS = {
+    ("/", ""): ("html", b"Administration overview"),
+    ("/api/v1/accounts", ""): ("api", b"user49@example.test"),
+    (
+        "/api/v1/mail",
+        "account=user00%40example.test&mailbox=INBOX",
+    ): ("api", b"Performance message"),
+    (
+        "/api/v1/mail/42",
+        "account=user00%40example.test&mailbox=INBOX",
+    ): ("api", b"Performance fixture"),
 }
 
 
@@ -55,7 +61,12 @@ class Result:
     error: str | None
 
 
-def request_once(url: str, timeout: float, expected_marker: bytes | None) -> Result:
+def request_once(
+    url: str,
+    timeout: float,
+    target_kind: str,
+    expected_marker: bytes | None,
+) -> Result:
     started = time.perf_counter()
     error: str | None = None
     try:
@@ -66,19 +77,42 @@ def request_once(url: str, timeout: float, expected_marker: bytes | None) -> Res
             headers={"Accept": "application/json", "User-Agent": "maddyweb-local-perf/1"},
         )
         with OPENER.open(request, timeout=timeout) as response:
-            maximum = MAX_HEALTH_BODY if expected_marker is None else MAX_HTML_BODY
+            maximum = MAX_HEALTH_BODY if target_kind == "health" else MAX_RESPONSE_BODY
             body = response.read(maximum + 1)
             if response.status != 200:
                 error = f"http-{response.status}"
             elif len(body) > maximum:
                 error = "response-too-large"
-            elif expected_marker is not None:
+            elif target_kind == "html":
                 content_type = response.headers.get_content_type()
                 if content_type != "text/html":
                     error = "unexpected-content-type"
-                elif b"<!doctype html>" not in body.lower() or expected_marker not in body:
+                elif (
+                    b"<!doctype html>" not in body.lower()
+                    or expected_marker is None
+                    or expected_marker not in body
+                ):
                     error = "unexpected-html"
-            else:
+            elif target_kind == "api":
+                content_type = response.headers.get_content_type()
+                if content_type != "application/json":
+                    error = "unexpected-content-type"
+                else:
+                    try:
+                        payload = json.loads(body)
+                    except UnicodeDecodeError, json.JSONDecodeError:
+                        error = "invalid-json"
+                    else:
+                        if (
+                            not isinstance(payload, dict)
+                            or payload.get("api_version") != "v1"
+                            or payload.get("ok") is not True
+                            or not isinstance(payload.get("data"), dict)
+                            or expected_marker is None
+                            or expected_marker not in body
+                        ):
+                            error = "unexpected-api-payload"
+            elif target_kind == "health":
                 try:
                     payload = json.loads(body)
                 except UnicodeDecodeError, json.JSONDecodeError:
@@ -96,6 +130,8 @@ def request_once(url: str, timeout: float, expected_marker: bytes | None) -> Res
                         or not isinstance(payload.get("certificate_management_enabled"), bool)
                     ):
                         error = "unexpected-payload"
+            else:
+                error = "invalid-target-kind"
     except urllib.error.HTTPError as exc:
         error = f"http-{exc.code}"
     except (OSError, urllib.error.URLError) as exc:
@@ -154,9 +190,10 @@ def main() -> None:
         fail("URL must use the fixed http://127.0.0.1:8787 listener")
     target = (parsed.path, parsed.query)
     if target == ("/healthz", ""):
+        target_kind = "health"
         expected_marker = None
-    elif target in HTML_TARGETS:
-        expected_marker = HTML_TARGETS[target]
+    elif target in TARGETS:
+        target_kind, expected_marker = TARGETS[target]
     else:
         fail("URL path and query are not a fixed performance target")
     if not 1 <= args.requests <= 100_000:
@@ -173,7 +210,7 @@ def main() -> None:
     assert_loopback_listener()
 
     for _ in range(args.warmup):
-        result = request_once(args.url, args.timeout_seconds, expected_marker)
+        result = request_once(args.url, args.timeout_seconds, target_kind, expected_marker)
         if result.error:
             fail(f"warmup request failed: {result.error}")
 
@@ -181,7 +218,12 @@ def main() -> None:
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as executor:
         results = list(
             executor.map(
-                lambda _: request_once(args.url, args.timeout_seconds, expected_marker),
+                lambda _: request_once(
+                    args.url,
+                    args.timeout_seconds,
+                    target_kind,
+                    expected_marker,
+                ),
                 range(args.requests),
             )
         )

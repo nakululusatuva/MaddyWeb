@@ -1,4 +1,4 @@
-"""Loopback-only fake backend used to measure real Web rendering in CI/WSL."""
+"""Loopback-only fake backend used to measure the real Web API in CI/WSL."""
 
 from __future__ import annotations
 
