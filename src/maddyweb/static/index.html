@@ -7,8 +7,8 @@
   <meta name="theme-color" content="#f4f6f9">
   <meta name="description" content="Private Maddy mail server administration console">
   <title>MaddyWeb</title>
-  <link rel="stylesheet" href="/static/app.css?v=7">
-  <script src="/static/app.js?v=8" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=8">
+  <script src="/static/app.js?v=9" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to main content</a>
@@ -127,30 +127,102 @@
       <section id="compose-view" class="view" data-view="compose" aria-labelledby="compose-title" hidden>
         <div class="page-heading"><div><p class="eyebrow">Local submission</p><h1 id="compose-title">Compose</h1><p>Send through Maddy and archive only after SMTP acceptance.</p></div></div>
         <form id="compose-form" class="data-card compose-card" action="/api/v1/send" method="post" enctype="multipart/form-data" autocomplete="off">
-          <fieldset><legend>Sender</legend><div class="form-columns compose-identity-fields"><label><span>Account</span><select id="compose-sender" name="sender" required></select></label><label><span>Sender name (optional)</span><input id="compose-sender-name" name="sender_name" maxlength="256" autocomplete="name" placeholder="Name shown to recipients" aria-describedby="sender-name-help"></label></div><p id="sender-name-help" class="field-help">Shown before the email address in the From header.</p></fieldset>
-          <label><span>Sending account password</span><input name="password" type="password" required maxlength="1024" autocomplete="current-password" aria-describedby="sending-password-help"></label>
-          <p id="sending-password-help" class="field-help">Use the selected mailbox password. MaddyWeb never stores it.</p>
-          <fieldset><legend>Recipients</legend><div class="form-columns"><label><span>To</span><input name="to" required maxlength="16384" inputmode="email" placeholder="user@example.com"></label><label><span>CC</span><input name="cc" maxlength="16384" inputmode="email"></label></div><label><span>BCC</span><input name="bcc" maxlength="16384" inputmode="email"></label></fieldset>
-          <label><span>Subject</span><input name="subject" maxlength="4096"></label>
-          <fieldset class="body-editor"><legend>Message body</legend>
-            <div class="body-mode-tabs" role="tablist" aria-label="Message body editor">
-              <button id="body-source-tab" class="body-mode-tab" type="button" role="tab" aria-selected="true" aria-controls="body-source-panel" tabindex="0" data-body-mode="source">HTML source</button>
-              <button id="body-preview-tab" class="body-mode-tab" type="button" role="tab" aria-selected="false" aria-controls="body-preview-panel" tabindex="-1" data-body-mode="preview">Preview</button>
+          <div class="compose-command-bar">
+            <button id="send-button" class="button button-primary compose-send" type="submit">Send</button>
+            <button id="attach-files-button" class="button button-secondary compose-file-command" type="button">Attach files</button>
+            <button id="insert-image-button" class="button button-secondary compose-file-command" type="button">Insert image</button>
+            <input id="attachments-input" class="compose-file-input" name="attachments" type="file" multiple hidden>
+            <input id="inline-images" class="compose-file-input" name="inline_images" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
+            <span class="send-progress" data-send-progress role="status" aria-live="polite"></span>
+          </div>
+
+          <div class="compose-envelope">
+            <div class="compose-row compose-from-row">
+              <span class="compose-row-label">From</span>
+              <div class="compose-from-fields">
+                <label class="sr-only" for="compose-sender-name">Sender name</label>
+                <input id="compose-sender-name" name="sender_name" maxlength="256" autocomplete="name" placeholder="Sender name (optional)" aria-describedby="sender-name-help">
+                <label class="sr-only" for="compose-sender">Sending account</label>
+                <select id="compose-sender" name="sender" required aria-label="Sending account"></select>
+              </div>
+              <span id="sender-name-help" class="compose-row-hint">Shown in From</span>
             </div>
-            <div id="body-source-panel" class="body-mode-panel" role="tabpanel" aria-labelledby="body-source-tab">
-              <label for="html-source"><span>HTML source</span></label>
-              <textarea id="html-source" class="html-source" name="html" maxlength="2097152" required spellcheck="false" aria-describedby="html-source-help" placeholder="<p>Write or paste HTML here.</p>"></textarea>
-              <p id="html-source-help" class="field-help">Edit HTML as plain source text. A plain-text alternative is generated automatically.</p>
+            <div class="compose-row">
+              <label class="compose-row-label" for="compose-password">Password</label>
+              <input id="compose-password" name="password" type="password" required maxlength="1024" autocomplete="current-password" placeholder="Required for this send" aria-describedby="sending-password-help">
+              <span id="sending-password-help" class="compose-row-hint">Never stored</span>
+            </div>
+            <div class="compose-row">
+              <label class="compose-row-label" for="compose-to">To</label>
+              <input id="compose-to" name="to" required maxlength="16384" inputmode="email" placeholder="recipient@example.com">
+              <div class="recipient-toggles">
+                <button class="recipient-toggle" type="button" data-recipient-toggle="cc" aria-expanded="false" aria-controls="compose-cc-row">Cc</button>
+                <button class="recipient-toggle" type="button" data-recipient-toggle="bcc" aria-expanded="false" aria-controls="compose-bcc-row">Bcc</button>
+              </div>
+            </div>
+            <div id="compose-cc-row" class="compose-row" hidden>
+              <label class="compose-row-label" for="compose-cc">Cc</label>
+              <input id="compose-cc" name="cc" maxlength="16384" inputmode="email">
+              <span></span>
+            </div>
+            <div id="compose-bcc-row" class="compose-row" hidden>
+              <label class="compose-row-label" for="compose-bcc">Bcc</label>
+              <input id="compose-bcc" name="bcc" maxlength="16384" inputmode="email">
+              <span></span>
+            </div>
+            <div class="compose-row compose-subject-row">
+              <label class="compose-row-label" for="compose-subject">Subject</label>
+              <input id="compose-subject" name="subject" maxlength="4096">
+              <span></span>
+            </div>
+          </div>
+
+          <section class="compose-editor-shell" aria-labelledby="message-body-label">
+            <h2 id="message-body-label" class="sr-only">Message body</h2>
+            <div class="compose-editor-toolbar">
+              <div class="format-toolbar" role="toolbar" aria-label="Message formatting">
+                <button type="button" class="format-button" data-format-command="bold" aria-label="Bold" aria-pressed="false" title="Bold"><strong>B</strong></button>
+                <button type="button" class="format-button" data-format-command="italic" aria-label="Italic" aria-pressed="false" title="Italic"><em>I</em></button>
+                <button type="button" class="format-button" data-format-command="underline" aria-label="Underline" aria-pressed="false" title="Underline"><u>U</u></button>
+                <span class="format-divider" aria-hidden="true"></span>
+                <button type="button" class="format-button format-button-wide" data-format-command="unordered-list" aria-label="Bulleted list" aria-pressed="false" title="Bulleted list">Bullets</button>
+                <button type="button" class="format-button format-button-wide" data-format-command="ordered-list" aria-label="Numbered list" aria-pressed="false" title="Numbered list">Numbered</button>
+                <button type="button" class="format-button format-button-wide" data-format-command="blockquote" aria-label="Block quote" aria-pressed="false" title="Block quote">Quote</button>
+                <button type="button" class="format-button format-button-wide" data-format-command="clear" aria-label="Clear formatting" title="Clear formatting">Clear</button>
+              </div>
+              <div class="body-mode-tabs" role="tablist" aria-label="Message body editor">
+                <button id="body-write-tab" class="body-mode-tab" type="button" role="tab" aria-selected="true" aria-controls="body-write-panel" tabindex="0" data-body-mode="write">Write</button>
+                <button id="body-source-tab" class="body-mode-tab" type="button" role="tab" aria-selected="false" aria-controls="body-source-panel" tabindex="-1" data-body-mode="source">Source</button>
+                <button id="body-preview-tab" class="body-mode-tab" type="button" role="tab" aria-selected="false" aria-controls="body-preview-panel" tabindex="-1" data-body-mode="preview">Preview</button>
+              </div>
+            </div>
+            <div id="body-write-panel" class="body-mode-panel" role="tabpanel" aria-labelledby="body-write-tab">
+              <div id="message-editor" class="compose-write" contenteditable="true" role="textbox" aria-multiline="true" aria-label="Message body" aria-describedby="write-body-help body-error" spellcheck="true" data-placeholder="Write your message..."></div>
+              <p id="write-body-help" class="field-help">Type a normal message here. A plain-text alternative is generated automatically.</p>
+            </div>
+            <div id="body-source-panel" class="body-mode-panel" role="tabpanel" aria-labelledby="body-source-tab" hidden>
+              <label class="sr-only" for="html-source">HTML source</label>
+              <textarea id="html-source" class="html-source" name="html" maxlength="2097152" spellcheck="false" aria-describedby="html-source-help body-error" placeholder="<p>Paste or edit HTML here.</p>"></textarea>
+              <p id="html-source-help" class="field-help">Paste or edit HTML. Preview shows the sanitized result.</p>
             </div>
             <div id="body-preview-panel" class="body-mode-panel" role="tabpanel" aria-labelledby="body-preview-tab" hidden>
               <iframe id="html-preview" class="html-preview" title="Sanitized HTML preview" sandbox="allow-same-origin"></iframe>
-              <p class="field-help">The preview is sanitized and isolated. Scripts, forms, remote resources, and link navigation are blocked.</p>
+              <p class="field-help">Scripts, forms, remote resources, and navigation are blocked.</p>
             </div>
-          </fieldset>
-          <label><span>Attachments</span><input name="attachments" type="file" multiple></label>
-          <label><span>Inline images (automatic CID)</span><input id="inline-images" name="inline_images" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple></label>
-          <div class="compose-actions"><button id="send-button" class="button button-primary" type="submit">Send message</button><span class="send-progress" data-send-progress role="status" aria-live="polite"></span></div>
-          <p class="field-help">Delivery precedes Sent archival. An archival failure never resends the message.</p>
+            <p id="body-error" class="compose-body-error" role="alert" hidden></p>
+          </section>
+
+          <div id="compose-file-tray" class="compose-file-tray" hidden>
+            <section id="attachment-tray" class="compose-file-group" aria-labelledby="attachment-tray-title" hidden>
+              <h2 id="attachment-tray-title">Attachments</h2>
+              <ul id="attachment-chips" class="compose-file-chips"></ul>
+            </section>
+            <section id="inline-image-tray" class="compose-file-group" aria-labelledby="inline-image-tray-title" hidden>
+              <h2 id="inline-image-tray-title">Inline images</h2>
+              <ul id="inline-image-chips" class="compose-file-chips"></ul>
+            </section>
+          </div>
+          <p class="compose-delivery-note">Delivery precedes Sent archival. An archival failure never resends the message.</p>
         </form>
       </section>
 

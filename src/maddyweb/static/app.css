@@ -1372,54 +1372,238 @@ td:last-child .button,
 }
 
 .compose-card {
-  position: relative;
-  display: grid;
-  width: min(100%, 980px);
-  gap: 18px;
-  padding: 25px;
-  overflow: visible;
+  width: min(100%, 1180px);
+  overflow: hidden;
   box-shadow: var(--shadow);
 }
 
-.compose-card::before {
+.compose-command-bar {
+  display: flex;
+  min-height: 62px;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  background:
+    linear-gradient(
+      110deg,
+      var(--surface),
+      color-mix(in srgb, var(--primary-soft) 48%, var(--surface))
+    );
+}
+
+.compose-send {
+  min-width: 92px;
+}
+
+.compose-file-command {
+  min-width: 112px;
+}
+
+.compose-file-input {
   position: absolute;
-  inset: 0 0 auto;
-  height: 4px;
-  border-radius: var(--radius) var(--radius) 0 0;
-  background: linear-gradient(90deg, var(--button-primary), #38a17d);
-  content: "";
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
 }
 
-.compose-card > label {
+.compose-command-bar .send-progress {
+  min-width: 0;
+  margin-left: auto;
+  text-align: right;
+}
+
+.compose-envelope {
   display: grid;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
 }
 
-.body-editor {
+.compose-row {
   display: grid;
   min-width: 0;
+  min-height: 51px;
+  grid-template-columns: 82px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.compose-row:last-child {
+  border-bottom: 0;
+}
+
+.compose-row-label {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.compose-row input,
+.compose-row select {
+  min-height: 38px;
+  padding: 7px 9px;
+  border-color: transparent;
+  border-radius: 7px;
+  background: transparent;
+}
+
+.compose-row input:hover,
+.compose-row select:hover {
+  border-color: var(--border);
+  background: var(--surface-hover);
+}
+
+.compose-row input:focus,
+.compose-row select:focus {
+  border-color: var(--focus);
+  background: var(--surface);
+}
+
+.compose-from-fields {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(150px, 0.7fr) minmax(210px, 1fr);
+  gap: 8px;
+}
+
+.compose-row-hint {
+  color: var(--text-muted);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.recipient-toggles {
+  display: flex;
+  gap: 4px;
+}
+
+.recipient-toggle {
+  min-width: 42px;
+  min-height: 34px;
+  padding: 5px 8px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  color: var(--primary);
+  background: transparent;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 780;
+}
+
+.recipient-toggle:hover,
+.recipient-toggle[aria-expanded="true"] {
+  border-color: var(--border);
+  background: var(--primary-soft);
+}
+
+.compose-editor-shell {
+  min-width: 0;
+  background: var(--surface);
+}
+
+.compose-editor-toolbar {
+  display: flex;
+  min-height: 56px;
+  align-items: center;
+  justify-content: space-between;
   gap: 12px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-muted);
+}
+
+.format-toolbar {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 4px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.format-toolbar::-webkit-scrollbar {
+  height: 4px;
+}
+
+.format-toolbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.format-toolbar::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: var(--border-strong);
+}
+
+.format-button {
+  display: inline-grid;
+  min-width: 36px;
+  min-height: 36px;
+  flex: 0 0 auto;
+  place-items: center;
+  padding: 5px 8px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  color: var(--text);
+  background: transparent;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.format-button-wide {
+  min-width: auto;
+}
+
+.format-button:hover,
+.format-button[aria-pressed="true"] {
+  border-color: var(--border);
+  color: var(--primary);
+  background: var(--surface);
+}
+
+.format-button:focus-visible,
+.recipient-toggle:focus-visible,
+.compose-file-remove:focus-visible {
+  outline: 3px solid color-mix(in srgb, var(--focus) 28%, transparent);
+  outline-offset: 1px;
+}
+
+.format-divider {
+  width: 1px;
+  height: 25px;
+  flex: 0 0 auto;
+  margin: 0 3px;
+  background: var(--border);
 }
 
 .body-mode-tabs {
   display: inline-flex;
-  width: fit-content;
+  width: max-content;
   max-width: 100%;
-  gap: 5px;
-  padding: 5px;
+  flex: 0 0 auto;
+  gap: 3px;
+  padding: 3px;
   border: 1px solid var(--border);
-  border-radius: 12px;
-  background: var(--surface-muted);
+  border-radius: 9px;
+  background: var(--surface);
 }
 
 .body-mode-tab {
-  min-height: 42px;
-  padding: 8px 15px;
+  min-height: 34px;
+  padding: 6px 11px;
   border: 1px solid transparent;
-  border-radius: 9px;
+  border-radius: 6px;
   color: var(--text-muted);
   background: transparent;
   font: inherit;
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 800;
   cursor: pointer;
   transition:
@@ -1435,10 +1619,10 @@ td:last-child .button,
 }
 
 .body-mode-tab[aria-selected="true"] {
-  border-color: var(--border);
-  color: var(--button-primary);
-  background: var(--surface);
-  box-shadow: 0 3px 10px rgb(15 23 42 / 8%);
+  border-color: color-mix(in srgb, var(--primary) 30%, var(--border));
+  color: var(--primary);
+  background: var(--primary-soft);
+  box-shadow: none;
 }
 
 .body-mode-tab:focus-visible {
@@ -1449,19 +1633,66 @@ td:last-child .button,
 .body-mode-panel {
   display: grid;
   min-width: 0;
-  gap: 10px;
+  background: var(--surface);
 }
 
+.compose-write,
 .html-source,
 .html-preview {
   width: 100%;
-  min-height: 360px;
-  border: 1px solid var(--border-strong);
-  border-radius: 12px;
+  min-height: clamp(390px, 55vh, 680px);
+  border: 0;
+  border-radius: 0;
+}
+
+.compose-write {
+  padding: 22px 24px;
+  background: var(--surface);
+  font-size: 15px;
+  line-height: 1.65;
+  overflow: auto;
+  overflow-wrap: anywhere;
+}
+
+.compose-write:empty::before {
+  color: var(--text-muted);
+  content: attr(data-placeholder);
+  pointer-events: none;
+}
+
+.compose-write:focus {
+  outline: 0;
+  box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--focus) 55%, transparent);
+}
+
+.compose-write[aria-invalid="true"] {
+  box-shadow: inset 0 0 0 2px var(--negative);
+}
+
+.compose-write img {
+  display: inline-block;
+  max-width: 100%;
+  height: auto;
+  margin: 4px;
+  vertical-align: middle;
+}
+
+.compose-write a {
+  color: var(--primary);
+  text-decoration: underline;
+  cursor: default;
+}
+
+.compose-write blockquote {
+  margin: 0.6em 0;
+  padding-left: 1em;
+  border-left: 3px solid var(--border-strong);
+  color: var(--text-muted);
 }
 
 .html-source {
-  padding: 15px;
+  padding: 22px 24px;
+  background: var(--surface);
   line-height: 1.55;
   tab-size: 2;
   resize: vertical;
@@ -1477,18 +1708,108 @@ td:last-child .button,
   background: #fff;
 }
 
-.compose-actions {
-  display: flex;
-  min-height: 58px;
-  align-items: center;
-  gap: 15px;
-  margin-top: 2px;
-  padding-top: 16px;
+.body-mode-panel .field-help {
+  margin: 0;
+  padding: 8px 15px;
   border-top: 1px solid var(--border);
+  background: var(--surface-muted);
 }
 
-.compose-actions .button-primary {
-  min-width: 138px;
+.compose-body-error {
+  margin: 0;
+  padding: 10px 16px;
+  border-top: 1px solid color-mix(in srgb, var(--negative) 38%, var(--border));
+  color: var(--negative);
+  background: var(--negative-soft);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.compose-file-tray {
+  display: grid;
+  gap: 10px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--border);
+  background: var(--surface-muted);
+}
+
+.compose-file-group {
+  display: grid;
+  grid-template-columns: 105px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+}
+
+.compose-file-group h2 {
+  margin: 9px 0 0;
+  color: var(--text-muted);
+  font-size: 11px;
+  letter-spacing: 0.035em;
+  text-transform: uppercase;
+}
+
+.compose-file-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.compose-file-chips li {
+  display: flex;
+  min-width: min(240px, 100%);
+  max-width: 100%;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 8px 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface);
+}
+
+.compose-file-detail {
+  display: grid;
+  min-width: 0;
+  flex: 1;
+}
+
+.compose-file-detail strong {
+  overflow: hidden;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.compose-file-detail small {
+  color: var(--text-muted);
+  font-size: 9px;
+}
+
+.compose-file-remove {
+  min-height: 30px;
+  padding: 4px 7px;
+  border: 0;
+  border-radius: 6px;
+  color: var(--negative);
+  background: transparent;
+  font: inherit;
+  font-size: 10px;
+  font-weight: 760;
+}
+
+.compose-file-remove:hover {
+  background: var(--negative-soft);
+}
+
+.compose-delivery-note {
+  margin: 0;
+  padding: 10px 16px;
+  border-top: 1px solid var(--border);
+  color: var(--text-muted);
+  background: var(--surface-muted);
+  font-size: 10px;
 }
 
 .send-progress {
@@ -1834,9 +2155,12 @@ dialog::backdrop {
   }
 
   .compact-card,
-  .compose-card,
   .message-card {
     padding: 18px 15px;
+  }
+
+  .compose-card {
+    padding: 0;
   }
 
   .form-columns,
@@ -1935,13 +2259,73 @@ dialog::backdrop {
     min-height: 380px;
   }
 
-  .compose-actions {
-    align-items: stretch;
-    flex-direction: column;
+  .compose-command-bar {
+    flex-wrap: wrap;
+    padding: 9px 10px;
   }
 
-  .compose-actions .button-primary {
+  .compose-command-bar .send-progress {
     width: 100%;
+    margin-left: 0;
+    text-align: left;
+  }
+
+  .compose-send {
+    min-width: 82px;
+  }
+
+  .compose-file-command {
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+
+  .compose-envelope {
+    padding: 6px 10px;
+  }
+
+  .compose-row {
+    min-height: 54px;
+    grid-template-columns: 66px minmax(0, 1fr) auto;
+    gap: 7px;
+  }
+
+  .compose-row-hint {
+    display: none;
+  }
+
+  .compose-from-fields {
+    grid-template-columns: 1fr;
+    gap: 3px;
+    padding-block: 6px;
+  }
+
+  .compose-from-row {
+    align-items: start;
+  }
+
+  .compose-from-row > .compose-row-label {
+    padding-top: 15px;
+  }
+
+  .compose-editor-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 7px;
+    padding: 7px 9px;
+  }
+
+  .format-toolbar {
+    width: 100%;
+    padding-bottom: 2px;
+  }
+
+  .format-button {
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  .format-button-wide {
+    min-width: auto;
   }
 
   .body-mode-tabs {
@@ -1949,12 +2333,36 @@ dialog::backdrop {
   }
 
   .body-mode-tab {
+    min-height: 42px;
     flex: 1;
   }
 
+  .compose-write,
   .html-source,
   .html-preview {
-    min-height: 300px;
+    min-height: 46vh;
+  }
+
+  .compose-write,
+  .html-source {
+    padding: 18px 16px;
+  }
+
+  .compose-file-group {
+    grid-template-columns: 1fr;
+    gap: 6px;
+  }
+
+  .compose-file-group h2 {
+    margin-top: 0;
+  }
+
+  .compose-file-chips {
+    display: grid;
+  }
+
+  .compose-file-chips li {
+    width: 100%;
   }
 
   .app-footer {
@@ -2132,6 +2540,10 @@ dialog::backdrop {
   input,
   select,
   textarea,
+  .compose-write,
+  .format-button,
+  .recipient-toggle,
+  .compose-file-chips li,
   .html-preview,
   .body-mode-tabs,
   dialog {
