@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import io
 import sys
 from collections.abc import Sequence
@@ -554,6 +555,106 @@ Subject: fixture subject
             "subject": "fixture subject",
         }
     ]
+
+
+def test_message_list_decodes_rfc2047_words_in_compact_and_full_output() -> None:
+    encoded_sender = "=?UTF-8?Q?J=C3=B6rg?= <jorg@example.test>"
+    encoded_subject = (
+        "=?utf-8?B?UmU65ZOI5ZOI5ZOI5ZOI5ZOI5ZOI5ZOI?= "
+        "=?utf-8?B?5ZOI?="
+    )
+    compact = f"UID 9: {encoded_sender} - {encoded_subject}\n"
+
+    compact_record = parse_message_list(compact)[0]
+    assert compact_record["from"] == "J\u00f6rg <jorg@example.test>"
+    assert compact_record["subject"] == "Re:" + "\u54c8" * 8
+    non_rfc_separator = parse_message_list(
+        "UID 10: sender@example.test - =?UTF-8?B?QQ==?=\u00a0=?UTF-8?B?Qg==?=\n"
+    )[0]
+    assert non_rfc_separator["subject"] == "A\u00a0B"
+
+    full = f"""- Server meta-data:
+UID: 10
+Sequence number: 1
+Flags: []
+Body size: 100
+Internal date: 1721600000 2024-07-22 00:00:00 +0000 UTC
+- Envelope:
+From: {encoded_sender}
+To: =?UTF-8?Q?M=C3=BCller?= <muller@example.test>
+Cc: =?UTF-8?Q?Ren=C3=A9e?= <renee@example.test>
+Bcc: =?UTF-8?Q?Zo=C3=AB?= <zoe@example.test>
+In-Reply-To: =?UTF-8?B?b3BhcXVl?=
+Message-Id: =?UTF-8?B?b3BhcXVl?=
+Subject: =?UTF-8?B?55S15a2Q5L+d5Y2V?=
+
+"""
+    full_record = parse_message_list(full)[0]
+    assert full_record["from"] == "J\u00f6rg <jorg@example.test>"
+    assert full_record["to"] == "M\u00fcller <muller@example.test>"
+    assert full_record["cc"] == "Ren\u00e9e <renee@example.test>"
+    assert full_record["bcc"] == "Zo\u00eb <zoe@example.test>"
+    assert full_record["in_reply_to"] == "=?UTF-8?B?b3BhcXVl?="
+    assert full_record["message_id"] == "=?UTF-8?B?b3BhcXVl?="
+    assert full_record["subject"] == "\u7535\u5b50\u4fdd\u5355"
+
+
+def test_message_list_preserves_raw_unicode_and_malformed_encoded_words() -> None:
+    raw_subject = "\u592a\u5e73\u6d0b\u4fdd\u9669"
+    malformed = "=?utf-8?B?6lyD5a6d6am5?="
+    invalid_base64 = "=?UTF-8?B?%%%%?="
+    invalid_q = "=?UTF-8?Q?bad=GG?="
+    unknown_charset = "=?x-unknown-charset?B?SGVsbG8=?="
+    mixed = "\u4e2d\u6587 =?UTF-8?B?5Li76aKY?="
+
+    assert parse_message_list(full_message_record(1, 1, raw_subject))[0]["subject"] == raw_subject
+    assert parse_message_list(full_message_record(2, 2, malformed))[0]["subject"] == malformed
+    assert (
+        parse_message_list(full_message_record(3, 3, invalid_base64))[0]["subject"]
+        == invalid_base64
+    )
+    assert (
+        parse_message_list(full_message_record(4, 4, unknown_charset))[0]["subject"]
+        == unknown_charset
+    )
+    assert parse_message_list(full_message_record(5, 5, invalid_q))[0]["subject"] == invalid_q
+    assert parse_message_list(full_message_record(6, 6, mixed))[0]["subject"] == (
+        "\u4e2d\u6587 \u4e3b\u9898"
+    )
+    neighboring = parse_message_list(
+        full_message_record(7, 7, invalid_base64)
+        + full_message_record(8, 8, "neighbor")
+    )
+    assert [record["subject"] for record in neighboring] == [invalid_base64, "neighbor"]
+
+
+def test_message_list_removes_controls_decoded_from_encoded_words() -> None:
+    encoded = "=?UTF-8?B?VmlzaWJsZQ0KQmNjOiBoaWRkZW5AZXhhbXBsZS50ZXN0?="
+
+    record = parse_message_list(full_message_record(1, 1, encoded))[0]
+
+    assert record["subject"] == "Visible Bcc: hidden@example.test"
+
+
+def test_message_list_bounds_encoded_word_count_and_decoded_length() -> None:
+    word = "=?UTF-8?B?QQ==?="
+    excessive_words = " ".join([word] * 65)
+    excessive_input = word + "x" * 4096
+    long_payload = base64.b64encode(b"A" * 600).decode("ascii")
+
+    excessive_record = parse_message_list(
+        full_message_record(1, 1, excessive_words)
+    )[0]
+    long_record = parse_message_list(
+        full_message_record(2, 2, f"=?UTF-8?B?{long_payload}?=")
+    )[0]
+    excessive_input_record = parse_message_list(
+        full_message_record(3, 3, excessive_input)
+    )[0]
+
+    assert excessive_record["subject"] == excessive_words[:512]
+    assert long_record["subject"] == "A" * 512
+    assert excessive_input_record["subject"] == excessive_input[:512]
 
 
 @pytest.mark.parametrize(
