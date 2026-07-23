@@ -3,18 +3,35 @@
 (() => {
   const API_ROOT = "/api/v1";
   const DELETE_MESSAGE_CONFIRMATION = "PERMANENTLY DELETE";
-  const ALLOWED_EDITOR_TAGS = new Map([
-    ["B", "strong"],
-    ["BR", "br"],
-    ["DIV", "div"],
-    ["EM", "em"],
-    ["I", "em"],
-    ["LI", "li"],
-    ["OL", "ol"],
-    ["P", "p"],
-    ["STRONG", "strong"],
-    ["UL", "ul"],
+  const ALLOWED_PREVIEW_TAGS = new Set([
+    "A", "ABBR", "B", "BLOCKQUOTE", "BR", "CAPTION", "CODE", "COL", "COLGROUP",
+    "DD", "DEL", "DIV", "DL", "DT", "EM", "H1", "H2", "H3", "H4", "H5", "H6",
+    "HR", "I", "IMG", "INS", "KBD", "LI", "OL", "P", "PRE", "Q", "S", "SAMP",
+    "SMALL", "SPAN", "STRONG", "SUB", "SUP", "TABLE", "TBODY", "TD", "TFOOT",
+    "TH", "THEAD", "TR", "U", "UL", "VAR",
   ]);
+  const REMOVED_PREVIEW_CONTENT_TAGS = new Set([
+    "APPLET", "EMBED", "FORM", "IFRAME", "MATH", "OBJECT", "SCRIPT", "STYLE", "SVG",
+    "TEMPLATE",
+  ]);
+  const PREVIEW_ATTRIBUTES = new Map([
+    ["A", new Set(["href", "title"])],
+    ["COL", new Set(["span", "width"])],
+    ["COLGROUP", new Set(["span", "width"])],
+    ["IMG", new Set(["alt", "height", "src", "title", "width"])],
+    ["OL", new Set(["start", "type"])],
+    ["TABLE", new Set(["summary"])],
+    ["TD", new Set(["colspan", "headers", "rowspan"])],
+    ["TH", new Set(["colspan", "headers", "rowspan", "scope"])],
+  ]);
+  const PREVIEW_VOID_TAGS = new Set(["BR", "COL", "HR", "IMG"]);
+  const PREVIEW_DOCUMENT_PREFIX = [
+    "<!doctype html><html lang=\"und\"><head><meta charset=\"utf-8\">",
+    "<meta name=\"referrer\" content=\"no-referrer\">",
+    "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; ",
+    "base-uri 'none'; form-action 'none'; img-src blob:; object-src 'none'; ",
+    "style-src 'self'\">",
+  ].join("");
 
   class ApiError extends Error {
     constructor(message, options = {}) {
@@ -67,6 +84,8 @@
     typedOpener: null,
     toastTimer: 0,
     inlineImages: [],
+    bodyMode: "source",
+    previewUrl: null,
     sendLocked: false,
     theme: "light",
   };
@@ -742,12 +761,63 @@
     renderMessage(data);
   };
 
-  const releaseInlineImages = () => {
+  const htmlTagEnd = (source, tagStart) => {
+    let quote = "";
+    for (let index = tagStart; index < source.length; index += 1) {
+      const character = source[index];
+      if (quote) {
+        if (character === quote) quote = "";
+      } else if (character === '"' || character === "'") {
+        quote = character;
+      } else if (character === ">") {
+        return index;
+      }
+    }
+    return -1;
+  };
+
+  const removeGeneratedCidImage = (source, cid) => {
+    const needle = `cid:${cid}`.toLowerCase();
+    let result = source;
+    let searchFrom = 0;
+    while (searchFrom < result.length) {
+      const lowered = result.toLowerCase();
+      const cidIndex = lowered.indexOf(needle, searchFrom);
+      if (cidIndex < 0) break;
+      const tagStart = lowered.lastIndexOf("<", cidIndex);
+      const tagSuffix = tagStart >= 0 ? lowered.slice(tagStart + 4, tagStart + 5) : "";
+      const isImageTag = tagStart >= 0
+        && lowered.startsWith("<img", tagStart)
+        && (!tagSuffix || /[\s/>]/.test(tagSuffix));
+      const tagEnd = isImageTag ? htmlTagEnd(result, tagStart) : -1;
+      if (tagEnd >= cidIndex) {
+        result = `${result.slice(0, tagStart)}${result.slice(tagEnd + 1)}`;
+        searchFrom = tagStart;
+      } else {
+        searchFrom = cidIndex + needle.length;
+      }
+    }
+    return result;
+  };
+
+  const releaseInlineImages = ({removeMarkup = false} = {}) => {
+    const source = byId("html-source");
+    if (removeMarkup && source instanceof HTMLTextAreaElement) {
+      for (const item of state.inlineImages) {
+        source.value = removeGeneratedCidImage(source.value, item.cid);
+      }
+    }
     for (const item of state.inlineImages) {
       window.URL.revokeObjectURL(item.previewUrl);
-      if (item.node instanceof HTMLElement) item.node.remove();
     }
     state.inlineImages = [];
+  };
+
+  const releaseBodyPreview = () => {
+    const frame = byId("html-preview");
+    if (frame instanceof HTMLIFrameElement) frame.removeAttribute("src");
+    if (state.previewUrl) window.URL.revokeObjectURL(state.previewUrl);
+    state.previewUrl = null;
   };
 
   const escapeText = (value) => String(value)
@@ -759,28 +829,108 @@
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
 
-  const serializeEditorNode = (node) => {
-    if (node.nodeType === Node.TEXT_NODE) return escapeText(node.nodeValue || "");
-    if (!(node instanceof HTMLElement)) return "";
-    if (node.tagName === "IMG" && node.dataset.generatedCid) {
-      const image = state.inlineImages.find(
-        (item) => item.cid === node.dataset.generatedCid && item.node === node,
-      );
-      if (!image) return "";
-      return `<img src="cid:${escapeAttribute(image.cid)}" alt="${
-        escapeAttribute(image.file.name)
-      }">`;
-    }
-    const children = Array.from(node.childNodes).map(serializeEditorNode).join("");
-    const tag = ALLOWED_EDITOR_TAGS.get(node.tagName);
-    if (!tag) return children;
-    if (tag === "br") return "<br>";
-    return `<${tag}>${children}</${tag}>`;
+  const previewImageUrl = (value) => {
+    if (!value.toLowerCase().startsWith("cid:")) return null;
+    const cid = value.slice(4).trim().replace(/^<|>$/g, "");
+    const image = state.inlineImages.find((item) => item.cid === cid);
+    return image ? image.previewUrl : null;
   };
 
-  const serializeEditor = () => {
-    const editor = byId("rich-editor");
-    return Array.from(editor.childNodes).map(serializeEditorNode).join("").trim();
+  const serializePreviewNode = (node) => {
+    if (node.nodeType === Node.TEXT_NODE) return escapeText(node.nodeValue || "");
+    if (!(node instanceof HTMLElement)) return "";
+    if (REMOVED_PREVIEW_CONTENT_TAGS.has(node.tagName)) return "";
+    const children = Array.from(node.childNodes).map(serializePreviewNode).join("");
+    if (!ALLOWED_PREVIEW_TAGS.has(node.tagName)) return children;
+
+    const rawImageSource = node.tagName === "IMG" ? node.getAttribute("src") : null;
+    const mappedImageSource = rawImageSource === null ? null : previewImageUrl(rawImageSource);
+    if (node.tagName === "IMG" && !mappedImageSource) return "";
+    const renderedAttributes = [];
+    const allowedAttributes = PREVIEW_ATTRIBUTES.get(node.tagName) || new Set();
+    const rawLinkTarget = node.tagName === "A" ? node.getAttribute("href") : null;
+    const normalizedLinkTarget = rawLinkTarget === null ? "" : rawLinkTarget.trim();
+    const loweredLinkTarget = normalizedLinkTarget.toLowerCase();
+    const previewLinkTarget = ["http://", "https://", "mailto:"]
+      .some((prefix) => loweredLinkTarget.startsWith(prefix))
+      ? normalizedLinkTarget
+      : "";
+    for (const attribute of Array.from(node.attributes)) {
+      const name = attribute.name.toLowerCase();
+      if (!allowedAttributes.has(name)) continue;
+      let value = attribute.value;
+      if (node.tagName === "IMG" && name === "src") {
+        value = mappedImageSource;
+      } else if (node.tagName === "A" && name === "href") {
+        if (!previewLinkTarget) continue;
+        value = "#preview-link-disabled";
+      } else if (node.tagName === "A" && name === "title" && previewLinkTarget) {
+        continue;
+      }
+      renderedAttributes.push(` ${name}="${escapeAttribute(value)}"`);
+    }
+    if (previewLinkTarget) {
+      const sourceTitle = (node.getAttribute("title") || "").trim();
+      const previewTitle = `Preview only; destination: ${previewLinkTarget}${
+        sourceTitle ? `; title: ${sourceTitle}` : ""
+      }`;
+      renderedAttributes.push(` title="${escapeAttribute(previewTitle)}"`);
+    }
+    const tag = node.tagName.toLowerCase();
+    const opening = `<${tag}${renderedAttributes.join("")}>`;
+    if (PREVIEW_VOID_TAGS.has(node.tagName)) return opening;
+    return `${opening}${children}</${tag}>`;
+  };
+
+  const sanitizedPreviewBody = (source) => {
+    const parsed = new DOMParser().parseFromString(source, "text/html");
+    return Array.from(parsed.body.childNodes)
+      .map(serializePreviewNode)
+      .join("")
+      .trim();
+  };
+
+  const previewBodyIsMeaningful = (source) => {
+    const sanitized = sanitizedPreviewBody(source);
+    if (!sanitized) return false;
+    const parsed = new DOMParser().parseFromString(sanitized, "text/html");
+    return Boolean(parsed.body.textContent.trim() || parsed.body.querySelector("img"));
+  };
+
+  const previewDocument = (source) => {
+    const sanitized = sanitizedPreviewBody(source);
+    const body = sanitized || '<p class="empty">Nothing to preview.</p>';
+    const stylesheetUrl = new URL("/static/preview.css?v=1", window.location.href).href;
+    return (
+      `${PREVIEW_DOCUMENT_PREFIX}<link rel="stylesheet" href="${
+        escapeAttribute(stylesheetUrl)
+      }"></head><body>${body}</body></html>`
+    );
+  };
+
+  const renderBodyPreview = () => {
+    const source = byId("html-source");
+    const frame = byId("html-preview");
+    if (!(source instanceof HTMLTextAreaElement) || !(frame instanceof HTMLIFrameElement)) return;
+    releaseBodyPreview();
+    const blob = new Blob([previewDocument(source.value)], {type: "text/html"});
+    state.previewUrl = window.URL.createObjectURL(blob);
+    frame.src = state.previewUrl;
+  };
+
+  const setBodyMode = (mode, {focus = false} = {}) => {
+    const nextMode = mode === "preview" ? "preview" : "source";
+    state.bodyMode = nextMode;
+    for (const tab of document.querySelectorAll("[data-body-mode]")) {
+      const selected = tab.getAttribute("data-body-mode") === nextMode;
+      tab.setAttribute("aria-selected", selected ? "true" : "false");
+      tab.setAttribute("tabindex", selected ? "0" : "-1");
+      if (focus && selected && tab instanceof HTMLButtonElement) tab.focus();
+    }
+    byId("body-source-panel").hidden = nextMode !== "source";
+    byId("body-preview-panel").hidden = nextMode !== "preview";
+    if (nextMode === "preview") renderBodyPreview();
+    else releaseBodyPreview();
   };
 
   const setComposeBusy = (busy, label = "") => {
@@ -807,7 +957,7 @@
   const resetCompose = () => {
     const form = byId("compose-form");
     form.reset();
-    byId("rich-editor").replaceChildren();
+    setBodyMode("source");
     releaseInlineImages();
   };
 
@@ -1096,42 +1246,75 @@
     navigate(buildMailUrl({account, mailbox}));
   });
 
-  document.querySelectorAll("[data-editor-command]").forEach((button) => {
+  const bodyModeTabs = Array.from(document.querySelectorAll("[data-body-mode]"));
+  for (const button of bodyModeTabs) {
     button.addEventListener("click", () => {
-      const command = button.getAttribute("data-editor-command");
-      if (command) document.execCommand(command, false);
-      byId("rich-editor").focus();
+      setBodyMode(button.getAttribute("data-body-mode"));
     });
+    button.addEventListener("keydown", (event) => {
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+      event.preventDefault();
+      const current = bodyModeTabs.indexOf(button);
+      const index = event.key === "Home"
+        ? 0
+        : event.key === "End"
+          ? bodyModeTabs.length - 1
+          : (current + (event.key === "ArrowRight" ? 1 : -1) + bodyModeTabs.length)
+            % bodyModeTabs.length;
+      setBodyMode(bodyModeTabs[index].getAttribute("data-body-mode"), {focus: true});
+    });
+  }
+
+  byId("html-source").addEventListener("input", (event) => {
+    if (event.target instanceof HTMLTextAreaElement) event.target.setCustomValidity("");
   });
 
   byId("inline-images").addEventListener("change", (event) => {
-    releaseInlineImages();
+    releaseInlineImages({removeMarkup: true});
     const input = event.target;
     if (!(input instanceof HTMLInputElement)) return;
-    const editor = byId("rich-editor");
+    const source = byId("html-source");
+    if (!(source instanceof HTMLTextAreaElement)) return;
+    const snippets = [];
     for (const file of Array.from(input.files || [])) {
       const cid = `${window.crypto.randomUUID()}@maddyweb.local`;
       const previewUrl = window.URL.createObjectURL(file);
-      const image = document.createElement("img");
-      image.alt = file.name;
-      image.dataset.generatedCid = cid;
-      image.src = previewUrl;
-      editor.append(image);
-      state.inlineImages.push({cid, file, previewUrl, node: image});
+      const markup = (
+        `<img src="cid:${escapeAttribute(cid)}" alt="${escapeAttribute(file.name)}">`
+      );
+      state.inlineImages.push({cid, file, previewUrl});
+      snippets.push(markup);
     }
+    if (snippets.length) {
+      const separator = source.value && !source.value.endsWith("\n") ? "\n" : "";
+      source.value += `${separator}${snippets.join("\n")}`;
+      source.setCustomValidity("");
+    }
+    if (state.bodyMode === "preview") renderBodyPreview();
   });
 
-  window.addEventListener("beforeunload", releaseInlineImages);
+  window.addEventListener("beforeunload", () => {
+    releaseBodyPreview();
+    releaseInlineImages();
+  });
 
   byId("compose-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = event.currentTarget;
     if (!(form instanceof HTMLFormElement)) return;
     if (form.dataset.submitting === "true" || state.sendLocked) return;
+    const bodySource = byId("html-source");
+    if (bodySource instanceof HTMLTextAreaElement) {
+      bodySource.setCustomValidity(
+        bodySource.value.trim() && previewBodyIsMeaningful(bodySource.value)
+          ? ""
+          : "Enter HTML that contains visible, safe content.",
+      );
+      if (!bodySource.checkValidity()) setBodyMode("source");
+    }
     if (!form.reportValidity()) return;
 
     const formData = new FormData(form);
-    formData.set("html", serializeEditor());
     formData.delete("inline_cids");
     for (const item of state.inlineImages) formData.append("inline_cids", item.cid);
     const passwordInput = form.elements.namedItem("password");

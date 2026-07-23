@@ -29,7 +29,7 @@ DEFAULT_CSP: Final = (
     "font-src 'self'; "
     "form-action 'self'; "
     "frame-ancestors 'none'; "
-    "frame-src 'self'; "
+    "frame-src 'self' blob:; "
     "img-src 'self' blob:; "
     "object-src 'none'; "
     "script-src 'self'; "

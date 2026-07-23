@@ -7,8 +7,8 @@
   <meta name="theme-color" content="#f4f6f9">
   <meta name="description" content="Private Maddy mail server administration console">
   <title>MaddyWeb</title>
-  <link rel="stylesheet" href="/static/app.css?v=6">
-  <script src="/static/app.js?v=7" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=7">
+  <script src="/static/app.js?v=8" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to main content</a>
@@ -127,19 +127,25 @@
       <section id="compose-view" class="view" data-view="compose" aria-labelledby="compose-title" hidden>
         <div class="page-heading"><div><p class="eyebrow">Local submission</p><h1 id="compose-title">Compose</h1><p>Send through Maddy and archive only after SMTP acceptance.</p></div></div>
         <form id="compose-form" class="data-card compose-card" action="/api/v1/send" method="post" enctype="multipart/form-data" autocomplete="off">
-          <label><span>Sender</span><select id="compose-sender" name="sender" required></select></label>
+          <fieldset><legend>Sender</legend><div class="form-columns compose-identity-fields"><label><span>Account</span><select id="compose-sender" name="sender" required></select></label><label><span>Sender name (optional)</span><input id="compose-sender-name" name="sender_name" maxlength="256" autocomplete="name" placeholder="Name shown to recipients" aria-describedby="sender-name-help"></label></div><p id="sender-name-help" class="field-help">Shown before the email address in the From header.</p></fieldset>
           <label><span>Sending account password</span><input name="password" type="password" required maxlength="1024" autocomplete="current-password" aria-describedby="sending-password-help"></label>
           <p id="sending-password-help" class="field-help">Use the selected mailbox password. MaddyWeb never stores it.</p>
           <fieldset><legend>Recipients</legend><div class="form-columns"><label><span>To</span><input name="to" required maxlength="16384" inputmode="email" placeholder="user@example.com"></label><label><span>CC</span><input name="cc" maxlength="16384" inputmode="email"></label></div><label><span>BCC</span><input name="bcc" maxlength="16384" inputmode="email"></label></fieldset>
           <label><span>Subject</span><input name="subject" maxlength="4096"></label>
-          <label><span>Plain-text body</span><textarea name="text" maxlength="2097152" required></textarea></label>
-          <fieldset><legend>Rich-text body (optional)</legend>
-            <div class="editor-toolbar" role="toolbar" aria-label="Text formatting">
-              <button class="button button-quiet" type="button" data-editor-command="bold">Bold</button>
-              <button class="button button-quiet" type="button" data-editor-command="italic">Italic</button>
-              <button class="button button-quiet" type="button" data-editor-command="insertUnorderedList">List</button>
+          <fieldset class="body-editor"><legend>Message body</legend>
+            <div class="body-mode-tabs" role="tablist" aria-label="Message body editor">
+              <button id="body-source-tab" class="body-mode-tab" type="button" role="tab" aria-selected="true" aria-controls="body-source-panel" tabindex="0" data-body-mode="source">HTML source</button>
+              <button id="body-preview-tab" class="body-mode-tab" type="button" role="tab" aria-selected="false" aria-controls="body-preview-panel" tabindex="-1" data-body-mode="preview">Preview</button>
             </div>
-            <div id="rich-editor" class="rich-editor" contenteditable="true" role="textbox" aria-multiline="true" aria-label="Rich-text body"></div>
+            <div id="body-source-panel" class="body-mode-panel" role="tabpanel" aria-labelledby="body-source-tab">
+              <label for="html-source"><span>HTML source</span></label>
+              <textarea id="html-source" class="html-source" name="html" maxlength="2097152" required spellcheck="false" aria-describedby="html-source-help" placeholder="<p>Write or paste HTML here.</p>"></textarea>
+              <p id="html-source-help" class="field-help">Edit HTML as plain source text. A plain-text alternative is generated automatically.</p>
+            </div>
+            <div id="body-preview-panel" class="body-mode-panel" role="tabpanel" aria-labelledby="body-preview-tab" hidden>
+              <iframe id="html-preview" class="html-preview" title="Sanitized HTML preview" sandbox="allow-same-origin"></iframe>
+              <p class="field-help">The preview is sanitized and isolated. Scripts, forms, remote resources, and link navigation are blocked.</p>
+            </div>
           </fieldset>
           <label><span>Attachments</span><input name="attachments" type="file" multiple></label>
           <label><span>Inline images (automatic CID)</span><input id="inline-images" name="inline_images" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple></label>
