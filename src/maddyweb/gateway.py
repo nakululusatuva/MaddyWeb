@@ -34,6 +34,11 @@ LOGGER = logging.getLogger(__name__)
 
 _HEALTH_CACHE_SECONDS = 10.0
 _ACCOUNT_CACHE_SECONDS = 2.0
+_SMTP_AUTH_PUBLIC_MESSAGE = (
+    "Authentication for the selected sending account was rejected. Check its mailbox "
+    "password and confirm that credentials are enabled, then try again. The message was "
+    "not submitted."
+)
 
 
 class HelperCallError(RuntimeError):
@@ -620,7 +625,15 @@ class HelperGateway:
             # Receiving a structured helper error proves the helper completed
             # classification.  messages.send performs every Maddy gate before
             # opening SMTP and has no fallible work after explicit acceptance.
-            raise DeliveryRejected("local submission did not accept the message") from exc
+            public_message = (
+                _SMTP_AUTH_PUBLIC_MESSAGE
+                if exc.code == "smtp_authentication_rejection"
+                else None
+            )
+            raise DeliveryRejected(
+                "local submission did not accept the message",
+                public_message=public_message,
+            ) from exc
         if result.get("accepted") is not True:
             raise DeliveryUncertain("helper returned no explicit SMTP acceptance")
         return message.message_id

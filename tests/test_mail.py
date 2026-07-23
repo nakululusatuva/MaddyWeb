@@ -13,6 +13,7 @@ from maddyweb.mail import (
     DeliveryRejected,
     DeliveryUncertain,
     MailError,
+    MailValidationError,
     OutgoingMessage,
     PreparedMessage,
     attachment_download_headers,
@@ -154,6 +155,22 @@ def test_header_injection_and_non_image_inline_are_rejected() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("field", "label"),
+    (("to", "To"), ("cc", "CC"), ("bcc", "BCC")),
+)
+def test_invalid_recipient_field_has_fixed_public_message(field: str, label: str) -> None:
+    with pytest.raises(MailValidationError) as error:
+        build_message(_message(**{field: ("not-an-address",)}))
+
+    assert str(error.value) == f"invalid {label} recipient address"
+    assert error.value.public_message == (
+        f"The {label} field contains an invalid email address. Use complete addresses and "
+        "separate multiple addresses with commas."
+    )
+    assert "not-an-address" not in error.value.public_message
+
+
 def test_parse_received_message_sanitizes_html_and_attachment_name() -> None:
     source = EmailMessage()
     source["From"] = "sender@example.test"
@@ -225,6 +242,23 @@ async def test_delivery_failure_classification(error: Exception, safe_to_retry: 
     assert result.retry_delivery is safe_to_retry
     assert gateway.spool_path is not None
     assert not gateway.spool_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_delivery_rejection_uses_only_explicit_public_message(caplog) -> None:
+    public_message = "SMTP authentication failed. Verify the account password."
+    gateway = _MailGateway(
+        DeliveryRejected("private diagnostic", public_message=public_message)
+    )
+    result = await deliver_and_save(
+        gateway,
+        _message(),
+        submission_password=FIXTURE_CREDENTIAL,
+    )
+    assert result.error == public_message
+    assert "private diagnostic" not in result.error
+    assert "message delivery was definitively not accepted" in caplog.text
+    assert "private diagnostic" not in caplog.text
 
 
 @pytest.mark.asyncio

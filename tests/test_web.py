@@ -17,7 +17,7 @@ import pytest_asyncio
 from aiohttp import CookieJar, FormData
 from aiohttp.test_utils import TestClient, TestServer
 
-from maddyweb.mail import PreparedMessage
+from maddyweb.mail import DeliveryRejected, PreparedMessage
 from maddyweb.web import MessagePage, create_app
 
 FIXTURE_CREDENTIAL = "-".join(("account", "credential"))
@@ -56,6 +56,7 @@ class FakeGateway:
         self.message_initial_offset = 42
         self.delivered: bytes | None = None
         self.sent: bytes | None = None
+        self.delivery_error: Exception | None = None
         self.spool_gate: asyncio.Event | None = None
         self.spool_active = 0
         self.two_spools_started = asyncio.Event()
@@ -218,6 +219,8 @@ class FakeGateway:
     ) -> str:
         assert submission_password == FIXTURE_CREDENTIAL
         self.operations.append(("deliver", envelope_from, recipients))
+        if self.delivery_error is not None:
+            raise self.delivery_error
         self.delivered = b"".join(message.iter_chunks())
         return "smtp-1"
 
@@ -290,22 +293,52 @@ async def test_home_static_assets_and_strict_headers(
     page = await response.text()
     assert response.status == 200
     assert "Administration overview" in page
+    assert 'href="/static/app.css?v=3"' in page
+    assert 'src="/static/app.js?v=3"' in page
+    assert '<main id="main" class="container" tabindex="-1">' in page
     assert "Access-Control-Allow-Origin" not in response.headers
     assert "script-src 'self'" in response.headers["Content-Security-Policy"]
     assert "img-src 'self' blob:" in response.headers["Content-Security-Policy"]
     assert response.headers["Referrer-Policy"] == "same-origin"
+
+    stylesheet = await client.get("/static/app.css")
+    assert stylesheet.status == 200
+    assert stylesheet.content_type == "text/css"
+    stylesheet_bytes = await stylesheet.read()
+    assert len(stylesheet_bytes) <= 16 * 1024
+    assert b"@import" not in stylesheet_bytes
+    assert b"url(" not in stylesheet_bytes
 
     javascript = await client.get("/static/app.js")
     assert javascript.status == 200
     assert javascript.content_type == "application/javascript"
     assert javascript.headers["X-Content-Type-Options"] == "nosniff"
     javascript_text = await javascript.text()
+    assert len(javascript_text.encode()) <= 4 * 1024
     assert "contenteditable" not in javascript_text
     assert "URL.createObjectURL" in javascript_text
     assert "readAsDataURL" not in javascript_text
+    assert 'submitButton.textContent = "Sending..."' in javascript_text
+    assert 'uploadForm.dataset.submitting = "true"' in javascript_text
 
     rejected = await client.get("/", headers={"Host": "evil.example"})
     assert rejected.status == 400
+
+
+@pytest.mark.asyncio
+async def test_shell_marks_one_active_navigation_item_per_page(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, _gateway = web_client
+    for path in ("/", "/accounts", "/mail", "/compose", "/certificates"):
+        response = await client.get(path)
+        assert response.status == 200
+        page = await response.text()
+        assert page.count('aria-current="page"') == 1
+        assert 'aria-label="Main navigation"' in page
+        assert "https://" not in page
+        assert "http://" not in page
+        assert " style=" not in page
 
 
 @pytest.mark.asyncio
@@ -676,6 +709,8 @@ async def test_compose_uses_enabled_sender_and_streams_cid_mime(
     token, page = await _get_token(client, "/compose")
     assert 'contenteditable="true"' in page
     assert '<select name="sender" required>' in page
+    assert 'aria-describedby="sending-password-help"' in page
+    assert "MaddyWeb never stores it." in page
     assert "admin@example.test" in page
     assert "disabled@example.test" not in page
 
@@ -715,6 +750,116 @@ async def test_compose_uses_enabled_sender_and_streams_cid_mime(
     parsed = BytesParser(policy=policy.default).parsebytes(gateway.delivered)
     assert parsed["Bcc"] is None
     assert any(part.get("Content-ID") == "<logo@maddyweb.local>" for part in parsed.walk())
+    success_page = await (await client.get("/compose?status=sent")).text()
+    assert "Maddy accepted the message for delivery" in success_page
+    assert "Remote inbox placement is not confirmed here." in success_page
+
+
+@pytest.mark.asyncio
+async def test_smtp_auth_rejection_is_actionable_and_does_not_echo_password(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+    gateway.delivery_error = DeliveryRejected(
+        "internal SMTP diagnostic",
+        public_message=(
+            "Authentication for the selected sending account was rejected. Check its mailbox "
+            "password and confirm that credentials are enabled, then try again. The message "
+            "was not submitted."
+        ),
+    )
+    token, _page = await _get_token(client, "/compose")
+    form = FormData()
+    for name, value in {
+        "_csrf": token,
+        "sender": "admin@example.test",
+        "password": FIXTURE_CREDENTIAL,
+        "to": "recipient@example.test",
+        "subject": "Authentication test",
+        "text": "body",
+        "html": "",
+    }.items():
+        form.add_field(name, value)
+    form.add_field("attachments", io.BytesIO(b"x"), filename="x.txt")
+    response = await client.post(
+        "/send",
+        data=form,
+        headers={"Origin": _origin(client), "X-CSRF-Token": token},
+        allow_redirects=False,
+    )
+    page = await response.text()
+    assert response.status == 502
+    assert "Message not delivered" in page
+    assert "Authentication for the selected sending account was rejected." in page
+    assert FIXTURE_CREDENTIAL not in page
+    assert "internal SMTP diagnostic" not in page
+    assert "WWW-Authenticate" not in response.headers
+    assert gateway.sent is None
+
+
+@pytest.mark.asyncio
+async def test_invalid_recipient_identifies_field_without_echoing_input(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+    token, _page = await _get_token(client, "/compose")
+    form = FormData()
+    for name, value in {
+        "_csrf": token,
+        "sender": "admin@example.test",
+        "password": FIXTURE_CREDENTIAL,
+        "to": "private-invalid-value",
+        "subject": "Address validation test",
+        "text": "body",
+        "html": "",
+    }.items():
+        form.add_field(name, value)
+    form.add_field("attachments", io.BytesIO(b"x"), filename="x.txt")
+    response = await client.post(
+        "/send",
+        data=form,
+        headers={"Origin": _origin(client), "X-CSRF-Token": token},
+        allow_redirects=False,
+    )
+    page = await response.text()
+
+    assert response.status == 400
+    assert "The To field contains an invalid email address." in page
+    assert "private-invalid-value" not in page
+    assert gateway.delivered is None
+
+
+@pytest.mark.asyncio
+async def test_fullwidth_recipient_separators_are_normalized(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+    token, _page = await _get_token(client, "/compose")
+    form = FormData()
+    for name, value in {
+        "_csrf": token,
+        "sender": "admin@example.test",
+        "password": FIXTURE_CREDENTIAL,
+        "to": "first@example.test\uff0csecond@example.test\uff1bthird@example.test",
+        "subject": "Separator test",
+        "text": "body",
+        "html": "",
+    }.items():
+        form.add_field(name, value)
+    form.add_field("attachments", io.BytesIO(b"x"), filename="x.txt")
+    response = await client.post(
+        "/send",
+        data=form,
+        headers={"Origin": _origin(client), "X-CSRF-Token": token},
+        allow_redirects=False,
+    )
+
+    assert response.status == 303
+    assert (
+        "deliver",
+        "admin@example.test",
+        ("first@example.test", "second@example.test", "third@example.test"),
+    ) in gateway.operations
 
 
 @pytest.mark.asyncio

@@ -59,24 +59,47 @@
   document.querySelectorAll('form[enctype="multipart/form-data"]').forEach((uploadForm) => {
     uploadForm.addEventListener("submit", async (event) => {
       event.preventDefault();
+      if (uploadForm.dataset.submitting === "true") return;
       syncEditor();
       const token = uploadForm.querySelector('input[name="_csrf"]');
       if (!(token instanceof HTMLInputElement)) return;
-      const response = await fetch(uploadForm.action, {
-        method: "POST",
-        body: new FormData(uploadForm),
-        credentials: "same-origin",
-        redirect: "follow",
-        headers: {"X-CSRF-Token": token.value},
-      });
-      if (response.redirected) {
-        window.location.assign(response.url);
-        return;
+      const submitButton = uploadForm.querySelector('button[type="submit"]');
+      const progress = uploadForm.querySelector("[data-send-progress]");
+      uploadForm.dataset.submitting = "true";
+      uploadForm.setAttribute("aria-busy", "true");
+      if (submitButton instanceof HTMLButtonElement) {
+        submitButton.disabled = true;
+        submitButton.classList.add("is-sending");
+        submitButton.textContent = "Sending...";
       }
-      const page = await response.text();
-      document.open();
-      document.write(page);
-      document.close();
+      if (progress) progress.textContent = "Submitting securely. Keep this page open.";
+
+      try {
+        const response = await fetch(uploadForm.action, {
+          method: "POST",
+          body: new FormData(uploadForm),
+          credentials: "same-origin",
+          redirect: "follow",
+          headers: {"X-CSRF-Token": token.value},
+        });
+        if (response.redirected) {
+          window.location.assign(response.url);
+          return;
+        }
+        const page = await response.text();
+        document.open();
+        document.write(page);
+        document.close();
+      } catch {
+        uploadForm.removeAttribute("aria-busy");
+        if (submitButton instanceof HTMLButtonElement) {
+          submitButton.classList.remove("is-sending");
+          submitButton.textContent = "Result unknown";
+        }
+        if (progress) {
+          progress.textContent = "The submission result is unknown. Do not resend. Check Sent or server logs before continuing.";
+        }
+      }
     });
   });
 })();

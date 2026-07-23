@@ -135,8 +135,20 @@ class MailLimitError(MailError):
     """A configured mail resource bound was exceeded."""
 
 
+class MailValidationError(MailError):
+    """Invalid message input with a fixed, safe explanation for the operator."""
+
+    def __init__(self, message: str, *, public_message: str) -> None:
+        super().__init__(message)
+        self.public_message = public_message
+
+
 class DeliveryRejected(RuntimeError):
     """The backend explicitly rejected delivery; resubmission cannot duplicate it."""
+
+    def __init__(self, message: str, *, public_message: str | None = None) -> None:
+        super().__init__(message)
+        self.public_message = public_message
 
 
 class DeliveryUncertain(RuntimeError):
@@ -584,10 +596,31 @@ class MailGateway(Protocol):
 def _validated_outgoing(
     value: OutgoingMessage,
 ) -> tuple[str, tuple[str, ...], tuple[str, ...], tuple[str, ...], str, str | None]:
-    sender = parse_address_list(value.sender, maximum=1)[0]
-    to = tuple(address for item in value.to for address in parse_address_list(item))
-    cc = tuple(address for item in value.cc for address in parse_address_list(item))
-    bcc = tuple(address for item in value.bcc for address in parse_address_list(item))
+    try:
+        sender = parse_address_list(value.sender, maximum=1)[0]
+    except MailError as exc:
+        raise MailValidationError(
+            "invalid sender address",
+            public_message="The selected sender account has an invalid email address.",
+        ) from exc
+
+    def recipient_field(items: Sequence[str], label: str) -> tuple[str, ...]:
+        try:
+            return tuple(address for item in items for address in parse_address_list(item))
+        except MailLimitError:
+            raise
+        except MailError as exc:
+            raise MailValidationError(
+                f"invalid {label} recipient address",
+                public_message=(
+                    f"The {label} field contains an invalid email address. Use complete addresses "
+                    "and separate multiple addresses with commas."
+                ),
+            ) from exc
+
+    to = recipient_field(value.to, "To")
+    cc = recipient_field(value.cc, "CC")
+    bcc = recipient_field(value.bcc, "BCC")
     if not to and not cc and not bcc:
         raise MailError("at least one recipient is required")
     if len(to) + len(cc) + len(bcc) > 100:
@@ -826,12 +859,13 @@ async def deliver_and_save(
                 prepared.recipients,
                 submission_password,
             )
-        except DeliveryRejected:
-            LOGGER.exception("message delivery was explicitly rejected")
+        except DeliveryRejected as exc:
+            LOGGER.warning("message delivery was definitively not accepted")
             return DeliveryResult(
                 delivered=False,
                 saved_to_sent=False,
-                error="The server explicitly rejected the message; it was not delivered.",
+                error=exc.public_message
+                or "Maddy did not accept the message; it was not submitted.",
                 retry_delivery=True,
             )
         except DeliveryUncertain:
@@ -975,6 +1009,7 @@ __all__ = [
     "MailError",
     "MailGateway",
     "MailLimitError",
+    "MailValidationError",
     "OutgoingMessage",
     "ParsedAttachment",
     "ParsedMessage",

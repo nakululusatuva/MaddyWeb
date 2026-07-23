@@ -28,6 +28,7 @@ from .mail import (
     DeliveryResult,
     MailError,
     MailGateway,
+    MailValidationError,
     OutgoingMessage,
     ParsedMessage,
     PreparedMessage,
@@ -1177,9 +1178,14 @@ async def compose(request: web.Request) -> web.Response:
     notice, kind = _notice(
         request.query.get("status"),
         {
-            "sent": ("Message delivered and saved to Sent.", "success"),
+            "sent": (
+                "Maddy accepted the message for delivery and saved it to Sent. Remote inbox "
+                "placement is not confirmed here.",
+                "success",
+            ),
             "sent-copy-failed": (
-                "Message delivered but not saved to Sent; do not resend.",
+                "Maddy accepted the message for delivery, but MaddyWeb could not confirm that it "
+                "was saved to Sent; do not resend.",
                 "warning",
             ),
         },
@@ -1365,7 +1371,7 @@ def _one(values: Mapping[str, list[str]], name: str, *, default: str = "") -> st
 
 
 def _split_addresses(value: str) -> tuple[str, ...]:
-    value = value.replace("\uff1b", ",").replace(";", ",")
+    value = value.replace("\uff0c", ",").replace("\uff1b", ",").replace(";", ",")
     return (value,) if value.strip() else ()
 
 
@@ -1480,10 +1486,15 @@ async def send_message(request: web.Request) -> web.Response:
                 )
         except MailError as exc:
             LOGGER.info("invalid outgoing message: %s", exc)
+            public_message = (
+                exc.public_message
+                if isinstance(exc, MailValidationError)
+                else "Recipients, body, or attachments violate a safety limit."
+            )
             return _html_response(
                 render_error(
                     "Invalid message format",
-                    "Recipients, body, or attachments violate a safety limit.",
+                    public_message,
                     csrf_token_for_request(request),
                 ),
                 status=400,
@@ -1492,9 +1503,14 @@ async def send_message(request: web.Request) -> web.Response:
             return _redirect("/compose?status=sent")
         if result.delivered:
             return _redirect("/compose?status=sent-copy-failed")
+        error_title = (
+            "Message not delivered"
+            if result.retry_delivery
+            else "Message delivery unconfirmed"
+        )
         return _html_response(
             render_error(
-                "Message delivery unconfirmed",
+                error_title,
                 result.error or "Message delivery failed.",
                 csrf_token_for_request(request),
             ),
