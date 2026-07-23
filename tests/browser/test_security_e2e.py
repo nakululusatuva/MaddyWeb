@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING
 from urllib.parse import urlencode, urlsplit
 
@@ -215,3 +216,90 @@ async def test_permanent_delete_requires_exact_confirmation(
     assert "status=deleted" in page.url
     assert submitted_origins == [live_application.base_url, live_application.base_url]
     assert live_application.gateway.permanent_deletions == [(ACCOUNT, MAILBOX, MESSAGE_ID)]
+
+
+async def test_compose_shows_progress_and_blocks_duplicate_submission(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    request_started = asyncio.Event()
+    release_request = asyncio.Event()
+    post_count = 0
+
+    async def hold_submission(route: Route) -> None:
+        nonlocal post_count
+        post_count += 1
+        request_started.set()
+        await release_request.wait()
+        await route.fulfill(
+            status=200,
+            content_type="text/html",
+            body="<!doctype html><html><body>Submission fixture complete</body></html>",
+        )
+
+    await page.route("**/send", hold_submission)
+    await page.goto(live_application.base_url + "/compose")
+    await page.locator('input[name="password"]').fill("test-only-credential")
+    await page.locator('input[name="to"]').fill("recipient@example.test")
+    await page.locator('textarea[name="text"]').fill("body")
+    button = page.locator("#send-button")
+    click = asyncio.create_task(button.click())
+    await asyncio.wait_for(request_started.wait(), timeout=2)
+
+    assert await button.is_disabled()
+    assert await button.inner_text() == "Sending..."
+    assert await page.locator("#compose-form").get_attribute("aria-busy") == "true"
+    assert "Keep this page open" in await page.locator("[data-send-progress]").inner_text()
+    await page.locator("#compose-form").evaluate(
+        "form => form.dispatchEvent(new Event('submit', {bubbles: true, cancelable: true}))"
+    )
+    await page.wait_for_timeout(50)
+    assert post_count == 1
+
+    release_request.set()
+    await click
+    await page.get_by_text("Submission fixture complete").wait_for()
+    assert post_count == 1
+
+
+async def test_compose_network_failure_never_invites_duplicate_retry(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    await page.route("**/send", lambda route: route.abort("connectionfailed"))
+    await page.goto(live_application.base_url + "/compose")
+    await page.locator('input[name="password"]').fill("test-only-credential")
+    await page.locator('input[name="to"]').fill("recipient@example.test")
+    await page.locator('textarea[name="text"]').fill("body")
+    button = page.locator("#send-button")
+    await button.click()
+    warning = page.locator("[data-send-progress]")
+    await warning.get_by_text("The submission result is unknown.").wait_for()
+
+    assert await button.is_disabled()
+    assert await button.inner_text() == "Result unknown"
+    assert await page.locator("#compose-form").get_attribute("data-submitting") == "true"
+    assert await page.locator("#compose-form").get_attribute("aria-busy") is None
+    assert "Do not resend" in await warning.inner_text()
+
+
+async def test_mobile_navigation_order_and_touch_targets(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    await page.set_viewport_size({"width": 320, "height": 844})
+    await page.goto(live_application.base_url + "/compose")
+    visible_links = page.locator(".primary-nav a:visible")
+
+    assert await visible_links.all_inner_texts() == [
+        "Compose",
+        "Mail",
+        "Accounts",
+        "Certificates",
+    ]
+    assert await page.locator('.compose-action[aria-current="page"]:visible').count() == 1
+    assert await page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+    for index in range(await visible_links.count()):
+        bounds = await visible_links.nth(index).bounding_box()
+        assert bounds is not None
+        assert bounds["height"] >= 44

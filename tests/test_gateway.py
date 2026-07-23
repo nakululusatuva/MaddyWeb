@@ -650,6 +650,60 @@ async def test_smtp_helper_codes_preserve_retry_semantics(
 
 
 @pytest.mark.asyncio
+async def test_smtp_auth_rejection_exposes_only_fixed_actionable_message(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient(
+        {
+            "messages.send": Response.failure(
+                "template",
+                "smtp_authentication_rejection",
+                "SMTP authentication was rejected",
+            )
+        }
+    )
+    gateway = gateway_with(client)
+    message = prepared(tmp_path)
+    with pytest.raises(DeliveryRejected) as raised:
+        await gateway.deliver_message(
+            message,
+            message.envelope_from,
+            message.recipients,
+            FIXTURE_CREDENTIAL,
+        )
+    assert raised.value.public_message == (
+        "Authentication for the selected sending account was rejected. Check its mailbox "
+        "password and confirm that credentials are enabled, then try again. The message was "
+        "not submitted."
+    )
+
+
+@pytest.mark.asyncio
+async def test_smtp_non_auth_rejection_does_not_expose_helper_message(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient(
+        {
+            "messages.send": Response.failure(
+                "template",
+                "smtp_permanent_rejection",
+                "SMTP rejected RCPT TO (550)",
+            )
+        }
+    )
+    gateway = gateway_with(client)
+    message = prepared(tmp_path)
+    with pytest.raises(DeliveryRejected) as raised:
+        await gateway.deliver_message(
+            message,
+            message.envelope_from,
+            message.recipients,
+            FIXTURE_CREDENTIAL,
+        )
+    assert raised.value.public_message is None
+
+
+@pytest.mark.asyncio
 async def test_certificate_status_flattens_source_and_deployed_fingerprints() -> None:
     client = FakeClient(
         {

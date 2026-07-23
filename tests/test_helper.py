@@ -465,6 +465,39 @@ def test_smtp_rejects_4xx_and_5xx_response_by_response(code: int, temporary: boo
     assert channel.closed is True
 
 
+@pytest.mark.parametrize("code", (454, 535))
+def test_smtp_auth_rejection_has_fixed_safe_classification(code: int) -> None:
+    error = SMTPRejected(code, "AUTH")
+    assert PrivilegedDispatcher._safe_error(error) == (
+        "smtp_authentication_rejection",
+        "SMTP authentication was rejected",
+    )
+
+
+@pytest.mark.parametrize("code", (454, 535))
+def test_smtp_client_stops_after_auth_rejection_and_hides_reply(code: int) -> None:
+    hostile_reply = f"{code} credential and server detail must stay private\r\n".encode()
+    channel = ScriptedChannel([b"220 ready\r\n", b"250 hello\r\n", hostile_reply])
+
+    with pytest.raises(SMTPRejected) as raised:
+        send_scripted(channel)
+
+    wire = b"".join(channel.writes)
+    assert raised.value.stage == "AUTH"
+    assert raised.value.code == code
+    assert b"AUTH PLAIN " in wire
+    assert b"MAIL FROM" not in wire
+    assert b"RCPT TO" not in wire
+    assert b"DATA\r\n" not in wire
+    safe_error = PrivilegedDispatcher._safe_error(raised.value)
+    assert safe_error == (
+        "smtp_authentication_rejection",
+        "SMTP authentication was rejected",
+    )
+    assert b"credential and server detail" not in repr(safe_error).encode()
+    assert channel.closed is True
+
+
 def test_smtp_disconnect_after_data_is_unknown_but_after_acceptance_is_success() -> None:
     prefix: list[bytes | BaseException] = [
         b"220 ready\r\n",

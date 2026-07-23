@@ -639,6 +639,11 @@ class PrivilegedDispatcher:
         if isinstance(exc, SMTPOutcomeUnknown):
             return "smtp_outcome_unknown", "Delivery outcome is unknown; do not retry automatically"
         if isinstance(exc, SMTPRejected):
+            if exc.stage == "AUTH":
+                return (
+                    "smtp_authentication_rejection",
+                    "SMTP authentication was rejected",
+                )
             kind = "temporary" if exc.temporary else "permanent"
             return f"smtp_{kind}_rejection", f"SMTP rejected {exc.stage} ({exc.code})"
         if isinstance(exc, SMTPTransportError):
