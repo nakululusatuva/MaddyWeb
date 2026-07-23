@@ -29,6 +29,7 @@ MAILBOX = "INBOX"
 TRASH_MAILBOX = "Custom Trash"
 MESSAGE_ID = "42"
 CERTIFICATE_NAME = "mx.example.test"
+CERTIFICATE_FINGERPRINT = ":".join(f"{value:02X}" for value in range(32))
 COOKIE_NAME = "__Host-maddyweb-browser-csrf"
 
 
@@ -228,8 +229,8 @@ class BrowserSecurityGateway:
                 {
                     "name": CERTIFICATE_NAME,
                     "expires": "2026-10-21T00:00:00Z",
-                    "source_fingerprint": "AA:BB:CC",
-                    "deployed_fingerprint": "AA:BB:CC",
+                    "source_fingerprint": CERTIFICATE_FINGERPRINT,
+                    "deployed_fingerprint": CERTIFICATE_FINGERPRINT,
                     "fingerprints_match": True,
                     "automation_safe": True,
                 }

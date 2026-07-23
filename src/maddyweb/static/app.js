@@ -310,6 +310,7 @@
 
   const showView = (name, shouldFocus) => {
     let active = null;
+    document.documentElement.dataset.view = name;
     document.querySelectorAll("[data-view]").forEach((view) => {
       const selected = view.getAttribute("data-view") === name;
       view.hidden = !selected;
@@ -830,6 +831,31 @@
     text: positive ? positiveText : negativeText,
   });
 
+  const fingerprintNode = (value) => {
+    const fingerprint = stringValue(value, "Unavailable");
+    return element("code", {
+      className: "certificate-fingerprint",
+      text: fingerprint,
+      title: fingerprint,
+    });
+  };
+
+  const certificateCell = (label, content, className = "") => {
+    const cell = element("td", {
+      className: `certificate-cell${className ? ` ${className}` : ""}`,
+    });
+    const mobileLabel = element("span", {
+      className: "certificate-mobile-label",
+      text: label,
+    });
+    mobileLabel.setAttribute("aria-hidden", "true");
+    const value = element("span", {className: "certificate-cell-value"});
+    if (content instanceof Node) value.append(content);
+    else value.textContent = String(content);
+    cell.append(mobileLabel, value);
+    return cell;
+  };
+
   const certificateAction = (label, className, handler) => {
     const button = element("button", {className, text: label, type: "button"});
     button.addEventListener("click", handler);
@@ -863,23 +889,47 @@
     const fragment = document.createDocumentFragment();
     for (const certificate of certificates) {
       const row = element("tr");
+      const name = stringValue(certificate.name, "Unknown");
+      const nameCell = certificateCell("Name", name, "certificate-name");
+      const nameValue = nameCell.querySelector(".certificate-cell-value");
+      if (nameValue instanceof HTMLElement) nameValue.title = name;
       row.append(
-        element("td", {text: stringValue(certificate.name, "Unknown")}),
-        element("td", {text: stringValue(certificate.expires, "Unknown")}),
+        nameCell,
+        certificateCell(
+          "Expiration",
+          stringValue(certificate.expires, "Unknown"),
+          "certificate-expiration",
+        ),
       );
-      for (const key of ["source_fingerprint", "deployed_fingerprint"]) {
-        const cell = element("td");
-        cell.append(element("code", {text: stringValue(certificate[key], "Unavailable")}));
-        row.append(cell);
-      }
-      const matchCell = element("td");
-      matchCell.append(statusPill(
-        certificate.fingerprints_match === true,
-        "Match",
-        "Mismatch",
-      ));
-      row.append(matchCell);
-      const actions = element("td");
+      row.append(
+        certificateCell(
+          "Source",
+          fingerprintNode(certificate.source_fingerprint),
+          "certificate-fingerprint-cell",
+        ),
+        certificateCell(
+          "Deployed",
+          fingerprintNode(certificate.deployed_fingerprint),
+          "certificate-fingerprint-cell",
+        ),
+        certificateCell(
+          "Match",
+          statusPill(
+            certificate.fingerprints_match === true,
+            "Match",
+            "Mismatch",
+          ),
+          "certificate-match",
+        ),
+      );
+      const actions = element("td", {
+        className: "certificate-cell certificate-actions",
+      });
+      const actionsLabel = element("span", {
+        className: "certificate-mobile-label",
+        text: "Actions",
+      });
+      actionsLabel.setAttribute("aria-hidden", "true");
       const actionRow = element("div", {className: "button-row"});
       if (certificate.automation_safe === true) {
         actionRow.append(
@@ -900,7 +950,7 @@
           text: "Read-only: Certbot lineage violates policy.",
         }));
       }
-      actions.append(actionRow);
+      actions.append(actionsLabel, actionRow);
       row.append(actions);
       fragment.append(row);
     }

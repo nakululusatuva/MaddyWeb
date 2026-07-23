@@ -631,6 +631,14 @@ dialog:focus-visible {
   outline-offset: -4px;
 }
 
+@media (min-width: 1081px) {
+  html[data-view="certificates"] .app-main {
+    max-width: 1920px;
+    padding-right: clamp(22px, 2vw, 28px);
+    padding-left: clamp(22px, 2vw, 28px);
+  }
+}
+
 .view {
   animation: view-enter 180ms ease-out;
 }
@@ -1081,6 +1089,53 @@ tbody tr.unread {
   background: color-mix(in srgb, var(--primary-soft) 42%, var(--surface));
   font-weight: 720;
   box-shadow: inset 3px 0 var(--primary);
+}
+
+.certificate-table {
+  width: max-content;
+  min-width: 100%;
+  table-layout: auto;
+}
+
+.certificate-table th,
+.certificate-table td {
+  padding-right: 8px;
+  padding-left: 8px;
+}
+
+.certificate-table td:not(.certificate-actions) {
+  white-space: nowrap;
+}
+
+.certificate-mobile-label {
+  display: none;
+}
+
+.certificate-cell-value {
+  display: block;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.certificate-fingerprint {
+  display: block;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 10px;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+}
+
+.certificate-actions {
+  width: 160px;
+}
+
+.certificate-actions .button-row {
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.certificate-actions .muted {
+  white-space: normal;
 }
 
 td:last-child .button,
@@ -1878,7 +1933,86 @@ dialog::backdrop {
     align-items: stretch;
   }
 
-  table:not(.message-table) {
+  .certificate-table {
+    display: block;
+    width: 100%;
+    min-width: 0;
+    table-layout: auto;
+  }
+
+  .certificate-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+  }
+
+  .certificate-table tbody {
+    display: grid;
+    gap: 12px;
+    padding: 12px;
+  }
+
+  .certificate-table tbody tr {
+    display: grid;
+    min-width: 0;
+    gap: 0;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--surface);
+  }
+
+  .certificate-table td {
+    display: grid;
+    min-width: 0;
+    min-height: 0;
+    grid-template-columns: 88px minmax(0, 1fr);
+    align-items: center;
+    gap: 10px;
+    padding: 6px 0;
+    border: 0;
+  }
+
+  .certificate-table .certificate-mobile-label {
+    display: block;
+    color: var(--text-muted);
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+
+  .certificate-table .certificate-actions {
+    display: block;
+    margin-top: 4px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
+  }
+
+  .certificate-table .certificate-actions .certificate-mobile-label {
+    margin-bottom: 8px;
+  }
+
+  .certificate-table .certificate-actions .button-row {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .certificate-table .certificate-actions .button {
+    width: 100%;
+    white-space: normal;
+  }
+
+  .certificate-table .certificate-fingerprint {
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+    white-space: normal;
+  }
+
+  table:not(.message-table):not(.certificate-table) {
     min-width: 760px;
   }
 }
