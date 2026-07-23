@@ -39,7 +39,7 @@ deployed_key_path = "/etc/maddy/certs/privkey.pem"
 [security]
 session_key_file = "/var/lib/maddyweb/session.key"
 csrf_ttl_seconds = 900
-cookie_name = "__Host-maddyweb"
+cookie_name = "__Host-maddyweb-native"
 
 [logging]
 level = "INFO"

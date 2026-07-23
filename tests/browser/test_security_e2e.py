@@ -3,20 +3,28 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import secrets
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlencode, urlsplit
 
 import pytest
+from aiohttp import web
 from conftest import (
     ACCOUNT,
     CERTIFICATE_NAME,
+    COOKIE_NAME,
     MAILBOX,
     MESSAGE_ID,
     NEW_ACCOUNT,
     TRASH_MAILBOX,
+    BrowserSecurityGateway,
     LiveApplication,
+    _listening_socket,
 )
+
+from maddyweb.web import create_app
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -24,9 +32,7 @@ if TYPE_CHECKING:
     from playwright.async_api import Page, Route
 
 pytestmark = pytest.mark.asyncio
-CLIENT_SOURCE_PATH = (
-    Path(__file__).resolve().parents[2] / "src" / "maddyweb" / "static" / "app.js"
-)
+CLIENT_SOURCE_PATH = Path(__file__).resolve().parents[2] / "src" / "maddyweb" / "static" / "app.js"
 
 
 async def _allow_loopback_only(route: Route) -> None:
@@ -119,9 +125,7 @@ async def test_spa_navigation_loads_each_operational_view_without_document_reloa
     await page.locator('a[data-section="certificates"]').click()
     await page.wait_for_url("**/certificates")
     await page.get_by_text(CERTIFICATE_NAME, exact=True).wait_for()
-    assert await page.locator(
-        'a[data-section="certificates"][aria-current="page"]'
-    ).count() == 1
+    assert await page.locator('a[data-section="certificates"][aria-current="page"]').count() == 1
 
     await page.go_back()
     await page.get_by_role("heading", name="Compose", exact=True).wait_for()
@@ -142,18 +146,14 @@ async def test_account_workflows_use_json_mutations_and_typed_deletion(
     await create_form.get_by_role("button", name="Create account").click()
     new_row = page.locator("#accounts-body tr").filter(has_text=NEW_ACCOUNT)
     await new_row.wait_for()
-    assert live_application.gateway.created_accounts == [
-        (NEW_ACCOUNT, "fixture-password-123")
-    ]
+    assert live_application.gateway.created_accounts == [(NEW_ACCOUNT, "fixture-password-123")]
 
     await new_row.get_by_role("button", name="Manage").click()
     password_form = page.locator("#change-password-form")
     await password_form.locator('input[name="password"]').fill("replacement-password-456")
     await password_form.get_by_role("button", name="Change password").click()
     await page.locator("#account-dialog").wait_for(state="hidden")
-    assert live_application.gateway.password_changes == [
-        (NEW_ACCOUNT, "replacement-password-456")
-    ]
+    assert live_application.gateway.password_changes == [(NEW_ACCOUNT, "replacement-password-456")]
 
     await new_row.get_by_role("button", name="Manage").click()
     limit_form = page.locator("#append-limit-form")
@@ -201,9 +201,7 @@ async def test_certificate_controls_serialize_writes_and_refresh_status(
     await page.locator("#timer-state").get_by_text("Disabled", exact=True).wait_for()
     assert live_application.gateway.timer_changes == [False]
 
-    certificate_row = page.locator("#certificates-body tr").filter(
-        has_text=CERTIFICATE_NAME
-    )
+    certificate_row = page.locator("#certificates-body tr").filter(has_text=CERTIFICATE_NAME)
     await certificate_row.get_by_role("button", name="Dry-run").click()
     await page.locator("#confirm-action").click()
     await page.locator("#confirm-dialog").wait_for(state="hidden")
@@ -282,12 +280,18 @@ async def test_rejects_missing_and_replayed_header_csrf(
                 headers: {"Content-Type": "application/json"},
                 body: JSON.stringify(body),
             });
-            return {status: response.status, payload: await response.json()};
+            return {
+                status: response.status,
+                payload: await response.json(),
+                replacement: response.headers.get("X-CSRF-Token"),
+            };
         }""",
         {"url": post_url, "body": body},
     )
     assert missing["status"] == 403
     assert missing["payload"]["error"]["code"] == "csrf_failed"
+    assert missing["replacement"]
+    token = missing["replacement"]
 
     attempted = await page.evaluate(
         """async ({url, body, token}) => {
@@ -356,8 +360,7 @@ async def test_message_html_is_sandboxed_and_attachment_filename_is_safe(
         "images => images.map(image => image.getAttribute('src'))"
     )
     assert all(
-        source is None
-        or (source.startswith("/api/v1/mail/") and "/inline/" in source)
+        source is None or (source.startswith("/api/v1/mail/") and "/inline/" in source)
         for source in image_sources
     )
     assert await frame_element.get_attribute("sandbox") == ""
@@ -399,9 +402,7 @@ async def test_move_to_trash_requires_explicit_confirmation(
     assert "current verified identifier" in await page.locator("#confirm-message").inner_text()
     await page.locator("#confirm-action").click()
     await dialog.wait_for(state="hidden")
-    await page.wait_for_url(
-        "**/mail?account=admin%40example.test&mailbox=Custom+Trash"
-    )
+    await page.wait_for_url("**/mail?account=admin%40example.test&mailbox=Custom+Trash")
     assert live_application.gateway.trash_moves == [(ACCOUNT, MAILBOX, MESSAGE_ID)]
     assert live_application.gateway.message_location == TRASH_MAILBOX
 
@@ -461,6 +462,304 @@ async def test_compose_shows_spinner_blocks_duplicates_and_reports_success(
     assert gateway.sent_saves == 1
 
 
+async def test_compose_resynchronizes_csrf_after_cookie_expiry(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    gateway = live_application.gateway
+    post_count = 0
+
+    def count_submission(request: object) -> None:
+        nonlocal post_count
+        if (
+            getattr(request, "method", "") == "POST"
+            and urlsplit(getattr(request, "url", "")).path == "/api/v1/send"
+        ):
+            post_count += 1
+
+    page.on("request", count_submission)
+    await page.goto(live_application.base_url + "/compose")
+    await page.locator("#compose-sender").select_option(ACCOUNT)
+    form = page.locator("#compose-form")
+    await form.locator('input[name="password"]').fill("fixture-mail-password")
+    await form.locator('input[name="to"]').fill("recipient@example.test")
+    await form.locator('textarea[name="text"]').fill("body")
+
+    await page.context.clear_cookies()
+    await page.locator("#send-button").click()
+
+    await (
+        page.locator("[data-send-progress]")
+        .get_by_text(
+            "Maddy accepted the message",
+            exact=False,
+        )
+        .wait_for()
+    )
+    assert post_count == 1
+    assert len(gateway.deliveries) == 1
+    assert gateway.sent_saves == 1
+
+
+async def test_compose_resynchronizes_csrf_after_another_tab_rotates_cookie(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    gateway = live_application.gateway
+    post_count = 0
+
+    def count_submission(request: object) -> None:
+        nonlocal post_count
+        if (
+            getattr(request, "method", "") == "POST"
+            and urlsplit(getattr(request, "url", "")).path == "/api/v1/send"
+        ):
+            post_count += 1
+
+    page.on("request", count_submission)
+    await page.goto(live_application.base_url + "/compose")
+    await page.locator("#compose-sender").select_option(ACCOUNT)
+    form = page.locator("#compose-form")
+    await form.locator('input[name="password"]').fill("fixture-mail-password")
+    await form.locator('input[name="to"]').fill("recipient@example.test")
+    await form.locator('textarea[name="text"]').fill("body")
+
+    other_page = await page.context.new_page()
+    try:
+        await other_page.goto(live_application.base_url + "/")
+        rotation = await other_page.evaluate(
+            """async () => {
+                const session = await fetch("/api/v1/session");
+                const token = (await session.json()).data.csrf_token;
+                const response = await fetch("/api/v1/not-real", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "X-CSRF-Token": token,
+                    },
+                    body: "{}",
+                });
+                return {
+                    status: response.status,
+                    replacement: response.headers.get("X-CSRF-Token"),
+                };
+            }"""
+        )
+        assert rotation["status"] == 404
+        assert rotation["replacement"]
+    finally:
+        await other_page.close()
+
+    await page.locator("#send-button").click()
+    await (
+        page.locator("[data-send-progress]")
+        .get_by_text(
+            "Maddy accepted the message",
+            exact=False,
+        )
+        .wait_for()
+    )
+    assert post_count == 1
+    assert len(gateway.deliveries) == 1
+    assert gateway.sent_saves == 1
+
+
+async def test_compose_recovers_from_same_cookie_name_on_another_loopback_port(
+    page: Page,
+    live_application: LiveApplication,
+    tmp_path: Path,
+) -> None:
+    other_gateway = BrowserSecurityGateway()
+    other_app = create_app(  # type: ignore[arg-type]
+        {
+            "server": {
+                "allowed_hosts": ("127.0.0.1",),
+                "concurrency": 4,
+                "max_upload_bytes": 4 * 1024 * 1024,
+                "request_body_timeout_seconds": 5,
+                "page_size": 20,
+                "temp_dir": tmp_path,
+            },
+            "security": {
+                "session_signing_key": secrets.token_bytes(32),
+                "csrf_ttl_seconds": 300,
+                "cookie_name": COOKIE_NAME,
+                "secure_cookies": True,
+            },
+        },
+        other_gateway,
+    )
+    other_runner = web.AppRunner(other_app, access_log=None)
+    await other_runner.setup()
+    listener, other_port = _listening_socket()
+    other_site = web.SockSite(other_runner, listener)
+    await other_site.start()
+
+    post_count = 0
+
+    def count_submission(request: object) -> None:
+        nonlocal post_count
+        if (
+            getattr(request, "method", "") == "POST"
+            and urlsplit(getattr(request, "url", "")).path == "/api/v1/send"
+        ):
+            post_count += 1
+
+    page.on("request", count_submission)
+    try:
+        await page.goto(live_application.base_url + "/compose")
+        await page.locator("#compose-sender").select_option(ACCOUNT)
+        form = page.locator("#compose-form")
+        await form.locator('input[name="password"]').fill("fixture-mail-password")
+        await form.locator('input[name="to"]').fill("recipient@example.test")
+        await form.locator('textarea[name="text"]').fill("body")
+
+        other_page = await page.context.new_page()
+        try:
+            await other_page.goto(f"http://127.0.0.1:{other_port}/")
+            await other_page.evaluate(
+                """async () => {
+                    const response = await fetch("/api/v1/session");
+                    return (await response.json()).data.csrf_token;
+                }"""
+            )
+        finally:
+            await other_page.close()
+
+        await page.locator("#send-button").click()
+        await (
+            page.locator("[data-send-progress]")
+            .get_by_text(
+                "Maddy accepted the message",
+                exact=False,
+            )
+            .wait_for()
+        )
+        assert post_count == 1
+        assert len(live_application.gateway.deliveries) == 1
+        assert live_application.gateway.sent_saves == 1
+        assert other_gateway.deliveries == []
+    finally:
+        await other_runner.cleanup()
+
+
+async def test_compose_never_retries_an_explicit_csrf_rejection(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    post_count = 0
+
+    async def reject_submission(route: Route) -> None:
+        nonlocal post_count
+        post_count += 1
+        await route.fulfill(
+            status=403,
+            content_type="application/json",
+            body=json.dumps(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "csrf_failed",
+                        "message": "CSRF check failed; refresh.",
+                    },
+                }
+            ),
+        )
+
+    await page.route("**/api/v1/send", reject_submission)
+    await page.goto(live_application.base_url + "/compose")
+    await page.locator("#compose-sender").select_option(ACCOUNT)
+    form = page.locator("#compose-form")
+    await form.locator('input[name="password"]').fill("fixture-mail-password")
+    await form.locator('input[name="to"]').fill("recipient@example.test")
+    await form.locator('textarea[name="text"]').fill("body")
+    await page.locator("#send-button").click()
+
+    alert = page.locator("#global-alert")
+    await alert.get_by_text("This attempt did not send a message", exact=False).wait_for()
+    await page.wait_for_timeout(50)
+    assert post_count == 1
+    assert live_application.gateway.deliveries == []
+    assert await page.locator("#send-button").is_enabled()
+    assert await form.locator('input[name="password"]').input_value() == ""
+
+
+async def test_compose_locks_after_an_unverifiable_success_response(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    post_count = 0
+
+    async def truncate_submission_response(route: Route) -> None:
+        nonlocal post_count
+        post_count += 1
+        await route.fulfill(
+            status=200,
+            content_type="application/json",
+            body='{"ok":true',
+        )
+
+    await page.route("**/api/v1/send", truncate_submission_response)
+    await page.goto(live_application.base_url + "/compose")
+    await page.locator("#compose-sender").select_option(ACCOUNT)
+    form = page.locator("#compose-form")
+    await form.locator('input[name="password"]').fill("fixture-mail-password")
+    await form.locator('input[name="to"]').fill("recipient@example.test")
+    await form.locator('textarea[name="text"]').fill("body")
+    button = page.locator("#send-button")
+    await button.click()
+
+    alert = page.locator("#global-alert")
+    await alert.get_by_text("The delivery result is unknown", exact=False).wait_for()
+    await page.wait_for_timeout(50)
+    assert post_count == 1
+    assert await button.is_disabled()
+    assert await button.inner_text() == "Sending locked"
+    assert await form.locator('input[name="password"]').input_value() == ""
+
+
+async def test_compose_locks_after_a_reused_csrf_token(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    post_count = 0
+
+    async def reject_submission(route: Route) -> None:
+        nonlocal post_count
+        post_count += 1
+        await route.fulfill(
+            status=403,
+            content_type="application/json",
+            body=json.dumps(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "csrf_reused",
+                        "message": "CSRF token reused; refresh.",
+                    },
+                }
+            ),
+        )
+
+    await page.route("**/api/v1/send", reject_submission)
+    await page.goto(live_application.base_url + "/compose")
+    await page.locator("#compose-sender").select_option(ACCOUNT)
+    form = page.locator("#compose-form")
+    await form.locator('input[name="password"]').fill("fixture-mail-password")
+    await form.locator('input[name="to"]').fill("recipient@example.test")
+    await form.locator('textarea[name="text"]').fill("body")
+    button = page.locator("#send-button")
+    await button.click()
+
+    alert = page.locator("#global-alert")
+    await alert.get_by_text("The delivery result is unknown", exact=False).wait_for()
+    await page.wait_for_timeout(50)
+    assert post_count == 1
+    assert live_application.gateway.deliveries == []
+    assert await button.is_disabled()
+    assert await button.inner_text() == "Sending locked"
+
+
 async def test_compose_network_failure_locks_ambiguous_submission(
     page: Page,
     live_application: LiveApplication,
@@ -513,9 +812,12 @@ async def test_theme_persists_and_mobile_navigation_has_safe_touch_targets(
     await toggle.click()
     assert await root.get_attribute("data-theme") == "dark"
     assert await toggle.get_attribute("aria-label") == "Use light theme"
-    assert await page.evaluate(
-        "getComputedStyle(document.documentElement).getPropertyValue('--surface')"
-    ) != initial_surface
+    assert (
+        await page.evaluate(
+            "getComputedStyle(document.documentElement).getPropertyValue('--surface')"
+        )
+        != initial_surface
+    )
     assert await page.evaluate("localStorage.getItem('maddyweb-theme')") == "dark"
     await page.reload()
     assert await root.get_attribute("data-theme") == "dark"

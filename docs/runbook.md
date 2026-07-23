@@ -375,6 +375,10 @@ ssh -vv -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=yes \
 - On `connect failed`, run smoke and status locally on the server. Do not temporarily change the listener to
   `0.0.0.0:8787`.
 - The browser Host must be `127.0.0.1` or `localhost`; otherwise the allowed-host check rejects it.
+- Browser cookies are scoped to the loopback hostname, not the local port. When two MaddyWeb servers may be
+  forwarded at the same time, configure a different `security.cookie_name` with the `__Host-` prefix on each
+  server. The SPA synchronizes its process-bound CSRF token immediately before each write, but unique cookie
+  names also prevent one remote server from replacing another server's cookie.
 
 ## Incident stop conditions
 
