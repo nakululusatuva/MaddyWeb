@@ -178,7 +178,11 @@
   };
 
   const executeMutation = async (path, options) => {
-    if (!state.csrfToken) await refreshSession();
+    // The process-bound token can expire, become invalid after a service
+    // restart, or be rotated by another tab. Synchronize immediately before
+    // every serialized write so the header and HttpOnly cookie still match.
+    // A rejected write is never retried automatically.
+    await refreshSession();
     const headers = {
       "Accept": "application/json",
       "X-CSRF-Token": state.csrfToken,
@@ -214,6 +218,12 @@
       state.csrfToken = "";
     }
     const payload = await readJson(response);
+    if (payload === null) {
+      throw new ApiError(
+        "The server response could not be verified.",
+        {status: response.status, ambiguous: true},
+      );
+    }
     if (!response.ok) {
       const error = errorFromResponse(response, payload);
       if (response.status >= 500 && error.code !== "message_not_delivered") {
@@ -224,6 +234,7 @@
     if (objectValue(payload).ok !== true) {
       throw new ApiError("The API response was not successful.", {
         status: response.status,
+        ambiguous: true,
       });
     }
     return objectValue(payload);
@@ -1102,6 +1113,7 @@
       const uncertain = error instanceof ApiError
         && (
           error.ambiguous
+          || error.code === "csrf_reused"
           || error.code === "delivery_unconfirmed"
           || (error.status >= 500 && error.code !== "message_not_delivered")
         );
@@ -1110,6 +1122,17 @@
         const message = "The delivery result is unknown. Do not resend. Check Sent and server logs.";
         showAlert(message);
         setComposeBusy(false, message);
+      } else if (error instanceof ApiError && error.code === "csrf_failed") {
+        const message = (
+          "The secure session changed before this delivery attempt started. "
+          + "This attempt did not send a message. "
+          + "Re-enter the sending password and try again."
+        );
+        showAlert(message);
+        setComposeBusy(
+          false,
+          "This delivery attempt did not start. Re-enter the password and try again.",
+        );
       } else {
         handleError(error, "The message was not delivered.");
         setComposeBusy(false, "The message was not delivered. Review the error and try again.");

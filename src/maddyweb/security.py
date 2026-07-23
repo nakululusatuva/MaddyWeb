@@ -484,6 +484,26 @@ def security_middleware(config: SecurityConfig) -> web.middleware:
             path="/",
         )
 
+    def recoverable_csrf_rejection(
+        request: web.Request,
+        *,
+        message: str,
+    ) -> web.Response:
+        """Reject before the handler while synchronizing the next explicit attempt."""
+
+        response = _error_response(
+            request,
+            status=403,
+            code="csrf_failed",
+            message=message,
+        )
+        replacement = new_csrf_token(csrf_key)
+        request[_CSRF_REQUEST_KEY] = replacement
+        set_csrf_cookie(response, replacement)
+        response.headers["X-CSRF-Token"] = replacement
+        _apply_security_headers(response)
+        return response
+
     @web.middleware
     async def middleware(request: web.Request, handler: web.RequestHandler) -> web.StreamResponse:
         hosts = request.headers.getall("Host", [])
@@ -557,14 +577,10 @@ def security_middleware(config: SecurityConfig) -> web.middleware:
             # pass CSRF validation.  Reject it before reading a potentially
             # unbounded slow request body.
             if cookie_token is None or verified_cookie is None:
-                response = _error_response(
+                return recoverable_csrf_rejection(
                     request,
-                    status=403,
-                    code="csrf_failed",
                     message="CSRF check failed; refresh.",
                 )
-                _apply_security_headers(response)
-                return response
             send_upload = request.path == "/api/v1/send"
             api_json_write = _is_api_path(request.path) and not send_upload
             required_content_type = (
@@ -592,14 +608,10 @@ def security_middleware(config: SecurityConfig) -> web.middleware:
                 _apply_security_headers(response)
                 return response
             if submitted is None or not hmac.compare_digest(cookie_token, submitted):
-                response = _error_response(
+                return recoverable_csrf_rejection(
                     request,
-                    status=403,
-                    code="csrf_failed",
                     message="CSRF check failed; refresh.",
                 )
-                _apply_security_headers(response)
-                return response
             nonce = verified_cookie[0]
             if not await nonces.reserve(nonce):
                 response = _error_response(

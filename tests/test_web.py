@@ -300,7 +300,7 @@ async def test_home_static_assets_and_strict_headers(
     assert response.status == 200
     assert "Administration overview" in page
     assert 'href="/static/app.css?v=5"' in page
-    assert 'src="/static/app.js?v=5"' in page
+    assert 'src="/static/app.js?v=6"' in page
     assert '<main id="main" class="app-main" tabindex="-1">' in page
     assert "admin@example.test" not in page
     assert "csrf_token" not in page

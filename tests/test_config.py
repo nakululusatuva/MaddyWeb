@@ -1,3 +1,4 @@
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,21 @@ def test_safe_defaults_are_loopback_and_small_after_explicit_mode() -> None:
     assert config.server.max_upload_bytes == 20 * 1024 * 1024
     assert config.maddy.mode == "docker"
     assert config.certificates.webroot_roots == ()
+
+
+def test_example_cookie_names_are_distinct_across_local_instances() -> None:
+    repository = Path(__file__).resolve().parents[1]
+    paths = (
+        repository / "deploy" / "examples" / "config.native.toml",
+        repository / "deploy" / "examples" / "config.wsl.toml",
+        repository / "docker" / "config.toml",
+    )
+    names = [
+        str(tomllib.loads(path.read_text(encoding="utf-8"))["security"]["cookie_name"])
+        for path in paths
+    ]
+    assert len(set(names)) == len(names)
+    assert all(name.startswith("__Host-maddyweb-") for name in names)
 
 
 @pytest.mark.parametrize(
@@ -154,9 +170,7 @@ def test_dedicated_custom_certificate_config_root_is_accepted() -> None:
             }
         }
     )
-    assert str(config.certificates.renewal_dir) == (
-        "/srv/maddyweb/certbot/site/renewal"
-    )
+    assert str(config.certificates.renewal_dir) == ("/srv/maddyweb/certbot/site/renewal")
 
 
 def test_docker_paths_default_inside_container_data_and_cannot_escape() -> None:

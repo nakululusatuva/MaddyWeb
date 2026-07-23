@@ -129,17 +129,23 @@ async def test_cookie_and_response_security_headers(security_client: TestClient)
 async def test_invalid_host_and_cross_origin_are_rejected(security_client: TestClient) -> None:
     invalid_host = await security_client.get("/token", headers={"Host": "evil.example"})
     assert invalid_host.status == 400
+    assert "Set-Cookie" not in invalid_host.headers
+    assert "X-CSRF-Token" not in invalid_host.headers
 
     await security_client.get("/token")
     token = _cookie(security_client)
     missing_origin = await security_client.post("/write", data={"_csrf": token})
     assert missing_origin.status == 403
+    assert "Set-Cookie" not in missing_origin.headers
+    assert "X-CSRF-Token" not in missing_origin.headers
     cross_origin = await security_client.post(
         "/write",
         data={"_csrf": token},
         headers={"Origin": "https://evil.example"},
     )
     assert cross_origin.status == 403
+    assert "Set-Cookie" not in cross_origin.headers
+    assert "X-CSRF-Token" not in cross_origin.headers
 
 
 @pytest.mark.asyncio
@@ -206,6 +212,104 @@ async def test_failed_write_consumes_nonce_and_rotates_cookie(
     )
     assert replay.status == 403
     assert re.search("token|CSRF", await replay.text())
+
+
+@pytest.mark.asyncio
+async def test_mismatched_csrf_pair_recovers_for_only_the_next_explicit_write(
+    security_client: TestClient,
+) -> None:
+    await security_client.get("/token")
+    stale_token = _cookie(security_client)
+    origin = str(security_client.make_url("/"))
+
+    rotation = await security_client.post(
+        "/fail",
+        data={"_csrf": stale_token},
+        headers={"Origin": origin},
+    )
+    assert rotation.status == 400
+    current_token = _cookie(security_client)
+    assert current_token != stale_token
+
+    rejected = await security_client.post(
+        "/write",
+        data={"_csrf": stale_token},
+        headers={"Origin": origin},
+    )
+    assert rejected.status == 403
+    replacement = rejected.headers["X-CSRF-Token"]
+    assert replacement == _cookie(security_client)
+    assert replacement != current_token
+
+    explicit_retry = await security_client.post(
+        "/write",
+        data={"_csrf": replacement},
+        headers={"Origin": origin},
+    )
+    assert explicit_retry.status == 200
+
+
+@pytest.mark.asyncio
+async def test_pre_restart_cookie_recovers_without_entering_the_handler() -> None:
+    config = SecurityConfig(
+        allowed_hosts=("127.0.0.1",),
+        session_signing_key=KEY,
+        secure_cookies=False,
+        csrf_cookie_name=COOKIE,
+        csrf_max_age=300,
+    )
+
+    first_app = web.Application(middlewares=[security_middleware(config)])
+
+    async def token(request: web.Request) -> web.Response:
+        return web.Response(text=csrf_token_for_request(request))
+
+    first_app.router.add_get("/token", token)
+    first_client = TestClient(TestServer(first_app), cookie_jar=CookieJar(unsafe=True))
+    await first_client.start_server()
+    try:
+        first_response = await first_client.get("/token")
+        stale_token = await first_response.text()
+        assert stale_token == _cookie(first_client)
+    finally:
+        await first_client.close()
+
+    handler_calls = 0
+    second_app = web.Application(middlewares=[security_middleware(config)])
+
+    async def write(_request: web.Request) -> web.Response:
+        nonlocal handler_calls
+        handler_calls += 1
+        return web.Response(text="written")
+
+    second_app.router.add_post("/write", write)
+    second_client = TestClient(TestServer(second_app), cookie_jar=CookieJar(unsafe=True))
+    await second_client.start_server()
+    try:
+        origin = str(second_client.make_url("/"))
+        rejected = await second_client.post(
+            "/write",
+            data={"_csrf": stale_token},
+            headers={
+                "Cookie": f"{COOKIE}={stale_token}",
+                "Origin": origin,
+            },
+        )
+        assert rejected.status == 403
+        assert handler_calls == 0
+        replacement = rejected.headers["X-CSRF-Token"]
+        assert replacement == _cookie(second_client)
+        assert replacement != stale_token
+
+        explicit_retry = await second_client.post(
+            "/write",
+            data={"_csrf": replacement},
+            headers={"Origin": origin},
+        )
+        assert explicit_retry.status == 200
+        assert handler_calls == 1
+    finally:
+        await second_client.close()
 
 
 @pytest.mark.asyncio
@@ -316,6 +420,7 @@ async def test_missing_csrf_cookie_is_rejected_without_reading_body() -> None:
             timeout=0.2,
         )
         assert response.status == 403
+        assert response.headers["X-CSRF-Token"] == _cookie(client)
     finally:
         await client.close()
 
