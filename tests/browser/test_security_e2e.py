@@ -94,6 +94,12 @@ async def _open_message(page: Page, live_application: LiveApplication) -> None:
     ).wait_for()
 
 
+async def _fill_write_body(page: Page, text: str) -> None:
+    editor = page.locator("#message-editor")
+    await editor.fill(text)
+    assert await page.locator("#body-write-tab").get_attribute("aria-selected") == "true"
+
+
 async def test_spa_navigation_loads_each_operational_view_without_document_reload(
     page: Page,
     live_application: LiveApplication,
@@ -499,14 +505,26 @@ async def test_compose_shows_spinner_blocks_duplicates_and_reports_success(
     await page.goto(live_application.base_url + "/compose")
     await page.locator("#compose-sender").select_option(ACCOUNT)
     form = page.locator("#compose-form")
+    assert await page.locator("#body-write-tab").get_attribute("aria-selected") == "true"
+    assert await page.locator("#body-write-panel").is_visible()
+    assert await page.locator("#body-source-panel").is_hidden()
+    assert await page.locator("#body-preview-panel").is_hidden()
     await form.locator('input[name="sender_name"]').fill("Browser Sender")
     await form.locator('input[name="password"]').fill("fixture-mail-password")
     await form.locator('input[name="to"]').fill("recipient@example.test")
     await form.locator('input[name="subject"]').fill("Browser delivery fixture")
-    await form.locator('textarea[name="html"]').fill("<p>body</p>")
+    await _fill_write_body(page, "A short message.")
+    await page.locator("#attachments-input").set_input_files(
+        {
+            "name": "notes.txt",
+            "mimeType": "text/plain",
+            "buffer": b"ordinary attachment",
+        }
+    )
+    assert await page.locator("#attachment-chips").get_by_text("notes.txt").is_visible()
     await page.locator("#body-preview-tab").click()
-    await page.frame_locator("#html-preview").locator("p").get_by_text(
-        "body", exact=True
+    await page.frame_locator("#html-preview").get_by_text(
+        "A short message.", exact=True
     ).wait_for()
     button = page.locator("#send-button")
 
@@ -530,22 +548,145 @@ async def test_compose_shows_spinner_blocks_duplicates_and_reports_success(
     progress = page.locator("[data-send-progress]")
     await progress.get_by_text("Maddy accepted the message", exact=False).wait_for()
     assert await button.is_enabled()
-    assert await button.inner_text() == "Send message"
+    assert await button.inner_text() == "Send"
     assert await form.get_attribute("aria-busy") is None
     assert await form.locator('input[name="password"]').input_value() == ""
     assert await form.locator('input[name="sender_name"]').input_value() == ""
     assert await form.locator('textarea[name="html"]').input_value() == ""
-    assert await page.locator("#body-source-tab").get_attribute("aria-selected") == "true"
-    assert await page.locator("#body-source-panel").is_visible()
+    assert await page.locator("#message-editor").inner_text() == ""
+    assert await page.locator("#body-write-tab").get_attribute("aria-selected") == "true"
+    assert await page.locator("#body-write-panel").is_visible()
+    assert await page.locator("#compose-file-tray").is_hidden()
     assert post_count == 1
     assert len(gateway.deliveries) == 1
     delivered = gateway.deliveries[0]
     parsed = BytesParser(policy=policy.default).parsebytes(delivered["raw"])
     assert parsed["From"].addresses[0].display_name == "Browser Sender"
     assert parsed["From"].addresses[0].addr_spec == ACCOUNT
+    plain_body = parsed.get_body(preferencelist=("plain",))
+    assert plain_body is not None
+    assert plain_body.get_content().strip() == "A short message."
+    attachment = next(parsed.iter_attachments())
+    assert attachment.get_filename() == "notes.txt"
+    assert attachment.get_payload(decode=True) == b"ordinary attachment"
     assert delivered["envelope_from"] == ACCOUNT
     assert gateway.deliveries[0]["recipients"] == ("recipient@example.test",)
     assert gateway.sent_saves == 1
+
+
+async def test_compose_write_source_preview_modes_and_formatting_stay_synchronized(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    await page.goto(live_application.base_url + "/compose")
+    editor = page.locator("#message-editor")
+    source = page.locator("#html-source")
+
+    await _fill_write_body(page, "Formatted message")
+    await editor.press("Control+A")
+    await page.get_by_role("button", name="Bold", exact=True).click()
+    await page.locator("#body-source-tab").click()
+    source_value = await source.input_value()
+    assert "Formatted message" in source_value
+    assert "<b>" in source_value or "<strong>" in source_value
+
+    edited_source = "<p>Edited <em>source</em></p>"
+    await source.fill(edited_source)
+    await page.locator("#body-write-tab").click()
+    assert await editor.inner_text() == "Edited source"
+    assert await editor.locator("em").inner_text() == "source"
+    assert await source.input_value() == edited_source
+
+    write_tab = page.locator("#body-write-tab")
+    await write_tab.focus()
+    await write_tab.press("ArrowRight")
+    assert await page.locator("#body-source-tab").get_attribute("aria-selected") == "true"
+    assert await page.locator("#body-source-tab").evaluate(
+        "node => node === document.activeElement"
+    )
+    await page.locator("#body-source-tab").press("End")
+    assert await page.locator("#body-preview-tab").get_attribute("aria-selected") == "true"
+    assert await page.locator("#body-preview-tab").evaluate(
+        "node => node === document.activeElement"
+    )
+    await page.frame_locator("#html-preview").locator("em").get_by_text(
+        "source", exact=True
+    ).wait_for()
+    await page.locator("#body-preview-tab").press("Home")
+    assert await write_tab.get_attribute("aria-selected") == "true"
+    assert await write_tab.evaluate("node => node === document.activeElement")
+    assert await source.input_value() == edited_source
+
+
+async def test_compose_write_paste_treats_html_as_literal_text_without_network_access(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    remote_requests: list[str] = []
+
+    def record_request(request: object) -> None:
+        url = getattr(request, "url", "")
+        if "tracker.invalid" in url:
+            remote_requests.append(url)
+
+    page.on("request", record_request)
+    await page.goto(live_application.base_url + "/compose")
+    editor = page.locator("#message-editor")
+    literal = '<img src="https://tracker.invalid/pixel"><script>unsafe()</script>'
+    await editor.focus()
+    await editor.evaluate(
+        """(node, value) => {
+            const data = new DataTransfer();
+            data.setData("text/html", value);
+            data.setData("text/plain", value);
+            node.dispatchEvent(new ClipboardEvent("paste", {
+                bubbles: true,
+                cancelable: true,
+                clipboardData: data,
+            }));
+        }""",
+        literal,
+    )
+    assert await editor.inner_text() == literal
+    assert await editor.locator("img, script").count() == 0
+    assert remote_requests == []
+    await page.locator("#body-source-tab").click()
+    assert "&lt;img" in await page.locator("#html-source").input_value()
+    await page.locator("#body-preview-tab").click()
+    assert await page.frame_locator("#html-preview").locator("body").inner_text() == literal
+    assert remote_requests == []
+
+
+async def test_compose_empty_body_reports_validation_on_visible_write_editor(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    post_count = 0
+
+    def count_submission(request: object) -> None:
+        nonlocal post_count
+        if (
+            getattr(request, "method", "") == "POST"
+            and urlsplit(getattr(request, "url", "")).path == "/api/v1/send"
+        ):
+            post_count += 1
+
+    page.on("request", count_submission)
+    await page.goto(live_application.base_url + "/compose")
+    await page.locator("#compose-sender").select_option(ACCOUNT)
+    form = page.locator("#compose-form")
+    await form.locator('input[name="password"]').fill("fixture-mail-password")
+    await form.locator('input[name="to"]').fill("recipient@example.test")
+    await page.locator("#send-button").click()
+
+    editor = page.locator("#message-editor")
+    assert post_count == 0
+    assert await page.locator("#body-write-tab").get_attribute("aria-selected") == "true"
+    assert await editor.get_attribute("aria-invalid") == "true"
+    assert await editor.evaluate("node => node === document.activeElement")
+    assert await page.locator("#body-error").inner_text() == (
+        "Write a message that contains visible, safe content."
+    )
 
 
 async def test_compose_html_source_preview_is_sandboxed_and_blocks_remote_content(
@@ -561,6 +702,8 @@ async def test_compose_html_source_preview_is_sandboxed_and_blocks_remote_conten
 
     page.on("request", record_request)
     await page.goto(live_application.base_url + "/compose")
+    assert await page.locator("#body-write-tab").get_attribute("aria-selected") == "true"
+    await page.locator("#body-source-tab").click()
     source = page.locator("#html-source")
     html = (
         "<h1>Preview heading</h1>"
@@ -596,6 +739,14 @@ async def test_compose_html_source_preview_is_sandboxed_and_blocks_remote_conten
     assert await page.locator("#body-source-tab").get_attribute("aria-selected") == "true"
     assert await page.locator("#body-preview-panel").is_hidden()
 
+    await page.locator("#body-write-tab").click()
+    write = page.locator("#message-editor")
+    assert await write.locator("script, form, img").count() == 0
+    assert await write.locator("h1").inner_text() == "Preview heading"
+    assert await write.locator("a").get_attribute("href") is None
+    assert await source.input_value() == html
+    assert remote_requests == []
+
     await page.locator("#inline-images").set_input_files(
         {
             "name": "logo.png",
@@ -606,6 +757,7 @@ async def test_compose_html_source_preview_is_sandboxed_and_blocks_remote_conten
             ),
         }
     )
+    await page.locator("#body-source-tab").click()
     first_source = await source.input_value()
     assert 'src="cid:' in first_source
     first_cid = first_source.split('src="cid:', 1)[1].split('"', 1)[0]
@@ -676,7 +828,7 @@ async def test_compose_resynchronizes_csrf_after_cookie_expiry(
     form = page.locator("#compose-form")
     await form.locator('input[name="password"]').fill("fixture-mail-password")
     await form.locator('input[name="to"]').fill("recipient@example.test")
-    await form.locator('textarea[name="html"]').fill("<p>body</p>")
+    await _fill_write_body(page, "body")
 
     await page.context.clear_cookies()
     await page.locator("#send-button").click()
@@ -715,7 +867,7 @@ async def test_compose_resynchronizes_csrf_after_another_tab_rotates_cookie(
     form = page.locator("#compose-form")
     await form.locator('input[name="password"]').fill("fixture-mail-password")
     await form.locator('input[name="to"]').fill("recipient@example.test")
-    await form.locator('textarea[name="html"]').fill("<p>body</p>")
+    await _fill_write_body(page, "body")
 
     other_page = await page.context.new_page()
     try:
@@ -805,7 +957,7 @@ async def test_compose_recovers_from_same_cookie_name_on_another_loopback_port(
         form = page.locator("#compose-form")
         await form.locator('input[name="password"]').fill("fixture-mail-password")
         await form.locator('input[name="to"]').fill("recipient@example.test")
-        await form.locator('textarea[name="html"]').fill("<p>body</p>")
+        await _fill_write_body(page, "body")
 
         other_page = await page.context.new_page()
         try:
@@ -865,7 +1017,7 @@ async def test_compose_never_retries_an_explicit_csrf_rejection(
     form = page.locator("#compose-form")
     await form.locator('input[name="password"]').fill("fixture-mail-password")
     await form.locator('input[name="to"]').fill("recipient@example.test")
-    await form.locator('textarea[name="html"]').fill("<p>body</p>")
+    await _fill_write_body(page, "body")
     await page.locator("#send-button").click()
 
     alert = page.locator("#global-alert")
@@ -898,7 +1050,7 @@ async def test_compose_locks_after_an_unverifiable_success_response(
     form = page.locator("#compose-form")
     await form.locator('input[name="password"]').fill("fixture-mail-password")
     await form.locator('input[name="to"]').fill("recipient@example.test")
-    await form.locator('textarea[name="html"]').fill("<p>body</p>")
+    await _fill_write_body(page, "body")
     button = page.locator("#send-button")
     await button.click()
 
@@ -940,7 +1092,7 @@ async def test_compose_locks_after_a_reused_csrf_token(
     form = page.locator("#compose-form")
     await form.locator('input[name="password"]').fill("fixture-mail-password")
     await form.locator('input[name="to"]').fill("recipient@example.test")
-    await form.locator('textarea[name="html"]').fill("<p>body</p>")
+    await _fill_write_body(page, "body")
     button = page.locator("#send-button")
     await button.click()
 
@@ -970,7 +1122,7 @@ async def test_compose_network_failure_locks_ambiguous_submission(
     form = page.locator("#compose-form")
     await form.locator('input[name="password"]').fill("fixture-mail-password")
     await form.locator('input[name="to"]').fill("recipient@example.test")
-    await form.locator('textarea[name="html"]').fill("<p>body</p>")
+    await _fill_write_body(page, "body")
     button = page.locator("#send-button")
     await button.click()
     warning = page.locator("[data-send-progress]")
@@ -1017,6 +1169,8 @@ async def test_theme_persists_and_mobile_navigation_has_safe_touch_targets(
 
     await page.set_viewport_size({"width": 320, "height": 844})
     await page.goto(live_application.base_url + "/compose")
+    await page.get_by_role("heading", name="Compose", exact=True).wait_for()
+    await page.locator('.compose-action[aria-current="page"]:visible').wait_for()
     visible_links = page.locator(".primary-nav a:visible")
     assert await visible_links.all_inner_texts() == [
         "Compose",
@@ -1028,8 +1182,11 @@ async def test_theme_persists_and_mobile_navigation_has_safe_touch_targets(
     assert await page.locator('.compose-action[aria-current="page"]:visible').count() == 1
     assert await page.locator("#compose-sender").is_visible()
     assert await page.locator("#compose-sender-name").is_visible()
+    assert await page.locator("#body-write-tab").is_visible()
     assert await page.locator("#body-source-tab").is_visible()
     assert await page.locator("#body-preview-tab").is_visible()
+    assert await page.locator("#message-editor").is_visible()
+    assert await page.get_by_role("toolbar", name="Message formatting").is_visible()
     assert await page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
     for index in range(await visible_links.count()):
         bounds = await visible_links.nth(index).bounding_box()
@@ -1047,6 +1204,9 @@ async def test_client_uses_safe_dom_construction_without_unsafe_html_sinks() -> 
         ".innerHTML",
         ".outerHTML",
         "insertAdjacentHTML",
+        "insertHTML",
+        "createContextualFragment",
+        "setHTMLUnsafe",
         "document.write",
         "document.writeln",
         "eval(",

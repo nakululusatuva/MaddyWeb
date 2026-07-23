@@ -299,16 +299,38 @@ async def test_home_static_assets_and_strict_headers(
     page = await response.text()
     assert response.status == 200
     assert "Administration overview" in page
-    assert 'href="/static/app.css?v=7"' in page
-    assert 'src="/static/app.js?v=8"' in page
+    assert 'href="/static/app.css?v=8"' in page
+    assert 'src="/static/app.js?v=9"' in page
     assert 'id="compose-sender-name"' in page
     assert 'name="sender_name"' in page
     assert 'maxlength="256"' in page
     assert 'aria-describedby="sender-name-help"' in page
+    assert 'id="body-write-tab"' in page
+    assert 'id="body-write-panel"' in page
+    assert 'id="message-editor"' in page
+    assert 'contenteditable="true"' in page
+    assert 'role="textbox"' in page
+    assert 'aria-multiline="true"' in page
+    assert 'role="toolbar" aria-label="Message formatting"' in page
+    assert (
+        'aria-selected="true" aria-controls="body-write-panel" tabindex="0" '
+        'data-body-mode="write"'
+    ) in page
     assert 'id="html-source"' in page
+    assert 'name="html"' in page
     assert 'id="html-preview"' in page
-    assert 'data-body-mode="source"' in page
-    assert 'data-body-mode="preview"' in page
+    assert (
+        'aria-selected="false" aria-controls="body-source-panel" tabindex="-1" '
+        'data-body-mode="source"'
+    ) in page
+    assert (
+        'aria-selected="false" aria-controls="body-preview-panel" tabindex="-1" '
+        'data-body-mode="preview"'
+    ) in page
+    assert 'id="body-source-panel" class="body-mode-panel"' in page
+    assert 'id="body-preview-panel" class="body-mode-panel"' in page
+    assert 'id="html-source" class="html-source" name="html"' in page
+    assert 'name="html" maxlength="2097152" required' not in page
     assert 'sandbox="allow-same-origin"' in page
     assert '<main id="main" class="app-main" tabindex="-1">' in page
     assert "admin@example.test" not in page
@@ -344,6 +366,9 @@ async def test_home_static_assets_and_strict_headers(
         "innerHTML",
         "outerHTML",
         "insertAdjacentHTML",
+        "insertHTML",
+        "createContextualFragment",
+        "setHTMLUnsafe",
         "document.write",
         "document.open",
         "srcdoc",

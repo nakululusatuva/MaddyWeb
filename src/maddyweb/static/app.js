@@ -84,7 +84,11 @@
     typedOpener: null,
     toastTimer: 0,
     inlineImages: [],
-    bodyMode: "source",
+    bodyMode: "write",
+    writeDirty: false,
+    writeSourceSnapshot: "",
+    writeLinkTargets: new WeakMap(),
+    writeImageCids: new WeakMap(),
     previewUrl: null,
     sendLocked: false,
     theme: "light",
@@ -777,24 +781,31 @@
   };
 
   const removeGeneratedCidImage = (source, cid) => {
-    const needle = `cid:${cid}`.toLowerCase();
     let result = source;
     let searchFrom = 0;
     while (searchFrom < result.length) {
       const lowered = result.toLowerCase();
-      const cidIndex = lowered.indexOf(needle, searchFrom);
-      if (cidIndex < 0) break;
-      const tagStart = lowered.lastIndexOf("<", cidIndex);
-      const tagSuffix = tagStart >= 0 ? lowered.slice(tagStart + 4, tagStart + 5) : "";
-      const isImageTag = tagStart >= 0
-        && lowered.startsWith("<img", tagStart)
-        && (!tagSuffix || /[\s/>]/.test(tagSuffix));
-      const tagEnd = isImageTag ? htmlTagEnd(result, tagStart) : -1;
-      if (tagEnd >= cidIndex) {
+      const tagStart = lowered.indexOf("<img", searchFrom);
+      if (tagStart < 0) break;
+      const tagSuffix = lowered.slice(tagStart + 4, tagStart + 5);
+      if (tagSuffix && !/[\s/>]/.test(tagSuffix)) {
+        searchFrom = tagStart + 4;
+        continue;
+      }
+      const tagEnd = htmlTagEnd(result, tagStart);
+      if (tagEnd < 0) break;
+      const fragment = result.slice(tagStart, tagEnd + 1);
+      const parsed = new DOMParser().parseFromString(fragment, "text/html");
+      const image = parsed.body.querySelector("img");
+      const rawSource = image ? image.getAttribute("src") : null;
+      const normalizedSource = rawSource === null
+        ? ""
+        : rawSource.trim().replace(/^cid:\s*/i, "cid:");
+      if (normalizedSource.toLowerCase() === `cid:${cid}`.toLowerCase()) {
         result = `${result.slice(0, tagStart)}${result.slice(tagEnd + 1)}`;
         searchFrom = tagStart;
       } else {
-        searchFrom = cidIndex + needle.length;
+        searchFrom = tagEnd + 1;
       }
     }
     return result;
@@ -829,6 +840,298 @@
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
 
+  const safeLinkTarget = (value) => {
+    const normalized = String(value || "").trim();
+    const lowered = normalized.toLowerCase();
+    return ["http://", "https://", "mailto:"].some((prefix) => lowered.startsWith(prefix))
+      ? normalized
+      : "";
+  };
+
+  const clearBodyError = () => {
+    const error = byId("body-error");
+    const editor = byId("message-editor");
+    const source = byId("html-source");
+    if (error) {
+      error.textContent = "";
+      error.hidden = true;
+    }
+    if (editor instanceof HTMLElement) editor.removeAttribute("aria-invalid");
+    if (source instanceof HTMLTextAreaElement) source.removeAttribute("aria-invalid");
+  };
+
+  const showBodyError = (message) => {
+    const error = byId("body-error");
+    const editor = byId("message-editor");
+    if (error) {
+      error.textContent = message;
+      error.hidden = false;
+    }
+    if (editor instanceof HTMLElement) editor.setAttribute("aria-invalid", "true");
+  };
+
+  const appendEditorNode = (sourceNode, parent) => {
+    if (sourceNode.nodeType === Node.TEXT_NODE) {
+      parent.append(document.createTextNode(sourceNode.nodeValue || ""));
+      return;
+    }
+    if (!(sourceNode instanceof HTMLElement)) return;
+    if (REMOVED_PREVIEW_CONTENT_TAGS.has(sourceNode.tagName)) return;
+    if (!ALLOWED_PREVIEW_TAGS.has(sourceNode.tagName)) {
+      for (const child of Array.from(sourceNode.childNodes)) appendEditorNode(child, parent);
+      return;
+    }
+
+    if (sourceNode.tagName === "IMG") {
+      const rawSource = sourceNode.getAttribute("src") || "";
+      if (!rawSource.toLowerCase().startsWith("cid:")) return;
+      const cid = rawSource.slice(4).trim().replace(/^<|>$/g, "");
+      const image = state.inlineImages.find((item) => item.cid === cid);
+      if (!image) return;
+      const editorImage = document.createElement("img");
+      editorImage.src = image.previewUrl;
+      for (const name of ["alt", "height", "title", "width"]) {
+        const value = sourceNode.getAttribute(name);
+        if (value !== null) editorImage.setAttribute(name, value);
+      }
+      state.writeImageCids.set(editorImage, cid);
+      parent.append(editorImage);
+      return;
+    }
+
+    const editorNode = document.createElement(sourceNode.tagName.toLowerCase());
+    const allowedAttributes = PREVIEW_ATTRIBUTES.get(sourceNode.tagName) || new Set();
+    for (const attribute of Array.from(sourceNode.attributes)) {
+      const name = attribute.name.toLowerCase();
+      if (!allowedAttributes.has(name) || name === "src" || name === "href") continue;
+      editorNode.setAttribute(name, attribute.value);
+    }
+    if (sourceNode.tagName === "A") {
+      const target = safeLinkTarget(sourceNode.getAttribute("href"));
+      if (target) state.writeLinkTargets.set(editorNode, target);
+    }
+    for (const child of Array.from(sourceNode.childNodes)) appendEditorNode(child, editorNode);
+    parent.append(editorNode);
+  };
+
+  const renderSourceInWrite = () => {
+    const source = byId("html-source");
+    const editor = byId("message-editor");
+    if (!(source instanceof HTMLTextAreaElement) || !(editor instanceof HTMLElement)) return;
+    const parsed = new DOMParser().parseFromString(source.value, "text/html");
+    const fragment = document.createDocumentFragment();
+    state.writeLinkTargets = new WeakMap();
+    state.writeImageCids = new WeakMap();
+    for (const child of Array.from(parsed.body.childNodes)) appendEditorNode(child, fragment);
+    editor.replaceChildren(fragment);
+    state.writeSourceSnapshot = source.value;
+    state.writeDirty = false;
+    clearBodyError();
+  };
+
+  const serializeEditorNode = (node) => {
+    if (node.nodeType === Node.TEXT_NODE) return escapeText(node.nodeValue || "");
+    if (!(node instanceof HTMLElement)) return "";
+    if (!ALLOWED_PREVIEW_TAGS.has(node.tagName)) {
+      return Array.from(node.childNodes).map(serializeEditorNode).join("");
+    }
+
+    const renderedAttributes = [];
+    if (node.tagName === "IMG") {
+      const cid = state.writeImageCids.get(node) || "";
+      const known = state.inlineImages.some((item) => item.cid === cid);
+      if (!known) return "";
+      renderedAttributes.push(` src="cid:${escapeAttribute(cid)}"`);
+    }
+    if (node.tagName === "A") {
+      const target = safeLinkTarget(state.writeLinkTargets.get(node));
+      if (target) renderedAttributes.push(` href="${escapeAttribute(target)}"`);
+    }
+    const allowedAttributes = PREVIEW_ATTRIBUTES.get(node.tagName) || new Set();
+    for (const attribute of Array.from(node.attributes)) {
+      const name = attribute.name.toLowerCase();
+      if (!allowedAttributes.has(name) || name === "src" || name === "href") continue;
+      renderedAttributes.push(` ${name}="${escapeAttribute(attribute.value)}"`);
+    }
+    const tag = node.tagName.toLowerCase();
+    const opening = `<${tag}${renderedAttributes.join("")}>`;
+    if (PREVIEW_VOID_TAGS.has(node.tagName)) return opening;
+    const children = Array.from(node.childNodes).map(serializeEditorNode).join("");
+    return `${opening}${children}</${tag}>`;
+  };
+
+  const commitWriteToSource = () => {
+    if (!state.writeDirty) return;
+    const source = byId("html-source");
+    const editor = byId("message-editor");
+    if (!(source instanceof HTMLTextAreaElement) || !(editor instanceof HTMLElement)) return;
+    source.value = Array.from(editor.childNodes).map(serializeEditorNode).join("");
+    state.writeSourceSnapshot = source.value;
+    state.writeDirty = false;
+    clearBodyError();
+  };
+
+  const markWriteDirty = () => {
+    state.writeDirty = true;
+    clearBodyError();
+  };
+
+  const editorSelectionRange = (editor) => {
+    const selection = window.getSelection();
+    if (selection && selection.rangeCount) {
+      const candidate = selection.getRangeAt(0);
+      if (editor.contains(candidate.commonAncestorContainer)) return candidate;
+    }
+    const range = document.createRange();
+    range.selectNodeContents(editor);
+    range.collapse(false);
+    return range;
+  };
+
+  const insertEditorNodes = (editor, nodes) => {
+    editor.focus();
+    const range = editorSelectionRange(editor);
+    range.deleteContents();
+    let last = null;
+    for (const node of nodes) {
+      range.insertNode(node);
+      range.setStartAfter(node);
+      range.collapse(true);
+      last = node;
+    }
+    const selection = window.getSelection();
+    if (selection && last) {
+      selection.removeAllRanges();
+      selection.addRange(range);
+    }
+    markWriteDirty();
+  };
+
+  const insertPlainText = (editor, value) => {
+    const nodes = [];
+    const lines = String(value).replaceAll("\r\n", "\n").replaceAll("\r", "\n").split("\n");
+    lines.forEach((line, index) => {
+      if (index) nodes.push(document.createElement("br"));
+      if (line) nodes.push(document.createTextNode(line));
+    });
+    if (!nodes.length) return;
+    insertEditorNodes(editor, nodes);
+  };
+
+  const replaceFileInput = (input, files) => {
+    const transfer = new DataTransfer();
+    for (const file of files) transfer.items.add(file);
+    input.files = transfer.files;
+  };
+
+  const displayFileSize = (size) => {
+    if (size < 1024) return `${size} B`;
+    if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KiB`;
+    return `${(size / (1024 * 1024)).toFixed(1)} MiB`;
+  };
+
+  const fileChip = (file, removeLabel, removeAction) => {
+    const detail = element("span", {className: "compose-file-detail"});
+    detail.append(
+      element("strong", {text: file.name || "Unnamed file"}),
+      element("small", {text: displayFileSize(file.size)}),
+    );
+    const remove = element("button", {
+      className: "compose-file-remove",
+      text: "Remove",
+      title: removeLabel,
+      type: "button",
+    });
+    remove.setAttribute("aria-label", removeLabel);
+    remove.addEventListener("click", removeAction);
+    return element("li", {}, [detail, remove]);
+  };
+
+  const updateFileTrayVisibility = () => {
+    const attachmentTray = byId("attachment-tray");
+    const inlineTray = byId("inline-image-tray");
+    const tray = byId("compose-file-tray");
+    if (!attachmentTray || !inlineTray || !tray) return;
+    tray.hidden = attachmentTray.hidden && inlineTray.hidden;
+  };
+
+  const renderAttachmentTray = () => {
+    const input = byId("attachments-input");
+    const list = byId("attachment-chips");
+    const tray = byId("attachment-tray");
+    if (
+      !(input instanceof HTMLInputElement)
+      || !(list instanceof HTMLUListElement)
+      || !tray
+    ) return;
+    const files = Array.from(input.files || []);
+    const fragment = document.createDocumentFragment();
+    files.forEach((file, index) => {
+      fragment.append(fileChip(file, `Remove attachment ${file.name}`, () => {
+        const remaining = Array.from(input.files || []).filter(
+          (_candidate, candidateIndex) => candidateIndex !== index,
+        );
+        replaceFileInput(input, remaining);
+        renderAttachmentTray();
+      }));
+    });
+    list.replaceChildren(fragment);
+    tray.hidden = files.length === 0;
+    updateFileTrayVisibility();
+  };
+
+  const renderInlineImageTray = () => {
+    const list = byId("inline-image-chips");
+    const tray = byId("inline-image-tray");
+    const input = byId("inline-images");
+    if (
+      !(list instanceof HTMLUListElement)
+      || !(input instanceof HTMLInputElement)
+      || !tray
+    ) return;
+    const fragment = document.createDocumentFragment();
+    state.inlineImages.forEach((item, index) => {
+      fragment.append(fileChip(item.file, `Remove inline image ${item.file.name}`, () => {
+        if (state.bodyMode === "write") commitWriteToSource();
+        const source = byId("html-source");
+        if (source instanceof HTMLTextAreaElement) {
+          source.value = removeGeneratedCidImage(source.value, item.cid);
+        }
+        window.URL.revokeObjectURL(item.previewUrl);
+        state.inlineImages.splice(index, 1);
+        replaceFileInput(input, state.inlineImages.map((candidate) => candidate.file));
+        if (state.bodyMode === "write") renderSourceInWrite();
+        if (state.bodyMode === "preview") renderBodyPreview();
+        renderInlineImageTray();
+      }));
+    });
+    list.replaceChildren(fragment);
+    tray.hidden = state.inlineImages.length === 0;
+    updateFileTrayVisibility();
+  };
+
+  const detectedInlineImageType = async (file) => {
+    const bytes = new Uint8Array(await file.slice(0, 16).arrayBuffer());
+    if (
+      bytes.length >= 8
+      && bytes[0] === 0x89
+      && bytes[1] === 0x50
+      && bytes[2] === 0x4e
+      && bytes[3] === 0x47
+      && bytes[4] === 0x0d
+      && bytes[5] === 0x0a
+      && bytes[6] === 0x1a
+      && bytes[7] === 0x0a
+    ) return "image/png";
+    if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+      return "image/jpeg";
+    }
+    const signature = String.fromCharCode(...bytes);
+    if (signature.startsWith("GIF87a") || signature.startsWith("GIF89a")) return "image/gif";
+    if (signature.startsWith("RIFF") && signature.slice(8, 12) === "WEBP") return "image/webp";
+    return "";
+  };
+
   const previewImageUrl = (value) => {
     if (!value.toLowerCase().startsWith("cid:")) return null;
     const cid = value.slice(4).trim().replace(/^<|>$/g, "");
@@ -849,12 +1152,7 @@
     const renderedAttributes = [];
     const allowedAttributes = PREVIEW_ATTRIBUTES.get(node.tagName) || new Set();
     const rawLinkTarget = node.tagName === "A" ? node.getAttribute("href") : null;
-    const normalizedLinkTarget = rawLinkTarget === null ? "" : rawLinkTarget.trim();
-    const loweredLinkTarget = normalizedLinkTarget.toLowerCase();
-    const previewLinkTarget = ["http://", "https://", "mailto:"]
-      .some((prefix) => loweredLinkTarget.startsWith(prefix))
-      ? normalizedLinkTarget
-      : "";
+    const previewLinkTarget = rawLinkTarget === null ? "" : safeLinkTarget(rawLinkTarget);
     for (const attribute of Array.from(node.attributes)) {
       const name = attribute.name.toLowerCase();
       if (!allowedAttributes.has(name)) continue;
@@ -919,7 +1217,9 @@
   };
 
   const setBodyMode = (mode, {focus = false} = {}) => {
-    const nextMode = mode === "preview" ? "preview" : "source";
+    const nextMode = ["write", "source", "preview"].includes(mode) ? mode : "write";
+    if (state.bodyMode === "write" && nextMode !== "write") commitWriteToSource();
+    if (nextMode === "write" && state.bodyMode !== "write") renderSourceInWrite();
     state.bodyMode = nextMode;
     for (const tab of document.querySelectorAll("[data-body-mode]")) {
       const selected = tab.getAttribute("data-body-mode") === nextMode;
@@ -927,6 +1227,7 @@
       tab.setAttribute("tabindex", selected ? "0" : "-1");
       if (focus && selected && tab instanceof HTMLButtonElement) tab.focus();
     }
+    byId("body-write-panel").hidden = nextMode !== "write";
     byId("body-source-panel").hidden = nextMode !== "source";
     byId("body-preview-panel").hidden = nextMode !== "preview";
     if (nextMode === "preview") renderBodyPreview();
@@ -950,15 +1251,34 @@
       ? "Sending..."
       : state.sendLocked
         ? "Sending locked"
-        : "Send message";
+        : "Send";
     if (progress) progress.textContent = label;
   };
 
   const resetCompose = () => {
     const form = byId("compose-form");
-    form.reset();
-    setBodyMode("source");
+    releaseBodyPreview();
     releaseInlineImages();
+    form.reset();
+    const source = byId("html-source");
+    const editor = byId("message-editor");
+    if (source instanceof HTMLTextAreaElement) source.value = "";
+    if (editor instanceof HTMLElement) editor.replaceChildren();
+    state.writeDirty = false;
+    state.writeSourceSnapshot = "";
+    state.writeLinkTargets = new WeakMap();
+    state.writeImageCids = new WeakMap();
+    for (const mode of ["cc", "bcc"]) {
+      const row = byId(`compose-${mode}-row`);
+      const toggle = document.querySelector(`[data-recipient-toggle="${mode}"]`);
+      if (row) row.hidden = true;
+      if (toggle) toggle.setAttribute("aria-expanded", "false");
+    }
+    clearBodyError();
+    renderAttachmentTray();
+    renderInlineImageTray();
+    setBodyMode("write");
+    updateFormattingButtons();
   };
 
   const loadCompose = async (signal) => {
@@ -1246,10 +1566,70 @@
     navigate(buildMailUrl({account, mailbox}));
   });
 
+  const FORMAT_COMMANDS = new Map([
+    ["bold", ["bold", null]],
+    ["italic", ["italic", null]],
+    ["underline", ["underline", null]],
+    ["unordered-list", ["insertUnorderedList", null]],
+    ["ordered-list", ["insertOrderedList", null]],
+    ["blockquote", ["formatBlock", "blockquote"]],
+    ["clear", ["removeFormat", null]],
+  ]);
+  const FORMAT_TOGGLE_STATES = new Map([
+    ["bold", "bold"],
+    ["italic", "italic"],
+    ["underline", "underline"],
+    ["unordered-list", "insertUnorderedList"],
+    ["ordered-list", "insertOrderedList"],
+  ]);
+
+  const updateFormattingButtons = () => {
+    for (const button of document.querySelectorAll("[data-format-command]")) {
+      const key = button.getAttribute("data-format-command");
+      const queryCommand = FORMAT_TOGGLE_STATES.get(key);
+      let active = false;
+      if (state.bodyMode === "write" && queryCommand) {
+        try {
+          active = document.queryCommandState(queryCommand);
+        } catch {
+          active = false;
+        }
+      }
+      if (button.hasAttribute("aria-pressed")) {
+        button.setAttribute("aria-pressed", active ? "true" : "false");
+      }
+    }
+  };
+
+  const runFormattingCommand = (key) => {
+    const command = FORMAT_COMMANDS.get(key);
+    const editor = byId("message-editor");
+    if (!command || !(editor instanceof HTMLElement) || state.bodyMode !== "write") return;
+    editor.focus();
+    document.execCommand(command[0], false, command[1]);
+    markWriteDirty();
+    updateFormattingButtons();
+  };
+
+  for (const toggle of document.querySelectorAll("[data-recipient-toggle]")) {
+    toggle.addEventListener("click", () => {
+      const mode = toggle.getAttribute("data-recipient-toggle");
+      if (mode !== "cc" && mode !== "bcc") return;
+      const row = byId(`compose-${mode}-row`);
+      const input = byId(`compose-${mode}`);
+      if (!row) return;
+      const visible = row.hidden;
+      row.hidden = !visible;
+      toggle.setAttribute("aria-expanded", visible ? "true" : "false");
+      if (visible && input instanceof HTMLInputElement) input.focus();
+    });
+  }
+
   const bodyModeTabs = Array.from(document.querySelectorAll("[data-body-mode]"));
   for (const button of bodyModeTabs) {
     button.addEventListener("click", () => {
       setBodyMode(button.getAttribute("data-body-mode"));
+      updateFormattingButtons();
     });
     button.addEventListener("keydown", (event) => {
       if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
@@ -1262,35 +1642,105 @@
           : (current + (event.key === "ArrowRight" ? 1 : -1) + bodyModeTabs.length)
             % bodyModeTabs.length;
       setBodyMode(bodyModeTabs[index].getAttribute("data-body-mode"), {focus: true});
+      updateFormattingButtons();
     });
   }
 
   byId("html-source").addEventListener("input", (event) => {
-    if (event.target instanceof HTMLTextAreaElement) event.target.setCustomValidity("");
+    if (event.target instanceof HTMLTextAreaElement) {
+      event.target.setCustomValidity("");
+      clearBodyError();
+    }
   });
 
-  byId("inline-images").addEventListener("change", (event) => {
-    releaseInlineImages({removeMarkup: true});
+  const editor = byId("message-editor");
+  editor.addEventListener("input", () => {
+    markWriteDirty();
+    updateFormattingButtons();
+  });
+  editor.addEventListener("paste", (event) => {
+    event.preventDefault();
+    insertPlainText(editor, event.clipboardData ? event.clipboardData.getData("text/plain") : "");
+  });
+  editor.addEventListener("drop", (event) => {
+    event.preventDefault();
+    insertPlainText(editor, event.dataTransfer ? event.dataTransfer.getData("text/plain") : "");
+  });
+  editor.addEventListener("click", (event) => {
+    if (event.target instanceof HTMLAnchorElement) event.preventDefault();
+    updateFormattingButtons();
+  });
+  editor.addEventListener("keyup", updateFormattingButtons);
+  editor.addEventListener("mouseup", updateFormattingButtons);
+
+  for (const button of document.querySelectorAll("[data-format-command]")) {
+    button.addEventListener("mousedown", (event) => event.preventDefault());
+    button.addEventListener("click", () => {
+      runFormattingCommand(button.getAttribute("data-format-command"));
+    });
+  }
+
+  byId("attach-files-button").addEventListener("click", () => {
+    byId("attachments-input").click();
+  });
+  byId("insert-image-button").addEventListener("click", () => {
+    byId("inline-images").click();
+  });
+  byId("attachments-input").addEventListener("change", renderAttachmentTray);
+
+  const insertMarkupInSource = (source, markup) => {
+    const start = state.bodyMode === "source" ? source.selectionStart : source.value.length;
+    const end = state.bodyMode === "source" ? source.selectionEnd : source.value.length;
+    const prefix = start > 0 && !source.value.slice(0, start).endsWith("\n") ? "\n" : "";
+    const suffix = end < source.value.length && !source.value.slice(end).startsWith("\n")
+      ? "\n"
+      : "";
+    source.setRangeText(`${prefix}${markup}${suffix}`, start, end, "end");
+    clearBodyError();
+  };
+
+  byId("inline-images").addEventListener("change", async (event) => {
     const input = event.target;
     if (!(input instanceof HTMLInputElement)) return;
     const source = byId("html-source");
     if (!(source instanceof HTMLTextAreaElement)) return;
-    const snippets = [];
-    for (const file of Array.from(input.files || [])) {
+    const files = Array.from(input.files || []);
+    const detectedTypes = await Promise.all(files.map(detectedInlineImageType));
+    if (detectedTypes.some((type) => !type)) {
+      replaceFileInput(input, state.inlineImages.map((item) => item.file));
+      showAlert("Inline images must be valid PNG, JPEG, GIF, or WebP files.");
+      return;
+    }
+    clearAlert();
+    if (state.bodyMode === "write") commitWriteToSource();
+    releaseInlineImages({removeMarkup: true});
+    if (state.bodyMode === "write") renderSourceInWrite();
+
+    const editorImages = [];
+    const sourceSnippets = [];
+    for (const file of files) {
       const cid = `${window.crypto.randomUUID()}@maddyweb.local`;
       const previewUrl = window.URL.createObjectURL(file);
-      const markup = (
-        `<img src="cid:${escapeAttribute(cid)}" alt="${escapeAttribute(file.name)}">`
-      );
-      state.inlineImages.push({cid, file, previewUrl});
-      snippets.push(markup);
+      const item = {cid, file, previewUrl};
+      state.inlineImages.push(item);
+      if (state.bodyMode === "write") {
+        const image = document.createElement("img");
+        image.src = previewUrl;
+        image.alt = file.name;
+        state.writeImageCids.set(image, cid);
+        editorImages.push(image);
+      } else {
+        sourceSnippets.push(
+          `<img src="cid:${escapeAttribute(cid)}" alt="${escapeAttribute(file.name)}">`,
+        );
+      }
     }
-    if (snippets.length) {
-      const separator = source.value && !source.value.endsWith("\n") ? "\n" : "";
-      source.value += `${separator}${snippets.join("\n")}`;
-      source.setCustomValidity("");
+    if (editorImages.length) insertEditorNodes(editor, editorImages);
+    if (sourceSnippets.length) {
+      insertMarkupInSource(source, sourceSnippets.join("\n"));
     }
     if (state.bodyMode === "preview") renderBodyPreview();
+    renderInlineImageTray();
   });
 
   window.addEventListener("beforeunload", () => {
@@ -1303,20 +1753,27 @@
     const form = event.currentTarget;
     if (!(form instanceof HTMLFormElement)) return;
     if (form.dataset.submitting === "true" || state.sendLocked) return;
+    if (state.bodyMode === "write") commitWriteToSource();
     const bodySource = byId("html-source");
     if (bodySource instanceof HTMLTextAreaElement) {
-      bodySource.setCustomValidity(
-        bodySource.value.trim() && previewBodyIsMeaningful(bodySource.value)
-          ? ""
-          : "Enter HTML that contains visible, safe content.",
-      );
-      if (!bodySource.checkValidity()) setBodyMode("source");
+      const validBody = bodySource.value.trim() && previewBodyIsMeaningful(bodySource.value);
+      if (!validBody) {
+        showBodyError("Write a message that contains visible, safe content.");
+        setBodyMode("write");
+        byId("message-editor").focus();
+        return;
+      }
+      clearBodyError();
     }
     if (!form.reportValidity()) return;
 
     const formData = new FormData(form);
+    formData.delete("inline_images");
     formData.delete("inline_cids");
-    for (const item of state.inlineImages) formData.append("inline_cids", item.cid);
+    for (const item of state.inlineImages) {
+      formData.append("inline_images", item.file, item.file.name);
+      formData.append("inline_cids", item.cid);
+    }
     const passwordInput = form.elements.namedItem("password");
     if (passwordInput instanceof HTMLInputElement) passwordInput.value = "";
     setComposeBusy(true, "Submitting securely. Keep this page open.");
@@ -1655,6 +2112,11 @@
 
   const initialize = async () => {
     initializeTheme();
+    setBodyMode("write");
+    renderSourceInWrite();
+    renderAttachmentTray();
+    renderInlineImageTray();
+    updateFormattingButtons();
     try {
       await refreshSession();
     } catch (error) {
