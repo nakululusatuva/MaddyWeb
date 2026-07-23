@@ -8,6 +8,10 @@ process from the restricted root helper; the two communicate only through
 The project's primary constraint is "fail closed": when the version, CLI fingerprint, configuration structure, Docker
 topology, or helper health does not match a tested contract, write operations are disabled instead of guessing compatibility.
 
+[![MaddyWeb administration overview with runtime health and mail operation shortcuts](docs/assets/maddyweb-overview.png)](docs/assets/maddyweb-overview.png)
+
+<p align="center"><em>MaddyWeb administration overview - private mail operations through a loopback-only console.</em></p>
+
 ## Browser architecture
 
 The administration console is a static single-page application: one fixed HTML shell, one local stylesheet,
