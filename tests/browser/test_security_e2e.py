@@ -13,6 +13,7 @@ import pytest
 from aiohttp import web
 from conftest import (
     ACCOUNT,
+    CERTIFICATE_FINGERPRINT,
     CERTIFICATE_NAME,
     COOKIE_NAME,
     MAILBOX,
@@ -211,6 +212,74 @@ async def test_certificate_controls_serialize_writes_and_refresh_status(
     await page.locator("#confirm-action").click()
     await page.locator("#confirm-dialog").wait_for(state="hidden")
     assert live_application.gateway.certificate_renewals == [CERTIFICATE_NAME]
+
+
+async def test_certificate_table_shows_full_fingerprints_and_contains_overflow(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    await page.set_viewport_size({"width": 1280, "height": 900})
+    await page.goto(live_application.base_url + "/certificates")
+    certificate_row = page.locator("#certificates-body tr").filter(has_text=CERTIFICATE_NAME)
+    await certificate_row.wait_for()
+
+    fingerprints = certificate_row.locator(".certificate-fingerprint")
+    assert await fingerprints.all_inner_texts() == [
+        CERTIFICATE_FINGERPRINT,
+        CERTIFICATE_FINGERPRINT,
+    ]
+    assert await fingerprints.evaluate_all(
+        "nodes => nodes.map((node) => node.title)"
+    ) == [
+        CERTIFICATE_FINGERPRINT,
+        CERTIFICATE_FINGERPRINT,
+    ]
+    assert all("..." not in value for value in await fingerprints.all_inner_texts())
+
+    values = certificate_row.locator("td:not(.certificate-actions) .certificate-cell-value")
+    for index in range(await values.count()):
+        assert (
+            await values.nth(index).evaluate("node => getComputedStyle(node).whiteSpace")
+            == "nowrap"
+        )
+    assert (
+        await certificate_row.locator(".certificate-actions .button-row").evaluate(
+            "node => getComputedStyle(node).flexWrap"
+        )
+        == "wrap"
+    )
+
+    table_scroll = page.locator("#certificates-view .table-scroll")
+    assert await table_scroll.evaluate("node => node.scrollWidth > node.clientWidth")
+    assert await page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+
+    await page.set_viewport_size({"width": 2048, "height": 900})
+    await page.wait_for_timeout(50)
+    wide_metrics = await table_scroll.evaluate(
+        "node => ({scrollWidth: node.scrollWidth, clientWidth: node.clientWidth})"
+    )
+    assert wide_metrics["scrollWidth"] <= wide_metrics["clientWidth"] + 1, wide_metrics
+    assert await page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+
+    await page.set_viewport_size({"width": 320, "height": 844})
+    await page.wait_for_timeout(50)
+    assert await table_scroll.evaluate("node => node.scrollWidth <= node.clientWidth + 1")
+    assert await page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+    assert await certificate_row.locator(".certificate-mobile-label:visible").all_inner_texts() == [
+        "NAME",
+        "EXPIRATION",
+        "SOURCE",
+        "DEPLOYED",
+        "MATCH",
+        "ACTIONS",
+    ]
+    assert (
+        await page.get_by_role(
+            "columnheader",
+            name="Source fingerprint",
+        ).count()
+        == 1
+    )
 
 
 async def test_rejects_unlisted_host(

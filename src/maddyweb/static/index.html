@@ -7,8 +7,8 @@
   <meta name="theme-color" content="#f4f6f9">
   <meta name="description" content="Private Maddy mail server administration console">
   <title>MaddyWeb</title>
-  <link rel="stylesheet" href="/static/app.css?v=5">
-  <script src="/static/app.js?v=6" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=6">
+  <script src="/static/app.js?v=7" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to main content</a>
@@ -159,7 +159,7 @@
       <section id="certificates-view" class="view" data-view="certificates" aria-labelledby="certificates-title" hidden>
         <div class="page-heading"><div><p class="eyebrow">Transport security</p><h1 id="certificates-title">TLS certificates</h1><p>Compare deployed fingerprints and control bounded renewal automation.</p></div></div>
         <section class="data-card compact-card timer-card"><div class="card-heading"><div><p class="eyebrow">Automation</p><h2>Renewal timer</h2></div></div><p>Current status: <strong id="timer-state">Loading</strong></p><button id="timer-action" class="button button-primary" type="button" disabled>Loading</button><p id="timer-policy" class="field-help"></p></section>
-        <section class="data-card"><div class="card-heading"><div><p class="eyebrow">TLS inventory</p><h2>Certificate status</h2></div></div><div class="table-scroll"><table><thead><tr><th scope="col">Name</th><th scope="col">Expiration</th><th scope="col">Source fingerprint</th><th scope="col">Deployed fingerprint</th><th scope="col">Match</th><th scope="col">Actions</th></tr></thead><tbody id="certificates-body"></tbody></table></div><div id="certificates-empty" class="empty-state" hidden>No certificate status.</div></section>
+        <section class="data-card"><div class="card-heading"><div><p class="eyebrow">TLS inventory</p><h2>Certificate status</h2></div></div><div class="table-scroll"><table class="certificate-table"><thead><tr><th scope="col">Name</th><th scope="col">Expiration</th><th scope="col">Source fingerprint</th><th scope="col">Deployed fingerprint</th><th scope="col">Match</th><th scope="col">Actions</th></tr></thead><tbody id="certificates-body"></tbody></table></div><div id="certificates-empty" class="empty-state" hidden>No certificate status.</div></section>
       </section>
 
       <section id="not-found-view" class="view" data-view="not-found" aria-labelledby="not-found-title" hidden>
