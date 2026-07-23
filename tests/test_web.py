@@ -299,13 +299,23 @@ async def test_home_static_assets_and_strict_headers(
     page = await response.text()
     assert response.status == 200
     assert "Administration overview" in page
-    assert 'href="/static/app.css?v=6"' in page
-    assert 'src="/static/app.js?v=7"' in page
+    assert 'href="/static/app.css?v=7"' in page
+    assert 'src="/static/app.js?v=8"' in page
+    assert 'id="compose-sender-name"' in page
+    assert 'name="sender_name"' in page
+    assert 'maxlength="256"' in page
+    assert 'aria-describedby="sender-name-help"' in page
+    assert 'id="html-source"' in page
+    assert 'id="html-preview"' in page
+    assert 'data-body-mode="source"' in page
+    assert 'data-body-mode="preview"' in page
+    assert 'sandbox="allow-same-origin"' in page
     assert '<main id="main" class="app-main" tabindex="-1">' in page
     assert "admin@example.test" not in page
     assert "csrf_token" not in page
     assert "Access-Control-Allow-Origin" not in response.headers
     assert "script-src 'self'" in response.headers["Content-Security-Policy"]
+    assert "frame-src 'self' blob:" in response.headers["Content-Security-Policy"]
     assert "img-src 'self' blob:" in response.headers["Content-Security-Policy"]
     assert response.headers["Referrer-Policy"] == "same-origin"
 
@@ -315,6 +325,13 @@ async def test_home_static_assets_and_strict_headers(
     stylesheet_bytes = await stylesheet.read()
     assert b"@import" not in stylesheet_bytes
     assert b"url(" not in stylesheet_bytes
+
+    preview_stylesheet = await client.get("/static/preview.css")
+    assert preview_stylesheet.status == 200
+    assert preview_stylesheet.content_type == "text/css"
+    preview_stylesheet_bytes = await preview_stylesheet.read()
+    assert b"@import" not in preview_stylesheet_bytes
+    assert b"url(" not in preview_stylesheet_bytes
 
     javascript = await client.get("/static/app.js")
     assert javascript.status == 200
@@ -333,7 +350,9 @@ async def test_home_static_assets_and_strict_headers(
         "eval(",
     ):
         assert forbidden_sink not in javascript_text
-    assert "serializeEditorNode" in javascript_text
+    assert "serializePreviewNode" in javascript_text
+    assert "new DOMParser()" in javascript_text
+    assert "new Blob(" in javascript_text
     assert "X-CSRF-Token" in javascript_text
 
     rejected = await client.get("/", headers={"Host": "evil.example"})
@@ -868,12 +887,13 @@ async def test_compose_uses_enabled_sender_and_streams_cid_mime(
 
     form = FormData()
     form.add_field("sender", "admin@example.test")
+    form.add_field("sender_name", "Web Console")
     form.add_field("password", FIXTURE_CREDENTIAL)
     form.add_field("to", "recipient@example.test")
     form.add_field("cc", "")
     form.add_field("bcc", "hidden@example.test")
     form.add_field("subject", "Rich text")
-    form.add_field("text", "plain")
+    form.add_field("text", "")
     form.add_field("html", '<p>rich<img src="cid:logo@maddyweb.local"></p>')
     form.add_field("inline_cids", "logo@maddyweb.local")
     form.add_field(
@@ -902,6 +922,15 @@ async def test_compose_uses_enabled_sender_and_streams_cid_mime(
     assert gateway.delivered is not None
     parsed = BytesParser(policy=policy.default).parsebytes(gateway.delivered)
     assert parsed["Bcc"] is None
+    assert parsed["From"].addresses[0].display_name == "Web Console"
+    assert parsed["From"].addresses[0].addr_spec == "admin@example.test"
+    assert parsed.get_body(("plain",)).get_content().strip() == "rich"
+    expected_delivery = (
+        "deliver",
+        "admin@example.test",
+        ("recipient@example.test", "hidden@example.test"),
+    )
+    assert expected_delivery in gateway.operations
     assert any(part.get("Content-ID") == "<logo@maddyweb.local>" for part in parsed.walk())
 
 
@@ -1101,6 +1130,59 @@ async def test_compose_rejects_duplicate_scalars_and_bounds_password_bytes(
         headers={"Origin": _origin(client), "X-CSRF-Token": token},
     )
     assert response.status == 413
+
+
+@pytest.mark.asyncio
+async def test_sender_name_rejects_duplicates_and_enforces_both_size_bounds(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+    token = await _get_token(client)
+    duplicate = FormData()
+    duplicate.add_field("sender_name", "First")
+    duplicate.add_field("sender_name", "Second")
+    duplicate.add_field("attachments", io.BytesIO(b"x"), filename="x.txt")
+    response = await client.post(
+        "/api/v1/send",
+        data=duplicate,
+        headers={"Origin": _origin(client), "X-CSRF-Token": token},
+    )
+    assert response.status == 400
+
+    token = await _get_token(client)
+    byte_oversized = FormData()
+    byte_oversized.add_field("sender_name", "x" * 1025)
+    byte_oversized.add_field("attachments", io.BytesIO(b"x"), filename="x.txt")
+    response = await client.post(
+        "/api/v1/send",
+        data=byte_oversized,
+        headers={"Origin": _origin(client), "X-CSRF-Token": token},
+    )
+    assert response.status == 413
+
+    token = await _get_token(client)
+    character_oversized = FormData()
+    for name, value in {
+        "sender": "admin@example.test",
+        "sender_name": "x" * 257,
+        "password": FIXTURE_CREDENTIAL,
+        "to": "recipient@example.test",
+        "subject": "Sender name bound",
+        "html": "<p>body</p>",
+    }.items():
+        character_oversized.add_field(name, value)
+    character_oversized.add_field("attachments", io.BytesIO(b"x"), filename="x.txt")
+    response = await client.post(
+        "/api/v1/send",
+        data=character_oversized,
+        headers={"Origin": _origin(client), "X-CSRF-Token": token},
+    )
+    payload = await response.json()
+    assert response.status == 400
+    assert payload["error"]["message"] == (
+        "Sender name must be 256 characters or fewer and cannot contain control characters."
+    )
+    assert gateway.delivered is None
 
 
 @pytest.mark.asyncio

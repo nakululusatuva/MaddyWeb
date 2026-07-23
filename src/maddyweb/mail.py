@@ -35,6 +35,7 @@ MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
 MAX_TOTAL_ATTACHMENT_BYTES = 25 * 1024 * 1024
 MAX_ATTACHMENTS = 64
 MAX_MIME_PARTS = 128
+MAX_SENDER_NAME_CHARACTERS = 256
 
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9!#$&^_.+-]+$")
@@ -192,6 +193,19 @@ class _TextExtractor(HTMLParser):
         self.parts.append(data)
 
 
+class _CidReferenceCollector(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.references: set[str] = set()
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "img":
+            return
+        source = next((value for name, value in attrs if name.lower() == "src"), None)
+        if source is not None and source.lower().startswith("cid:"):
+            self.references.add(source[4:].strip("<>"))
+
+
 class _CidImageRewriter(HTMLParser):
     """Re-serialize sanitized HTML while mapping only exact, known CID images."""
 
@@ -258,6 +272,13 @@ def html_to_text(value: str) -> str:
     parser.close()
     lines = (" ".join(line.split()) for line in "".join(parser.parts).splitlines())
     return "\n".join(line for line in lines if line).strip()
+
+
+def _html_cid_references(value: str) -> set[str]:
+    parser = _CidReferenceCollector()
+    parser.feed(value)
+    parser.close()
+    return parser.references
 
 
 def rewrite_cid_images(value: str, cid_urls: Mapping[str, str]) -> str:
@@ -500,6 +521,7 @@ class OutgoingMessage:
     to: tuple[str, ...]
     subject: str
     text: str
+    sender_name: str = ""
     cc: tuple[str, ...] = ()
     bcc: tuple[str, ...] = ()
     html: str | None = None
@@ -595,13 +617,35 @@ class MailGateway(Protocol):
 
 def _validated_outgoing(
     value: OutgoingMessage,
-) -> tuple[str, tuple[str, ...], tuple[str, ...], tuple[str, ...], str, str | None]:
+) -> tuple[
+    str,
+    str,
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+    str,
+    str | None,
+]:
     try:
         sender = parse_address_list(value.sender, maximum=1)[0]
     except MailError as exc:
         raise MailValidationError(
             "invalid sender address",
             public_message="The selected sender account has an invalid email address.",
+        ) from exc
+    try:
+        sender_name = _validate_header_value(
+            value.sender_name,
+            "sender name",
+            maximum=MAX_SENDER_NAME_CHARACTERS,
+        )
+    except MailError as exc:
+        raise MailValidationError(
+            "invalid sender name",
+            public_message=(
+                "Sender name must be 256 characters or fewer and cannot contain control "
+                "characters."
+            ),
         ) from exc
 
     def recipient_field(items: Sequence[str], label: str) -> tuple[str, ...]:
@@ -644,7 +688,24 @@ def _validated_outgoing(
             raise MailError("inline images require unique content IDs")
         seen_cids.add(cid)
         _split_content_type(image.content_type, inline=True)
-    return sender, to, cc, bcc, subject, safe_html
+    if safe_html is not None:
+        cid_references = _html_cid_references(safe_html)
+        if cid_references - seen_cids:
+            raise MailValidationError(
+                "HTML body references an unattached inline image",
+                public_message="HTML references an inline image that is no longer attached.",
+            )
+        if seen_cids - cid_references:
+            raise MailValidationError(
+                "inline image is not referenced by the HTML body",
+                public_message="An attached inline image is no longer referenced by the HTML body.",
+            )
+        if not html_to_text(safe_html) and not cid_references:
+            raise MailValidationError(
+                "HTML body is empty after sanitization",
+                public_message="The HTML body is empty after unsafe content is removed.",
+            )
+    return sender, sender_name, to, cc, bcc, subject, safe_html
 
 
 def _header_block(message: EmailMessage) -> bytes:
@@ -740,7 +801,7 @@ def prepare_message(
 ) -> PreparedMessage:
     """Stream a complete MIME message to a mode-0600 temporary file."""
 
-    sender, to, cc, bcc, subject, safe_html = _validated_outgoing(value)
+    sender, sender_name, to, cc, bcc, subject, safe_html = _validated_outgoing(value)
     envelope_from = _envelope_address(sender)
     envelope_recipients = tuple(_envelope_address(item) for item in (*to, *cc, *bcc))
     sender_domain = envelope_from.rsplit("@", 1)[-1]
@@ -750,7 +811,11 @@ def prepare_message(
     related_boundary = f"maddyweb-related-{uuid.uuid4().hex}"
 
     top = EmailMessage(policy=policy.SMTP)
-    top["From"] = sender
+    top["From"] = (
+        Address(display_name=sender_name, addr_spec=envelope_from)
+        if sender_name
+        else sender
+    )
     if to:
         top["To"] = ", ".join(to)
     if cc:

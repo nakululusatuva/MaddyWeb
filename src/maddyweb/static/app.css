@@ -912,8 +912,7 @@ label > span,
 
 input,
 select,
-textarea,
-.rich-editor {
+textarea {
   width: 100%;
   min-height: 42px;
   padding: 9px 11px;
@@ -929,15 +928,13 @@ textarea,
 
 input:hover,
 select:hover,
-textarea:hover,
-.rich-editor:hover {
+textarea:hover {
   border-color: color-mix(in srgb, var(--primary) 58%, var(--border-strong));
 }
 
 input:focus,
 select:focus,
-textarea:focus,
-.rich-editor:focus {
+textarea:focus {
   border-color: var(--focus);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--focus) 15%, transparent);
 }
@@ -1397,37 +1394,87 @@ td:last-child .button,
   display: grid;
 }
 
-.compose-card textarea[name="text"] {
-  min-height: 180px;
+.body-editor {
+  display: grid;
+  min-width: 0;
+  gap: 12px;
 }
 
-.editor-toolbar {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-bottom: 8px;
-  padding: 7px;
+.body-mode-tabs {
+  display: inline-flex;
+  width: fit-content;
+  max-width: 100%;
+  gap: 5px;
+  padding: 5px;
   border: 1px solid var(--border);
-  border-radius: 9px;
+  border-radius: 12px;
   background: var(--surface-muted);
 }
 
-.rich-editor {
-  min-height: 230px;
-  overflow: auto;
-  line-height: 1.6;
-  overflow-wrap: anywhere;
-}
-
-.rich-editor:empty::before {
+.body-mode-tab {
+  min-height: 42px;
+  padding: 8px 15px;
+  border: 1px solid transparent;
+  border-radius: 9px;
   color: var(--text-muted);
-  content: "Optional formatted message";
-  pointer-events: none;
+  background: transparent;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 800;
+  cursor: pointer;
+  transition:
+    border-color 140ms ease,
+    background 140ms ease,
+    color 140ms ease,
+    box-shadow 140ms ease;
 }
 
-.rich-editor img {
-  max-width: 100%;
-  height: auto;
+.body-mode-tab:hover {
+  color: var(--text);
+  background: var(--surface-hover);
+}
+
+.body-mode-tab[aria-selected="true"] {
+  border-color: var(--border);
+  color: var(--button-primary);
+  background: var(--surface);
+  box-shadow: 0 3px 10px rgb(15 23 42 / 8%);
+}
+
+.body-mode-tab:focus-visible {
+  outline: 3px solid color-mix(in srgb, var(--button-primary) 28%, transparent);
+  outline-offset: 2px;
+}
+
+.body-mode-panel {
+  display: grid;
+  min-width: 0;
+  gap: 10px;
+}
+
+.html-source,
+.html-preview {
+  width: 100%;
+  min-height: 360px;
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+}
+
+.html-source {
+  padding: 15px;
+  line-height: 1.55;
+  tab-size: 2;
+  resize: vertical;
+  font-family:
+    "SFMono-Regular",
+    Consolas,
+    "Liberation Mono",
+    monospace;
+}
+
+.html-preview {
+  display: block;
+  background: #fff;
 }
 
 .compose-actions {
@@ -1806,7 +1853,7 @@ dialog::backdrop {
   select,
   textarea,
   input[type="file"],
-  .rich-editor,
+  .html-preview,
   .attachment-list a {
     min-height: 44px;
   }
@@ -1895,6 +1942,19 @@ dialog::backdrop {
 
   .compose-actions .button-primary {
     width: 100%;
+  }
+
+  .body-mode-tabs {
+    width: 100%;
+  }
+
+  .body-mode-tab {
+    flex: 1;
+  }
+
+  .html-source,
+  .html-preview {
+    min-height: 300px;
   }
 
   .app-footer {
@@ -2072,7 +2132,8 @@ dialog::backdrop {
   input,
   select,
   textarea,
-  .rich-editor,
+  .html-preview,
+  .body-mode-tabs,
   dialog {
     border: 1px solid CanvasText;
   }

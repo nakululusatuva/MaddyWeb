@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import secrets
+from email import policy
+from email.parser import BytesParser
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlencode, urlsplit
@@ -496,10 +499,15 @@ async def test_compose_shows_spinner_blocks_duplicates_and_reports_success(
     await page.goto(live_application.base_url + "/compose")
     await page.locator("#compose-sender").select_option(ACCOUNT)
     form = page.locator("#compose-form")
+    await form.locator('input[name="sender_name"]').fill("Browser Sender")
     await form.locator('input[name="password"]').fill("fixture-mail-password")
     await form.locator('input[name="to"]').fill("recipient@example.test")
     await form.locator('input[name="subject"]').fill("Browser delivery fixture")
-    await form.locator('textarea[name="text"]').fill("body")
+    await form.locator('textarea[name="html"]').fill("<p>body</p>")
+    await page.locator("#body-preview-tab").click()
+    await page.frame_locator("#html-preview").locator("p").get_by_text(
+        "body", exact=True
+    ).wait_for()
     button = page.locator("#send-button")
 
     await button.click()
@@ -525,10 +533,126 @@ async def test_compose_shows_spinner_blocks_duplicates_and_reports_success(
     assert await button.inner_text() == "Send message"
     assert await form.get_attribute("aria-busy") is None
     assert await form.locator('input[name="password"]').input_value() == ""
+    assert await form.locator('input[name="sender_name"]').input_value() == ""
+    assert await form.locator('textarea[name="html"]').input_value() == ""
+    assert await page.locator("#body-source-tab").get_attribute("aria-selected") == "true"
+    assert await page.locator("#body-source-panel").is_visible()
     assert post_count == 1
     assert len(gateway.deliveries) == 1
+    delivered = gateway.deliveries[0]
+    parsed = BytesParser(policy=policy.default).parsebytes(delivered["raw"])
+    assert parsed["From"].addresses[0].display_name == "Browser Sender"
+    assert parsed["From"].addresses[0].addr_spec == ACCOUNT
+    assert delivered["envelope_from"] == ACCOUNT
     assert gateway.deliveries[0]["recipients"] == ("recipient@example.test",)
     assert gateway.sent_saves == 1
+
+
+async def test_compose_html_source_preview_is_sandboxed_and_blocks_remote_content(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    remote_requests: list[str] = []
+
+    def record_request(request: object) -> None:
+        url = getattr(request, "url", "")
+        if "tracker.invalid" in url:
+            remote_requests.append(url)
+
+    page.on("request", record_request)
+    await page.goto(live_application.base_url + "/compose")
+    source = page.locator("#html-source")
+    html = (
+        "<h1>Preview heading</h1>"
+        "<script>window.top.previewCompromised=true</script>"
+        '<img src="https://tracker.invalid/pixel" alt="remote">'
+        '<a href="https://tracker.invalid/link">Safe link text</a>'
+        '<form action="https://tracker.invalid/submit"><input value="unsafe"></form>'
+    )
+    await page.evaluate("window.previewCompromised = false")
+    await source.fill(html)
+    await page.locator("#body-preview-tab").click()
+
+    frame = page.frame_locator("#html-preview")
+    await frame.locator("h1").get_by_text("Preview heading", exact=True).wait_for()
+    assert (
+        await page.locator("#html-preview").get_attribute("sandbox")
+        == "allow-same-origin"
+    )
+    assert await frame.locator("script, form, img").count() == 0
+    preview_link = frame.locator("a")
+    assert await preview_link.inner_text() == "Safe link text"
+    assert (await preview_link.get_attribute("href") or "").endswith("#preview-link-disabled")
+    assert await preview_link.get_attribute("title") == (
+        "Preview only; destination: https://tracker.invalid/link"
+    )
+    assert await page.evaluate("window.previewCompromised") is False
+    assert remote_requests == []
+    assert await page.locator("#body-preview-tab").get_attribute("aria-selected") == "true"
+    assert await page.locator("#body-source-panel").is_hidden()
+
+    await page.locator("#body-source-tab").click()
+    assert await source.input_value() == html
+    assert await page.locator("#body-source-tab").get_attribute("aria-selected") == "true"
+    assert await page.locator("#body-preview-panel").is_hidden()
+
+    await page.locator("#inline-images").set_input_files(
+        {
+            "name": "logo.png",
+            "mimeType": "image/png",
+            "buffer": base64.b64decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+                "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+            ),
+        }
+    )
+    first_source = await source.input_value()
+    assert 'src="cid:' in first_source
+    first_cid = first_source.split('src="cid:', 1)[1].split('"', 1)[0]
+    await source.fill(
+        first_source.replace(
+            f'<img src="cid:{first_cid}" alt="logo.png">',
+            f'<img title="1 > 0" class="manual" src="cid:{first_cid}" alt="edited">',
+        )
+    )
+    await page.locator("#inline-images").set_input_files(
+        {
+            "name": "replacement.png",
+            "mimeType": "image/png",
+            "buffer": base64.b64decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+                "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+            ),
+        }
+    )
+    replacement_source = await source.input_value()
+    assert first_cid not in replacement_source
+    assert ' 0">' not in replacement_source
+    assert replacement_source.count('src="cid:') == 1
+    await page.locator("#body-preview-tab").click()
+    inline_preview = frame.locator("img")
+    await inline_preview.wait_for()
+    assert (await inline_preview.get_attribute("src") or "").startswith("blob:")
+    await page.wait_for_function(
+        "() => document.querySelector('#html-preview')?.contentDocument"
+        "?.querySelector('img')?.naturalWidth > 0"
+    )
+    assert await frame.locator("body").evaluate(
+        "node => getComputedStyle(node).paddingTop"
+    ) == "16px"
+    assert remote_requests == []
+
+    await page.locator("#body-source-tab").click()
+    await page.locator("#inline-images").set_input_files([])
+    assert 'src="cid:' not in await source.input_value()
+    await page.locator("#body-preview-tab").click()
+    assert await frame.locator("img").count() == 0
+    assert remote_requests == []
+
+    await page.locator("#body-source-tab").click()
+    await source.fill('<img alt="missing source">')
+    await page.locator("#body-preview-tab").click()
+    assert await frame.locator(".empty").inner_text() == "Nothing to preview."
 
 
 async def test_compose_resynchronizes_csrf_after_cookie_expiry(
@@ -552,7 +676,7 @@ async def test_compose_resynchronizes_csrf_after_cookie_expiry(
     form = page.locator("#compose-form")
     await form.locator('input[name="password"]').fill("fixture-mail-password")
     await form.locator('input[name="to"]').fill("recipient@example.test")
-    await form.locator('textarea[name="text"]').fill("body")
+    await form.locator('textarea[name="html"]').fill("<p>body</p>")
 
     await page.context.clear_cookies()
     await page.locator("#send-button").click()
@@ -591,7 +715,7 @@ async def test_compose_resynchronizes_csrf_after_another_tab_rotates_cookie(
     form = page.locator("#compose-form")
     await form.locator('input[name="password"]').fill("fixture-mail-password")
     await form.locator('input[name="to"]').fill("recipient@example.test")
-    await form.locator('textarea[name="text"]').fill("body")
+    await form.locator('textarea[name="html"]').fill("<p>body</p>")
 
     other_page = await page.context.new_page()
     try:
@@ -681,7 +805,7 @@ async def test_compose_recovers_from_same_cookie_name_on_another_loopback_port(
         form = page.locator("#compose-form")
         await form.locator('input[name="password"]').fill("fixture-mail-password")
         await form.locator('input[name="to"]').fill("recipient@example.test")
-        await form.locator('textarea[name="text"]').fill("body")
+        await form.locator('textarea[name="html"]').fill("<p>body</p>")
 
         other_page = await page.context.new_page()
         try:
@@ -741,7 +865,7 @@ async def test_compose_never_retries_an_explicit_csrf_rejection(
     form = page.locator("#compose-form")
     await form.locator('input[name="password"]').fill("fixture-mail-password")
     await form.locator('input[name="to"]').fill("recipient@example.test")
-    await form.locator('textarea[name="text"]').fill("body")
+    await form.locator('textarea[name="html"]').fill("<p>body</p>")
     await page.locator("#send-button").click()
 
     alert = page.locator("#global-alert")
@@ -774,7 +898,7 @@ async def test_compose_locks_after_an_unverifiable_success_response(
     form = page.locator("#compose-form")
     await form.locator('input[name="password"]').fill("fixture-mail-password")
     await form.locator('input[name="to"]').fill("recipient@example.test")
-    await form.locator('textarea[name="text"]').fill("body")
+    await form.locator('textarea[name="html"]').fill("<p>body</p>")
     button = page.locator("#send-button")
     await button.click()
 
@@ -816,7 +940,7 @@ async def test_compose_locks_after_a_reused_csrf_token(
     form = page.locator("#compose-form")
     await form.locator('input[name="password"]').fill("fixture-mail-password")
     await form.locator('input[name="to"]').fill("recipient@example.test")
-    await form.locator('textarea[name="text"]').fill("body")
+    await form.locator('textarea[name="html"]').fill("<p>body</p>")
     button = page.locator("#send-button")
     await button.click()
 
@@ -846,7 +970,7 @@ async def test_compose_network_failure_locks_ambiguous_submission(
     form = page.locator("#compose-form")
     await form.locator('input[name="password"]').fill("fixture-mail-password")
     await form.locator('input[name="to"]').fill("recipient@example.test")
-    await form.locator('textarea[name="text"]').fill("body")
+    await form.locator('textarea[name="html"]').fill("<p>body</p>")
     button = page.locator("#send-button")
     await button.click()
     warning = page.locator("[data-send-progress]")
@@ -902,6 +1026,10 @@ async def test_theme_persists_and_mobile_navigation_has_safe_touch_targets(
         "Certificates",
     ]
     assert await page.locator('.compose-action[aria-current="page"]:visible').count() == 1
+    assert await page.locator("#compose-sender").is_visible()
+    assert await page.locator("#compose-sender-name").is_visible()
+    assert await page.locator("#body-source-tab").is_visible()
+    assert await page.locator("#body-preview-tab").is_visible()
     assert await page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
     for index in range(await visible_links.count()):
         bounds = await visible_links.nth(index).bounding_box()

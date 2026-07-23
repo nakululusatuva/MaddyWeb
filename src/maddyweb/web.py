@@ -1698,6 +1698,7 @@ async def send_message(request: web.Request) -> web.Response:
             scalar_fields=frozenset(
                 {
                     "sender",
+                    "sender_name",
                     "password",
                     "to",
                     "cc",
@@ -1711,6 +1712,7 @@ async def send_message(request: web.Request) -> web.Response:
             file_fields=frozenset({"attachments", "inline_images"}),
             scalar_limits={
                 "sender": 1024,
+                "sender_name": 1024,
                 "password": 4096,
                 "to": 16 * 1024,
                 "cc": 16 * 1024,
@@ -1763,6 +1765,7 @@ async def send_message(request: web.Request) -> web.Response:
         html_body = _one(scalars, "html").strip()
         outgoing = OutgoingMessage(
             sender=sender,
+            sender_name=_one(scalars, "sender_name"),
             to=_split_addresses(_one(scalars, "to")),
             cc=_split_addresses(_one(scalars, "cc")),
             bcc=_split_addresses(_one(scalars, "bcc")),
@@ -1999,6 +2002,7 @@ async def static_asset(request: web.Request) -> web.Response:
     content_types = {
         "app.css": "text/css",
         "app.js": "application/javascript",
+        "preview.css": "text/css",
     }
     content_type = content_types.get(name)
     if content_type is None:

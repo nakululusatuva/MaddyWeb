@@ -1,0 +1,33 @@
+html {
+  color-scheme: light;
+}
+
+body {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 1rem;
+  color: #172033;
+  background: #fff;
+  overflow-wrap: anywhere;
+  font: 15px/1.55 system-ui, sans-serif;
+}
+
+img {
+  max-width: 100%;
+  height: auto;
+}
+
+table {
+  max-width: 100%;
+  border-collapse: collapse;
+}
+
+blockquote {
+  margin-left: 0.25rem;
+  padding-left: 0.8rem;
+  border-left: 3px solid #ccd3df;
+}
+
+.empty {
+  color: #667085;
+}

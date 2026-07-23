@@ -99,6 +99,7 @@ def test_attachment_filename_and_headers_are_download_only() -> None:
 def test_rich_mime_contains_alternative_cid_and_no_bcc_header() -> None:
     built = build_message(
         _message(
+            sender_name="Example Sender",
             cc=("copy@example.test",),
             bcc=("hidden@example.test",),
             html='<p>Rich text<img src="cid:logo"></p>',
@@ -108,6 +109,10 @@ def test_rich_mime_contains_alternative_cid_and_no_bcc_header() -> None:
     )
     parsed = BytesParser(policy=policy.default).parsebytes(built.raw)
     assert parsed.get_content_type() == "multipart/mixed"
+    from_address = parsed["From"].addresses[0]
+    assert from_address.display_name == "Example Sender"
+    assert from_address.addr_spec == "sender@example.test"
+    assert built.envelope_from == "sender@example.test"
     assert parsed["Bcc"] is None
     assert "hidden@example.test" in built.recipients
     assert parsed.get_body(("plain",)).get_content().strip() == "Plain-text body"
@@ -153,6 +158,77 @@ def test_header_injection_and_non_image_inline_are_rejected() -> None:
                 inline_images=(Attachment("x.txt", b"x", "text/plain", "not-image"),),
             )
         )
+    with pytest.raises(MailValidationError) as stale_cid:
+        build_message(_message(html='<img src="cid:no-longer-attached">'))
+    assert stale_cid.value.public_message == (
+        "HTML references an inline image that is no longer attached."
+    )
+    with pytest.raises(MailValidationError) as unused_inline:
+        build_message(
+            _message(
+                html="<p>Body without the selected image</p>",
+                inline_images=(Attachment("unused.png", b"PNG", "image/png", "unused"),),
+            )
+        )
+    assert unused_inline.value.public_message == (
+        "An attached inline image is no longer referenced by the HTML body."
+    )
+
+
+def test_sender_name_is_encoded_and_cannot_inject_headers() -> None:
+    unicode_name = "Jos" + chr(0xE9) + " Example"
+    built = build_message(_message(sender_name=unicode_name))
+    parsed = BytesParser(policy=policy.default).parsebytes(built.raw)
+    from_address = parsed["From"].addresses[0]
+    assert from_address.display_name == unicode_name
+    assert from_address.addr_spec == "sender@example.test"
+    assert built.envelope_from == "sender@example.test"
+    raw_headers = built.raw.partition(b"\r\n\r\n")[0]
+    assert b"=?utf-8?" in raw_headers.lower()
+    assert unicode_name.encode("utf-8") not in raw_headers
+
+    maximum_name = "x" * 256
+    maximum = build_message(_message(sender_name=maximum_name))
+    maximum_parsed = BytesParser(policy=policy.default).parsebytes(maximum.raw)
+    assert maximum_parsed["From"].addresses[0].display_name == maximum_name
+
+    with pytest.raises(MailValidationError) as injected:
+        build_message(_message(sender_name="Trusted\r\nBcc: attacker@example.test"))
+    assert injected.value.public_message == (
+        "Sender name must be 256 characters or fewer and cannot contain control characters."
+    )
+
+    with pytest.raises(MailValidationError):
+        build_message(_message(sender_name="x" * 257))
+
+
+def test_html_body_that_is_empty_after_sanitization_is_rejected() -> None:
+    for html_body in (
+        "<script>alert(1)</script>",
+        '<img src="https://tracker.invalid/pixel">',
+        '<img alt="missing source">',
+    ):
+        with pytest.raises(MailValidationError) as rejected:
+            build_message(_message(html=html_body))
+        assert rejected.value.public_message == (
+            "The HTML body is empty after unsafe content is removed."
+        )
+
+
+def test_blank_sender_name_keeps_address_only_from_header() -> None:
+    built = build_message(_message(sender_name="   "))
+    parsed = BytesParser(policy=policy.default).parsebytes(built.raw)
+    from_address = parsed["From"].addresses[0]
+    assert from_address.display_name == ""
+    assert from_address.addr_spec == "sender@example.test"
+
+
+def test_sender_name_punctuation_is_quoted_by_the_email_library() -> None:
+    sender_name = 'Example, "Sender"'
+    built = build_message(_message(sender_name=sender_name))
+    parsed = BytesParser(policy=policy.default).parsebytes(built.raw)
+    assert parsed["From"].addresses[0].display_name == sender_name
+    assert built.envelope_from == "sender@example.test"
 
 
 @pytest.mark.parametrize(
