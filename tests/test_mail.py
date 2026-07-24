@@ -5,6 +5,7 @@ from email import policy
 from email.message import EmailMessage
 from email.parser import BytesParser
 from pathlib import Path
+from urllib.parse import unquote
 
 import pytest
 
@@ -13,15 +14,19 @@ from maddyweb.mail import (
     DeliveryRejected,
     DeliveryUncertain,
     MailError,
+    MailLimitError,
     MailValidationError,
     OutgoingMessage,
     PreparedMessage,
     attachment_download_headers,
     build_message,
     deliver_and_save,
+    derive_reply_recipients,
     detect_safe_image_type,
     parse_message,
     prepare_message,
+    reply_subject,
+    reply_thread_headers,
     rewrite_cid_images,
     safe_filename,
     sandboxed_html_document,
@@ -88,12 +93,18 @@ def test_cid_rewriter_only_maps_exact_known_safe_url() -> None:
 
 def test_attachment_filename_and_headers_are_download_only() -> None:
     assert safe_filename("../../evil\r\n.html") == "evil.html"
+    deceptive = "invoice\u202ecod.exe\u2066\u200b"
+    assert safe_filename(deceptive) == "invoicecod.exe"
     headers = attachment_download_headers('../../bad"\r\n.html')
     assert headers["Content-Type"] == "application/octet-stream"
     assert headers["X-Content-Type-Options"] == "nosniff"
     assert headers["Content-Disposition"].startswith("attachment;")
     assert "\r" not in headers["Content-Disposition"]
     assert "\n" not in headers["Content-Disposition"]
+    deceptive_header = attachment_download_headers(deceptive)["Content-Disposition"]
+    decoded_filename = unquote(deceptive_header.split("filename*=UTF-8''", 1)[1])
+    assert decoded_filename == "invoicecod.exe"
+    assert all(control not in decoded_filename for control in ("\u202e", "\u2066", "\u200b"))
 
 
 def test_rich_mime_contains_alternative_cid_and_no_bcc_header() -> None:
@@ -290,6 +301,116 @@ def test_parse_html_only_message_provides_sanitized_plain_text_fallback() -> Non
     assert "Visible message" in parsed.text
 
 
+def test_threading_headers_are_parsed_and_emitted_without_bcc() -> None:
+    source = EmailMessage()
+    source["From"] = "Author <author@example.test>"
+    source["Reply-To"] = "Help Desk <reply@example.test>"
+    source["To"] = "Self <self@example.test>"
+    source["Cc"] = "Other <other@example.test>"
+    source["Bcc"] = "Hidden <hidden@example.test>"
+    source["Subject"] = "Question"
+    source["Message-ID"] = "<current@example.test>"
+    source["In-Reply-To"] = "<parent@example.test>"
+    source["References"] = "<root@example.test> <parent@example.test>"
+    source.set_content("body")
+
+    parsed = parse_message(source.as_bytes(policy=policy.SMTP))
+
+    assert parsed.reply_to == ("Help Desk <reply@example.test>",)
+    assert parsed.message_id == "<current@example.test>"
+    assert parsed.in_reply_to == "<parent@example.test>"
+    assert parsed.references == ("<root@example.test>", "<parent@example.test>")
+
+    built = build_message(
+        _message(
+            reply_to=("Help Desk <reply@example.test>",),
+            in_reply_to=parsed.message_id,
+            references=reply_thread_headers(parsed)[1],
+        )
+    )
+    emitted = BytesParser(policy=policy.default).parsebytes(built.raw)
+    assert str(emitted["Reply-To"]) == "Help Desk <reply@example.test>"
+    assert str(emitted["Message-ID"]) == built.message_id
+    assert str(emitted["In-Reply-To"]) == "<current@example.test>"
+    assert str(emitted["References"]) == (
+        "<root@example.test> <parent@example.test> <current@example.test>"
+    )
+    assert emitted["Bcc"] is None
+
+
+def test_reply_recipient_derivation_excludes_self_bcc_and_duplicates() -> None:
+    source = EmailMessage()
+    source["From"] = "Author <author@example.test>"
+    source["Reply-To"] = "Help Desk <reply@example.test>"
+    source["To"] = "Self <self@example.test>, Other <other@example.test>"
+    source["Cc"] = (
+        "Duplicate <OTHER@example.test>, Self Alias <alias@example.test>, Team <team@example.test>"
+    )
+    source["Bcc"] = "Hidden <hidden@example.test>"
+    source["Subject"] = "Question"
+    source.set_content("body")
+    parsed = parse_message(source.as_bytes(policy=policy.SMTP))
+
+    reply = derive_reply_recipients(
+        parsed,
+        ("self@example.test", "alias@example.test"),
+    )
+    reply_all = derive_reply_recipients(
+        parsed,
+        ("self@example.test", "alias@example.test"),
+        reply_all=True,
+    )
+
+    assert reply.to == ("Help Desk <reply@example.test>",)
+    assert reply.cc == ()
+    assert reply_all.to == ("Help Desk <reply@example.test>",)
+    assert reply_all.cc == ("Other <other@example.test>", "Team <team@example.test>")
+    assert "hidden@example.test" not in " ".join((*reply_all.to, *reply_all.cc))
+
+
+def test_reply_to_own_message_falls_back_to_first_non_self_recipient() -> None:
+    source = EmailMessage()
+    source["From"] = "Self <self@example.test>"
+    source["To"] = "Self <self@example.test>, First <first@example.test>"
+    source["Cc"] = "Second <second@example.test>"
+    source["Subject"] = "Sent message"
+    source.set_content("body")
+    parsed = parse_message(source.as_bytes(policy=policy.SMTP))
+
+    reply = derive_reply_recipients(parsed, "self@example.test")
+    reply_all = derive_reply_recipients(parsed, "self@example.test", reply_all=True)
+
+    assert reply.to == ("First <first@example.test>",)
+    assert reply_all.to == ("First <first@example.test>",)
+    assert reply_all.cc == ("Second <second@example.test>",)
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    (
+        ("Question", "Re: Question"),
+        ("re: Question", "Re: Question"),
+        ("RE[2]: Question", "Re: Question"),
+        ("", "Re: (No subject)"),
+    ),
+)
+def test_reply_subject_adds_one_bounded_safe_prefix(source: str, expected: str) -> None:
+    assert reply_subject(source) == expected
+
+
+def test_reply_headers_reject_injection_invalid_ids_and_unbounded_references() -> None:
+    with pytest.raises(MailError, match="reply subject"):
+        reply_subject("Question\r\nBcc: hidden@example.test")
+    with pytest.raises(MailError, match="In-Reply-To"):
+        build_message(_message(in_reply_to="not-a-message-id"))
+    with pytest.raises(MailError, match="References"):
+        build_message(_message(references=("<ok@example.test>", "invalid")))
+    with pytest.raises(MailLimitError, match="too many References"):
+        build_message(
+            _message(references=tuple(f"<reference-{index}@example.test>" for index in range(33)))
+        )
+
+
 class _MailGateway:
     def __init__(self, delivery_error: Exception | None = None, *, fail_sent: bool = False):
         self.delivery_error = delivery_error
@@ -343,9 +464,7 @@ async def test_delivery_failure_classification(error: Exception, safe_to_retry: 
 @pytest.mark.asyncio
 async def test_delivery_rejection_uses_only_explicit_public_message(caplog) -> None:
     public_message = "SMTP authentication failed. Verify the account password."
-    gateway = _MailGateway(
-        DeliveryRejected("private diagnostic", public_message=public_message)
-    )
+    gateway = _MailGateway(DeliveryRejected("private diagnostic", public_message=public_message))
     result = await deliver_and_save(
         gateway,
         _message(),

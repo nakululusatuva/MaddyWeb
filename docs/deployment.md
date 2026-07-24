@@ -18,6 +18,16 @@ paths must be absolute Linux paths. Complete a full rehearsal on a non-productio
 
 The installer does not access the network, download Python, Maddy, images, or dependencies, or modify Nginx.
 
+After unified authentication has been initialized, every routine backup must
+include `auth-state.tar` and `auth-state.status` from `backup.sh`. A Maddy-only
+snapshot is no longer a complete MaddyWeb recovery point.
+
+Public HTTPS exposure is a separate, explicitly reviewed operation. It is not
+performed by the application installer. See the
+[Cloudflare public-edge runbook](public-edge.md) for the two supported
+production hostnames, origin allowlisting, dedicated Web certificate timers,
+and host-specific Nginx ownership rules.
+
 ## 2. Select the Maddy mode
 
 ### Native mode
@@ -79,6 +89,13 @@ listen = "127.0.0.1:8787"
 allowed_hosts = ["127.0.0.1", "localhost"]
 request_body_timeout_seconds = 15
 
+[security]
+auth_state_dir = "/var/lib/maddyweb-auth"
+session_cookie_name = "__Host-maddyweb-session"
+csrf_cookie_name = "__Host-maddyweb-csrf"
+public_origin = ""
+totp_issuer = "MaddyWeb Example"
+
 [maddy]
 helper_socket = "/run/maddyweb/helper.sock"
 submission_host = "127.0.0.1"
@@ -94,6 +111,20 @@ scopes.
 Submission configuration and rollback commands validate this value against
 the effective `/etc/maddyweb/config.toml`; a command-line override cannot
 weaken the configured network boundary.
+
+`security.auth_state_dir` is fixed to the root-only path shown above. Cookie
+names must be distinct, use the `__Host-` prefix, and remain unique when the
+same browser reaches multiple MaddyWeb deployments. `totp_issuer` is the
+printable Google Authenticator issuer shown to users and must be stable for
+the lifetime of the factors.
+
+For an SSH-only deployment, leave `security.public_origin` empty and keep
+`server.allowed_hosts` loopback-only. For the reviewed public edge, add
+exactly that server's public hostname to `allowed_hosts`, set
+`public_origin` to its exact `https://` origin, and use the host-specific
+issuer. Do not put both production public hostnames in one configuration.
+Follow [public-edge.md](public-edge.md), which supplies the corresponding
+Nginx templates and read-only checker.
 
 `server.request_body_timeout_seconds` limits the time to read the complete HTTP request body, preventing slow or
 stalled uploads from occupying scarce workers indefinitely; the production validator accepts 1..120 seconds, fixed at 15 in the template.
@@ -130,6 +161,48 @@ python3.14 scripts/validate-config.py \
 ```
 
 For Docker mode, also add `--expected-container maddy`.
+
+### Closed-schema configuration upgrades
+
+`--config-template` is used automatically only when
+`/etc/maddyweb/config.toml` does not yet exist. On an upgrade, the installer
+keeps the existing file unless the operator explicitly adds
+`--replace-config`. It never merges tables or silently adds new keys.
+
+Use replacement for this unified-authentication upgrade because the existing
+production files predate `auth_state_dir`, the public origin, the TOTP issuer,
+and the `__Host-` cookie names. Prepare one complete host-specific candidate
+as a root-owned, single-link file that is not group or world writable. Validate
+that candidate independently, then add both of these options to the dry run:
+
+```console
+--config-template /absolute/reviewed-config.toml \
+--replace-config --activate
+```
+
+Do not edit the live file before installation. Replacement requires
+activation so an old process can never open the new closed schema. After the
+install approval is consumed, the installer copies the old and prospective
+files into a root-only transaction directory, revalidates the prospective
+copy, and seals the exact predecessor configuration and release binding under
+`/var/lib/maddyweb-config-history` before changing the live file. That
+root-owned directory is mode `0700`; its configuration and manifest files are
+single-link root-owned mode `0600`. The record contains exact old and new
+hashes and is never copied into Git, the wheel, or the release tree.
+
+The installer then quiesces Web, helper socket, and helper, atomically replaces
+the live file, and reads its hash and metadata back. Every ordinary failure
+path restores the exact old configuration before restoring or restarting the
+old release. If either the release link or configuration cannot be restored
+and verified, all MaddyWeb units remain stopped. The short-lived transaction
+copy is deleted after success; the sealed predecessor record remains available
+only for the exact new-release-to-recorded-predecessor rollback.
+
+Production activation also requires the installed wheel itself to report
+`required-unified-mailbox-v1`. An older or otherwise unattested artifact may
+be retained for an explicitly withdrawn rollback, but the installer refuses to
+activate it. This prevents an ordinary install from bypassing the public-edge
+withdrawal gate.
 
 ## 4. Read-only preflight
 
@@ -198,7 +271,10 @@ The wheelhouse must contain every transitive dependency wheel required by the lo
 `pip --no-index --no-deps` for the independently SHA-256-verified MaddyWeb wheel. Thus an unhashed
 extra file in the wheelhouse is not selected; a missing wheel, version drift, or hash mismatch fails
 without fetching from the network. The installed release retains a read-only copy named `REQUIREMENTS.lock` and
-records its SHA-256 in `INSTALL-MANIFEST`.
+records its SHA-256 in `INSTALL-MANIFEST`. The install manifest also records
+the prospective configuration SHA-256 and whether the installer performed an
+explicit transactional replacement; it never contains the configuration
+contents.
 
 Production apply does not pass the initially verified external wheel path directly to pip. After approval is consumed,
 the installer creates root-owned `0700` staging and opens the single-link artifact with `O_NOFOLLOW`,
@@ -251,7 +327,9 @@ bash scripts/install.sh \
 ```
 
 Save and manually review the reported host, mode, container, commit, artifact, release
-directory, and activation state. Without `--apply`, the command does not write the filesystem, systemd, or container.
+directory, activation state, replacement state, and prospective configuration
+SHA-256. Without `--apply`, the command does not write the filesystem,
+systemd, or container.
 
 ## 7. One-time production authorization and apply
 
@@ -284,8 +362,12 @@ The installer:
 3. creates an offline virtual environment under `/opt/maddyweb/releases/<commit>`;
 4. writes the release and install manifests;
 5. installs the Web service, helper service, and socket unit;
-6. atomically switches `/opt/maddyweb/current`;
-7. with `--activate`, enables the helper socket and Web service and runs the strict smoke gate. If any unit
+6. when explicitly requested, atomically replaces the complete configuration
+   under the same rollback transaction;
+7. atomically switches `/opt/maddyweb/current`;
+8. retains the reviewed public-edge assets and checker inside the same
+   immutable commit-named release;
+9. with `--activate`, enables the helper socket and Web service and runs the strict smoke gate. If any unit
    installation, daemon reload, restart, or smoke step fails, it restores the previous release symlink,
    all three unit files, and their original enabled and active states. A failed fresh install stops and disables the new units.
 
@@ -358,7 +440,39 @@ The installer does not modify the management Submission block in Maddy configura
 then enable Web and helper. For an upgrade with a healthy Submission endpoint, add `--activate` after review
 to apply. The installer never checks, edits, or reloads Nginx.
 
-## 8. Verification and SSH
+## 8. Initialize unified authentication
+
+Do not enable the public virtual host until every existing mailbox has an
+authentication lifecycle and at least one real mailbox has a root-assigned
+administrator role.
+
+For a migration that enrolls existing accounts in advance, generate the
+one-time manifest and offline Google Authenticator handoff on the trusted
+workstation, import the manifest through SSH standard input directly into
+root `maddyweb auth-bootstrap`, and delete the manifest immediately after a
+verified import. The complete command sequence, ACL and checksum checks,
+secret prohibitions, and failure behavior are mandatory and documented in
+[Authentication and identity operations](authentication.md). Do not replace
+that flow with `scp`, a remote temporary file, a password argument, or an
+environment variable.
+
+An existing account that is intentionally not bootstrapped remains a normal
+user and must enroll Google Authenticator after the first correct Maddy
+password login. An account created through MaddyWeb receives its TOTP and ten
+recovery codes immediately. Only the root command can change roles:
+
+```console
+sudo /opt/maddyweb/current/bin/maddyweb auth-role \
+  --config /etc/maddyweb/config.toml \
+  --email administrator@example.net \
+  --role admin
+```
+
+An administrator is always a real Maddy mailbox. There is no separate Web
+administrator password. A bootstrap-created administrator must change its
+random initial Maddy password at first login.
+
+## 9. Verification and access
 
 Run the strict smoke gate on the server:
 
@@ -372,12 +486,22 @@ The smoke test verifies that the only listener is `127.0.0.1:8787`, and checks t
 the exact health fields, and a supported Maddy version. The performance gate reads only the same loopback
 health endpoint and reports p50, p95, p99, throughput, and error count.
 
-Verify the host key from the administrator workstation before opening a tunnel:
+For a public deployment, also run the selected read-only public-edge checker,
+verify the public login boundary and `/healthz` denial, and confirm Cloudflare
+Full (strict) as described in [public-edge.md](public-edge.md). Port 8787 must
+remain loopback-only after Nginx is active.
+
+For an SSH-only deployment, verify the host key from the administrator
+workstation before opening an optional tunnel:
 
 ```console
 ssh -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=yes \
   -N -L 127.0.0.1:8787:127.0.0.1:8787 admin@mail.example.net
 ```
 
-Open only `http://127.0.0.1:8787/` in the browser. The entry point disappears when SSH disconnects. Do not create
-a public listener, Nginx proxy, or Docker publish rule as a persistent substitute.
+Open only `http://localhost:8787/` in the browser; the `localhost` origin is
+required for the Secure, `__Host-` authentication cookies. Authentication
+remains mandatory through the tunnel, and the entry point disappears when
+SSH disconnects. Do not create a public listener or Docker publish rule. If
+Internet access is required, use the reviewed public edge instead of an
+unreviewed reverse proxy.

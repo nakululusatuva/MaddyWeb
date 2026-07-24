@@ -12,6 +12,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Self
+from urllib.parse import urlsplit
 
 _CONTAINER_RE = re.compile(r"\A[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}\Z")
 _UNIT_RE = re.compile(r"\A[a-zA-Z0-9][a-zA-Z0-9_.@-]*\.timer\Z")
@@ -38,6 +39,11 @@ _DEFAULT_DEPLOYED_KEY = PurePosixPath("/data/tls/privkey.pem")
 _NATIVE_DEPLOYED_CERT = PurePosixPath("/var/lib/maddy/tls/fullchain.pem")
 _NATIVE_DEPLOYED_KEY = PurePosixPath("/var/lib/maddy/tls/privkey.pem")
 _DEFAULT_SESSION_KEY = PurePosixPath("/var/lib/maddyweb/session.key")
+_DEFAULT_AUTH_STATE_DIR = PurePosixPath("/var/lib/maddyweb-auth")
+_DNS_HOST_RE = re.compile(
+    r"\A(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*"
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z"
+)
 
 DEFAULT_WEB_HOST = "127.0.0.1"
 DEFAULT_WEB_PORT = 8787
@@ -111,6 +117,46 @@ def _absolute(value: str, name: str) -> PurePosixPath:
     return path
 
 
+def _host(value: str, name: str) -> str:
+    candidate = value.strip().rstrip(".").lower()
+    if (
+        not candidate
+        or candidate != value.lower()
+        or any(ord(character) < 0x21 or ord(character) > 0x7E for character in candidate)
+    ):
+        raise ConfigError(f"{name} contains an invalid host")
+    try:
+        address = ipaddress.ip_address(candidate)
+    except ValueError:
+        if _DNS_HOST_RE.fullmatch(candidate) is None:
+            raise ConfigError(f"{name} contains an invalid host") from None
+    else:
+        if address.version != 4:
+            raise ConfigError(f"{name} supports only an IPv4 literal or DNS hostname")
+    return candidate
+
+
+def _https_origin(value: str, name: str) -> str:
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be a valid HTTPS origin") from exc
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+        or port not in {None, 443}
+    ):
+        raise ConfigError(f"{name} must be an HTTPS origin without a path")
+    host = _host(parsed.hostname, name)
+    return f"https://{host}"
+
+
 @dataclass(frozen=True, slots=True)
 class ServerConfig:
     listen: str = DEFAULT_WEB_LISTEN
@@ -150,16 +196,18 @@ class ServerConfig:
         if not 1 <= port <= 65535:
             raise ConfigError("server.listen port is out of range")
         hosts = tuple(
-            item.lower()
-            for item in _strings(
-                raw,
-                "allowed_hosts",
-                defaults.allowed_hosts,
-                "server.allowed_hosts",
+            dict.fromkeys(
+                _host(item, "server.allowed_hosts")
+                for item in _strings(
+                    raw,
+                    "allowed_hosts",
+                    defaults.allowed_hosts,
+                    "server.allowed_hosts",
+                )
             )
         )
-        if not hosts or not set(hosts) <= {"127.0.0.1", "localhost"}:
-            raise ConfigError("server.allowed_hosts may contain only 127.0.0.1 and localhost")
+        if not hosts:
+            raise ConfigError("server.allowed_hosts must not be empty")
         concurrency = _integer(raw, "concurrency", defaults.concurrency, "server.concurrency")
         backlog = _integer(raw, "backlog", defaults.backlog, "server.backlog")
         keepalive = _integer(
@@ -506,13 +554,25 @@ class CertificateConfig:
 @dataclass(frozen=True, slots=True)
 class SecurityConfig:
     session_key_file: PurePosixPath = _DEFAULT_SESSION_KEY
+    auth_state_dir: PurePosixPath = _DEFAULT_AUTH_STATE_DIR
     csrf_ttl_seconds: int = 900
-    cookie_name: str = "__Host-maddyweb"
+    session_cookie_name: str = "__Host-maddyweb-session"
+    csrf_cookie_name: str = "__Host-maddyweb-csrf"
+    public_origin: str = ""
+    totp_issuer: str = "MaddyWeb"
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> Self:
         defaults = cls()
-        allowed = {"session_key_file", "csrf_ttl_seconds", "cookie_name"}
+        allowed = {
+            "session_key_file",
+            "auth_state_dir",
+            "csrf_ttl_seconds",
+            "session_cookie_name",
+            "csrf_cookie_name",
+            "public_origin",
+            "totp_issuer",
+        }
         _closed("security", raw, allowed)
         ttl = _integer(
             raw,
@@ -522,11 +582,58 @@ class SecurityConfig:
         )
         if not 60 <= ttl <= 3600:
             raise ConfigError("security.csrf_ttl_seconds must be between 60 and 3600")
-        cookie = _string(raw, "cookie_name", defaults.cookie_name, "security.cookie_name")
-        if not cookie.startswith("__Host-") or not re.fullmatch(
-            r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,64}", cookie
+        session_cookie = _string(
+            raw,
+            "session_cookie_name",
+            defaults.session_cookie_name,
+            "security.session_cookie_name",
+        )
+        csrf_cookie = _string(
+            raw,
+            "csrf_cookie_name",
+            defaults.csrf_cookie_name,
+            "security.csrf_cookie_name",
+        )
+        for field_name, cookie in (
+            ("security.session_cookie_name", session_cookie),
+            ("security.csrf_cookie_name", csrf_cookie),
         ):
-            raise ConfigError("security.cookie_name is invalid")
+            if not cookie.startswith("__Host-") or not re.fullmatch(
+                r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,64}", cookie
+            ):
+                raise ConfigError(f"{field_name} is invalid")
+        if session_cookie == csrf_cookie:
+            raise ConfigError("session and CSRF cookies must use different names")
+        public_origin_value = _string(
+            raw,
+            "public_origin",
+            defaults.public_origin,
+            "security.public_origin",
+        )
+        public_origin = (
+            _https_origin(public_origin_value, "security.public_origin")
+            if public_origin_value
+            else ""
+        )
+        issuer = _string(raw, "totp_issuer", defaults.totp_issuer, "security.totp_issuer")
+        if (
+            not 1 <= len(issuer) <= 64
+            or not issuer.isascii()
+            or any(ord(character) < 0x20 or ord(character) == 0x7F for character in issuer)
+            or ":" in issuer
+        ):
+            raise ConfigError("security.totp_issuer must be printable ASCII without a colon")
+        auth_state_dir = _absolute(
+            _string(
+                raw,
+                "auth_state_dir",
+                str(defaults.auth_state_dir),
+                "security.auth_state_dir",
+            ),
+            "security.auth_state_dir",
+        )
+        if auth_state_dir != _DEFAULT_AUTH_STATE_DIR:
+            raise ConfigError(f"security.auth_state_dir must be exactly {_DEFAULT_AUTH_STATE_DIR}")
         return cls(
             session_key_file=_absolute(
                 _string(
@@ -537,8 +644,12 @@ class SecurityConfig:
                 ),
                 "security.session_key_file",
             ),
+            auth_state_dir=auth_state_dir,
             csrf_ttl_seconds=ttl,
-            cookie_name=cookie,
+            session_cookie_name=session_cookie,
+            csrf_cookie_name=csrf_cookie,
+            public_origin=public_origin,
+            totp_issuer=issuer,
         )
 
 
@@ -586,11 +697,19 @@ class AppConfig:
             ):
                 if not path.is_relative_to(maddy.data_dir):
                     raise ConfigError(f"{name} must be inside maddy.data_dir in Docker mode")
+        server = ServerConfig.from_dict(raw.get("server", {}))
+        security = SecurityConfig.from_dict(raw.get("security", {}))
+        if security.public_origin:
+            public_host = urlsplit(security.public_origin).hostname
+            if public_host not in server.allowed_hosts:
+                raise ConfigError(
+                    "security.public_origin hostname must be listed in server.allowed_hosts"
+                )
         return cls(
-            server=ServerConfig.from_dict(raw.get("server", {})),
+            server=server,
             maddy=maddy,
             certificates=certificates,
-            security=SecurityConfig.from_dict(raw.get("security", {})),
+            security=security,
             logging=LoggingConfig.from_dict(raw.get("logging", {})),
         )
 

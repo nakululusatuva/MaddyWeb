@@ -39,8 +39,12 @@ deployed_key_path = "/etc/maddy/certs/privkey.pem"
 
 [security]
 session_key_file = "/var/lib/maddyweb/session.key"
+auth_state_dir = "/var/lib/maddyweb-auth"
 csrf_ttl_seconds = 900
-cookie_name = "__Host-maddyweb-native"
+session_cookie_name = "__Host-maddyweb-native-session"
+csrf_cookie_name = "__Host-maddyweb-native-csrf"
+public_origin = ""
+totp_issuer = "MaddyWeb Native"
 
 [logging]
 level = "INFO"

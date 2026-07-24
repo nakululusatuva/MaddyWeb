@@ -69,6 +69,14 @@
 
   const state = {
     csrfToken: "",
+    authState: "checking",
+    principal: {},
+    role: "admin",
+    capabilities: new Set(),
+    sessionExpiresAt: 0,
+    idleExpiresAt: 0,
+    sessionTimer: 0,
+    effectiveAccount: "",
     routeController: null,
     mutationTail: Promise.resolve(),
     health: null,
@@ -83,6 +91,12 @@
     typedAction: null,
     typedExpected: "",
     typedOpener: null,
+    stepUpTarget: null,
+    stepUpOpener: null,
+    disclosedCredentials: null,
+    disclosureOpener: null,
+    disclosureContinue: null,
+    disclosureDownloadUrl: null,
     toastTimer: 0,
     inlineImages: [],
     bodyMode: "write",
@@ -102,6 +116,8 @@
   const confirmDialog = byId("confirm-dialog");
   const typedDialog = byId("typed-confirm-dialog");
   const accountDialog = byId("account-dialog");
+  const stepUpDialog = byId("step-up-dialog");
+  const credentialDisclosureDialog = byId("credential-disclosure-dialog");
 
   const setLoading = (message = "") => {
     if (loadingStatus) loadingStatus.textContent = message;
@@ -139,8 +155,40 @@
     return url;
   };
 
+  const scopedAccount = () => (
+    state.effectiveAccount || stringValue(objectValue(state.principal).account_id)
+  );
+
+  const mappedApiPath = (path) => {
+    const source = new URL(`${API_ROOT}${path}`, window.location.origin);
+    const logicalPath = source.pathname.slice(API_ROOT.length);
+    let mappedPath = logicalPath;
+
+    if (logicalPath === "/compose" || logicalPath === "/send") {
+      mappedPath = state.role === "admin"
+        ? `/admin${logicalPath}`
+        : `/me${logicalPath}`;
+      source.searchParams.delete("account");
+    } else if (logicalPath === "/mail" || logicalPath.startsWith("/mail/")) {
+      mappedPath = state.role === "admin"
+        ? `/admin${logicalPath}`
+        : `/me${logicalPath}`;
+      if (state.role !== "admin") source.searchParams.delete("account");
+    } else if (logicalPath === "/accounts" || logicalPath.startsWith("/accounts/")) {
+      mappedPath = `/admin${logicalPath}`;
+    } else if (
+      logicalPath === "/certificates"
+      || logicalPath.startsWith("/certificates/")
+    ) {
+      mappedPath = `/admin${logicalPath}`;
+    }
+
+    source.pathname = `${API_ROOT}${mappedPath}`;
+    return `${source.pathname}${source.search}`;
+  };
+
   const apiPath = (path) => {
-    const url = sameOriginUrl(`${API_ROOT}${path}`, API_ROOT);
+    const url = sameOriginUrl(mappedApiPath(path), API_ROOT);
     if (!url) throw new ApiError("The client rejected an invalid API path.");
     return `${url.pathname}${url.search}`;
   };
@@ -194,12 +242,190 @@
     return objectValue(payload.data);
   };
 
-  const refreshSession = async (signal = undefined) => {
-    const data = await apiData("/session", signal ? {signal} : {});
+  const sessionData = (payload) => {
+    const root = objectValue(payload);
+    return root.ok === true ? objectValue(root.data) : root;
+  };
+
+  const sessionIsActive = (data) => {
+    const principal = objectValue(data.principal);
+    return Boolean(
+      stringValue(principal.email)
+      && /^[0-9a-f]{32}$/.test(stringValue(principal.account_id)),
+    );
+  };
+
+  const defaultCapabilities = (role) => (
+    role === "admin"
+      ? [
+        "mail.read",
+        "mail.send",
+        "mail.mutate",
+        "admin.accounts",
+        "admin.certificates",
+        "admin.mailbox_access",
+      ]
+      : ["mail.read", "mail.send", "mail.mutate"]
+  );
+
+  const capabilityAllowed = (capability) => (
+    !capability || state.capabilities.has(capability)
+  );
+
+  const formatSessionTime = (value) => {
+    if (!Number.isSafeInteger(value) || value <= 0) return "Not provided";
+    const date = new Date(value * 1000);
+    return Number.isNaN(date.valueOf()) ? "Not provided" : date.toLocaleString();
+  };
+
+  const applySessionUi = () => {
+    const principal = objectValue(state.principal);
+    const address = stringValue(principal.email, "Mail account");
+    const displayName = address.split("@")[0] || "Mail account";
+    const role = state.role === "admin" ? "admin" : "mailbox";
+    document.documentElement.dataset.authState = state.authState;
+    document.documentElement.dataset.role = role;
+
+    document.querySelectorAll("[data-role]").forEach((node) => {
+      node.hidden = node.getAttribute("data-role") !== role;
+    });
+    document.querySelectorAll("[data-capability]").forEach((node) => {
+      node.hidden = !capabilityAllowed(node.getAttribute("data-capability"));
+    });
+    document.querySelectorAll("[data-authenticated-only]").forEach((node) => {
+      node.hidden = state.authState !== "active";
+    });
+
+    const identity = byId("account-identity");
+    identity.hidden = false;
+    byId("account-display-name").textContent = displayName;
+    byId("account-address").textContent = address;
+    byId("account-avatar").textContent = (displayName || address).slice(0, 1).toUpperCase();
+    byId("session-expiry").hidden = false;
+    byId("logout-button").hidden = false;
+    byId("sidebar-session-label").textContent = role === "admin"
+      ? "Administrator session"
+      : "Mailbox session";
+    byId("sidebar-session-detail").textContent = address;
+    const brand = document.querySelector(".brand");
+    if (brand instanceof HTMLAnchorElement) {
+      brand.href = role === "admin" ? "/" : "/mail";
+    }
+    byId("mail-account-field").hidden = role !== "admin";
+
+    const passwordRow = byId("compose-password-row");
+    const password = byId("compose-password");
+    passwordRow.hidden = false;
+    password.required = true;
+
+    byId("security-address").textContent = address;
+    byId("security-role").textContent = role === "admin" ? "Administrator" : "Mailbox user";
+    byId("security-session-state").textContent = state.authState === "active" ? "Active" : "Unknown";
+    byId("security-session-expiration").textContent = formatSessionTime(state.sessionExpiresAt);
+    byId("security-idle-expiration").textContent = formatSessionTime(state.idleExpiresAt);
+    const remaining = principal.recovery_codes_remaining;
+    byId("security-recovery-count").textContent = Number.isSafeInteger(remaining)
+      ? String(remaining)
+      : "Unknown";
+    const totpEnabled = principal.totp_enrolled !== false;
+    byId("security-totp-state").textContent = totpEnabled ? "Enabled" : "Required";
+    byId("security-totp-state").className = (
+      `status-pill ${totpEnabled ? "status-positive" : "status-warning"}`
+    );
+    const passwordChangeRequired = principal.password_change_required === true;
+    byId("password-change-required").hidden = !passwordChangeRequired;
+    const recoveryForm = byId("regenerate-recovery-form");
+    for (const control of recoveryForm.elements) {
+      if (
+        control instanceof HTMLInputElement
+        || control instanceof HTMLButtonElement
+      ) control.disabled = passwordChangeRequired;
+    }
+  };
+
+  const updateSessionClock = () => {
+    window.clearInterval(state.sessionTimer);
+    const update = () => {
+      const expirations = [state.sessionExpiresAt, state.idleExpiresAt]
+        .filter((value) => Number.isSafeInteger(value) && value > 0);
+      const expires = expirations.length
+        ? Math.min(...expirations) * 1000
+        : Number.NaN;
+      const label = byId("session-expiry");
+      if (!Number.isFinite(expires)) {
+        label.textContent = "Session active";
+        return;
+      }
+      const remaining = expires - Date.now();
+      if (remaining <= 0) {
+        window.clearInterval(state.sessionTimer);
+        window.location.replace("/login");
+        return;
+      }
+      const minutes = Math.max(1, Math.ceil(remaining / 60000));
+      label.textContent = `Session expires in ${minutes} min`;
+    };
+    update();
+    state.sessionTimer = window.setInterval(update, 30000);
+  };
+
+  const applySessionData = (data) => {
+    const principal = objectValue(data.principal);
+    const role = stringValue(principal.role, "mailbox") === "admin" ? "admin" : "mailbox";
+    state.authState = sessionIsActive(data) ? "active" : "anonymous";
+    state.principal = principal;
+    state.role = role;
+    state.capabilities = new Set(
+      arrayValue(data.capabilities).map((value) => stringValue(value)).filter(Boolean),
+    );
+    if (!state.capabilities.size) {
+      state.capabilities = new Set(defaultCapabilities(role));
+    }
+    state.sessionExpiresAt = Number.isSafeInteger(principal.absolute_expires_at)
+      ? principal.absolute_expires_at
+      : 0;
+    state.idleExpiresAt = Number.isSafeInteger(principal.idle_expires_at)
+      ? principal.idle_expires_at
+      : 0;
     const token = stringValue(data.csrf_token);
-    if (!token) throw new ApiError("The server did not provide a CSRF token.");
-    state.csrfToken = token;
-    return token;
+    if (token) state.csrfToken = token;
+    applySessionUi();
+    updateSessionClock();
+  };
+
+  const fetchAuthSession = async (signal = undefined) => {
+    const {payload, response} = await requestJson(`${API_ROOT}/auth/session`, {
+      allowErrorStatus: true,
+      signal,
+    });
+    if (!response.ok) throw errorFromResponse(response, payload);
+    return sessionData(payload);
+  };
+
+  const bootstrapSession = async (signal = undefined) => {
+    const auth = await fetchAuthSession(signal);
+    applySessionData(auth);
+    if (!sessionIsActive(auth)) {
+      window.location.replace("/login");
+      throw new ApiError("Authentication is required.", {
+        code: "auth_required",
+        status: 401,
+      });
+    }
+  };
+
+  const refreshSession = async (signal = undefined) => {
+    const data = await fetchAuthSession(signal);
+    if (!sessionIsActive(data)) {
+      window.location.replace("/login");
+      throw new ApiError("Your session has ended.", {
+        code: "session_expired",
+        status: 401,
+      });
+    }
+    applySessionData(data);
+    if (!state.csrfToken) throw new ApiError("The server did not provide a CSRF token.");
+    return state.csrfToken;
   };
 
   const executeMutation = async (path, options) => {
@@ -221,7 +447,9 @@
       body = options.formData;
     } else {
       headers["Content-Type"] = "application/json";
-      body = JSON.stringify(options.json || {});
+      const values = {...objectValue(options.json)};
+      if (state.role !== "admin") delete values.account;
+      body = JSON.stringify(values);
     }
 
     let response;
@@ -255,7 +483,10 @@
     }
     if (!response.ok) {
       const error = errorFromResponse(response, payload);
-      if (response.status >= 500 && error.code !== "message_not_delivered") {
+      if (
+        response.status >= 500
+        && !new Set(["logout_failed", "message_not_delivered"]).has(error.code)
+      ) {
         error.ambiguous = true;
       }
       throw error;
@@ -278,6 +509,30 @@
 
   const handleError = (error, fallback = "The request could not be completed.") => {
     if (error && error.name === "AbortError") return;
+    const verificationFailure = error instanceof ApiError && new Set([
+      "invalid_credentials",
+      "invalid_second_factor",
+      "invalid_challenge",
+    ]).has(error.code);
+    if (error instanceof ApiError && error.status === 401 && !verificationFailure) {
+      window.clearInterval(state.sessionTimer);
+      state.csrfToken = "";
+      state.mail = null;
+      state.message = null;
+      state.accounts = [];
+      releaseBodyPreview();
+      releaseInlineImages();
+      window.location.replace("/login");
+      return;
+    }
+    if (
+      error instanceof ApiError
+      && error.status === 403
+      && (error.code === "access_denied" || error.code === "forbidden")
+    ) {
+      showView("access-denied", true);
+      return;
+    }
     const baseMessage = error instanceof ApiError ? error.message : fallback;
     const message = error instanceof ApiError && error.ambiguous
       ? `${baseMessage} The result may be unknown; refresh the affected data before another change.`
@@ -339,12 +594,25 @@
 
   const showView = (name, shouldFocus) => {
     let active = null;
+    const mailWorkspace = byId("mail-workspace");
+    const mailContext = name === "mail" || name === "message";
     document.documentElement.dataset.view = name;
+    if (mailWorkspace) mailWorkspace.hidden = !mailContext;
+    const workspaceIndicator = byId("admin-workspace-indicator");
+    if (workspaceIndicator && name !== "compose" && !mailContext) {
+      workspaceIndicator.hidden = true;
+    }
+    if (mailContext) {
+      document.documentElement.dataset.mobileMailPane = name === "message" ? "reading" : "list";
+    }
     document.querySelectorAll("[data-view]").forEach((view) => {
-      const selected = view.getAttribute("data-view") === name;
+      const viewName = view.getAttribute("data-view");
+      const selected = viewName === name || (viewName === "mail" && name === "message");
       view.hidden = !selected;
-      if (selected) active = view;
+      if (viewName === name) active = view;
     });
+    const placeholder = byId("message-placeholder");
+    if (placeholder) placeholder.hidden = name === "message";
     setActiveNavigation(name === "message" ? "mail" : name);
     if (active instanceof HTMLElement) focusViewHeading(active, shouldFocus);
   };
@@ -358,6 +626,8 @@
     if (path === "/compose") return {name: "compose"};
     if (path === "/accounts") return {name: "accounts"};
     if (path === "/certificates") return {name: "certificates"};
+    if (path === "/security") return {name: "security"};
+    if (path === "/access-denied") return {name: "access-denied"};
     return {name: "not-found"};
   };
 
@@ -369,6 +639,8 @@
       compose: "Compose",
       accounts: "Accounts",
       certificates: "Certificates",
+      security: "Security",
+      "access-denied": "Access denied",
       "not-found": "Page not found",
     };
     return `${titles[route.name] || "MaddyWeb"} - MaddyWeb`;
@@ -450,7 +722,10 @@
     return ["Credentials disabled", "status-neutral"];
   };
 
-  const accountId = (account) => stringValue(account.id);
+  const accountId = (account) => {
+    const value = stringValue(account.id);
+    return /^[0-9a-f]{32}$/.test(value) ? value : "";
+  };
   const accountAddress = (account) => stringValue(account.address, accountId(account));
 
   const openAccountDialog = (account, opener) => {
@@ -496,7 +771,22 @@
         type: "button",
       });
       manage.addEventListener("click", () => openAccountDialog(account, manage));
-      actionsCell.append(manage);
+      const actions = element("div", {className: "cell-actions"});
+      if (capabilityAllowed("admin.mailbox_access")) {
+        const openMailbox = element("button", {
+          className: "button button-secondary",
+          text: "Open mailbox",
+          type: "button",
+        });
+        openMailbox.addEventListener("click", () => {
+          const selected = accountId(account) || accountAddress(account);
+          state.effectiveAccount = selected;
+          navigate(buildMailUrl({account: selected}));
+        });
+        actions.append(openMailbox);
+      }
+      actions.append(manage);
+      actionsCell.append(actions);
       row.append(addressCell, statusCell, limitCell, actionsCell);
       fragment.append(row);
     }
@@ -530,7 +820,9 @@
 
   const buildMailUrl = ({account = "", mailbox = "", cursor = ""}) => {
     const url = new URL("/mail", window.location.origin);
-    if (account) url.searchParams.set("account", account);
+    if (account && state.role === "admin") {
+      url.searchParams.set("account", account);
+    }
     if (mailbox) url.searchParams.set("mailbox", mailbox);
     if (cursor) url.searchParams.set("cursor", cursor);
     return `${url.pathname}${url.search}`;
@@ -539,16 +831,32 @@
   const buildForwardUrl = ({account, mailbox, uid, mode}) => {
     const url = new URL("/compose", window.location.origin);
     url.searchParams.set("forward", mode);
-    url.searchParams.set("account", account);
+    if (account && state.role === "admin") {
+      url.searchParams.set("account", account);
+    }
     url.searchParams.set("mailbox", mailbox);
     url.searchParams.set("uid", uid);
     return `${url.pathname}${url.search}`;
   };
 
-  const messageApiQuery = (context) => new URLSearchParams({
-    account: context.account,
-    mailbox: context.mailbox,
-  });
+  const messageApiQuery = (context) => {
+    const query = new URLSearchParams({mailbox: context.mailbox});
+    if (state.role === "admin") {
+      query.set("account", context.account);
+    }
+    return query;
+  };
+
+  const mailResourceUrl = (value) => {
+    const url = sameOriginUrl(value, API_ROOT);
+    if (!url) return null;
+    const path = url.pathname;
+    const allowed = (
+      path.startsWith(`${API_ROOT}/me/mail/`)
+      || path.startsWith(`${API_ROOT}/admin/mail/`)
+    );
+    return allowed ? url : null;
+  };
 
   const loadMessageActionSnapshot = async (context, signal) => {
     signal.throwIfAborted();
@@ -559,9 +867,10 @@
       {signal},
     );
     signal.throwIfAborted();
+    const detailAccount = stringValue(detail.account);
     if (
       stringValue(detail.uid) !== context.uid
-      || stringValue(detail.account) !== context.account
+      || (detailAccount && detailAccount !== context.account)
       || stringValue(detail.mailbox) !== context.mailbox
       || !Number.isSafeInteger(detail.size)
       || detail.size <= 0
@@ -678,11 +987,40 @@
   };
 
   const renderMail = (mail) => {
-    const account = stringValue(mail.selected_account);
-    const mailbox = stringValue(mail.selected_mailbox);
-    const accounts = arrayValue(mail.accounts).map(objectValue);
-    const mailboxes = arrayValue(mail.mailboxes).map(objectValue);
-    const messages = arrayValue(mail.messages).map(objectValue);
+    const requestedAccount = new URLSearchParams(window.location.search).get("account") || "";
+    const account = stringValue(
+      mail.selected_account,
+      requestedAccount || scopedAccount(),
+    );
+    const requestedMailbox = new URLSearchParams(window.location.search).get("mailbox") || "";
+    const mailbox = stringValue(mail.selected_mailbox, requestedMailbox);
+    if (state.role === "admin" && account) {
+      state.effectiveAccount = account;
+    }
+    const workspaceIndicator = byId("admin-workspace-indicator");
+    workspaceIndicator.hidden = !(
+      state.role === "admin" && account
+    );
+    let accounts = arrayValue(mail.accounts).map(objectValue);
+    if (!accounts.length && account) {
+      accounts = [{
+        id: account,
+        address: state.role === "admin"
+          ? account
+          : stringValue(objectValue(state.principal).email, account),
+      }];
+    }
+    const selectedAccount = accounts.find((item) => accountId(item) === account);
+    const accountLabel = selectedAccount
+      ? accountAddress(selectedAccount)
+      : state.role === "admin"
+        ? account
+        : stringValue(objectValue(state.principal).email, account);
+    if (!workspaceIndicator.hidden) {
+      byId("admin-workspace-address").textContent = accountLabel;
+    }
+    const mailboxes = arrayValue(mail.mailboxes || mail.folders).map(objectValue);
+    const messages = arrayValue(mail.messages || mail.items).map(objectValue);
     const selectedMailbox = mailboxes.find(
       (item) => stringValue(item.name) === mailbox,
     );
@@ -710,12 +1048,48 @@
       account ? "Select a mailbox" : "Select an account first",
     );
     byId("mail-mailbox").disabled = !account;
+    byId("current-mailbox-identity").textContent = accountLabel;
+    byId("mail-title").textContent = mailbox || "Mail";
+    byId("mail-list-summary").textContent = mailbox
+      ? `${messages.length} message${messages.length === 1 ? "" : "s"} on this page`
+      : "Select a folder to browse messages.";
+
+    const folderFragment = document.createDocumentFragment();
+    for (const item of mailboxes) {
+      const name = stringValue(item.name);
+      if (!name) continue;
+      const link = element("a", {className: "mail-folder-link"});
+      link.href = buildMailUrl({account, mailbox: name});
+      link.dataset.route = "";
+      if (name === mailbox) link.setAttribute("aria-current", "page");
+      const normalized = name.toLowerCase();
+      const symbol = normalized === "inbox"
+        ? "I"
+        : normalized === "sent"
+          ? "S"
+          : normalized === "trash"
+            ? "T"
+            : normalized === "archive" || normalized === "all mail"
+              ? "A"
+              : normalized === "drafts"
+                ? "D"
+                : "F";
+      link.append(
+        element("span", {className: "mail-folder-icon", text: symbol}),
+        element("span", {className: "mail-folder-name", text: name}),
+      );
+      folderFragment.append(link);
+    }
+    byId("mail-folder-list").replaceChildren(folderFragment);
 
     const currentQuery = new URLSearchParams(window.location.search);
     if (
       account
       && mailbox
-      && currentQuery.get("account") === account
+      && (
+        state.role !== "admin"
+        || currentQuery.get("account") === account
+      )
       && !currentQuery.get("mailbox")
     ) {
       window.history.replaceState(null, "", buildMailUrl({account, mailbox}));
@@ -725,7 +1099,9 @@
     for (const message of messages) {
       const uid = stringValue(message.uid);
       const url = new URL(`/mail/${encodeURIComponent(uid)}`, window.location.origin);
-      url.searchParams.set("account", account);
+      if (state.role === "admin") {
+        url.searchParams.set("account", account);
+      }
       url.searchParams.set("mailbox", mailbox);
       const sender = stringValue(message.sender, "Unknown sender");
       const subject = stringValue(message.subject, "(No subject)");
@@ -844,7 +1220,13 @@
     const query = new URLSearchParams();
     for (const name of ["account", "mailbox", "cursor"]) {
       const value = new URLSearchParams(window.location.search).get(name);
-      if (value) query.set(name, value);
+      if (
+        value
+        && (
+          name !== "account"
+          || state.role === "admin"
+        )
+      ) query.set(name, value);
     }
     const suffix = query.size ? `?${query.toString()}` : "";
     const data = await apiData(`/mail${suffix}`, {signal});
@@ -875,10 +1257,7 @@
       fragment.append(section);
     }
     if (message.has_html === true) {
-      const source = sameOriginUrl(
-        stringValue(message.html_url),
-        `${API_ROOT}/mail/`,
-      );
+      const source = mailResourceUrl(stringValue(message.html_url));
       if (source) {
         const section = element("section", {className: "message-part"});
         section.append(element("h2", {text: "Sanitized HTML body"}));
@@ -907,10 +1286,7 @@
     const fragment = document.createDocumentFragment();
     const attachments = arrayValue(message.attachments).map(objectValue);
     for (const attachment of attachments) {
-      const source = sameOriginUrl(
-        stringValue(attachment.url),
-        `${API_ROOT}/mail/`,
-      );
+      const source = mailResourceUrl(stringValue(attachment.url));
       if (!source) continue;
       const item = element("li");
       const copy = element("span");
@@ -947,7 +1323,8 @@
       ? "Message too large to preview"
       : stringValue(message.subject, "(No subject)");
     byId("message-title").textContent = subject;
-    byId("message-summary").textContent = `${stringValue(message.account)} / ${
+    const account = stringValue(message.account, scopedAccount());
+    byId("message-summary").textContent = `${account} / ${
       stringValue(message.mailbox)
     } / UID ${stringValue(message.uid)}`;
     byId("message-sender").textContent = oversized
@@ -965,10 +1342,26 @@
       ? "Unavailable in oversized preview"
       : stringValue(message.date, "Unknown date");
 
-    const account = stringValue(message.account);
     const mailbox = stringValue(message.mailbox);
     byId("message-back").href = buildMailUrl({account, mailbox});
-    const raw = sameOriginUrl(stringValue(message.raw_url), `${API_ROOT}/mail/`);
+    const messageContextUrl = (action) => {
+      const url = new URL("/compose", window.location.origin);
+      url.searchParams.set(action, stringValue(message.uid));
+      url.searchParams.set("mailbox", mailbox);
+      if (state.role === "admin") {
+        url.searchParams.set("account", account);
+      }
+      return `${url.pathname}${url.search}`;
+    };
+    byId("message-reply").href = messageContextUrl("reply");
+    byId("message-reply-all").href = messageContextUrl("reply_all");
+    byId("message-forward").href = buildForwardUrl({
+      account,
+      mailbox,
+      uid: stringValue(message.uid),
+      mode: "inline",
+    });
+    const raw = mailResourceUrl(stringValue(message.raw_url));
     const rawLink = byId("message-raw");
     if (raw) {
       rawLink.href = `${raw.pathname}${raw.search}`;
@@ -985,12 +1378,12 @@
   const loadMessage = async (route, signal) => {
     setLoading("Loading message.");
     const query = new URLSearchParams(window.location.search);
-    const account = query.get("account") || "";
+    const account = query.get("account") || scopedAccount();
     const mailbox = query.get("mailbox") || "";
     if (!account || !mailbox) {
       throw new ApiError("The message route requires account and mailbox context.");
     }
-    const apiQuery = new URLSearchParams({account, mailbox});
+    const apiQuery = messageApiQuery({account, mailbox});
     const data = await apiData(
       `/mail/${encodeURIComponent(route.uid)}?${apiQuery.toString()}`,
       {signal},
@@ -1429,6 +1822,37 @@
     return Boolean(parsed.body.textContent.trim() || parsed.body.querySelector("img"));
   };
 
+  const plainTextAlternative = (source) => {
+    const parsed = new DOMParser().parseFromString(sanitizedPreviewBody(source), "text/html");
+    const blockTags = new Set([
+      "ADDRESS", "BLOCKQUOTE", "DD", "DIV", "DL", "DT", "H1", "H2", "H3", "H4",
+      "H5", "H6", "LI", "OL", "P", "PRE", "TABLE", "TBODY", "TD", "TFOOT", "TH",
+      "THEAD", "TR", "UL",
+    ]);
+    const renderNode = (node) => {
+      if (node.nodeType === Node.TEXT_NODE) return node.nodeValue || "";
+      if (!(node instanceof HTMLElement)) return "";
+      if (node.tagName === "BR") return "\n";
+      if (node.tagName === "HR") return "\n---\n";
+      if (node.tagName === "IMG") {
+        const alt = (node.getAttribute("alt") || "").trim();
+        return alt ? `[Inline image: ${alt}]` : "[Inline image]";
+      }
+      const content = Array.from(node.childNodes).map(renderNode).join("");
+      if (node.tagName === "LI") return `- ${content}\n`;
+      return blockTags.has(node.tagName) ? `${content}\n` : content;
+    };
+    return Array.from(parsed.body.childNodes)
+      .map(renderNode)
+      .join("")
+      .replaceAll("\u00a0", " ")
+      .split("\n")
+      .map((line) => line.replace(/[ \t]+$/g, ""))
+      .join("\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+  };
+
   const previewDocument = (source) => {
     const sanitized = sanitizedPreviewBody(source);
     const body = sanitized || '<p class="empty">Nothing to preview.</p>';
@@ -1498,6 +1922,13 @@
     const editor = byId("message-editor");
     if (source instanceof HTMLTextAreaElement) source.value = "";
     if (editor instanceof HTMLElement) editor.replaceChildren();
+    for (const id of ["compose-in-reply-to", "compose-references"]) {
+      const input = byId(id);
+      if (input instanceof HTMLInputElement) {
+        input.value = "";
+        input.disabled = true;
+      }
+    }
     state.writeDirty = false;
     state.writeSourceSnapshot = "";
     state.writeLinkTargets = new WeakMap();
@@ -1520,13 +1951,17 @@
     const mode = query.get("forward");
     if (mode === null) return null;
     const allowedNames = new Set(["forward", "account", "mailbox", "uid"]);
+    const requiredNames = state.role !== "admin"
+      ? ["forward", "mailbox", "uid"]
+      : ["forward", "account", "mailbox", "uid"];
     if (
       Array.from(query.keys()).some((name) => !allowedNames.has(name))
-      || Array.from(allowedNames).some((name) => query.getAll(name).length !== 1)
+      || requiredNames.some((name) => query.getAll(name).length !== 1)
+      || query.getAll("account").length > 1
     ) {
       throw new ApiError("The forward request contains an unsupported parameter.");
     }
-    const account = query.get("account") || "";
+    const account = query.get("account") || scopedAccount();
     const mailbox = query.get("mailbox") || "";
     const uid = query.get("uid") || "";
     if (
@@ -1538,6 +1973,90 @@
       throw new ApiError("The forward request is incomplete or invalid.");
     }
     return {mode, account, mailbox, uid};
+  };
+
+  const replyContextFromLocation = () => {
+    const query = new URLSearchParams(window.location.search);
+    const replyUid = query.get("reply");
+    const replyAllUid = query.get("reply_all");
+    if (replyUid === null && replyAllUid === null) return null;
+    if (replyUid !== null && replyAllUid !== null) {
+      throw new ApiError("Choose either Reply or Reply all.");
+    }
+    const mode = replyAllUid !== null ? "reply_all" : "reply";
+    const uid = replyAllUid || replyUid || "";
+    const allowedNames = new Set([mode, "account", "mailbox"]);
+    if (
+      Array.from(query.keys()).some((name) => !allowedNames.has(name))
+      || query.getAll(mode).length !== 1
+      || query.getAll("mailbox").length !== 1
+      || query.getAll("account").length > 1
+    ) {
+      throw new ApiError("The reply request contains an unsupported parameter.");
+    }
+    const account = query.get("account") || scopedAccount();
+    const mailbox = query.get("mailbox") || "";
+    if (!account || !mailbox || !/^[1-9][0-9]{0,9}$/.test(uid)) {
+      throw new ApiError("The reply request is incomplete or invalid.");
+    }
+    return {mode, account, mailbox, uid};
+  };
+
+  const replySubject = (subject) => {
+    const value = stringValue(subject, "(No subject)").trim() || "(No subject)";
+    return /^re:/i.test(value) ? value : `Re: ${value}`;
+  };
+
+  const addressValues = (value) => {
+    if (Array.isArray(value)) {
+      return value.map((item) => stringValue(item).trim()).filter(Boolean);
+    }
+    const single = stringValue(value).trim();
+    return single ? [single] : [];
+  };
+
+  const applyReplyDraft = async (context, senders, signal) => {
+    const query = messageApiQuery(context);
+    query.set("mode", context.mode);
+    const reply = await apiData(
+      `/mail/${encodeURIComponent(context.uid)}/reply?${query.toString()}`,
+      {signal},
+    );
+    const senderAccountId = stringValue(reply.sender_account_id);
+    if (senderAccountId !== context.account || !senders.includes(senderAccountId)) {
+      throw new ApiError("The server returned a mismatched reply identity.");
+    }
+    const to = addressValues(reply.to);
+    const cc = context.mode === "reply_all" ? addressValues(reply.cc) : [];
+    if (!to.length) throw new ApiError("The server did not provide a reply recipient.");
+
+    byId("compose-to").value = to.join(", ");
+    byId("compose-cc").value = cc.join(", ");
+    const ccRow = byId("compose-cc-row");
+    const ccToggle = document.querySelector('[data-recipient-toggle="cc"]');
+    ccRow.hidden = cc.length === 0;
+    if (ccToggle) ccToggle.setAttribute("aria-expanded", cc.length ? "true" : "false");
+    byId("compose-subject").value = stringValue(reply.subject);
+
+    const source = byId("html-source");
+    source.value = `<pre>${escapeText(stringValue(reply.text))}</pre>`;
+    renderSourceInWrite();
+    setBodyMode("write");
+
+    const parent = stringValue(reply.in_reply_to);
+    const references = addressValues(reply.references);
+    const parentInput = byId("compose-in-reply-to");
+    const referencesInput = byId("compose-references");
+    parentInput.value = parent;
+    parentInput.disabled = !parent;
+    referencesInput.value = references.join(" ");
+    referencesInput.disabled = references.length === 0;
+
+    const sender = byId("compose-sender");
+    if (sender instanceof HTMLSelectElement) {
+      sender.value = senderAccountId;
+    }
+    showToast(context.mode === "reply_all" ? "Reply-all draft prepared." : "Reply draft prepared.");
   };
 
   const forwardedSubject = (subject) => {
@@ -1618,11 +2137,15 @@
   };
 
   const forwardDownloadUrl = (value, context, expectedPath) => {
-    const url = sameOriginUrl(stringValue(value), expectedPath);
+    const url = mailResourceUrl(stringValue(value));
+    const accountMatches = (
+      state.role !== "admin"
+      || url?.searchParams.get("account") === context.account
+    );
     if (
       !url
       || url.pathname !== expectedPath
-      || url.searchParams.get("account") !== context.account
+      || !accountMatches
       || url.searchParams.get("mailbox") !== context.mailbox
     ) {
       throw new ApiError("The server returned an invalid message download URL.");
@@ -1669,9 +2192,10 @@
         `/mail/${encodeURIComponent(context.uid)}?${query}`,
         {signal},
       );
+      const detailAccount = stringValue(detail.account);
       if (
         stringValue(detail.uid) !== context.uid
-        || stringValue(detail.account) !== context.account
+        || (detailAccount && detailAccount !== context.account)
         || stringValue(detail.mailbox) !== context.mailbox
       ) {
         throw new ApiError("The server returned a mismatched forward source.");
@@ -1702,8 +2226,9 @@
     const files = [];
     let used = 0;
     if (context.mode === "attachment") {
-      const rawPath = `${API_ROOT}/mail/${encodeURIComponent(context.uid)}/raw`;
-      const url = forwardDownloadUrl(`${rawPath}?${query}`, context, rawPath);
+      const rawValue = apiPath(`/mail/${encodeURIComponent(context.uid)}/raw?${query}`);
+      const rawPath = new URL(rawValue, window.location.origin).pathname;
+      const url = forwardDownloadUrl(rawValue, context, rawPath);
       files.push(await downloadForwardFile({
         url,
         filename: `forwarded-message-${context.uid}.eml`,
@@ -1719,10 +2244,12 @@
           throw new ApiError("The original attachments exceed the configured upload limit.");
         }
         const attachmentId = stringValue(attachment.id);
-        const prefix = (
-          `${API_ROOT}/mail/${encodeURIComponent(context.uid)}/attachments/`
-          + encodeURIComponent(attachmentId)
+        const attachmentValue = apiPath(
+          `/mail/${encodeURIComponent(context.uid)}/attachments/${
+            encodeURIComponent(attachmentId)
+          }?${query}`,
         );
+        const prefix = new URL(attachmentValue, window.location.origin).pathname;
         const url = forwardDownloadUrl(attachment.url, context, prefix);
         const file = await downloadForwardFile({
           url,
@@ -1767,15 +2294,26 @@
   const loadCompose = async (signal) => {
     setLoading("Loading sending accounts.");
     const forwardContext = forwardContextFromLocation();
-    if (forwardContext) resetCompose();
+    const replyContext = replyContextFromLocation();
+    if (forwardContext && replyContext) {
+      throw new ApiError("A draft cannot be both a reply and a forward.");
+    }
+    if (forwardContext || replyContext) resetCompose();
     const data = await apiData("/compose", {signal});
-    const senders = arrayValue(data.senders)
-      .map((value) => stringValue(value))
-      .filter(Boolean);
+    const senderRecords = arrayValue(data.senders)
+      .map(objectValue)
+      .map((value) => ({
+        id: stringValue(value.id),
+        address: stringValue(value.address),
+      }))
+      .filter((value) => /^[0-9a-f]{32}$/.test(value.id) && value.address);
+    const senders = senderRecords.map((value) => value.id);
     const select = byId("compose-sender");
     const fragment = document.createDocumentFragment();
     if (!senders.length) fragment.append(optionNode("", "No enabled sending accounts"));
-    for (const sender of senders) fragment.append(optionNode(sender, sender));
+    for (const sender of senderRecords) {
+      fragment.append(optionNode(sender.id, sender.address));
+    }
     select.replaceChildren(fragment);
     select.disabled = senders.length === 0;
     byId("send-button").disabled = senders.length === 0 || state.sendLocked;
@@ -1786,6 +2324,9 @@
         : 20 * 1024 * 1024;
       setLoading("Preparing forward draft.");
       await applyForwardDraft(forwardContext, senders, maximumUpload, signal);
+    } else if (replyContext) {
+      setLoading("Preparing reply draft.");
+      await applyReplyDraft(replyContext, senders, signal);
     }
   };
 
@@ -1969,6 +2510,77 @@
     input.focus();
   };
 
+  const disclosedCredentialText = () => {
+    const disclosure = objectValue(state.disclosedCredentials);
+    const lines = [
+      "MaddyWeb one-time authentication credentials",
+      stringValue(disclosure.account)
+        ? `Account: ${stringValue(disclosure.account)}`
+        : "",
+      stringValue(disclosure.secret)
+        ? `Manual authenticator setup key: ${stringValue(disclosure.secret)}`
+        : "",
+      "",
+      "Recovery codes:",
+      ...arrayValue(disclosure.recoveryCodes).map((value) => stringValue(value)),
+      "",
+    ];
+    return lines.filter((value, index) => value || index >= 3).join("\n");
+  };
+
+  const clearDisclosedCredentials = () => {
+    if (state.disclosureDownloadUrl) {
+      window.URL.revokeObjectURL(state.disclosureDownloadUrl);
+    }
+    state.disclosureDownloadUrl = null;
+    state.disclosedCredentials = null;
+    byId("credential-secret").textContent = "";
+    byId("credential-recovery-codes").replaceChildren();
+    byId("credential-disclosure-acknowledged").checked = false;
+    byId("credential-disclosure-continue").disabled = true;
+  };
+
+  const openCredentialDisclosure = ({
+    title,
+    account,
+    secret = "",
+    recoveryCodes,
+    opener,
+    onContinue,
+  }) => {
+    const codes = arrayValue(recoveryCodes)
+      .map((value) => stringValue(value).trim())
+      .filter(Boolean);
+    const setupKey = stringValue(secret).replace(/\s+/g, "");
+    if (!codes.length) {
+      throw new ApiError("The server did not provide recovery codes.");
+    }
+    clearDisclosedCredentials();
+    state.disclosedCredentials = {
+      account: stringValue(account),
+      secret: setupKey,
+      recoveryCodes: codes,
+    };
+    state.disclosureOpener = opener instanceof HTMLElement ? opener : null;
+    state.disclosureContinue = typeof onContinue === "function" ? onContinue : null;
+    byId("credential-disclosure-title").textContent = title;
+    byId("credential-disclosure-account").textContent = stringValue(account);
+    const secretSection = byId("credential-secret-section");
+    secretSection.hidden = !setupKey;
+    byId("credential-secret").textContent = setupKey
+      ? setupKey.match(/.{1,4}/g)?.join(" ") || setupKey
+      : "";
+    const fragment = document.createDocumentFragment();
+    for (const code of codes) {
+      const item = element("li");
+      item.append(element("code", {text: code}));
+      fragment.append(item);
+    }
+    byId("credential-recovery-codes").replaceChildren(fragment);
+    credentialDisclosureDialog.showModal();
+    byId("credential-disclosure-acknowledged").focus();
+  };
+
   const finishAction = (payload, fallback) => {
     clearAlert();
     const message = stringValue(payload.message, fallback);
@@ -1994,7 +2606,22 @@
   };
 
   const renderRoute = async (shouldFocus = true) => {
-    const route = parseRoute();
+    let route = parseRoute();
+    const adminOnly = new Set(["overview", "accounts", "certificates"]);
+    const mailOnly = new Set(["mail", "message"]);
+    if (
+      objectValue(state.principal).password_change_required === true
+      && route.name !== "security"
+    ) {
+      route = {name: "security"};
+      window.history.replaceState(null, "", "/security");
+    } else if (adminOnly.has(route.name) && state.role !== "admin") {
+      route = {name: "access-denied"};
+    } else if (mailOnly.has(route.name) && !capabilityAllowed("mail.read")) {
+      route = {name: "access-denied"};
+    } else if (route.name === "compose" && !capabilityAllowed("mail.send")) {
+      route = {name: "access-denied"};
+    }
     document.title = titleForRoute(route);
     showView(route.name, shouldFocus);
     clearAlert();
@@ -2009,7 +2636,10 @@
     try {
       if (route.name === "overview") await loadOverview(signal);
       else if (route.name === "mail") await loadMail(signal);
-      else if (route.name === "message") await loadMessage(route, signal);
+      else if (route.name === "message") {
+        await loadMail(signal);
+        await loadMessage(route, signal);
+      }
       else if (route.name === "compose") await loadCompose(signal);
       else if (route.name === "accounts") await loadAccounts(signal);
       else if (route.name === "certificates") await loadCertificates(signal);
@@ -2042,6 +2672,33 @@
 
   window.addEventListener("popstate", () => void renderRoute());
 
+  const logout = async () => {
+    const buttons = [
+      byId("logout-button"),
+      byId("security-logout-button"),
+      byId("access-denied-logout"),
+    ];
+    for (const button of buttons) {
+      if (button instanceof HTMLButtonElement) button.disabled = true;
+    }
+    try {
+      await mutate("/auth/logout", {json: {}});
+    } catch (error) {
+      handleError(error, "Sign out could not be confirmed. Retry before leaving this browser.");
+      for (const button of buttons) {
+        if (button instanceof HTMLButtonElement) button.disabled = false;
+      }
+      return;
+    }
+    window.clearInterval(state.sessionTimer);
+    state.csrfToken = "";
+    state.accounts = [];
+    state.mail = null;
+    state.message = null;
+    resetCompose();
+    window.location.replace("/login");
+  };
+
   byId("theme-toggle").addEventListener("click", () => {
     const next = state.theme === "dark" ? "light" : "dark";
     applyTheme(next);
@@ -2054,14 +2711,31 @@
 
   byId("mail-account").addEventListener("change", (event) => {
     const value = event.target instanceof HTMLSelectElement ? event.target.value : "";
+    if (state.role === "admin") {
+      state.effectiveAccount = value;
+    }
     navigate(buildMailUrl({account: value}));
   });
 
   byId("mail-mailbox").addEventListener("change", (event) => {
     const mailbox = event.target instanceof HTMLSelectElement ? event.target.value : "";
-    const account = byId("mail-account").value;
+    const account = byId("mail-account").value || scopedAccount();
     navigate(buildMailUrl({account, mailbox}));
   });
+
+  byId("mobile-folders-button").addEventListener("click", () => {
+    document.documentElement.dataset.mobileMailPane = "folders";
+    byId("mail-folder-pane").querySelector("a, select, button")?.focus();
+  });
+
+  byId("mobile-list-button").addEventListener("click", () => {
+    const back = byId("message-back");
+    if (back instanceof HTMLAnchorElement) navigate(back.href);
+  });
+
+  byId("logout-button").addEventListener("click", () => void logout());
+  byId("security-logout-button").addEventListener("click", () => void logout());
+  byId("access-denied-logout").addEventListener("click", () => void logout());
 
   const FORMAT_COMMANDS = new Map([
     ["bold", ["bold", null]],
@@ -2243,7 +2917,15 @@
   window.addEventListener("beforeunload", () => {
     releaseBodyPreview();
     releaseInlineImages();
+    clearDisclosedCredentials();
   });
+
+  byId("own-password-form").elements.namedItem("confirm_password").addEventListener(
+    "input",
+    (event) => {
+      if (event.target instanceof HTMLInputElement) event.target.setCustomValidity("");
+    },
+  );
 
   byId("compose-form").addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -2265,6 +2947,9 @@
     if (!form.reportValidity()) return;
 
     const formData = new FormData(form);
+    if (bodySource instanceof HTMLTextAreaElement) {
+      formData.set("text", plainTextAlternative(bodySource.value));
+    }
     formData.delete("inline_images");
     formData.delete("inline_cids");
     for (const item of state.inlineImages) {
@@ -2329,6 +3014,84 @@
     }
   });
 
+  byId("own-password-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    if (!(form instanceof HTMLFormElement) || !form.reportValidity()) return;
+    const currentInput = form.elements.namedItem("current_password");
+    const newInput = form.elements.namedItem("new_password");
+    const confirmInput = form.elements.namedItem("confirm_password");
+    if (
+      !(currentInput instanceof HTMLInputElement)
+      || !(newInput instanceof HTMLInputElement)
+      || !(confirmInput instanceof HTMLInputElement)
+    ) return;
+    if (newInput.value !== confirmInput.value) {
+      confirmInput.setCustomValidity("The new passwords do not match.");
+      confirmInput.reportValidity();
+      return;
+    }
+    confirmInput.setCustomValidity("");
+    const currentPassword = currentInput.value;
+    const newPassword = newInput.value;
+    currentInput.value = "";
+    newInput.value = "";
+    confirmInput.value = "";
+    const button = form.querySelector('button[type="submit"]');
+    if (!(button instanceof HTMLButtonElement)) return;
+    button.disabled = true;
+    clearAlert();
+    try {
+      const payload = await mutate("/auth/password/change", {
+        json: {
+          current_password: currentPassword,
+          new_password: newPassword,
+        },
+      });
+      finishAction(payload, "Password changed. Sign in again.");
+      window.location.replace("/login");
+    } catch (error) {
+      handleError(error, "The password could not be changed.");
+      button.disabled = false;
+    }
+  });
+
+  byId("regenerate-recovery-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    if (!(form instanceof HTMLFormElement) || !form.reportValidity()) return;
+    const passwordInput = form.elements.namedItem("password");
+    const codeInput = form.elements.namedItem("code");
+    if (
+      !(passwordInput instanceof HTMLInputElement)
+      || !(codeInput instanceof HTMLInputElement)
+    ) return;
+    const password = passwordInput.value;
+    const code = codeInput.value.replace(/\s+/g, "");
+    passwordInput.value = "";
+    codeInput.value = "";
+    const button = form.querySelector('button[type="submit"]');
+    if (!(button instanceof HTMLButtonElement)) return;
+    button.disabled = true;
+    clearAlert();
+    try {
+      const payload = await mutate("/auth/recovery-codes/regenerate", {
+        json: {password, code},
+      });
+      const data = objectValue(payload.data);
+      openCredentialDisclosure({
+        title: "Save your new recovery codes",
+        account: stringValue(objectValue(state.principal).email),
+        recoveryCodes: data.recovery_codes,
+        opener: button,
+        onContinue: () => window.location.replace("/login"),
+      });
+    } catch (error) {
+      handleError(error, "Recovery codes could not be regenerated.");
+      button.disabled = false;
+    }
+  });
+
   byId("create-account-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = event.currentTarget;
@@ -2347,7 +3110,42 @@
       const payload = await mutate("/accounts", {json: {username, password}});
       finishAction(payload, "Account created.");
       form.reset();
-      await loadAccounts();
+      const data = objectValue(payload.data);
+      const recoveryCodes = arrayValue(data.recovery_codes);
+      const secret = stringValue(data.totp_secret);
+      if (!secret || !recoveryCodes.length) {
+        throw new ApiError(
+          "The account was created, but the server did not return its enrollment credentials.",
+          {ambiguous: true},
+        );
+      }
+      const createdId = accountId(data);
+      const createdAddress = stringValue(data.address, username);
+      if (createdId) {
+        state.accounts = [
+          ...state.accounts.filter((account) => accountId(account) !== createdId),
+          {
+            id: createdId,
+            address: createdAddress,
+            has_credentials: true,
+            has_mailbox: true,
+            append_limit: null,
+          },
+        ];
+        renderAccounts(state.accounts);
+      }
+      openCredentialDisclosure({
+        title: "Save the new account credentials",
+        account: createdAddress,
+        secret,
+        recoveryCodes,
+        opener: button,
+        onContinue: () => {
+          void loadAccounts().catch((error) => {
+            handleError(error, "The account list could not be refreshed.");
+          });
+        },
+      });
     } catch (error) {
       handleError(error, "The account could not be created.");
     } finally {
@@ -2411,6 +3209,86 @@
     }
   });
 
+  byId("reset-account-totp").addEventListener("click", (event) => {
+    const account = objectValue(state.selectedAccount);
+    const id = accountId(account);
+    const address = accountAddress(account);
+    if (!id || !address) return;
+    state.stepUpTarget = {id, address};
+    state.stepUpOpener = state.accountOpener instanceof HTMLElement
+      ? state.accountOpener
+      : event.currentTarget;
+    byId("step-up-account").textContent = address;
+    byId("step-up-error").hidden = true;
+    byId("step-up-error").textContent = "";
+    byId("step-up-form").reset();
+    closeDialog(accountDialog);
+    stepUpDialog.showModal();
+    const password = byId("step-up-form").elements.namedItem("password");
+    if (password instanceof HTMLInputElement) password.focus();
+  });
+
+  byId("step-up-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const target = objectValue(state.stepUpTarget);
+    const id = stringValue(target.id);
+    const address = stringValue(target.address);
+    if (
+      !(form instanceof HTMLFormElement)
+      || !form.reportValidity()
+      || !/^[0-9a-f]{32}$/.test(id)
+      || !address
+    ) return;
+    const passwordInput = form.elements.namedItem("password");
+    const codeInput = form.elements.namedItem("code");
+    if (
+      !(passwordInput instanceof HTMLInputElement)
+      || !(codeInput instanceof HTMLInputElement)
+    ) return;
+    const password = passwordInput.value;
+    const code = codeInput.value.replace(/\s+/g, "");
+    passwordInput.value = "";
+    codeInput.value = "";
+    const button = form.querySelector('button[type="submit"]');
+    if (!(button instanceof HTMLButtonElement)) return;
+    button.disabled = true;
+    clearAlert();
+    byId("step-up-error").hidden = true;
+    byId("step-up-error").textContent = "";
+    try {
+      await mutate("/auth/step-up", {json: {password, code}});
+      const payload = await mutate(`/accounts/${encodeURIComponent(id)}/totp/reset`, {
+        json: {confirmation: "RESET TOTP"},
+      });
+      const data = objectValue(payload.data);
+      const secret = stringValue(data.totp_secret);
+      const recoveryCodes = arrayValue(data.recovery_codes);
+      if (!secret || !recoveryCodes.length) {
+        throw new ApiError("The server did not provide the replacement TOTP credentials.");
+      }
+      closeDialog(stepUpDialog);
+      openCredentialDisclosure({
+        title: "Save the replacement TOTP credentials",
+        account: stringValue(data.email, address),
+        secret,
+        recoveryCodes,
+        opener: state.stepUpOpener,
+        onContinue: id === stringValue(objectValue(state.principal).account_id)
+          ? () => window.location.replace("/login")
+          : null,
+      });
+      finishAction(payload, "Account TOTP reset.");
+    } catch (error) {
+      const message = error instanceof ApiError
+        ? error.message
+        : "Account TOTP could not be reset.";
+      byId("step-up-error").textContent = message;
+      byId("step-up-error").hidden = false;
+      button.disabled = false;
+    }
+  });
+
   byId("disable-credentials").addEventListener("click", (event) => {
     const account = state.selectedAccount || {};
     const id = accountId(account);
@@ -2470,7 +3348,7 @@
       action: async () => {
         const payload = await mutate(`/mail/${encodeURIComponent(uid)}/trash`, {
           json: {
-            account: stringValue(message.account),
+            account: stringValue(message.account, scopedAccount()),
             mailbox: stringValue(message.mailbox),
             freshness: stringValue(message.freshness_token),
           },
@@ -2478,7 +3356,10 @@
         finishAction(payload, "Message moved to Trash.");
         const data = objectValue(payload.data);
         navigate(buildMailUrl({
-          account: stringValue(data.account, stringValue(message.account)),
+          account: stringValue(
+            data.account,
+            stringValue(message.account, scopedAccount()),
+          ),
           mailbox: stringValue(data.mailbox, "Trash"),
         }));
       },
@@ -2497,7 +3378,7 @@
       action: async () => {
         const payload = await mutate(`/mail/${encodeURIComponent(uid)}/delete`, {
           json: {
-            account: stringValue(message.account),
+            account: stringValue(message.account, scopedAccount()),
             mailbox: stringValue(message.mailbox),
             freshness: stringValue(message.freshness_token),
             confirmation: DELETE_MESSAGE_CONFIRMATION,
@@ -2505,7 +3386,7 @@
         });
         finishAction(payload, "Message permanently deleted.");
         navigate(buildMailUrl({
-          account: stringValue(message.account),
+          account: stringValue(message.account, scopedAccount()),
           mailbox: stringValue(message.mailbox),
         }));
       },
@@ -2528,6 +3409,50 @@
         await loadCertificates();
       },
     });
+  });
+
+  byId("credential-disclosure-acknowledged").addEventListener("change", (event) => {
+    byId("credential-disclosure-continue").disabled = !event.currentTarget.checked;
+  });
+
+  byId("copy-disclosed-credentials").addEventListener("click", async () => {
+    if (!state.disclosedCredentials) return;
+    try {
+      await navigator.clipboard.writeText(disclosedCredentialText());
+      showToast("One-time credentials copied.");
+    } catch {
+      showAlert("Clipboard access was denied. Select and copy the values manually.");
+    }
+  });
+
+  byId("download-disclosed-credentials").addEventListener("click", () => {
+    if (!state.disclosedCredentials) return;
+    if (state.disclosureDownloadUrl) {
+      window.URL.revokeObjectURL(state.disclosureDownloadUrl);
+    }
+    state.disclosureDownloadUrl = window.URL.createObjectURL(new Blob(
+      [disclosedCredentialText()],
+      {type: "text/plain;charset=utf-8"},
+    ));
+    const link = element("a");
+    link.href = state.disclosureDownloadUrl;
+    link.download = "maddyweb-one-time-credentials.txt";
+    link.click();
+  });
+
+  byId("credential-disclosure-continue").addEventListener("click", () => {
+    if (
+      !state.disclosedCredentials
+      || !byId("credential-disclosure-acknowledged").checked
+    ) return;
+    const onContinue = state.disclosureContinue;
+    const opener = state.disclosureOpener;
+    state.disclosureContinue = null;
+    state.disclosureOpener = null;
+    credentialDisclosureDialog.close();
+    clearDisclosedCredentials();
+    if (onContinue) onContinue();
+    else if (opener instanceof HTMLElement && document.contains(opener)) opener.focus();
   });
 
   byId("confirm-action").addEventListener("click", async (event) => {
@@ -2607,6 +3532,25 @@
     state.accountOpener = null;
   });
 
+  stepUpDialog.addEventListener("close", () => {
+    byId("step-up-form").reset();
+    byId("step-up-error").hidden = true;
+    byId("step-up-error").textContent = "";
+    state.stepUpTarget = null;
+    if (
+      !credentialDisclosureDialog.open
+      && state.stepUpOpener instanceof HTMLElement
+      && document.contains(state.stepUpOpener)
+    ) {
+      state.stepUpOpener.focus();
+    }
+    state.stepUpOpener = null;
+  });
+
+  credentialDisclosureDialog.addEventListener("cancel", (event) => {
+    event.preventDefault();
+  });
+
   const initialize = async () => {
     initializeTheme();
     setBodyMode("write");
@@ -2615,9 +3559,10 @@
     renderInlineImageTray();
     updateFormattingButtons();
     try {
-      await refreshSession();
+      await bootstrapSession();
     } catch (error) {
       handleError(error, "The secure session could not be initialized.");
+      if (state.authState !== "active") return;
     }
     if (parseRoute().name !== "overview") {
       try {

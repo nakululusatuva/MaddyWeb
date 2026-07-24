@@ -10,6 +10,7 @@ import sys
 import tomllib
 from pathlib import Path, PurePosixPath
 from typing import Any, Never
+from urllib.parse import urlsplit
 
 SCHEMA: dict[str, set[str]] = {
     "server": {
@@ -50,7 +51,15 @@ SCHEMA: dict[str, set[str]] = {
         "deployed_cert_path",
         "deployed_key_path",
     },
-    "security": {"session_key_file", "csrf_ttl_seconds", "cookie_name"},
+    "security": {
+        "session_key_file",
+        "auth_state_dir",
+        "csrf_ttl_seconds",
+        "session_cookie_name",
+        "csrf_cookie_name",
+        "public_origin",
+        "totp_issuer",
+    },
     "logging": {"level"},
 }
 OPTIONAL_KEYS: dict[str, set[str]] = {
@@ -61,6 +70,11 @@ CONTAINER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 SERVICE_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 TIMER_UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@-]*\.timer$")
 SYSTEMD_PATH_COMPONENT_RE = re.compile(r"^[A-Za-z0-9_+.][A-Za-z0-9_.+-]*$")
+DNS_HOST_RE = re.compile(
+    r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*"
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+)
+COOKIE_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,64}$")
 
 
 def fail(message: str) -> Never:
@@ -125,6 +139,52 @@ def string_list(value: Any, name: str) -> list[str]:
     return value
 
 
+def host(value: Any, name: str) -> str:
+    candidate = string(value, name).strip().rstrip(".").lower()
+    if (
+        candidate != value
+        or not candidate
+        or any(ord(character) < 0x21 or ord(character) > 0x7E for character in candidate)
+    ):
+        fail(f"{name} contains an invalid host")
+    try:
+        address = ipaddress.ip_address(candidate)
+    except ValueError:
+        if DNS_HOST_RE.fullmatch(candidate) is None:
+            fail(f"{name} contains an invalid host")
+    else:
+        if address.version != 4:
+            fail(f"{name} supports only an IPv4 literal or DNS hostname")
+    return candidate
+
+
+def https_origin(value: Any, name: str) -> str:
+    candidate = string(value, name, allow_empty=True)
+    if not candidate:
+        return ""
+    try:
+        parsed = urlsplit(candidate)
+        port = parsed.port
+    except ValueError:
+        fail(f"{name} must be a valid HTTPS origin")
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+        or port not in {None, 443}
+    ):
+        fail(f"{name} must be an HTTPS origin without a path")
+    normalized_host = host(parsed.hostname, name)
+    normalized = f"https://{normalized_host}"
+    if candidate.rstrip("/") != normalized:
+        fail(f"{name} must use its canonical lowercase form")
+    return normalized
+
+
 def validate(
     config: dict[str, Any],
     expected_host: str,
@@ -152,9 +212,12 @@ def validate(
             fail("the expected server address itself is not loopback")
     except ValueError:
         fail("expected host must be a literal loopback address")
-    hosts = string_list(server["allowed_hosts"], "server.allowed_hosts")
-    if not hosts or not set(hosts) <= {"127.0.0.1", "localhost"}:
-        fail("server.allowed_hosts may contain only 127.0.0.1 and localhost")
+    hosts = [
+        host(value, f"server.allowed_hosts[{index}]")
+        for index, value in enumerate(string_list(server["allowed_hosts"], "server.allowed_hosts"))
+    ]
+    if not hosts or len(set(hosts)) != len(hosts):
+        fail("server.allowed_hosts must be non-empty and contain no duplicates")
     integer(server["concurrency"], "server.concurrency", 1, 64)
     integer(server["backlog"], "server.backlog", 1, 256)
     integer(server["keepalive_seconds"], "server.keepalive_seconds", 1, 30)
@@ -252,8 +315,7 @@ def validate(
     for index, value in enumerate(webroot_roots):
         root = PurePosixPath(absolute(value, f"certificates.webroot_roots[{index}]"))
         if not any(
-            root == allowed or root.is_relative_to(allowed)
-            for allowed in permitted_webroots
+            root == allowed or root.is_relative_to(allowed) for allowed in permitted_webroots
         ):
             fail("certificates.webroot_roots must stay below /var/www or /srv/www")
     for field in ("deployed_cert_path", "deployed_key_path"):
@@ -273,10 +335,37 @@ def validate(
 
     security = table(config, "security")
     absolute(security["session_key_file"], "security.session_key_file")
+    auth_state_dir = absolute(security["auth_state_dir"], "security.auth_state_dir")
+    if auth_state_dir != "/var/lib/maddyweb-auth":
+        fail("security.auth_state_dir must be exactly /var/lib/maddyweb-auth")
     integer(security["csrf_ttl_seconds"], "security.csrf_ttl_seconds", 60, 3600)
-    cookie = string(security["cookie_name"], "security.cookie_name")
-    if not cookie.startswith("__Host-"):
-        fail("security.cookie_name must use the __Host- prefix")
+    session_cookie = string(
+        security["session_cookie_name"],
+        "security.session_cookie_name",
+    )
+    csrf_cookie = string(
+        security["csrf_cookie_name"],
+        "security.csrf_cookie_name",
+    )
+    for name, cookie in (
+        ("security.session_cookie_name", session_cookie),
+        ("security.csrf_cookie_name", csrf_cookie),
+    ):
+        if not cookie.startswith("__Host-") or COOKIE_RE.fullmatch(cookie) is None:
+            fail(f"{name} is invalid")
+    if session_cookie == csrf_cookie:
+        fail("session and CSRF cookies must use different names")
+    public_origin = https_origin(security["public_origin"], "security.public_origin")
+    if public_origin and urlsplit(public_origin).hostname not in hosts:
+        fail("security.public_origin hostname must be listed in server.allowed_hosts")
+    issuer = string(security["totp_issuer"], "security.totp_issuer")
+    if (
+        not 1 <= len(issuer) <= 64
+        or not issuer.isascii()
+        or ":" in issuer
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in issuer)
+    ):
+        fail("security.totp_issuer must be printable ASCII without a colon")
 
     logging = table(config, "logging")
     if string(logging["level"], "logging.level").upper() not in {

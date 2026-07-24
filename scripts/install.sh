@@ -13,12 +13,33 @@ readonly RELEASE_ROOT="$PREFIX/releases"
 readonly CURRENT_LINK="$PREFIX/current"
 readonly SYSTEMD_ROOT="/etc/systemd/system"
 readonly CONFIG_ROOT="/etc/maddyweb"
+readonly CONFIG_HISTORY_ROOT="/var/lib/maddyweb-config-history"
 readonly DEPENDENCY_LOCK="$REPO_ROOT/requirements.lock"
 readonly CERTBOT_ROOT="/etc/letsencrypt"
 readonly CERTBOT_RENEWAL_HOOKS="$CERTBOT_ROOT/renewal-hooks"
 readonly CERTBOT_DEPLOY_HOOKS="$CERTBOT_RENEWAL_HOOKS/deploy"
 readonly CERTBOT_DEPLOY_HOOK="$CERTBOT_DEPLOY_HOOKS/maddyweb"
 readonly CERTBOT_HOOK_MARKER="# Managed by MaddyWeb install.sh; do not edit."
+readonly PUBLIC_EDGE_ROOT="$REPO_ROOT/deploy/public-edge"
+readonly PUBLIC_EDGE_CHECKER="$PUBLIC_EDGE_ROOT/check-public-edge.sh"
+readonly PUBLIC_EDGE_DOCUMENTATION="$REPO_ROOT/docs/public-edge.md"
+readonly -a PUBLIC_EDGE_NGINX_ASSETS=(
+    cloudflare-http.conf
+    cloudflare-realip.conf
+    maddy.custom.example.test.bootstrap.conf
+    maddy.custom.example.test.conf
+    maddy.custom.example.test.withdrawn.conf
+    maddy.standalone.example.test.bootstrap.conf
+    maddy.standalone.example.test.conf
+    maddy.standalone.example.test.withdrawn.conf
+    custom-maddyweb-http.inc
+)
+readonly -a PUBLIC_EDGE_SYSTEMD_ASSETS=(
+    maddyweb-web-cert-custom.service
+    maddyweb-web-cert-custom.timer
+    maddyweb-web-cert-standalone.service
+    maddyweb-web-cert-standalone.timer
+)
 
 assert_config_root_metadata() {
     [[ -d "$CONFIG_ROOT" && ! -L "$CONFIG_ROOT" ]] \
@@ -39,6 +60,29 @@ assert_managed_config_file() {
     metadata=$(stat -c '%u:%g:%a:%h' -- "$path") || die "cannot inspect $path"
     [[ "$metadata" == "0:${expected_gid}:640:1" ]] \
         || die "$path must be single-link root:maddyweb 0640"
+}
+
+assert_replacement_config_source() {
+    local path=${1:?replacement config path is required}
+    [[ -f "$path" && ! -L "$path" ]] \
+        || die "replacement config must be a regular non-symlink file"
+    local owner mode links
+    owner=$(stat -c '%u' -- "$path") || die "cannot inspect replacement config owner"
+    mode=$(stat -c '%a' -- "$path") || die "cannot inspect replacement config mode"
+    links=$(stat -c '%h' -- "$path") || die "cannot inspect replacement config links"
+    [[ "$owner" == 0 && "$links" == 1 ]] \
+        || die "replacement config must be root-owned with one hard link"
+    (( (8#$mode & 8#022) == 0 )) \
+        || die "replacement config must not be group or world writable"
+}
+
+assert_config_history_root() {
+    [[ -d "$CONFIG_HISTORY_ROOT" && ! -L "$CONFIG_HISTORY_ROOT" ]] \
+        || die "configuration history root must be a real directory"
+    [[ "$(realpath -e -- "$CONFIG_HISTORY_ROOT")" == "$CONFIG_HISTORY_ROOT" ]] \
+        || die "configuration history root must be canonical"
+    [[ "$(stat -c '%u:%g:%a' -- "$CONFIG_HISTORY_ROOT")" == "0:0:700" ]] \
+        || die "configuration history root must be root:root 0700"
 }
 
 secure_root_directory() {
@@ -82,6 +126,7 @@ Options:
   Native: --maddy-binary /absolute/maddy --maddy-state /absolute/state-dir
   Docker: --docker-binary /absolute/docker --container SAFE_NAME
   --config-template PATH   Defaults to the matching native/docker example
+  --replace-config        Transactionally replace an existing config from the template
   --python PATH            Default: resolved python3
   --approval-file PATH     Required for a production --apply
   --apply                  Mutate this host; without this, print the plan only
@@ -106,6 +151,7 @@ maddy_state=""
 docker_binary="$(command -v docker || true)"
 container=""
 config_template=""
+replace_config=false
 python_binary="$(command -v python3 || true)"
 approval_file=""
 apply=false
@@ -126,6 +172,7 @@ while (($#)); do
         --docker-binary) (($# >= 2)) || die "--docker-binary requires a value"; docker_binary=$2; shift 2 ;;
         --container) (($# >= 2)) || die "--container requires a value"; container=$2; shift 2 ;;
         --config-template) (($# >= 2)) || die "--config-template requires a value"; config_template=$2; shift 2 ;;
+        --replace-config) replace_config=true; shift ;;
         --python) (($# >= 2)) || die "--python requires a value"; python_binary=$2; shift 2 ;;
         --approval-file) (($# >= 2)) || die "--approval-file requires a value"; approval_file=$2; shift 2 ;;
         --apply) apply=true; shift ;;
@@ -137,6 +184,9 @@ done
 
 case "$environment" in development|production) ;; *) die "--environment must be development or production" ;; esac
 case "$maddy_mode" in native|docker) ;; *) die "--maddy-mode must be native or docker" ;; esac
+if [[ "$replace_config" == true && "$activate" != true ]]; then
+    die "--replace-config requires --activate so no old process can use the new schema"
+fi
 [[ -n "$target_host" ]] || die "--host is required"
 [[ "$target_host" == "$(hostname)" ]] || die "--host does not match this host: $(hostname)"
 [[ -n "$artifact" && -n "$artifact_manifest" && -n "$wheelhouse" && -n "$maddy_config" && -n "$python_binary" ]] || die "artifact, manifest, wheelhouse, Maddy config, and Python are required"
@@ -149,6 +199,14 @@ require_directory "$wheelhouse" "offline wheelhouse"
 require_path_below "$artifact" "$wheelhouse"
 require_absolute_path "$python_binary" "Python binary"
 [[ -x "$python_binary" ]] || die "Python binary is not executable"
+require_regular_file "$PUBLIC_EDGE_CHECKER" "public-edge checker"
+require_regular_file "$PUBLIC_EDGE_DOCUMENTATION" "public-edge documentation"
+for public_edge_asset in "${PUBLIC_EDGE_NGINX_ASSETS[@]}"; do
+    require_regular_file "$PUBLIC_EDGE_ROOT/nginx/$public_edge_asset" "public-edge Nginx asset"
+done
+for public_edge_asset in "${PUBLIC_EDGE_SYSTEMD_ASSETS[@]}"; do
+    require_regular_file "$PUBLIC_EDGE_ROOT/systemd/$public_edge_asset" "public-edge systemd asset"
+done
 artifact_report=$("$python_binary" "$SCRIPT_DIR/verify-release-artifact.py" \
     --artifact "$artifact" --manifest "$artifact_manifest" --expected-sha256 "$expected_sha256")
 release_commit=$("$python_binary" -c 'import json,sys; print(json.loads(sys.argv[1])["commit"])' "$artifact_report")
@@ -164,6 +222,9 @@ if [[ -z "$config_template" ]]; then
     fi
 fi
 require_regular_file "$config_template" "config template"
+if [[ "$replace_config" == true ]]; then
+    assert_replacement_config_source "$config_template"
+fi
 
 run_preflight() {
     local app_config=${1:?application config is required}
@@ -190,19 +251,32 @@ else
 fi
 
 preflight_config="$config_template"
+existing_config_sha256=""
 if [[ -e "$CONFIG_ROOT/config.toml" || -L "$CONFIG_ROOT/config.toml" ]]; then
     assert_config_root_metadata
     assert_managed_config_file "$CONFIG_ROOT/config.toml"
-    preflight_config="$CONFIG_ROOT/config.toml"
+    existing_config_sha256=$(sha256_file "$CONFIG_ROOT/config.toml")
+    [[ "$existing_config_sha256" =~ ^[0-9a-f]{64}$ ]] \
+        || die "existing configuration checksum is invalid"
+    if [[ "$replace_config" != true ]]; then
+        preflight_config="$CONFIG_ROOT/config.toml"
+    fi
+elif [[ "$replace_config" == true ]]; then
+    die "--replace-config requires an existing managed config"
 fi
 run_preflight "$preflight_config"
+prospective_config_sha256=$(sha256_file "$preflight_config")
+[[ "$prospective_config_sha256" =~ ^[0-9a-f]{64}$ ]] \
+    || die "prospective configuration checksum is invalid"
 
 artifact_name=$(basename -- "$artifact")
 release_name=$release_commit
 release_path="$RELEASE_ROOT/$release_name"
 
-printf 'environment=%s\nhost=%s\nmaddy_mode=%s\ncontainer=%s\nartifact=%s\ncommit=%s\nrelease=%s\nactivate=%s\n' \
-    "$environment" "$target_host" "$maddy_mode" "$container" "$artifact" "$release_commit" "$release_path" "$activate"
+printf 'environment=%s\nhost=%s\nmaddy_mode=%s\ncontainer=%s\nartifact=%s\ncommit=%s\nrelease=%s\nactivate=%s\nreplace_config=%s\nconfig_sha256=%s\n' \
+    "$environment" "$target_host" "$maddy_mode" "$container" "$artifact" \
+    "$release_commit" "$release_path" "$activate" "$replace_config" \
+    "$prospective_config_sha256"
 
 if [[ "$apply" != true ]]; then
     log "dry-run complete; pass --apply only after reviewing the plan"
@@ -219,10 +293,23 @@ fi
 
 require_command install
 require_command cmp
+require_command find
 require_command realpath
 require_command systemd-sysusers
 require_command systemd-tmpfiles
 require_command systemctl
+require_command sync
+require_command flock
+
+approval_root_metadata=$(stat -c '%u:%g:%a' -- "$MADDYWEB_APPROVAL_ROOT") \
+    || die "cannot inspect approval runtime directory"
+[[ "$approval_root_metadata" == "0:0:700" ]] \
+    || die "approval runtime directory must be root:root 0700"
+deployment_lock="$MADDYWEB_APPROVAL_ROOT/deployment.lock"
+exec {deployment_lock_fd}>> "$deployment_lock"
+[[ "$(stat -c '%u:%g:%a:%h' -- "$deployment_lock")" == "0:0:600:1" ]] \
+    || die "deployment lock must be single-link root:root 0600"
+flock -n "$deployment_lock_fd" || die "another MaddyWeb deployment transaction is active"
 
 install -d -o root -g root -m 0755 -- "$PREFIX" "$RELEASE_ROOT"
 systemd-sysusers "$REPO_ROOT/deploy/systemd/maddyweb.sysusers"
@@ -233,12 +320,22 @@ else
     install -d -o root -g maddyweb -m 0750 -- "$CONFIG_ROOT"
 fi
 assert_config_root_metadata
+if [[ -e "$CONFIG_HISTORY_ROOT" || -L "$CONFIG_HISTORY_ROOT" ]]; then
+    assert_config_history_root
+else
+    install -d -o root -g root -m 0700 -- "$CONFIG_HISTORY_ROOT"
+    assert_config_history_root
+fi
 
 if [[ ! -e "$CONFIG_ROOT/config.toml" && ! -L "$CONFIG_ROOT/config.toml" ]]; then
     install -o root -g maddyweb -m 0640 -- "$config_template" "$CONFIG_ROOT/config.toml"
 fi
 assert_managed_config_file "$CONFIG_ROOT/config.toml"
-config_validation=(--config "$CONFIG_ROOT/config.toml" --expected-maddy-mode "$maddy_mode")
+effective_config="$CONFIG_ROOT/config.toml"
+if [[ "$replace_config" == true ]]; then
+    effective_config="$preflight_config"
+fi
+config_validation=(--config "$effective_config" --expected-maddy-mode "$maddy_mode")
 if [[ "$maddy_mode" == docker ]]; then
     config_validation+=(
         --expected-container "$container"
@@ -253,7 +350,7 @@ else
     )
 fi
 "$python_binary" "$SCRIPT_DIR/validate-config.py" "${config_validation[@]}"
-run_preflight "$CONFIG_ROOT/config.toml"
+run_preflight "$effective_config"
 if [[ "$maddy_mode" == native ]]; then
     [[ "$(realpath -e -- "$maddy_config")" == "$maddy_config" ]] \
         || die "native Maddy config path must not traverse a symbolic link"
@@ -267,7 +364,7 @@ if config["certificates"]["enabled"]:
         str(pathlib.PurePosixPath(config["certificates"][name]).parent)
         for name in ("deployed_cert_path", "deployed_key_path")
     }
-    print("\n".join(sorted(values)))' "$CONFIG_ROOT/config.toml") \
+    print("\n".join(sorted(values)))' "$effective_config") \
         || die "cannot derive native certificate target parents"
     if [[ -n "$certificate_parents" ]]; then
         while IFS= read -r certificate_parent; do
@@ -278,9 +375,9 @@ if config["certificates"]["enabled"]:
     fi
 fi
 if [[ -e /var/lib/maddyweb/session.key || -L /var/lib/maddyweb/session.key ]]; then
-    "$python_binary" "$SCRIPT_DIR/create-session-key.py" --config "$CONFIG_ROOT/config.toml" --check-existing
+    "$python_binary" "$SCRIPT_DIR/create-session-key.py" --config "$effective_config" --check-existing
 else
-    "$python_binary" "$SCRIPT_DIR/create-session-key.py" --config "$CONFIG_ROOT/config.toml"
+    "$python_binary" "$SCRIPT_DIR/create-session-key.py" --config "$effective_config"
 fi
 if [[ ! -e "$CONFIG_ROOT/maddyweb.env" && ! -L "$CONFIG_ROOT/maddyweb.env" ]]; then
     install -o root -g maddyweb -m 0640 -- "$REPO_ROOT/deploy/systemd/maddyweb.env.example" "$CONFIG_ROOT/maddyweb.env"
@@ -313,19 +410,47 @@ staged_commit=$("$python_binary" -c \
     --requirement "$staging/REQUIREMENTS.lock"
 "$staging/bin/python" -m pip install --no-index --no-deps -- "$artifact_copy"
 "$staging/bin/python" -I -m maddyweb --help >/dev/null
+authentication_profile=unauthenticated
+reported_authentication_profile=$(
+    "$staging/bin/python" -I -m maddyweb.release_attestation 2>/dev/null
+) || reported_authentication_profile=""
+if [[ "$reported_authentication_profile" == required-unified-mailbox-v1 ]]; then
+    authentication_profile=$reported_authentication_profile
+fi
+if [[ "$environment" == production && "$activate" == true \
+    && "$authentication_profile" != required-unified-mailbox-v1 ]]; then
+    die "production activation requires the unified mandatory-authentication profile"
+fi
 "$staging/bin/python" -I "$SCRIPT_DIR/render-systemd-sandbox.py" \
-    --config "$CONFIG_ROOT/config.toml" --output-dir "$staging"
+    --config "$effective_config" --output-dir "$staging"
 install -d -o root -g root -m 0755 -- "$staging/libexec"
 install -o root -g root -m 0444 -- \
     "$SCRIPT_DIR/certbot-deploy-hook.py" "$staging/libexec/certbot-deploy-hook.py"
 install -o root -g root -m 0555 -- \
     "$SCRIPT_DIR/certbot-deploy-hook.sh" "$staging/CERTBOT-DEPLOY-HOOK"
+install -d -o root -g root -m 0755 -- \
+    "$staging/public-edge" "$staging/public-edge/nginx" \
+    "$staging/public-edge/systemd"
+install -o root -g root -m 0555 -- \
+    "$PUBLIC_EDGE_CHECKER" "$staging/public-edge/check-public-edge.sh"
+install -o root -g root -m 0444 -- \
+    "$PUBLIC_EDGE_DOCUMENTATION" "$staging/public-edge/public-edge.md"
+for public_edge_asset in "${PUBLIC_EDGE_NGINX_ASSETS[@]}"; do
+    install -o root -g root -m 0444 -- \
+        "$PUBLIC_EDGE_ROOT/nginx/$public_edge_asset" \
+        "$staging/public-edge/nginx/$public_edge_asset"
+done
+for public_edge_asset in "${PUBLIC_EDGE_SYSTEMD_ASSETS[@]}"; do
+    install -o root -g root -m 0444 -- \
+        "$PUBLIC_EDGE_ROOT/systemd/$public_edge_asset" \
+        "$staging/public-edge/systemd/$public_edge_asset"
+done
 web_temp_dir=$("$staging/bin/python" -I -c \
     'import sys; from maddyweb.config import load_config; print(load_config(sys.argv[1]).server.temp_dir)' \
-    "$CONFIG_ROOT/config.toml")
+    "$effective_config")
 certificates_enabled=$("$staging/bin/python" -I -c \
     'import sys; from maddyweb.config import load_config; print(int(load_config(sys.argv[1]).certificates.enabled))' \
-    "$CONFIG_ROOT/config.toml")
+    "$effective_config")
 [[ "$certificates_enabled" == 0 || "$certificates_enabled" == 1 ]] \
     || die "certificate enablement state is invalid"
 require_absolute_path "$web_temp_dir" "server.temp_dir"
@@ -346,19 +471,80 @@ else
 fi
 [[ "$(realpath -e -- "$web_temp_dir")" == "$web_temp_dir" ]] \
     || die "server.temp_dir must not traverse a symbolic link"
-printf 'format=maddyweb-install-v1\ncommit=%s\nartifact=%s\nsha256=%s\ndependencies_sha256=%s\nmaddy_mode=%s\ncontainer=%s\ninstalled_at=%s\n' \
+printf 'format=maddyweb-install-v2\ncommit=%s\nartifact=%s\nsha256=%s\ndependencies_sha256=%s\nauthentication_profile=%s\nconfig_sha256=%s\nconfig_replaced=%s\nmaddy_mode=%s\ncontainer=%s\ninstalled_at=%s\n' \
     "$release_commit" "$artifact_name" "$expected_sha256" "$dependency_lock_sha256" \
+    "$authentication_profile" "$prospective_config_sha256" "$replace_config" \
     "$maddy_mode" "$container" \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$staging/INSTALL-MANIFEST"
 chmod -R u=rwX,go=rX -- "$staging"
 mv -- "$staging" "$release_path"
 
+unit_backup=""
+cleanup_pretransaction() {
+    local status=$? cleanup_status=0 current_target=""
+    trap - EXIT INT TERM
+    if [[ -n "${unit_backup:-}" && -d "$unit_backup" && ! -L "$unit_backup" ]]; then
+        rm -f -- \
+            "$unit_backup/maddyweb-helper.socket" \
+            "$unit_backup/maddyweb-helper.service" \
+            "$unit_backup/maddyweb.service" \
+            "$unit_backup/DROPIN-web-paths.conf" \
+            "$unit_backup/DROPIN-helper-paths.conf" \
+            "$unit_backup/CERTBOT-DEPLOY-HOOK" \
+            "$unit_backup/CONFIG.toml" \
+            "$unit_backup/CONFIG-CANDIDATE.toml" \
+            || cleanup_status=1
+        rmdir -- "$unit_backup" || cleanup_status=1
+    fi
+    if [[ -L "$CURRENT_LINK" ]]; then
+        current_target=$(readlink -f -- "$CURRENT_LINK" 2>/dev/null) || cleanup_status=1
+    fi
+    if [[ -d "$release_path" && ! -L "$release_path" \
+        && "$current_target" != "$release_path" ]]; then
+        if [[ ! -e "$staging" && ! -L "$staging" ]]; then
+            mv -T -- "$release_path" "$staging" || cleanup_status=1
+        else
+            cleanup_status=1
+        fi
+    fi
+    if (( cleanup_status != 0 )); then
+        log "CRITICAL: pre-transaction cleanup was incomplete"
+    fi
+    exit "$status"
+}
+trap cleanup_pretransaction EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 previous=""
 if [[ -L "$CURRENT_LINK" ]]; then
     previous=$(readlink -f -- "$CURRENT_LINK")
     require_path_below "$previous" "$RELEASE_ROOT"
+    [[ "$previous" =~ ^${RELEASE_ROOT}/[0-9a-f]{40}$ ]] \
+        || die "current release target must be a full lowercase commit"
+    require_directory "$previous" "current release target"
+    [[ "$(realpath -e -- "$previous")" == "$previous" ]] \
+        || die "current release target must be canonical"
+    require_regular_file "$previous/INSTALL-MANIFEST" "current release manifest"
+    previous_manifest_commit=$(
+        awk -F= '$1 == "commit" {print $2}' "$previous/INSTALL-MANIFEST"
+    )
+    [[ "$previous_manifest_commit" == "$(basename -- "$previous")" ]] \
+        || die "current release manifest does not match its directory"
 elif [[ -e "$CURRENT_LINK" ]]; then
     die "$CURRENT_LINK exists but is not a symbolic link"
+fi
+config_history_path=""
+config_history_staging=""
+if [[ "$replace_config" == true ]]; then
+    [[ -n "$previous" ]] \
+        || die "configuration replacement requires an existing current release"
+    config_history_path="$CONFIG_HISTORY_ROOT/$release_commit"
+    config_history_staging="$CONFIG_HISTORY_ROOT/.staging-$release_commit-$$"
+    [[ ! -e "$config_history_path" && ! -L "$config_history_path" ]] \
+        || die "configuration rollback history already exists for this release"
+    [[ ! -e "$config_history_staging" && ! -L "$config_history_staging" ]] \
+        || die "configuration rollback history staging path already exists"
 fi
 
 unit_names=(maddyweb-helper.socket maddyweb-helper.service maddyweb.service)
@@ -376,14 +562,31 @@ declare -A dropin_source=(
 )
 declare -A dropin_existed=()
 declare -A dropin_parent_existed=()
-approval_root_metadata=$(stat -c '%u:%g:%a' -- "$MADDYWEB_APPROVAL_ROOT") \
-    || die "cannot inspect approval runtime directory"
-[[ "$approval_root_metadata" == "0:0:700" ]] \
-    || die "approval runtime directory must be root:root 0700"
 unit_backup=$(mktemp -d --tmpdir="$MADDYWEB_APPROVAL_ROOT" .install-unit-backup.XXXXXXXX)
 require_path_below "$unit_backup" "$MADDYWEB_APPROVAL_ROOT"
 [[ "$(stat -c '%u:%g:%a' -- "$unit_backup")" == "0:0:700" ]] \
     || die "unit backup directory metadata is unsafe"
+config_backup="$unit_backup/CONFIG.toml"
+config_candidate="$unit_backup/CONFIG-CANDIDATE.toml"
+config_mutation_started=false
+config_history_mutation_started=false
+config_temporary="$CONFIG_ROOT/.config.toml.install-$$"
+config_recovery_temporary="$CONFIG_ROOT/.config.toml.recovery-$$"
+
+if [[ "$replace_config" == true ]]; then
+    assert_managed_config_file "$CONFIG_ROOT/config.toml"
+    [[ "$(sha256_file "$CONFIG_ROOT/config.toml")" == "$existing_config_sha256" ]] \
+        || die "existing configuration changed after the reviewed preflight"
+    [[ "$(sha256_file "$preflight_config")" == "$prospective_config_sha256" ]] \
+        || die "prospective configuration changed after the reviewed preflight"
+    install -o root -g root -m 0600 -- "$CONFIG_ROOT/config.toml" "$config_backup"
+    install -o root -g root -m 0600 -- "$preflight_config" "$config_candidate"
+    [[ "$(sha256_file "$config_backup")" == "$existing_config_sha256" ]] \
+        || die "configuration backup checksum changed"
+    [[ "$(sha256_file "$config_candidate")" == "$prospective_config_sha256" ]] \
+        || die "staged prospective configuration checksum changed"
+    run_preflight "$config_candidate"
+fi
 
 for unit in "${unit_names[@]}"; do
     unit_path="$SYSTEMD_ROOT/$unit"
@@ -487,12 +690,116 @@ fi
 
 install_transaction_active=false
 
+remove_config_history_directory() {
+    local directory=${1:?configuration history directory is required}
+    local require_complete=${2:-false}
+    local entry name
+    local -a entries=()
+    [[ -e "$directory" || -L "$directory" ]] || return 0
+    [[ -d "$directory" && ! -L "$directory" ]] || return 1
+    [[ "$(stat -c '%u:%g:%a' -- "$directory" 2>/dev/null)" == "0:0:700" ]] \
+        || return 1
+    mapfile -d '' -t entries < <(
+        find "$directory" -xdev -mindepth 1 -maxdepth 1 -print0
+    )
+    if [[ "$require_complete" == true && "${#entries[@]}" -ne 2 ]]; then
+        return 1
+    fi
+    for entry in "${entries[@]}"; do
+        name=$(basename -- "$entry")
+        case "$name" in
+            MANIFEST|previous-config.toml) ;;
+            *) return 1 ;;
+        esac
+        [[ -f "$entry" && ! -L "$entry" ]] || return 1
+        [[ "$(stat -c '%u:%g:%a:%h' -- "$entry" 2>/dev/null)" == "0:0:600:1" ]] \
+            || return 1
+    done
+    if [[ "$require_complete" == true ]]; then
+        [[ "$(sha256_file "$directory/previous-config.toml" 2>/dev/null)" \
+            == "$existing_config_sha256" ]] || return 1
+    fi
+    rm -f -- "$directory/MANIFEST" "$directory/previous-config.toml" || return 1
+    rmdir -- "$directory"
+}
+
+remove_config_history_transaction() {
+    local status=0
+    [[ "$config_history_mutation_started" == true ]] || return 0
+    remove_config_history_directory "$config_history_staging" false || status=1
+    remove_config_history_directory "$config_history_path" true || status=1
+    return "$status"
+}
+
+verify_config_history_directory() {
+    local directory=${1:?configuration history directory is required}
+    local entry name
+    local -a entries=()
+    [[ -d "$directory" && ! -L "$directory" ]] || return 1
+    [[ "$(stat -c '%u:%g:%a' -- "$directory" 2>/dev/null)" == "0:0:700" ]] \
+        || return 1
+    mapfile -d '' -t entries < <(
+        find "$directory" -xdev -mindepth 1 -maxdepth 1 -print0
+    )
+    [[ "${#entries[@]}" -eq 2 ]] || return 1
+    for entry in "${entries[@]}"; do
+        name=$(basename -- "$entry")
+        case "$name" in
+            MANIFEST|previous-config.toml) ;;
+            *) return 1 ;;
+        esac
+        [[ -f "$entry" && ! -L "$entry" ]] || return 1
+        [[ "$(stat -c '%u:%g:%a:%h' -- "$entry" 2>/dev/null)" == "0:0:600:1" ]] \
+            || return 1
+    done
+    [[ "$(sha256_file "$directory/previous-config.toml" 2>/dev/null)" \
+        == "$existing_config_sha256" ]] || return 1
+    cmp -s -- "$directory/MANIFEST" <(
+        printf 'format=maddyweb-config-rollback-v1\ninstalled_release=%s\nprevious_release=%s\ninstalled_config_sha256=%s\nprevious_config_sha256=%s\n' \
+            "$release_path" "$previous" "$prospective_config_sha256" \
+            "$existing_config_sha256"
+    )
+}
+
+persist_config_history() {
+    [[ "$replace_config" == true ]] || return 0
+    assert_config_history_root
+    assert_managed_config_file "$CONFIG_ROOT/config.toml"
+    [[ "$(sha256_file "$CONFIG_ROOT/config.toml")" == "$existing_config_sha256" ]] \
+        || return 1
+    [[ ! -e "$config_history_path" && ! -L "$config_history_path" ]] || return 1
+    [[ ! -e "$config_history_staging" && ! -L "$config_history_staging" ]] || return 1
+    config_history_mutation_started=true
+    install -d -o root -g root -m 0700 -- "$config_history_staging" || return 1
+    install -o root -g root -m 0600 -- \
+        "$config_backup" "$config_history_staging/previous-config.toml" || return 1
+    printf 'format=maddyweb-config-rollback-v1\ninstalled_release=%s\nprevious_release=%s\ninstalled_config_sha256=%s\nprevious_config_sha256=%s\n' \
+        "$release_path" "$previous" "$prospective_config_sha256" \
+        "$existing_config_sha256" > "$config_history_staging/MANIFEST" || return 1
+    chmod 0600 -- "$config_history_staging/MANIFEST" || return 1
+    [[ "$(stat -c '%u:%g:%a:%h' -- "$config_history_staging/MANIFEST")" \
+        == "0:0:600:1" ]] || return 1
+    [[ "$(stat -c '%u:%g:%a:%h' -- "$config_history_staging/previous-config.toml")" \
+        == "0:0:600:1" ]] || return 1
+    [[ "$(sha256_file "$config_history_staging/previous-config.toml")" \
+        == "$existing_config_sha256" ]] || return 1
+    verify_config_history_directory "$config_history_staging" || return 1
+    mv -T -- "$config_history_staging" "$config_history_path" || return 1
+    sync -f "$CONFIG_HISTORY_ROOT" || return 1
+    verify_config_history_directory "$config_history_path" || return 1
+}
+
 restore_install_transaction() {
     local status=0 unit unit_path key target parent recovery_link failed_link restored_current
+    local units_quiesced=true release_restored=false config_restored=true can_restart=false
     install_transaction_active=false
-    log "restoring pre-install release, units, Certbot hook, enablement, and active state"
+    log "restoring pre-install release, configuration, units, Certbot hook, enablement, and active state"
     for unit in "${unit_names[@]}"; do
-        systemctl stop "$unit" >/dev/null 2>&1 || true
+        if ! systemctl stop "$unit" >/dev/null 2>&1; then status=1; fi
+        if systemctl is-active --quiet "$unit"; then
+            status=1
+            units_quiesced=false
+        fi
         systemctl disable "$unit" >/dev/null 2>&1 || true
     done
     if [[ -n "$previous" ]]; then
@@ -503,14 +810,45 @@ restore_install_transaction() {
             if [[ -L "$recovery_link" ]]; then
                 rm -f -- "$recovery_link" || status=1
             fi
+        else
+            release_restored=true
         fi
     elif [[ -L "$CURRENT_LINK" ]]; then
         failed_link="$PREFIX/.failed-current-$release_commit"
         if [[ -e "$failed_link" || -L "$failed_link" ]] \
             || ! mv -- "$CURRENT_LINK" "$failed_link"; then
             status=1
+        else
+            release_restored=true
         fi
+    else
+        release_restored=true
     fi
+    if [[ "$config_mutation_started" == true ]]; then
+        config_restored=false
+        rm -f -- "$config_temporary" "$config_recovery_temporary" || status=1
+        if install -o root -g maddyweb -m 0640 -- \
+            "$config_backup" "$config_recovery_temporary" \
+            && mv -fT -- "$config_recovery_temporary" "$CONFIG_ROOT/config.toml" \
+            && sync -f "$CONFIG_ROOT"; then
+            cmp -s -- "$config_backup" "$CONFIG_ROOT/config.toml" || status=1
+            [[ "$(sha256_file "$CONFIG_ROOT/config.toml" 2>/dev/null)" \
+                == "$existing_config_sha256" ]] || status=1
+            [[ "$(stat -c '%u:%g:%a:%h' -- "$CONFIG_ROOT/config.toml" 2>/dev/null)" \
+                == "0:${expected_web_gid}:640:1" ]] || status=1
+            if cmp -s -- "$config_backup" "$CONFIG_ROOT/config.toml" \
+                && [[ "$(sha256_file "$CONFIG_ROOT/config.toml" 2>/dev/null)" \
+                    == "$existing_config_sha256" ]] \
+                && [[ "$(stat -c '%u:%g:%a:%h' -- "$CONFIG_ROOT/config.toml" 2>/dev/null)" \
+                    == "0:${expected_web_gid}:640:1" ]]; then
+                config_restored=true
+            fi
+        else
+            status=1
+        fi
+        rm -f -- "$config_recovery_temporary" || status=1
+    fi
+    remove_config_history_transaction || status=1
     if [[ "$certbot_hook_mutation_started" == true ]]; then
         if [[ "$certbot_hook_existed" == true ]]; then
             if secure_root_directory "$CERTBOT_DEPLOY_HOOKS"; then
@@ -587,18 +925,26 @@ restore_install_transaction() {
             systemctl disable "$unit" >/dev/null || status=1
         fi
     done
-    for unit in "${unit_names[@]}"; do
-        if [[ "${unit_active[$unit]}" == true ]]; then
-            systemctl start "$unit" || status=1
-        fi
-    done
-    # Starting Web can socket-activate the helper; restore originally inactive
-    # units after all required active units have reached their start job.
-    for unit in "${unit_names[@]}"; do
-        if [[ "${unit_active[$unit]}" == false ]]; then
-            systemctl stop "$unit" >/dev/null 2>&1 || true
-        fi
-    done
+    if (( status == 0 )) && [[ "$units_quiesced" == true \
+        && "$release_restored" == true && "$config_restored" == true ]]; then
+        can_restart=true
+    fi
+    if [[ "$can_restart" == true ]]; then
+        for unit in "${unit_names[@]}"; do
+            if [[ "${unit_active[$unit]}" == true ]]; then
+                systemctl start "$unit" || status=1
+            fi
+        done
+        # Starting Web can socket-activate the helper; restore originally inactive
+        # units after all required active units have reached their start job.
+        for unit in "${unit_names[@]}"; do
+            if [[ "${unit_active[$unit]}" == false ]]; then
+                systemctl stop "$unit" >/dev/null 2>&1 || true
+            fi
+        done
+    else
+        status=1
+    fi
     for unit in "${unit_names[@]}"; do
         if [[ "${unit_active[$unit]}" == true ]]; then
             systemctl is-active --quiet "$unit" || status=1
@@ -617,6 +963,25 @@ restore_install_transaction() {
     elif [[ -L "$CURRENT_LINK" ]]; then
         status=1
     fi
+    if (( status == 0 )); then
+        if [[ -d "$release_path" && ! -L "$release_path" \
+            && ! -e "$staging" && ! -L "$staging" ]]; then
+            mv -T -- "$release_path" "$staging" || status=1
+        else
+            status=1
+        fi
+    fi
+    if (( status == 0 )); then
+        for unit in "${unit_names[@]}"; do
+            rm -f -- "$unit_backup/$unit" || status=1
+        done
+        for key in "${dropin_keys[@]}"; do
+            rm -f -- "$unit_backup/DROPIN-$key.conf" || status=1
+        done
+        rm -f -- "$unit_backup/CERTBOT-DEPLOY-HOOK" \
+            "$config_backup" "$config_candidate" || status=1
+        rmdir -- "$unit_backup" || status=1
+    fi
     if (( status != 0 )); then
         log "CRITICAL: install rollback was incomplete; unit backup retained at $unit_backup"
     fi
@@ -628,7 +993,7 @@ abort_install_transaction() {
     install_transaction_active=false
     trap - EXIT INT TERM
     if restore_install_transaction; then
-        die "$reason; exact prior release and unit state was restored"
+        die "$reason; exact prior release, configuration, and unit state was restored"
     fi
     die "$reason and transactional restoration was incomplete"
 }
@@ -639,7 +1004,7 @@ on_install_transaction_exit() {
     if [[ "$install_transaction_active" == true ]]; then
         (( status != 0 )) || status=1
         if restore_install_transaction; then
-            log "installation exited unexpectedly; exact prior release and unit state was restored"
+            log "installation exited unexpectedly; exact prior release, configuration, and unit state was restored"
         else
             log "CRITICAL: installation exited unexpectedly and restoration was incomplete"
         fi
@@ -651,6 +1016,37 @@ install_transaction_active=true
 trap on_install_transaction_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+if [[ "$replace_config" == true ]]; then
+    persist_config_history \
+        || abort_install_transaction "configuration rollback history persistence failed"
+fi
+
+if [[ "$replace_config" == true ]]; then
+    for unit in maddyweb.service maddyweb-helper.socket maddyweb-helper.service; do
+        if [[ "${unit_existed[$unit]}" == true ]] \
+            || systemctl is-active --quiet "$unit"; then
+            systemctl stop "$unit" \
+                || abort_install_transaction "cannot quiesce units for configuration replacement"
+        fi
+        if systemctl is-active --quiet "$unit"; then
+            abort_install_transaction "unit remained active during configuration replacement"
+        fi
+    done
+    [[ "$(sha256_file "$CONFIG_ROOT/config.toml")" == "$existing_config_sha256" ]] \
+        || abort_install_transaction "existing configuration changed before replacement"
+    [[ ! -e "$config_temporary" && ! -L "$config_temporary" ]] \
+        || abort_install_transaction "configuration replacement temporary path already exists"
+    config_mutation_started=true
+    if ! install -o root -g maddyweb -m 0640 -- \
+        "$config_candidate" "$config_temporary" \
+        || ! mv -fT -- "$config_temporary" "$CONFIG_ROOT/config.toml" \
+        || ! sync -f "$CONFIG_ROOT" \
+        || ! assert_managed_config_file "$CONFIG_ROOT/config.toml" \
+        || [[ "$(sha256_file "$CONFIG_ROOT/config.toml")" != "$prospective_config_sha256" ]]; then
+        abort_install_transaction "configuration replacement failed its readback gate"
+    fi
+fi
 
 if ! install -o root -g root -m 0644 -- \
     "$REPO_ROOT/deploy/systemd/maddyweb.service" "$SYSTEMD_ROOT/maddyweb.service" \
@@ -745,11 +1141,31 @@ if [[ "$activate" == true ]]; then
     fi
 fi
 
+if [[ "$replace_config" == true ]]; then
+    assert_managed_config_file "$CONFIG_ROOT/config.toml"
+    [[ "$(sha256_file "$CONFIG_ROOT/config.toml")" == "$prospective_config_sha256" ]] \
+        || abort_install_transaction "live configuration changed before install commit"
+    verify_config_history_directory "$config_history_path" \
+        || abort_install_transaction "configuration rollback history changed before install commit"
+fi
+
 if [[ -n "$previous" ]]; then
-    previous_release_temp="/var/lib/maddyweb/.previous-release-$$"
+    previous_release_record="$CONFIG_HISTORY_ROOT/previous-release"
+    if [[ -e "$previous_release_record" || -L "$previous_release_record" ]]; then
+        [[ -f "$previous_release_record" && ! -L "$previous_release_record" \
+            && "$(stat -c '%u:%g:%a:%h' -- "$previous_release_record")" == "0:0:600:1" ]] \
+            || abort_install_transaction "previous-release metadata target is unsafe"
+    fi
+    previous_release_temp=$(
+        mktemp --tmpdir="$CONFIG_HISTORY_ROOT" .previous-release.XXXXXXXX
+    ) || abort_install_transaction "previous-release metadata staging failed"
     if ! printf '%s\n' "$previous" > "$previous_release_temp" \
         || ! chmod 0600 -- "$previous_release_temp" \
-        || ! mv -fT -- "$previous_release_temp" /var/lib/maddyweb/previous-release; then
+        || ! mv -fT -- "$previous_release_temp" "$previous_release_record" \
+        || ! sync -f "$CONFIG_HISTORY_ROOT" \
+        || [[ "$(stat -c '%u:%g:%a:%h' -- "$previous_release_record" 2>/dev/null)" \
+            != "0:0:600:1" ]] \
+        || [[ "$(<"$previous_release_record")" != "$previous" ]]; then
         rm -f -- "$previous_release_temp" || true
         abort_install_transaction "previous-release metadata update failed"
     fi
@@ -765,6 +1181,7 @@ for key in "${dropin_keys[@]}"; do
     rm -f -- "$unit_backup/DROPIN-$key.conf" || unit_backup_cleanup_status=1
 done
 rm -f -- "$unit_backup/CERTBOT-DEPLOY-HOOK" || unit_backup_cleanup_status=1
+rm -f -- "$config_backup" "$config_candidate" || unit_backup_cleanup_status=1
 if ! rmdir -- "$unit_backup"; then unit_backup_cleanup_status=1; fi
 if (( unit_backup_cleanup_status != 0 )); then
     log "WARNING: installation succeeded but the root-only transaction backup could not be removed: $unit_backup"

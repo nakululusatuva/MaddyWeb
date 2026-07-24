@@ -140,9 +140,7 @@ def test_smoke_rejects_public_listener_without_grace(
     monkeypatch.setattr(
         smoke["subprocess"],
         "run",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            stdout=f"LISTEN 0 16 {listener} 0.0.0.0:*\n"
-        ),
+        lambda *_args, **_kwargs: SimpleNamespace(stdout=f"LISTEN 0 16 {listener} 0.0.0.0:*\n"),
     )
     monkeypatch.setattr(smoke["time"], "sleep", fake_sleep)
     with pytest.raises(SystemExit):
@@ -531,6 +529,7 @@ def test_docker_helper_does_not_gain_native_host_paths(tmp_path: Path) -> None:
     assert write_paths == {
         "/var/backups/maddyweb",
         "/run/maddyweb",
+        "/var/lib/maddyweb-auth",
     }
     assert "ReadOnlyPaths=" not in helper_drop_in
     assert "ReadWritePaths=" not in helper_drop_in
@@ -611,9 +610,7 @@ def test_nondefault_paths_render_exact_systemd_sandbox_allowlists(tmp_path: Path
         'data_dir = "/var/lib/maddy"': 'data_dir = "/srv/maddy/state"',
         "enabled = false": "enabled = true",
         "names = []": 'names = ["mx.example.invalid"]',
-        'live_dir = "/etc/letsencrypt/live"': (
-            'live_dir = "/srv/maddyweb/certbot/live"'
-        ),
+        'live_dir = "/etc/letsencrypt/live"': ('live_dir = "/srv/maddyweb/certbot/live"'),
         'renewal_dir = "/etc/letsencrypt/renewal"': (
             'renewal_dir = "/srv/maddyweb/certbot/renewal"'
         ),
@@ -742,6 +739,7 @@ def test_systemd_privilege_boundary() -> None:
     assert helper_write_paths == {
         "/var/backups/maddyweb",
         "/run/maddyweb",
+        "/var/lib/maddyweb-auth",
     }
     assert "ListenStream=/run/maddyweb/helper.sock" in socket
     assert "SocketUser=root" in socket
@@ -788,7 +786,7 @@ def test_mutating_scripts_are_dry_run_and_approval_gated() -> None:
     assert 'assert_managed_config_file "$CONFIG_ROOT/maddyweb.env"' in install_source
     assert 'preflight_config="$CONFIG_ROOT/config.toml"' in install_source
     assert 'run_preflight "$preflight_config"' in install_source
-    assert 'run_preflight "$CONFIG_ROOT/config.toml"' in install_source
+    assert 'run_preflight "$effective_config"' in install_source
     assert "--artifact-sha256" in rollback_source
     preflight_source = (ROOT / "scripts/preflight.sh").read_text(encoding="utf-8")
     assert "Docker must not publish MaddyWeb's managed port 1587" in preflight_source
@@ -856,8 +854,7 @@ def test_submission_transactions_enforce_scope_and_network_mode() -> None:
     assert '"restart_policy_sha256", "network_mode")' in backup
     assert "rollback release cannot load the effective MaddyWeb configuration" in rollback
     compatibility_gate = (
-        "'import sys; from maddyweb.config import load_config; "
-        "load_config(sys.argv[1])'"
+        "'import sys; from maddyweb.config import load_config; load_config(sys.argv[1])'"
     )
     assert compatibility_gate in rollback
     assert '["id"])' in rollback
@@ -880,6 +877,143 @@ def test_install_activation_is_transactional() -> None:
     assert 'cmp -s -- "$unit_backup/$unit" "$unit_path"' in source
     assert '"$release_path/bin/python" "$SCRIPT_DIR/smoke-test.py"' in source
     assert "CRITICAL: install rollback was incomplete" in source
+
+
+def test_install_config_replacement_is_explicit_atomic_and_rollback_bound() -> None:
+    source = (ROOT / "scripts/install.sh").read_text(encoding="utf-8")
+    guide = (ROOT / "docs/deployment.md").read_text(encoding="utf-8")
+
+    assert "--replace-config" in source
+    assert "--replace-config requires --activate" in source
+    assert "replacement config must be root-owned with one hard link" in source
+    assert "replacement config must not be group or world writable" in source
+    assert 'preflight_config="$config_template"' in source
+    assert 'run_preflight "$preflight_config"' in source
+    assert "prospective_config_sha256" in source
+    assert 'config_backup="$unit_backup/CONFIG.toml"' in source
+    assert 'config_candidate="$unit_backup/CONFIG-CANDIDATE.toml"' in source
+    assert 'run_preflight "$config_candidate"' in source
+    assert "configuration replacement temporary path already exists" in source
+    assert 'mv -fT -- "$config_temporary" "$CONFIG_ROOT/config.toml"' in source
+    assert "configuration replacement failed its readback gate" in source
+    assert "format=maddyweb-install-v2" in source
+    assert "config_sha256=%s" in source
+    assert "config_replaced=%s" in source
+    assert 'mv -fT -- "$config_recovery_temporary" "$CONFIG_ROOT/config.toml"' in source
+    assert "restoring pre-install release, configuration, units" in source
+    restore = source[
+        source.index("restore_install_transaction()") : source.index("abort_install_transaction()")
+    ]
+    assert restore.index("config_mutation_started") < restore.index('systemctl start "$unit"')
+    assert '"$staging/CONFIG' not in source
+    assert "It never merges tables or silently adds new keys." in guide
+    assert "restores the exact old configuration before restoring or restarting" in guide
+
+
+def test_config_history_is_sealed_before_mutation_and_rollback_is_exact() -> None:
+    install = (ROOT / "scripts/install.sh").read_text(encoding="utf-8")
+    rollback = (ROOT / "scripts/rollback.sh").read_text(encoding="utf-8")
+    deployment = (ROOT / "docs/deployment.md").read_text(encoding="utf-8")
+    runbook = (ROOT / "docs/runbook.md").read_text(encoding="utf-8")
+
+    assert 'readonly CONFIG_HISTORY_ROOT="/var/lib/maddyweb-config-history"' in install
+    assert "format=maddyweb-config-rollback-v1" in install
+    assert 'mv -T -- "$config_history_staging" "$config_history_path"' in install
+    assert 'sync -f "$CONFIG_HISTORY_ROOT"' in install
+    assert "verify_config_history_directory" in install
+    activation = install[install.index("install_transaction_active=true") :]
+    assert activation.index("persist_config_history") < activation.index(
+        'mv -fT -- "$config_temporary" "$CONFIG_ROOT/config.toml"'
+    )
+    restore = install[
+        install.index("restore_install_transaction()") : install.index(
+            "abort_install_transaction()"
+        )
+    ]
+    assert "release_restored=false" in restore
+    assert "config_restored=true" in restore
+    assert '[[ "$can_restart" == true ]]' in restore
+    assert restore.index('[[ "$can_restart" == true ]]') < restore.index('systemctl start "$unit"')
+    assert 'flock -n "$deployment_lock_fd"' in install
+    assert "another MaddyWeb deployment transaction is active" in install
+    assert "/var/lib/maddyweb/.previous-release-" not in install
+    assert 'mktemp --tmpdir="$CONFIG_HISTORY_ROOT" .previous-release.XXXXXXXX' in install
+
+    assert "--restore-previous-config" in rollback
+    assert "--acknowledge-public-edge-withdrawn" in rollback
+    assert "configuration history is not bound to the current release" in rollback
+    assert "configuration history is not bound to the requested predecessor" in rollback
+    assert "configuration rollback history must contain exactly two files" in rollback
+    assert "single-link root:root 0600" in rollback
+    assert 'effective_app_config="$previous_config"' in rollback
+    assert 'mv -fT -- "$temporary" "$app_config"' in rollback
+    assert "quiesce_maddyweb_units" in rollback
+    assert "restored_config=true" in rollback
+    assert 'flock -n "$deployment_lock_fd"' in rollback
+    assert "/var/lib/maddyweb/.previous-release-rollback-" not in rollback
+    assert "root-only record associated with the exact current commit" in " ".join(runbook.split())
+    assert "never copied into Git, the wheel, or the release tree" in deployment
+
+
+def test_unauthenticated_rollback_requires_attestation_and_public_withdrawal() -> None:
+    install = (ROOT / "scripts/install.sh").read_text(encoding="utf-8")
+    rollback = (ROOT / "scripts/rollback.sh").read_text(encoding="utf-8")
+    web_source = (ROOT / "src/maddyweb/web.py").read_text(encoding="utf-8")
+    attestation_source = (ROOT / "src/maddyweb/release_attestation.py").read_text(encoding="utf-8")
+
+    profile = "required-unified-mailbox-v1"
+    assert "AUTHENTICATION_PROFILE = SUPPORTED_AUTHENTICATION_PROFILE" in web_source
+    assert f'SUPPORTED_AUTHENTICATION_PROFILE = "{profile}"' in attestation_source
+    assert "SUPPORTED_AUTHENTICATION_CAPABILITIES = (" in attestation_source
+    assert "type(capabilities) is tuple" in attestation_source
+    assert "authentication_profile=%s" in install
+    assert "-I -m maddyweb.release_attestation" in install
+    assert '[[ "$environment" == production && "$activate" == true' in install
+    assert "production activation requires the unified mandatory-authentication profile" in install
+    profile_probe = install.index("-I -m maddyweb.release_attestation")
+    activation_gate = install.index(
+        "production activation requires the unified mandatory-authentication profile"
+    )
+    release_switch = install.index('mv -Tf -- "$temporary_link" "$CURRENT_LINK"')
+    assert profile_probe < activation_gate < release_switch
+    assert "-I -m maddyweb.release_attestation" in rollback
+    assert "find_spec" not in install
+    assert "find_spec" not in rollback
+    assert 'manifest_profile" == required-unified-mailbox-v1' in rollback
+    assert 'runtime_profile" == required-unified-mailbox-v1' in rollback
+    assert "printf 'unauthenticated\\n'" in rollback
+    assert "an unauthenticated rollback target requires --restore-previous-config" in rollback
+    assert (
+        "an unauthenticated rollback target requires --acknowledge-public-edge-withdrawn"
+    ) in rollback
+    assert 'cmp -s -- "$withdrawn_source" "$installed_public_vhost"' in rollback
+    assert '"${nginx_test[@]}"' in rollback
+    assert "?maddyweb-withdrawal=$nonce" in rollback
+    assert '[[ "$status" == 503 ]]' in rollback
+    assert rollback.count("verify_public_edge_withdrawal") >= 4
+
+
+def test_backup_captures_one_complete_authentication_generation() -> None:
+    source = (ROOT / "scripts/backup.sh").read_text(encoding="utf-8")
+    guide = (ROOT / "docs/runbook.md").read_text(encoding="utf-8")
+
+    assert 'readonly AUTH_STATE_DIR="/var/lib/maddyweb-auth"' in source
+    assert source.index("stop_active_maddyweb_units") < source.rindex("snapshot_auth_state")
+    assert "quiesce_all_maddyweb_units_for_snapshot" in source
+    assert "cannot normalize every MaddyWeb unit to inactive for the snapshot" in source
+    assert source.index("quiesce_all_maddyweb_units_for_snapshot") < source.rindex(
+        "snapshot_auth_state"
+    )
+    assert '[[ "$(stat -c \'%u:%g:%a\' -- "$AUTH_STATE_DIR")" == "0:0:700" ]]' in source
+    assert 'assert_auth_state_file "$AUTH_STATE_DIR/master.key" 32' in source
+    assert 'assert_auth_state_file "$AUTH_STATE_DIR/auth.sqlite3"' in source
+    assert "authentication state contains an incomplete or unexpected entry set" in source
+    assert "authentication master key changed during backup" in source
+    assert "authentication database changed during backup" in source
+    assert "format=maddyweb-backup-v2" in source
+    assert "sha256_file auth-state.tar > auth-state.tar.sha256" in source
+    assert "sha256_file auth-state.status > auth-state.status.sha256" in source
+    assert "master key and database are one inseparable" in guide
 
 
 def test_certbot_hook_install_and_release_rollback_are_fail_closed() -> None:
@@ -1076,7 +1210,9 @@ def test_operational_scripts_do_not_accept_passwords_or_modify_nginx() -> None:
         path.read_text(encoding="utf-8")
         for root in (ROOT / "scripts", ROOT / "deploy", ROOT / "docker")
         for path in root.rglob("*")
-        if path.is_file() and (path.suffix in text_suffixes or path.name in text_names)
+        if path.is_file()
+        and not path.is_relative_to(ROOT / "deploy/public-edge")
+        and (path.suffix in text_suffixes or path.name in text_names)
     )
     assert "--password" not in sources
     assert not re.search(r"systemctl\s+(?:reload|restart)\s+nginx", sources)
@@ -1124,9 +1260,7 @@ def test_named_volume_submission_is_identity_bound_and_has_no_volume_argument() 
     assert "expected_container_id: str" in volume_tool
     assert "container_id != expected_container_id" in volume_tool
     snapshot = configure[
-        configure.index("container_snapshot_matches()") : configure.index(
-            "named_volume_snapshot()"
-        )
+        configure.index("container_snapshot_matches()") : configure.index("named_volume_snapshot()")
     ]
     for key in (
         "network_mode",
@@ -1219,6 +1353,21 @@ def test_named_volume_helper_cleanup_is_proven_and_not_global() -> None:
     assert "helper still exists after cleanup" in cleanup
     assert "label=io.maddyweb.purpose=submission-volume-config" not in integration
     assert '--filter "volume=$volume"' in integration
+
+
+def test_named_volume_fault_injection_waits_for_final_docker_state() -> None:
+    integration = (ROOT / "tests/integration/test-named-volume-submission.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "wait_running_unpaused()" in integration
+    wait = integration[
+        integration.index("wait_running_unpaused()") : integration.index("trap cleanup EXIT")
+    ]
+    assert "for _ in {1..50}" in wait
+    assert "'{{.State.Running}} {{.State.Paused}}'" in wait
+    assert '[[ "$state" == "true false" ]]' in wait
+    assert integration.count('wait_running_unpaused "$container_id"') == 2
 
 
 def test_named_volume_helper_cleanup_fails_if_absence_query_cannot_complete(

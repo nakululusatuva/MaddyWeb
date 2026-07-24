@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO, Self
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 HEADER_SIZE = 4
 DEFAULT_MAX_FRAME_BYTES = 64 * 1024
 DEFAULT_MAX_STREAM_BYTES = 32 * 1024 * 1024
@@ -27,6 +27,7 @@ _HEADER = struct.Struct("!I")
 _ID_RE = re.compile(r"\A[A-Za-z0-9_.-]{1,64}\Z")
 _OPERATION_RE = re.compile(r"\A[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*){1,5}\Z")
 _ERROR_CODE_RE = re.compile(r"\A[a-z][a-z0-9_]{0,63}\Z")
+_AUTH_TOKEN_RE = re.compile(r"\A[A-Za-z0-9_-]{43}\Z")
 
 
 class ProtocolError(ValueError):
@@ -296,7 +297,7 @@ class Request:
     request_id: str
     operation: str
     params: dict[str, Any] = field(default_factory=dict)
-    actor: str | None = None
+    auth_token: str | None = None
     stream_length: int | None = None
 
     def __post_init__(self) -> None:
@@ -305,13 +306,11 @@ class Request:
         if not isinstance(self.params, dict):
             raise ProtocolError("params must be an object")
         _validate_json_value(self.params)
-        if self.actor is not None and (
-            not isinstance(self.actor, str)
-            or not self.actor
-            or len(self.actor) > 128
-            or any(ord(char) < 0x20 or ord(char) == 0x7F for char in self.actor)
+        if self.auth_token is not None and (
+            not isinstance(self.auth_token, str)
+            or _AUTH_TOKEN_RE.fullmatch(self.auth_token) is None
         ):
-            raise ProtocolError("invalid actor")
+            raise ProtocolError("invalid authentication token")
         if self.stream_length is not None and (
             type(self.stream_length) is not int or self.stream_length <= 0
         ):
@@ -323,7 +322,7 @@ class Request:
         operation: str,
         params: Mapping[str, Any] | None = None,
         *,
-        actor: str | None = None,
+        auth_token: str | None = None,
         request_id: str | None = None,
         stream_length: int | None = None,
     ) -> Self:
@@ -331,7 +330,7 @@ class Request:
             request_id or uuid.uuid4().hex,
             operation,
             dict(params or {}),
-            actor,
+            auth_token,
             stream_length,
         )
 
@@ -339,7 +338,7 @@ class Request:
     def from_payload(cls, payload: Mapping[str, Any]) -> Self:
         _check_keys(
             payload,
-            {"version", "id", "operation", "params", "actor", "stream_length"},
+            {"version", "id", "operation", "params", "auth_token", "stream_length"},
             {"version", "id", "operation", "params"},
         )
         if payload["version"] != PROTOCOL_VERSION:
@@ -351,7 +350,7 @@ class Request:
             request_id=payload["id"],
             operation=payload["operation"],
             params=dict(params),
-            actor=payload.get("actor"),
+            auth_token=payload.get("auth_token"),
             stream_length=payload.get("stream_length"),
         )
 
@@ -362,8 +361,8 @@ class Request:
             "operation": self.operation,
             "params": self.params,
         }
-        if self.actor is not None:
-            payload["actor"] = self.actor
+        if self.auth_token is not None:
+            payload["auth_token"] = self.auth_token
         if self.stream_length is not None:
             payload["stream_length"] = self.stream_length
         return payload

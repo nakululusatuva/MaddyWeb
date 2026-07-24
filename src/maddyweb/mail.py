@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import tempfile
+import unicodedata
 import uuid
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
@@ -36,10 +37,14 @@ MAX_TOTAL_ATTACHMENT_BYTES = 25 * 1024 * 1024
 MAX_ATTACHMENTS = 64
 MAX_MIME_PARTS = 128
 MAX_SENDER_NAME_CHARACTERS = 256
+MAX_THREAD_MESSAGE_IDS = 32
 
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9!#$&^_.+-]+$")
 _CID_RE = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~@-]{1,200}$")
+_MESSAGE_ID_RE = re.compile(r"<[^<>\s@]+@[^<>\s@]+>", re.ASCII)
+_REPLY_PREFIX_RE = re.compile(r"\A\s*re(?:\[\d{1,4}\])?\s*:\s*", re.IGNORECASE)
+_UNSAFE_FILENAME_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
 
 
 @cache
@@ -372,8 +377,14 @@ def safe_filename(value: str | None, *, default: str = "attachment.bin") -> str:
 
     if not value:
         return default
-    name = value.replace("\\", "/").rsplit("/", 1)[-1]
+    name = unicodedata.normalize("NFC", value).replace("\\", "/").rsplit("/", 1)[-1]
     name = _CONTROL_RE.sub("", name).strip().strip(".")
+    name = "".join(
+        character
+        for character in name
+        if unicodedata.category(character) not in _UNSAFE_FILENAME_CATEGORIES
+    )
+    name = name.strip().strip(".")
     if not name or name in {".", ".."}:
         return default
     return name[:180]
@@ -527,6 +538,9 @@ class OutgoingMessage:
     html: str | None = None
     inline_images: tuple[Attachment, ...] = ()
     attachments: tuple[Attachment, ...] = ()
+    reply_to: tuple[str, ...] = ()
+    in_reply_to: str = ""
+    references: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -598,6 +612,146 @@ class ParsedMessage:
     text: str
     html: str | None
     attachments: tuple[ParsedAttachment, ...]
+    reply_to: tuple[str, ...] = ()
+    in_reply_to: str = ""
+    references: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ReplyRecipients:
+    to: tuple[str, ...]
+    cc: tuple[str, ...] = ()
+
+
+def _validate_message_id(value: str, label: str) -> str:
+    candidate = _validate_header_value(value, label, maximum=998)
+    if not candidate.isascii() or _MESSAGE_ID_RE.fullmatch(candidate) is None:
+        raise MailError(f"invalid {label}")
+    return candidate
+
+
+def _extract_message_ids(
+    values: str | Iterable[str],
+    *,
+    maximum: int = MAX_THREAD_MESSAGE_IDS,
+) -> tuple[str, ...]:
+    source = [values] if isinstance(values, str) else list(values)
+    found: list[str] = []
+    seen: set[str] = set()
+    for value in source:
+        rendered = _CONTROL_RE.sub("", str(value))[:998]
+        for match in _MESSAGE_ID_RE.finditer(rendered):
+            message_id = match.group(0)
+            if not message_id.isascii():
+                continue
+            key = message_id.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(message_id)
+    return tuple(found[-maximum:])
+
+
+def _validate_references(values: Sequence[str]) -> tuple[str, ...]:
+    if len(values) > MAX_THREAD_MESSAGE_IDS:
+        raise MailLimitError("too many References message IDs")
+    references: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        message_id = _validate_message_id(value, "References message ID")
+        key = message_id.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        references.append(message_id)
+    if len(" ".join(references)) > 998:
+        raise MailLimitError("References header is too large")
+    return tuple(references)
+
+
+def _received_addresses(values: Iterable[str]) -> tuple[tuple[str, str], ...]:
+    source = [_CONTROL_RE.sub("", str(value))[:998] for value in values]
+    result: list[tuple[str, str]] = []
+    for display_name, addr_spec in getaddresses(source):
+        if not addr_spec or "@" not in addr_spec:
+            continue
+        try:
+            address = Address(display_name=display_name, addr_spec=addr_spec)
+        except TypeError, ValueError:
+            continue
+        if not address.username or not address.domain:
+            continue
+        result.append((str(address), address.addr_spec.casefold()))
+    return tuple(result)
+
+
+def derive_reply_recipients(
+    message: ParsedMessage,
+    self_addresses: str | Iterable[str],
+    *,
+    reply_all: bool = False,
+) -> ReplyRecipients:
+    """Derive safe Reply or Reply All recipients without using Bcc data."""
+
+    self_source = [self_addresses] if isinstance(self_addresses, str) else list(self_addresses)
+    if not self_source:
+        raise MailError("at least one self address is required")
+    self_keys = {
+        _envelope_address(address).casefold()
+        for value in self_source
+        for address in parse_address_list(value)
+    }
+
+    primary_source = message.reply_to or ((message.sender,) if message.sender else ())
+    primary = _received_addresses(primary_source)
+    original = _received_addresses((*message.to, *message.cc))
+    to: list[str] = []
+    cc: list[str] = []
+    seen = set(self_keys)
+
+    def append_unique(destination: list[str], item: tuple[str, str]) -> bool:
+        rendered, key = item
+        if key in seen:
+            return False
+        seen.add(key)
+        destination.append(rendered)
+        return True
+
+    for item in primary:
+        append_unique(to, item)
+    if not to:
+        for item in original:
+            if append_unique(to, item):
+                break
+    if reply_all:
+        for item in original:
+            append_unique(cc, item)
+    return ReplyRecipients(to=tuple(to), cc=tuple(cc))
+
+
+def reply_subject(subject: str) -> str:
+    """Return a bounded English reply subject with exactly one leading marker."""
+
+    source = _validate_header_value(subject or "(No subject)", "reply subject")
+    prefix = _REPLY_PREFIX_RE.match(source)
+    remainder = source[prefix.end() :] if prefix is not None else source
+    candidate = f"Re: {remainder.strip()}" if remainder.strip() else "Re:"
+    return candidate[:998].rstrip()
+
+
+def reply_thread_headers(message: ParsedMessage) -> tuple[str, tuple[str, ...]]:
+    """Return a parent Message-ID and bounded References chain for a reply."""
+
+    parent_ids = _extract_message_ids(message.message_id, maximum=1)
+    parent = parent_ids[0] if parent_ids else ""
+    base = message.references or ((message.in_reply_to,) if message.in_reply_to else ())
+    references = list(_extract_message_ids(base))
+    if parent and parent.casefold() not in {value.casefold() for value in references}:
+        references.append(parent)
+    references = references[-MAX_THREAD_MESSAGE_IDS:]
+    while references and len(" ".join(references)) > 998:
+        references.pop(0)
+    return parent, tuple(references)
 
 
 @runtime_checkable
@@ -623,8 +777,11 @@ def _validated_outgoing(
     tuple[str, ...],
     tuple[str, ...],
     tuple[str, ...],
+    tuple[str, ...],
     str,
     str | None,
+    str,
+    tuple[str, ...],
 ]:
     try:
         sender = parse_address_list(value.sender, maximum=1)[0]
@@ -643,8 +800,7 @@ def _validated_outgoing(
         raise MailValidationError(
             "invalid sender name",
             public_message=(
-                "Sender name must be 256 characters or fewer and cannot contain control "
-                "characters."
+                "Sender name must be 256 characters or fewer and cannot contain control characters."
             ),
         ) from exc
 
@@ -665,11 +821,20 @@ def _validated_outgoing(
     to = recipient_field(value.to, "To")
     cc = recipient_field(value.cc, "CC")
     bcc = recipient_field(value.bcc, "BCC")
+    reply_to = recipient_field(value.reply_to, "Reply-To") if value.reply_to else ()
     if not to and not cc and not bcc:
         raise MailError("at least one recipient is required")
     if len(to) + len(cc) + len(bcc) > 100:
         raise MailLimitError("too many recipients")
+    if len(reply_to) > 100:
+        raise MailLimitError("too many Reply-To addresses")
     subject = _validate_header_value(value.subject, "subject")
+    in_reply_to = (
+        _validate_message_id(value.in_reply_to, "In-Reply-To message ID")
+        if value.in_reply_to
+        else ""
+    )
+    references = _validate_references(value.references)
     if len(value.text) > MAX_BODY_CHARACTERS:
         raise MailLimitError("text body is too large")
 
@@ -705,7 +870,18 @@ def _validated_outgoing(
                 "HTML body is empty after sanitization",
                 public_message="The HTML body is empty after unsafe content is removed.",
             )
-    return sender, sender_name, to, cc, bcc, subject, safe_html
+    return (
+        sender,
+        sender_name,
+        to,
+        cc,
+        bcc,
+        reply_to,
+        subject,
+        safe_html,
+        in_reply_to,
+        references,
+    )
 
 
 def _header_block(message: EmailMessage) -> bytes:
@@ -801,7 +977,18 @@ def prepare_message(
 ) -> PreparedMessage:
     """Stream a complete MIME message to a mode-0600 temporary file."""
 
-    sender, sender_name, to, cc, bcc, subject, safe_html = _validated_outgoing(value)
+    (
+        sender,
+        sender_name,
+        to,
+        cc,
+        bcc,
+        reply_to,
+        subject,
+        safe_html,
+        in_reply_to,
+        references,
+    ) = _validated_outgoing(value)
     envelope_from = _envelope_address(sender)
     envelope_recipients = tuple(_envelope_address(item) for item in (*to, *cc, *bcc))
     sender_domain = envelope_from.rsplit("@", 1)[-1]
@@ -812,17 +999,21 @@ def prepare_message(
 
     top = EmailMessage(policy=policy.SMTP)
     top["From"] = (
-        Address(display_name=sender_name, addr_spec=envelope_from)
-        if sender_name
-        else sender
+        Address(display_name=sender_name, addr_spec=envelope_from) if sender_name else sender
     )
     if to:
         top["To"] = ", ".join(to)
     if cc:
         top["Cc"] = ", ".join(cc)
+    if reply_to:
+        top["Reply-To"] = ", ".join(reply_to)
     top["Subject"] = subject
     top["Date"] = format_datetime(datetime.now(UTC))
     top["Message-ID"] = message_id
+    if in_reply_to:
+        top["In-Reply-To"] = in_reply_to
+    if references:
+        top["References"] = " ".join(references)
     top.set_type("multipart/mixed")
     top.set_boundary(mixed_boundary)
 
@@ -1052,6 +1243,8 @@ def parse_message(raw: bytes) -> ParsedMessage:
 
     if not text_body and html_body:
         text_body = html_to_text(html_body)
+    in_reply_to = _extract_message_ids(message.get_all("In-Reply-To", []), maximum=1)
+    references = _extract_message_ids(message.get_all("References", []))
     return ParsedMessage(
         subject=_header_text(message, "Subject") or "(No subject)",
         sender=_header_text(message, "From"),
@@ -1062,6 +1255,9 @@ def parse_message(raw: bytes) -> ParsedMessage:
         text=text_body,
         html=html_body,
         attachments=tuple(attachments),
+        reply_to=tuple(str(value) for value in message.get_all("Reply-To", [])),
+        in_reply_to=in_reply_to[0] if in_reply_to else "",
+        references=references,
     )
 
 
@@ -1079,14 +1275,18 @@ __all__ = [
     "ParsedAttachment",
     "ParsedMessage",
     "PreparedMessage",
+    "ReplyRecipients",
     "attachment_download_headers",
     "build_message",
     "deliver_and_save",
+    "derive_reply_recipients",
     "detect_safe_image_type",
     "html_to_text",
     "parse_address_list",
     "parse_message",
     "prepare_message",
+    "reply_subject",
+    "reply_thread_headers",
     "rewrite_cid_images",
     "safe_filename",
     "sandboxed_html_document",

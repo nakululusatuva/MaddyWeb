@@ -67,6 +67,21 @@ cleanup() {
     fi
     exit "$status"
 }
+
+wait_running_unpaused() {
+    local target=$1 state=""
+    for _ in {1..50}; do
+        state=$("$docker_binary" inspect --format \
+            '{{.State.Running}} {{.State.Paused}}' "$target" 2>/dev/null) || true
+        if [[ "$state" == "true false" ]]; then
+            return 0
+        fi
+        sleep 0.2
+    done
+    printf 'last Docker state: %s\n' "${state:-unavailable}" >&2
+    return 1
+}
+
 trap cleanup EXIT
 
 docker volume create --label "$label" "$volume" >/dev/null
@@ -233,7 +248,7 @@ if "$release/configure-submission.sh" "${common_args[@]}" \
     --allow-downtime --apply >/dev/null 2>&1; then
     die "fixture unexpectedly passed the listener gate"
 fi
-[[ "$(docker inspect --format '{{.State.Running}} {{.State.Paused}}' "$container_id")" == "true false" ]] \
+wait_running_unpaused "$container_id" \
     || die "failed transaction did not restore running/unpaused state"
 final_copy="$work/final.conf"
 "$python_binary" "$release/docker-volume-config.py" \
@@ -281,7 +296,7 @@ if "$release/configure-submission.sh" "${host_args[@]}" \
     --allow-downtime --apply >/dev/null 2>&1; then
     die "host-network sleep fixture unexpectedly passed the listener gate"
 fi
-[[ "$(docker inspect --format '{{.State.Running}} {{.State.Paused}}' "$container_id")" == "true false" ]] \
+wait_running_unpaused "$container_id" \
     || die "host-network rollback did not restore running and unpaused state"
 [[ -z "$(ss -H -ltn 'sport = :1587')" ]] \
     || die "host-network rollback left port 1587 occupied"

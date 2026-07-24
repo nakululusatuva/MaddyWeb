@@ -1,0 +1,14 @@
+[Unit]
+Description=Twice-daily renewal check for the maddy.custom.example.test Web certificate
+Documentation=file:/opt/maddyweb/current/public-edge/public-edge.md
+
+[Timer]
+OnBootSec=35min
+OnCalendar=*-*-* 04,16:17:00
+RandomizedDelaySec=30min
+AccuracySec=5min
+Persistent=true
+Unit=maddyweb-web-cert-custom.service
+
+[Install]
+WantedBy=timers.target

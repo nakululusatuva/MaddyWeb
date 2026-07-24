@@ -9,12 +9,14 @@ small JSON control frame; filesystem paths never cross the privilege boundary.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import copy
 import logging
 import os
 import stat
 import time
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -39,6 +41,32 @@ _SMTP_AUTH_PUBLIC_MESSAGE = (
     "password and confirm that credentials are enabled, then try again. The message was "
     "not submitted."
 )
+_AUTH_TOKEN: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "maddyweb_helper_auth_token",
+    default=None,
+)
+_TARGET_ACCOUNT_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "maddyweb_helper_target_account_id",
+    default=None,
+)
+_USE_CONTEXT_TOKEN = object()
+
+
+@contextmanager
+def bind_helper_identity(
+    auth_token: str,
+    *,
+    target_account_id: str | None = None,
+) -> Any:
+    """Bind one authenticated browser identity to downstream helper calls."""
+
+    token_marker = _AUTH_TOKEN.set(auth_token)
+    target_marker = _TARGET_ACCOUNT_ID.set(target_account_id)
+    try:
+        yield
+    finally:
+        _TARGET_ACCOUNT_ID.reset(target_marker)
+        _AUTH_TOKEN.reset(token_marker)
 
 
 class HelperCallError(RuntimeError):
@@ -124,8 +152,15 @@ class HelperGateway:
         self._account_mutation_tasks: set[asyncio.Task[Any]] = set()
         self._account_cache_quarantined = False
 
-    async def _call(self, operation: str, params: Mapping[str, Any] | None = None) -> Any:
-        request = Request.create(operation, params, actor="maddyweb")
+    async def _call(
+        self,
+        operation: str,
+        params: Mapping[str, Any] | None = None,
+        *,
+        auth_token: str | None | object = _USE_CONTEXT_TOKEN,
+    ) -> Any:
+        resolved_token = _AUTH_TOKEN.get() if auth_token is _USE_CONTEXT_TOKEN else auth_token
+        request = Request.create(operation, params, auth_token=resolved_token)
         client = self._certificate_client if operation.startswith("certificates.") else self._client
         response = await asyncio.to_thread(client.call, request)
         return _checked_result(response)
@@ -141,7 +176,7 @@ class HelperGateway:
         request = Request.create(
             operation,
             params,
-            actor="maddyweb",
+            auth_token=_AUTH_TOKEN.get(),
             stream_length=message.size,
         )
 
@@ -150,6 +185,151 @@ class HelperGateway:
                 return self._client.call_with_stream(request, source)
 
         return _checked_result(await asyncio.to_thread(send))
+
+    async def begin_password_login(
+        self,
+        email: str,
+        password: str,
+        *,
+        client_ip: str,
+    ) -> Mapping[str, Any]:
+        return _mapping(
+            await self._call(
+                "auth.password_begin",
+                {"email": email, "password": password, "client_ip": client_ip},
+                auth_token=None,
+            ),
+            "auth.password_begin",
+        )
+
+    async def begin_totp_enrollment(self, challenge: str) -> Mapping[str, Any]:
+        return _mapping(
+            await self._call(
+                "auth.enrollment_begin",
+                {"challenge": challenge},
+                auth_token=None,
+            ),
+            "auth.enrollment_begin",
+        )
+
+    async def complete_totp_enrollment(
+        self,
+        challenge: str,
+        code: str,
+        *,
+        client_ip: str,
+    ) -> Mapping[str, Any]:
+        return _mapping(
+            await self._call(
+                "auth.enrollment_complete",
+                {"challenge": challenge, "code": code, "client_ip": client_ip},
+                auth_token=None,
+            ),
+            "auth.enrollment_complete",
+        )
+
+    async def complete_totp_login(
+        self,
+        challenge: str,
+        code: str,
+        *,
+        client_ip: str,
+    ) -> Mapping[str, Any]:
+        return _mapping(
+            await self._call(
+                "auth.totp_complete",
+                {"challenge": challenge, "code": code, "client_ip": client_ip},
+                auth_token=None,
+            ),
+            "auth.totp_complete",
+        )
+
+    async def complete_recovery_login(
+        self,
+        challenge: str,
+        recovery_code: str,
+        *,
+        client_ip: str,
+    ) -> Mapping[str, Any]:
+        return _mapping(
+            await self._call(
+                "auth.recovery_complete",
+                {
+                    "challenge": challenge,
+                    "recovery_code": recovery_code,
+                    "client_ip": client_ip,
+                },
+                auth_token=None,
+            ),
+            "auth.recovery_complete",
+        )
+
+    async def session(self, token: str) -> Mapping[str, Any]:
+        return _mapping(
+            await self._call("auth.session", auth_token=token),
+            "auth.session",
+        )
+
+    async def logout(self, token: str) -> None:
+        await self._call("auth.logout", auth_token=token)
+
+    async def change_own_password(
+        self,
+        current_password: str,
+        new_password: str,
+        *,
+        client_ip: str,
+    ) -> Mapping[str, Any]:
+        return _mapping(
+            await self._call(
+                "auth.change_password",
+                {
+                    "current_password": current_password,
+                    "new_password": new_password,
+                    "client_ip": client_ip,
+                },
+            ),
+            "auth.change_password",
+        )
+
+    async def regenerate_recovery_codes(
+        self,
+        password: str,
+        code: str,
+        *,
+        client_ip: str,
+    ) -> Mapping[str, Any]:
+        return _mapping(
+            await self._call(
+                "auth.recovery_regenerate",
+                {"password": password, "code": code, "client_ip": client_ip},
+            ),
+            "auth.recovery_regenerate",
+        )
+
+    async def step_up(
+        self,
+        password: str,
+        code: str,
+        *,
+        client_ip: str,
+    ) -> Mapping[str, Any]:
+        return _mapping(
+            await self._call(
+                "auth.step_up",
+                {"password": password, "code": code, "client_ip": client_ip},
+            ),
+            "auth.step_up",
+        )
+
+    async def rotate_account_totp(self, account_id: str) -> Mapping[str, Any]:
+        return _mapping(
+            await self._call(
+                "auth.admin_rotate_totp",
+                {"target_account_id": account_id, "confirm": True},
+            ),
+            "auth.admin_rotate_totp",
+        )
 
     async def health(self) -> Mapping[str, object]:
         """Return a cached, fixed-schema, non-sensitive readiness snapshot."""
@@ -173,15 +353,12 @@ class HelperGateway:
                 "certificate_management_enabled": False,
             }
             try:
-                version = _mapping(await self._call("maddy.version"), "maddy.version")
+                version = _mapping(await self._call("maddy.health"), "maddy.health")
                 result["maddy_version"] = str(version.get("version", "unknown"))
                 result["maddy_write_enabled"] = version.get("writes_enabled") is True
-                # A read of the account indexes checks that both configured
-                # credential and IMAP storage blocks remain available.  Its
-                # contents are deliberately discarded.
-                await self._fetch_accounts()
-                result["storage_available"] = True
-                result["status"] = "ok"
+                result["storage_available"] = version.get("storage_available") is True
+                if result["storage_available"]:
+                    result["status"] = "ok"
             except Exception:
                 LOGGER.warning("Maddy helper health probe failed", exc_info=True)
             if self._config.certificates.enabled and self._config.certificates.names:
@@ -260,10 +437,7 @@ class HelperGateway:
                 # shield future from logging an expected late exception after
                 # its HTTP waiter was cancelled.
                 return _TaskOutcome(error=exc)
-            if (
-                generation == self._account_generation
-                and self._account_mutations_inflight == 0
-            ):
+            if generation == self._account_generation and self._account_mutations_inflight == 0:
                 # A successful uncached read after an ambiguous mutation is
                 # authoritative: the single helper serves connections serially.
                 self._account_cache_quarantined = False
@@ -404,31 +578,62 @@ class HelperGateway:
     async def change_password(self, account_id: str, password: str) -> None:
         await self._account_mutation(
             "accounts.change_password",
-            {"username": account_id, "password": password},
+            {"target_account_id": account_id, "password": password},
         )
 
     async def set_append_limit(self, account_id: str, limit: int) -> None:
         await self._account_mutation(
             "accounts.set_append_limit",
-            {"username": account_id, "value": limit},
+            {"target_account_id": account_id, "value": limit},
         )
 
     async def disable_credentials(self, account_id: str) -> None:
         await self._account_mutation(
             "accounts.disable_credentials",
-            {"username": account_id, "confirm": True},
+            {"target_account_id": account_id, "confirm": True},
         )
 
     async def delete_mailbox(self, account_id: str) -> None:
         await self._account_mutation(
             "accounts.delete_imap_account",
-            {"username": account_id, "confirm": True},
+            {"target_account_id": account_id, "confirm": True},
         )
 
     async def list_mailboxes(self, account_id: str) -> Sequence[object]:
         return _sequence(
-            await self._call("mailboxes.list", {"username": account_id}),
+            await self._call("mailboxes.list", {"target_account_id": account_id}),
             "mailboxes.list",
+        )
+
+    async def create_mailbox(self, account_id: str, mailbox: str) -> None:
+        await self._call(
+            "mailboxes.create",
+            {"target_account_id": account_id, "mailbox": mailbox},
+        )
+
+    async def rename_mailbox(
+        self,
+        account_id: str,
+        old_name: str,
+        new_name: str,
+    ) -> None:
+        await self._call(
+            "mailboxes.rename",
+            {
+                "target_account_id": account_id,
+                "old_name": old_name,
+                "new_name": new_name,
+            },
+        )
+
+    async def delete_named_mailbox(self, account_id: str, mailbox: str) -> None:
+        await self._call(
+            "mailboxes.delete",
+            {
+                "target_account_id": account_id,
+                "mailbox": mailbox,
+                "confirm": True,
+            },
         )
 
     async def list_messages(
@@ -443,7 +648,7 @@ class HelperGateway:
             await self._call(
                 "messages.list",
                 {
-                    "username": account_id,
+                    "target_account_id": account_id,
                     "mailbox": mailbox,
                     "limit": limit,
                     "offset": offset,
@@ -486,8 +691,8 @@ class HelperGateway:
             raise ValueError("invalid raw-message download limit")
         request = Request.create(
             "messages.get",
-            {"username": account_id, "mailbox": mailbox, "uid": message_id},
-            actor="maddyweb",
+            {"target_account_id": account_id, "mailbox": mailbox, "uid": message_id},
+            auth_token=_AUTH_TOKEN.get(),
         )
 
         def receive() -> tuple[Response, int]:
@@ -512,7 +717,7 @@ class HelperGateway:
             await self._call(
                 "messages.move",
                 {
-                    "username": account_id,
+                    "target_account_id": account_id,
                     "source": mailbox,
                     "uid": _single_uid(message_id),
                     "target_special": "trash",
@@ -535,7 +740,7 @@ class HelperGateway:
             await self._call(
                 "messages.move",
                 {
-                    "username": account_id,
+                    "target_account_id": account_id,
                     "source": mailbox,
                     "uid": _single_uid(message_id),
                     "target_special": "archive",
@@ -548,6 +753,49 @@ class HelperGateway:
             raise HelperCallError("invalid_response", "messages.move returned no target mailbox")
         return target
 
+    async def move_message(
+        self,
+        account_id: str,
+        mailbox: str,
+        message_id: str,
+        target: str,
+    ) -> str:
+        result = _mapping(
+            await self._call(
+                "messages.move",
+                {
+                    "target_account_id": account_id,
+                    "source": mailbox,
+                    "uid": _single_uid(message_id),
+                    "target": target,
+                },
+            ),
+            "messages.move",
+        )
+        moved_to = result.get("target")
+        if not isinstance(moved_to, str) or not moved_to:
+            raise HelperCallError("invalid_response", "messages.move returned no target mailbox")
+        return moved_to
+
+    async def set_message_seen(
+        self,
+        account_id: str,
+        mailbox: str,
+        message_id: str,
+        *,
+        seen: bool,
+    ) -> None:
+        operation = "messages.add_flags" if seen else "messages.remove_flags"
+        await self._call(
+            operation,
+            {
+                "target_account_id": account_id,
+                "mailbox": mailbox,
+                "uid_set": _single_uid(message_id),
+                "flags": ["\\Seen"],
+            },
+        )
+
     async def delete_message_permanently(
         self,
         account_id: str,
@@ -557,7 +805,7 @@ class HelperGateway:
         await self._call(
             "messages.delete",
             {
-                "username": account_id,
+                "target_account_id": account_id,
                 "mailbox": mailbox,
                 "uid": _single_uid(message_id),
                 "confirm": True,
@@ -633,10 +881,14 @@ class HelperGateway:
                 await self._upload(
                     "messages.send",
                     {
-                        "username": envelope_from,
                         "password": submission_password,
                         "mail_from": envelope_from,
                         "recipients": list(recipients),
+                        **(
+                            {"target_account_id": _TARGET_ACCOUNT_ID.get()}
+                            if _TARGET_ACCOUNT_ID.get() is not None
+                            else {}
+                        ),
                     },
                     message,
                 ),
@@ -649,9 +901,7 @@ class HelperGateway:
             # classification.  messages.send performs every Maddy gate before
             # opening SMTP and has no fallible work after explicit acceptance.
             public_message = (
-                _SMTP_AUTH_PUBLIC_MESSAGE
-                if exc.code == "smtp_authentication_rejection"
-                else None
+                _SMTP_AUTH_PUBLIC_MESSAGE if exc.code == "smtp_authentication_rejection" else None
             )
             raise DeliveryRejected(
                 "local submission did not accept the message",
@@ -665,12 +915,16 @@ class HelperGateway:
         await self._upload(
             "messages.append",
             {
-                "username": message.envelope_from,
                 "mailbox_special": "sent",
                 "flags": ["\\Seen"],
+                **(
+                    {"target_account_id": _TARGET_ACCOUNT_ID.get()}
+                    if _TARGET_ACCOUNT_ID.get() is not None
+                    else {}
+                ),
             },
             message,
         )
 
 
-__all__ = ["HelperCallError", "HelperGateway"]
+__all__ = ["HelperCallError", "HelperGateway", "bind_helper_identity"]

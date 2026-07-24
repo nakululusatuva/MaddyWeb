@@ -10,6 +10,7 @@ source "$SCRIPT_DIR/lib/common.sh"
 readonly PREFIX="/opt/maddyweb"
 readonly RELEASE_ROOT="$PREFIX/releases"
 readonly CURRENT_LINK="$PREFIX/current"
+readonly CONFIG_HISTORY_ROOT="/var/lib/maddyweb-config-history"
 readonly CERTBOT_DEPLOY_HOOK="/etc/letsencrypt/renewal-hooks/deploy/maddyweb"
 readonly CERTBOT_HOOK_MARKER="# Managed by MaddyWeb install.sh; do not edit."
 
@@ -19,16 +20,207 @@ Usage: rollback.sh --environment development|production --host HOST \
   --release /opt/maddyweb/releases/<40-char-commit> --artifact-sha256 HEX \
   [--app-config /etc/maddyweb/config.toml] [--approval-file PATH] [--apply]
 
+Configuration-schema rollback:
+  --restore-previous-config
+  --acknowledge-public-edge-withdrawn
+
 Optional managed-listener rollback (performed under the same approval):
   --remove-managed-submission --maddy-mode native|docker \
   --maddy-config /absolute/host/maddy.conf [mode-specific Maddy options]
   Docker host networking also requires:
   --docker-submission-scope host-loopback
 
-Rolls back only the MaddyWeb release symlink. It never downgrades Maddy or
-restores Maddy state automatically because newer Maddy releases may migrate
-their database irreversibly. Without --apply this is a read-only plan.
+By default this rolls back only the MaddyWeb release symlink. A configuration
+can be restored only from the root-only history bound to the current installed
+release and its recorded predecessor. An unauthenticated target additionally
+requires a verified public 503 withdrawal and the explicit acknowledgement.
+This never downgrades Maddy or restores Maddy state automatically. Without
+--apply this is a read-only plan.
 EOF
+}
+
+assert_root_private_file() {
+    local path=${1:?file path is required}
+    [[ -f "$path" && ! -L "$path" ]] || die "required file is missing or unsafe: $path"
+    [[ "$(stat -c '%u:%g:%a:%h' -- "$path")" == "0:0:600:1" ]] \
+        || die "file must be single-link root:root 0600: $path"
+}
+
+assert_config_history_root() {
+    [[ -d "$CONFIG_HISTORY_ROOT" && ! -L "$CONFIG_HISTORY_ROOT" ]] \
+        || die "configuration history root must be a real directory"
+    [[ "$(realpath -e -- "$CONFIG_HISTORY_ROOT")" == "$CONFIG_HISTORY_ROOT" ]] \
+        || die "configuration history root must be canonical"
+    [[ "$(stat -c '%u:%g:%a' -- "$CONFIG_HISTORY_ROOT")" == "0:0:700" ]] \
+        || die "configuration history root must be root:root 0700"
+}
+
+load_config_history() {
+    assert_config_history_root
+    [[ -d "$config_history_path" && ! -L "$config_history_path" ]] \
+        || die "configuration rollback history is missing for the current release"
+    [[ "$(realpath -e -- "$config_history_path")" == "$config_history_path" ]] \
+        || die "configuration rollback history path must be canonical"
+    [[ "$(stat -c '%u:%g:%a' -- "$config_history_path")" == "0:0:700" ]] \
+        || die "configuration rollback history directory must be root:root 0700"
+
+    local manifest="$config_history_path/MANIFEST"
+    local previous_config="$config_history_path/previous-config.toml"
+    local entry name
+    local -a entries=()
+    mapfile -d '' -t entries < <(
+        find "$config_history_path" -xdev -mindepth 1 -maxdepth 1 -print0
+    )
+    [[ "${#entries[@]}" -eq 2 ]] \
+        || die "configuration rollback history must contain exactly two files"
+    for entry in "${entries[@]}"; do
+        name=$(basename -- "$entry")
+        case "$name" in
+            MANIFEST|previous-config.toml) ;;
+            *) die "configuration rollback history contains an unexpected entry" ;;
+        esac
+    done
+    assert_root_private_file "$manifest"
+    assert_root_private_file "$previous_config"
+
+    local format="" installed_release="" previous_release=""
+    local installed_hash="" previous_hash="" key value
+    local seen_format=false seen_installed=false seen_previous=false
+    local seen_installed_hash=false seen_previous_hash=false
+    local line_count=0
+    while IFS='=' read -r key value; do
+        ((line_count += 1))
+        case "$key" in
+            format)
+                [[ "$seen_format" == false ]] || die "duplicate configuration history field: format"
+                format=$value
+                seen_format=true
+                ;;
+            installed_release)
+                [[ "$seen_installed" == false ]] \
+                    || die "duplicate configuration history field: installed_release"
+                installed_release=$value
+                seen_installed=true
+                ;;
+            previous_release)
+                [[ "$seen_previous" == false ]] \
+                    || die "duplicate configuration history field: previous_release"
+                previous_release=$value
+                seen_previous=true
+                ;;
+            installed_config_sha256)
+                [[ "$seen_installed_hash" == false ]] \
+                    || die "duplicate configuration history field: installed_config_sha256"
+                installed_hash=$value
+                seen_installed_hash=true
+                ;;
+            previous_config_sha256)
+                [[ "$seen_previous_hash" == false ]] \
+                    || die "duplicate configuration history field: previous_config_sha256"
+                previous_hash=$value
+                seen_previous_hash=true
+                ;;
+            *)
+                die "unknown configuration history field: $key"
+                ;;
+        esac
+    done < "$manifest"
+
+    [[ "$line_count" -eq 5 && "$format" == "maddyweb-config-rollback-v1" ]] \
+        || die "configuration rollback history manifest format is invalid"
+    [[ "$installed_release" == "$current" ]] \
+        || die "configuration history is not bound to the current release"
+    [[ "$previous_release" == "$release" ]] \
+        || die "configuration history is not bound to the requested predecessor"
+    [[ "$installed_hash" =~ ^[0-9a-f]{64}$ && "$previous_hash" =~ ^[0-9a-f]{64}$ ]] \
+        || die "configuration history contains an invalid checksum"
+    [[ "$(sha256_file "$app_config")" == "$installed_hash" ]] \
+        || die "live configuration no longer matches its installed release"
+    [[ "$(sha256_file "$previous_config")" == "$previous_hash" ]] \
+        || die "recorded predecessor configuration checksum does not match"
+
+    installed_config_sha256=$installed_hash
+    previous_config_sha256=$previous_hash
+    effective_app_config="$previous_config"
+}
+
+target_authentication_capability() {
+    local manifest_profile runtime_profile
+    manifest_profile=$(
+        awk -F= '$1 == "authentication_profile" {print $2}' \
+            "$release/INSTALL-MANIFEST"
+    ) || manifest_profile=""
+    runtime_profile=$(
+        "$release/bin/python" -I -m maddyweb.release_attestation 2>/dev/null
+    ) || runtime_profile=""
+    if [[ "$manifest_profile" == required-unified-mailbox-v1 \
+        && "$runtime_profile" == required-unified-mailbox-v1 ]]; then
+        printf 'authenticated\n'
+    else
+        printf 'unauthenticated\n'
+    fi
+}
+
+assert_root_managed_file() {
+    local path=${1:?managed file path is required}
+    [[ -f "$path" && ! -L "$path" ]] || die "managed file is missing or unsafe: $path"
+    local owner mode links
+    owner=$(stat -c '%u' -- "$path") || die "cannot inspect managed file owner: $path"
+    mode=$(stat -c '%a' -- "$path") || die "cannot inspect managed file mode: $path"
+    links=$(stat -c '%h' -- "$path") || die "cannot inspect managed file links: $path"
+    [[ "$owner" == 0 && "$links" == 1 ]] \
+        || die "managed file identity is unsafe: $path"
+    (( (8#$mode & 8#022) == 0 )) \
+        || die "managed file is group or world writable: $path"
+}
+
+select_public_edge_withdrawal() {
+    current_public_origin=$(
+        "$current/bin/python" -I - "$app_config" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as handle:
+    config = tomllib.load(handle)
+print(config.get("security", {}).get("public_origin", ""))
+PY
+    ) || die "cannot read the current public origin"
+    case "$current_public_origin" in
+        https://maddy.standalone.example.test)
+            public_domain="maddy.standalone.example.test"
+            withdrawn_source="$current/public-edge/nginx/maddy.standalone.example.test.withdrawn.conf"
+            installed_public_vhost="/etc/nginx/conf.d/maddy.standalone.example.test.conf"
+            nginx_test=(/usr/bin/nginx -t -c /etc/nginx/nginx.conf)
+            ;;
+        https://maddy.custom.example.test)
+            public_domain="maddy.custom.example.test"
+            withdrawn_source="$current/public-edge/nginx/maddy.custom.example.test.withdrawn.conf"
+            installed_public_vhost="/etc/custom-acme/maddyweb/maddy.custom.example.test.conf"
+            nginx_test=(/usr/bin/nginx -t -c /etc/custom-acme/nginx.conf)
+            ;;
+        *)
+            die "unauthenticated rollback requires one supported public-edge profile"
+            ;;
+    esac
+}
+
+verify_public_edge_withdrawal() {
+    assert_root_managed_file "$withdrawn_source"
+    assert_root_managed_file "$installed_public_vhost"
+    cmp -s -- "$withdrawn_source" "$installed_public_vhost" \
+        || die "public edge is not the exact reviewed 503 withdrawal asset"
+    "${nginx_test[@]}" >/dev/null 2>&1 \
+        || die "withdrawn public-edge Nginx configuration test failed"
+    local nonce status
+    nonce="$(date +%s)-$$-${RANDOM}"
+    status=$(
+        curl --noproxy '*' --silent --show-error --output /dev/null \
+            --write-out '%{http_code}' --connect-timeout 5 --max-time 15 \
+            --header 'Cache-Control: no-cache' \
+            "https://$public_domain/?maddyweb-withdrawal=$nonce"
+    ) || die "public withdrawal probe failed"
+    [[ "$status" == 503 ]] \
+        || die "public edge returned HTTP $status instead of the required 503"
 }
 
 environment=""
@@ -37,6 +229,8 @@ release=""
 expected_sha256=""
 approval_file=""
 app_config="/etc/maddyweb/config.toml"
+restore_previous_config=false
+acknowledge_public_edge_withdrawn=false
 remove_submission=false
 maddy_mode=""
 maddy_config=""
@@ -56,6 +250,8 @@ while (($#)); do
         --artifact-sha256) (($# >= 2)) || die "--artifact-sha256 requires a value"; expected_sha256=${2,,}; shift 2 ;;
         --app-config) (($# >= 2)) || die "--app-config requires a value"; app_config=$2; shift 2 ;;
         --approval-file) (($# >= 2)) || die "--approval-file requires a value"; approval_file=$2; shift 2 ;;
+        --restore-previous-config) restore_previous_config=true; shift ;;
+        --acknowledge-public-edge-withdrawn) acknowledge_public_edge_withdrawn=true; shift ;;
         --remove-managed-submission) remove_submission=true; shift ;;
         --maddy-mode) (($# >= 2)) || die "--maddy-mode requires a value"; maddy_mode=$2; shift 2 ;;
         --maddy-config) (($# >= 2)) || die "--maddy-config requires a value"; maddy_config=$2; shift 2 ;;
@@ -78,31 +274,82 @@ case "$docker_submission_scope" in
 esac
 [[ -n "$target_host" && "$target_host" == "$(hostname)" ]] || die "--host must exactly match $(hostname)"
 [[ "$expected_sha256" =~ ^[0-9a-f]{64}$ ]] || die "--artifact-sha256 must be 64 lowercase hexadecimal characters"
+require_command realpath
+require_command find
 require_directory "$release" "rollback release"
 require_path_below "$release" "$RELEASE_ROOT"
+[[ "$(realpath -e -- "$release")" == "$release" ]] \
+    || die "rollback release path must be canonical and traverse no symbolic link"
 release_commit=$(basename -- "$release")
 [[ "$release_commit" =~ ^[0-9a-f]{40}$ ]] || die "rollback release directory must be a full lowercase commit"
 [[ -x "$release/bin/python" ]] || die "rollback release has no executable Python"
 require_regular_file "$app_config" "MaddyWeb config"
 assert_private_file_mode "$app_config"
-require_command realpath
 [[ "$(realpath -e -- "$app_config")" == "$app_config" ]] \
     || die "MaddyWeb config path must be canonical and traverse no symbolic link"
 if [[ "$environment" == production ]]; then
     [[ "$app_config" == /etc/maddyweb/config.toml ]] \
         || die "production requires --app-config exactly /etc/maddyweb/config.toml"
-    [[ "$(stat -c '%u:%a:%h' -- "$app_config")" == "0:640:1" ]] \
-        || die "production MaddyWeb config must be single-link root-owned mode 0640"
+    expected_web_gid=$(id -g maddyweb) || die "cannot resolve maddyweb group"
+    [[ "$(stat -c '%u:%g:%a:%h' -- "$app_config")" == "0:${expected_web_gid}:640:1" ]] \
+        || die "production MaddyWeb config must be single-link root-owned mode 0640 with the maddyweb group"
 fi
+[[ -L "$CURRENT_LINK" ]] || die "current release link is missing or unsafe"
+[[ "$(stat -c '%u:%h' -- "$CURRENT_LINK")" == "0:1" ]] \
+    || die "current release link identity is unsafe"
+current=$(readlink -f -- "$CURRENT_LINK")
+require_path_below "$current" "$RELEASE_ROOT"
+[[ "$current" =~ ^${RELEASE_ROOT}/[0-9a-f]{40}$ ]] \
+    || die "current release target is not a full lowercase commit"
+[[ "$current" != "$release" ]] || die "requested release is already current"
+[[ -x "$current/bin/python" ]] || die "current release has no executable Python"
 require_regular_file "$release/INSTALL-MANIFEST" "release manifest"
 manifest_sha=$(awk -F= '$1 == "sha256" {print $2}' "$release/INSTALL-MANIFEST")
 manifest_commit=$(awk -F= '$1 == "commit" {print $2}' "$release/INSTALL-MANIFEST")
 [[ "$manifest_sha" == "$expected_sha256" ]] || die "release manifest checksum does not match explicit artifact checksum"
 [[ "$manifest_commit" == "$release_commit" ]] || die "release manifest commit does not match its directory"
 "$release/bin/python" -m maddyweb --help >/dev/null || die "rollback release cannot import maddyweb"
+
+target_authentication=$(target_authentication_capability) \
+    || die "cannot determine rollback target authentication capability"
+case "$target_authentication" in
+    authenticated|unauthenticated) ;;
+    *) die "rollback target returned an invalid authentication capability" ;;
+esac
+
+effective_app_config="$app_config"
+installed_config_sha256=$(sha256_file "$app_config")
+previous_config_sha256=""
+config_history_path=""
+if [[ "$restore_previous_config" == true ]]; then
+    [[ "$app_config" == /etc/maddyweb/config.toml ]] \
+        || die "--restore-previous-config requires /etc/maddyweb/config.toml"
+    require_root
+    config_history_path="$CONFIG_HISTORY_ROOT/$(basename -- "$current")"
+    load_config_history
+fi
+
+public_domain=""
+current_public_origin=""
+withdrawn_source=""
+installed_public_vhost=""
+nginx_test=()
+if [[ "$target_authentication" == unauthenticated ]]; then
+    [[ "$restore_previous_config" == true ]] \
+        || die "an unauthenticated rollback target requires --restore-previous-config"
+    [[ "$acknowledge_public_edge_withdrawn" == true ]] \
+        || die "an unauthenticated rollback target requires --acknowledge-public-edge-withdrawn"
+    require_command cmp
+    require_command curl
+    select_public_edge_withdrawal
+    verify_public_edge_withdrawal
+elif [[ "$acknowledge_public_edge_withdrawn" == true ]]; then
+    die "--acknowledge-public-edge-withdrawn is valid only for an unauthenticated target"
+fi
+
 "$release/bin/python" -I -c \
     'import sys; from maddyweb.config import load_config; load_config(sys.argv[1])' \
-    "$app_config" \
+    "$effective_app_config" \
     || die "rollback release cannot load the effective MaddyWeb configuration"
 
 if [[ -f "$CERTBOT_DEPLOY_HOOK" && ! -L "$CERTBOT_DEPLOY_HOOK" ]]; then
@@ -140,7 +387,7 @@ if [[ "$remove_submission" == true ]]; then
         [[ -n "$maddy_binary" && -z "$container" ]] || die "native managed removal requires --maddy-binary and no container"
         submission_version=$(assert_supported_maddy "$maddy_binary")
         "$release/bin/python" "$SCRIPT_DIR/validate-config.py" \
-            --config "$app_config" --expected-host 127.0.0.1 --expected-port 8787 \
+            --config "$effective_app_config" --expected-host 127.0.0.1 --expected-port 8787 \
             --expected-maddy-mode native --expected-maddy-binary "$maddy_binary" \
             --expected-maddy-config "$maddy_config" >/dev/null
     else
@@ -175,11 +422,11 @@ if [[ "$remove_submission" == true ]]; then
         submission_version=$(extract_maddy_version "$version_output")
         version_in_supported_range "$submission_version" || die "unsupported container Maddy version"
         "$release/bin/python" "$SCRIPT_DIR/validate-config.py" \
-            --config "$app_config" --expected-host 127.0.0.1 --expected-port 8787 \
+            --config "$effective_app_config" --expected-host 127.0.0.1 --expected-port 8787 \
             --expected-maddy-mode docker --expected-container "$container" \
             --expected-maddy-config /data/maddy.conf --expected-maddy-data /data \
             >/dev/null
-        configured_submission_scope=$("$release/bin/python" - "$app_config" <<'PY'
+        configured_submission_scope=$("$release/bin/python" - "$effective_app_config" <<'PY'
 import sys
 import tomllib
 
@@ -199,13 +446,11 @@ elif [[ -n "$maddy_mode$maddy_config$maddy_binary$container" \
     die "managed Maddy options require --remove-managed-submission"
 fi
 
-[[ -L "$CURRENT_LINK" ]] || die "current release link is missing or unsafe"
-current=$(readlink -f -- "$CURRENT_LINK")
-require_path_below "$current" "$RELEASE_ROOT"
-[[ "$current" != "$release" ]] || die "requested release is already current"
-printf 'environment=%s\nhost=%s\nfrom=%s\nto=%s\ncommit=%s\nartifact_sha256=%s\nremove_managed_submission=%s\ndocker_submission_scope=%s\nnetwork_mode=%s\n' \
+printf 'environment=%s\nhost=%s\nfrom=%s\nto=%s\ncommit=%s\nartifact_sha256=%s\ntarget_authentication=%s\nrestore_previous_config=%s\ninstalled_config_sha256=%s\nprevious_config_sha256=%s\npublic_withdrawal=%s\nremove_managed_submission=%s\ndocker_submission_scope=%s\nnetwork_mode=%s\n' \
     "$environment" "$target_host" "$current" "$release" "$release_commit" \
-    "$expected_sha256" "$remove_submission" "$docker_submission_scope" \
+    "$expected_sha256" "$target_authentication" "$restore_previous_config" \
+    "$installed_config_sha256" "${previous_config_sha256:-none}" \
+    "${public_domain:-none}" "$remove_submission" "$docker_submission_scope" \
     "${network_mode:-native}"
 
 if [[ "$apply" != true ]]; then
@@ -220,12 +465,115 @@ elif [[ -n "$approval_file" ]]; then
     die "approval files are accepted only for production"
 fi
 require_command systemctl
+require_command sync
+require_command flock
+require_command install
+
+[[ "$(stat -c '%u:%g:%a' -- "$MADDYWEB_APPROVAL_ROOT")" == "0:0:700" ]] \
+    || die "approval runtime directory must be root:root 0700"
+deployment_lock="$MADDYWEB_APPROVAL_ROOT/deployment.lock"
+exec {deployment_lock_fd}>> "$deployment_lock"
+[[ "$(stat -c '%u:%g:%a:%h' -- "$deployment_lock")" == "0:0:600:1" ]] \
+    || die "deployment lock must be single-link root:root 0600"
+flock -n "$deployment_lock_fd" || die "another MaddyWeb deployment transaction is active"
+
+if [[ -e "$CONFIG_HISTORY_ROOT" || -L "$CONFIG_HISTORY_ROOT" ]]; then
+    assert_config_history_root
+else
+    install -d -o root -g root -m 0700 -- "$CONFIG_HISTORY_ROOT"
+    assert_config_history_root
+fi
+if [[ "$restore_previous_config" == true ]]; then
+    load_config_history
+fi
+if [[ "$target_authentication" == unauthenticated ]]; then
+    verify_public_edge_withdrawal
+fi
 
 submission_backup=""
 submission_candidate_hash=""
 submission_edit_started=false
 native_pid_before=""
 rollback_transaction_active=false
+config_transaction_dir=""
+config_backup=""
+config_candidate=""
+config_temporary="/etc/maddyweb/.config.toml.rollback-$$"
+config_recovery_temporary="/etc/maddyweb/.config.toml.rollback-recovery-$$"
+config_edit_started=false
+expected_web_gid=$(id -g maddyweb) || die "cannot resolve maddyweb group"
+
+assert_live_config() {
+    local expected_hash=${1:?expected configuration checksum is required}
+    [[ -f "$app_config" && ! -L "$app_config" ]] || return 1
+    [[ "$(stat -c '%u:%g:%a:%h' -- "$app_config" 2>/dev/null)" \
+        == "0:${expected_web_gid}:640:1" ]] || return 1
+    [[ "$(sha256_file "$app_config" 2>/dev/null)" == "$expected_hash" ]]
+}
+
+quiesce_maddyweb_units() {
+    local unit status=0
+    for unit in maddyweb.service maddyweb-helper.socket maddyweb-helper.service; do
+        systemctl stop "$unit" || status=1
+    done
+    for unit in maddyweb.service maddyweb-helper.socket maddyweb-helper.service; do
+        if systemctl is-active --quiet "$unit"; then status=1; fi
+    done
+    return "$status"
+}
+
+atomic_install_config() {
+    local source=${1:?configuration source is required}
+    local expected_hash=${2:?configuration checksum is required}
+    local temporary=${3:?configuration temporary path is required}
+    [[ ! -e "$temporary" && ! -L "$temporary" ]] || return 1
+    install -o root -g maddyweb -m 0640 -- "$source" "$temporary" \
+        && mv -fT -- "$temporary" "$app_config" \
+        && sync -f "$(dirname -- "$app_config")" \
+        && assert_live_config "$expected_hash"
+}
+
+cleanup_config_transaction() {
+    local status=0
+    rm -f -- "$config_temporary" "$config_recovery_temporary" || status=1
+    if [[ -n "$config_transaction_dir" ]]; then
+        rm -f -- "$config_transaction_dir/current-config.toml" \
+            "$config_transaction_dir/previous-config.toml" || status=1
+        rmdir -- "$config_transaction_dir" || status=1
+    fi
+    return "$status"
+}
+
+prepare_config_transaction() {
+    [[ "$restore_previous_config" == true ]] || return 0
+    assert_live_config "$installed_config_sha256" \
+        || return 1
+    config_transaction_dir=$(
+        mktemp -d --tmpdir="$MADDYWEB_APPROVAL_ROOT" .rollback-config.XXXXXXXX
+    ) || return 1
+    case "$config_transaction_dir" in
+        "$MADDYWEB_APPROVAL_ROOT"/.rollback-config.*) ;;
+        *) return 1 ;;
+    esac
+    [[ "$(stat -c '%u:%g:%a' -- "$config_transaction_dir")" == "0:0:700" ]] \
+        || return 1
+    config_backup="$config_transaction_dir/current-config.toml"
+    config_candidate="$config_transaction_dir/previous-config.toml"
+    install -o root -g root -m 0600 -- "$app_config" "$config_backup" \
+        || return 1
+    install -o root -g root -m 0600 -- "$effective_app_config" "$config_candidate" \
+        || return 1
+    [[ -f "$config_backup" && ! -L "$config_backup" \
+        && "$(stat -c '%u:%g:%a:%h' -- "$config_backup")" == "0:0:600:1" ]] \
+        || return 1
+    [[ -f "$config_candidate" && ! -L "$config_candidate" \
+        && "$(stat -c '%u:%g:%a:%h' -- "$config_candidate")" == "0:0:600:1" ]] \
+        || return 1
+    [[ "$(sha256_file "$config_backup")" == "$installed_config_sha256" ]] \
+        || return 1
+    [[ "$(sha256_file "$config_candidate")" == "$previous_config_sha256" ]] \
+        || return 1
+}
 
 switch_link() {
     local target=${1:?target is required}
@@ -367,19 +715,35 @@ restore_submission() {
 }
 
 restore_previous_release_state() {
-    local status=0 restored_link=false restored_current
+    local status=0 quiesced=false restored_link=false restored_config=true restored_current
     rollback_transaction_active=false
-    log "restoring the exact pre-rollback release and managed Submission state"
+    log "restoring the exact pre-rollback release, configuration, and managed Submission state"
+    if quiesce_maddyweb_units; then quiesced=true; else status=1; fi
     if switch_link "$current"; then restored_link=true; else status=1; fi
+    if [[ "$config_edit_started" == true ]]; then
+        restored_config=false
+        rm -f -- "$config_temporary" "$config_recovery_temporary" || status=1
+        if [[ "$quiesced" == true ]] \
+            && atomic_install_config \
+                "$config_backup" "$installed_config_sha256" "$config_recovery_temporary"; then
+            restored_config=true
+        else
+            status=1
+        fi
+    fi
     if [[ "$remove_submission" == true ]]; then restore_submission || status=1; fi
-    if [[ "$restored_link" == true ]]; then
+    if (( status == 0 )) && [[ "$quiesced" == true \
+        && "$restored_link" == true && "$restored_config" == true ]]; then
         systemctl restart maddyweb-helper.socket maddyweb.service || status=1
         systemctl try-restart maddyweb-helper.service || status=1
         restored_current=$(readlink -f -- "$CURRENT_LINK" 2>/dev/null) || status=1
         [[ "${restored_current:-}" == "$current" ]] || status=1
         systemctl is-active --quiet maddyweb-helper.socket maddyweb.service || status=1
         "$current/bin/python" "$SCRIPT_DIR/smoke-test.py" || status=1
+    else
+        status=1
     fi
+    cleanup_config_transaction || status=1
     if (( status != 0 )); then
         log "CRITICAL: rollback candidate failed and restoration of the previous state was incomplete"
     fi
@@ -391,7 +755,7 @@ abort_rollback_transaction() {
     rollback_transaction_active=false
     trap - EXIT INT TERM
     if restore_previous_release_state; then
-        die "$reason; exact previous release and managed Submission state were restored"
+        die "$reason; exact previous release, configuration, and managed Submission state were restored"
     fi
     die "$reason and restoration of the previous state was incomplete"
 }
@@ -428,6 +792,9 @@ trap on_rollback_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+prepare_config_transaction \
+    || abort_rollback_transaction "cannot prepare the root-only configuration transaction"
+
 if [[ "$remove_submission" == true ]]; then
     install -d -o root -g root -m 0700 -- "$submission_backup_dir"
     submission_edit_started=true
@@ -446,6 +813,22 @@ if [[ "$remove_submission" == true ]]; then
     fi
 fi
 
+if [[ "$target_authentication" == unauthenticated ]]; then
+    verify_public_edge_withdrawal
+fi
+if [[ "$restore_previous_config" == true ]]; then
+    quiesce_maddyweb_units \
+        || abort_rollback_transaction "cannot quiesce MaddyWeb for configuration restoration"
+    assert_live_config "$installed_config_sha256" \
+        || abort_rollback_transaction "live configuration changed before restoration"
+    [[ "$(sha256_file "$config_candidate")" == "$previous_config_sha256" ]] \
+        || abort_rollback_transaction "staged predecessor configuration changed"
+    config_edit_started=true
+    atomic_install_config \
+        "$config_candidate" "$previous_config_sha256" "$config_temporary" \
+        || abort_rollback_transaction "predecessor configuration restoration failed"
+fi
+
 switch_link "$release" || abort_rollback_transaction "rollback release switch failed"
 if ! systemctl restart maddyweb-helper.socket maddyweb.service \
     || ! systemctl try-restart maddyweb-helper.service \
@@ -453,13 +836,28 @@ if ! systemctl restart maddyweb-helper.socket maddyweb.service \
     || ! "$release/bin/python" "$SCRIPT_DIR/smoke-test.py"; then
     abort_rollback_transaction "rollback candidate activation or smoke gate failed"
 fi
-previous_release_temp="/var/lib/maddyweb/.previous-release-rollback-$$"
+previous_release_record="$CONFIG_HISTORY_ROOT/previous-release"
+if [[ -e "$previous_release_record" || -L "$previous_release_record" ]]; then
+    [[ -f "$previous_release_record" && ! -L "$previous_release_record" \
+        && "$(stat -c '%u:%g:%a:%h' -- "$previous_release_record")" == "0:0:600:1" ]] \
+        || abort_rollback_transaction "previous-release metadata target is unsafe"
+fi
+previous_release_temp=$(
+    mktemp --tmpdir="$CONFIG_HISTORY_ROOT" .previous-release.XXXXXXXX
+) || abort_rollback_transaction "previous-release metadata staging failed"
 if ! printf '%s\n' "$current" > "$previous_release_temp" \
     || ! chmod 0600 -- "$previous_release_temp" \
-    || ! mv -fT -- "$previous_release_temp" /var/lib/maddyweb/previous-release; then
+    || ! mv -fT -- "$previous_release_temp" "$previous_release_record" \
+    || ! sync -f "$CONFIG_HISTORY_ROOT" \
+    || [[ "$(stat -c '%u:%g:%a:%h' -- "$previous_release_record" 2>/dev/null)" \
+        != "0:0:600:1" ]] \
+    || [[ "$(<"$previous_release_record")" != "$current" ]]; then
     rm -f -- "$previous_release_temp" || true
     abort_rollback_transaction "previous-release metadata update failed"
 fi
 rollback_transaction_active=false
 trap - EXIT INT TERM
+if ! cleanup_config_transaction; then
+    die "rollback completed but its root-only runtime configuration backup could not be removed"
+fi
 log "rollback completed: $release"

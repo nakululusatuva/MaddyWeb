@@ -19,6 +19,7 @@ from typing import Never
 
 MAX_HEALTH_BODY = 4096
 MAX_RESPONSE_BODY = 512 * 1024
+PERFORMANCE_ACCOUNT_ID = "00000000000000000000000000000001"
 HEALTH_FIELDS = {
     "status",
     "version",
@@ -30,14 +31,14 @@ HEALTH_FIELDS = {
 }
 TARGETS = {
     ("/", ""): ("html", b"Administration overview"),
-    ("/api/v1/accounts", ""): ("api", b"user49@example.test"),
+    ("/api/v1/admin/accounts", ""): ("api", b"user49@example.test"),
     (
-        "/api/v1/mail",
-        "account=user00%40example.test&mailbox=INBOX",
+        "/api/v1/admin/mail",
+        f"account={PERFORMANCE_ACCOUNT_ID}&mailbox=INBOX",
     ): ("api", b"Performance message"),
     (
-        "/api/v1/mail/42",
-        "account=user00%40example.test&mailbox=INBOX",
+        "/api/v1/admin/mail/42",
+        f"account={PERFORMANCE_ACCOUNT_ID}&mailbox=INBOX",
     ): ("api", b"Performance fixture"),
 }
 

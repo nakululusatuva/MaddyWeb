@@ -45,10 +45,15 @@ def test_example_cookie_names_are_distinct_across_local_instances() -> None:
         repository / "deploy" / "examples" / "config.wsl.toml",
         repository / "docker" / "config.toml",
     )
-    names = [
-        str(tomllib.loads(path.read_text(encoding="utf-8"))["security"]["cookie_name"])
-        for path in paths
-    ]
+    names = []
+    for path in paths:
+        security = tomllib.loads(path.read_text(encoding="utf-8"))["security"]
+        names.extend(
+            (
+                str(security["session_cookie_name"]),
+                str(security["csrf_cookie_name"]),
+            )
+        )
     assert len(set(names)) == len(names)
     assert all(name.startswith("__Host-maddyweb-") for name in names)
 
@@ -136,7 +141,7 @@ def test_load_toml(tmp_path: Path) -> None:
         ({"server": {"allowed_hosts": "127.0.0.1"}}, "array"),
         ({"certificates": {"enabled": "false"}}, "boolean"),
         ({"certificates": {"names": "mx.example.test"}}, "array"),
-        ({"security": {"cookie_name": "unprefixed"}}, "cookie_name"),
+        ({"security": {"session_cookie_name": "unprefixed"}}, "session_cookie_name"),
         ({"maddy": {"helper_socket": "../helper.sock"}}, "absolute"),
     ],
 )
@@ -252,3 +257,50 @@ def test_posix_deployment_paths_stay_posix_on_every_development_platform() -> No
     config = _config()
     assert str(config.server.temp_dir) == "/var/tmp/maddyweb"  # noqa: S108 - expected policy
     assert str(config.maddy.helper_socket) == "/run/maddyweb/helper.sock"
+
+
+def test_public_origin_requires_matching_allowed_host() -> None:
+    with pytest.raises(ConfigError, match="allowed_hosts"):
+        _config({"security": {"public_origin": "https://maddy.example.test"}})
+    config = _config(
+        {
+            "server": {
+                "allowed_hosts": [
+                    "127.0.0.1",
+                    "localhost",
+                    "maddy.example.test",
+                ]
+            },
+            "security": {
+                "public_origin": "https://maddy.example.test",
+                "totp_issuer": "MaddyWeb Example",
+            },
+        }
+    )
+    assert config.security.public_origin == "https://maddy.example.test"
+
+
+@pytest.mark.parametrize(
+    "origin",
+    (
+        "http://maddy.example.test",
+        "https://user@maddy.example.test",
+        "https://maddy.example.test/path",
+        "https://maddy.example.test:8443",
+    ),
+)
+def test_public_origin_is_strict_https_origin(origin: str) -> None:
+    with pytest.raises(ConfigError, match="HTTPS origin"):
+        _config({"security": {"public_origin": origin}})
+
+
+def test_session_and_csrf_cookie_names_must_be_distinct() -> None:
+    with pytest.raises(ConfigError, match="different names"):
+        _config(
+            {
+                "security": {
+                    "session_cookie_name": "__Host-maddyweb-same",
+                    "csrf_cookie_name": "__Host-maddyweb-same",
+                }
+            }
+        )

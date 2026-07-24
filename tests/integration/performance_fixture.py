@@ -14,6 +14,11 @@ from aiohttp import web
 import maddyweb.cli  # noqa: F401 - mirror production entry-point import cost
 from maddyweb.web import MessagePage, create_app
 
+PERFORMANCE_ACCOUNT_ID = f"{1:032x}"
+PERFORMANCE_ACCOUNT_ADDRESS = "user00@example.test"
+SESSION_COOKIE_NAME = "__Host-maddyweb-performance-session"
+SESSION_TOKEN = "S" * 43
+
 
 class PerformanceGateway:
     def __init__(self) -> None:
@@ -36,10 +41,24 @@ class PerformanceGateway:
             "certificate_management_enabled": False,
         }
 
+    async def session(self, token: str) -> dict[str, object]:
+        if token != SESSION_TOKEN:
+            raise RuntimeError("invalid performance fixture session")
+        return {
+            "account_id": PERFORMANCE_ACCOUNT_ID,
+            "email": PERFORMANCE_ACCOUNT_ADDRESS,
+            "role": "admin",
+            "password_change_required": False,
+            "enrollment_state": "active",
+            "idle_expires_at": 2_000_000_000,
+            "absolute_expires_at": 2_000_010_000,
+            "recovery_codes_remaining": 10,
+        }
+
     async def list_accounts(self) -> list[dict[str, object]]:
         return [
             {
-                "id": f"user{index:02d}@example.test",
+                "id": f"{index + 1:032x}",
                 "address": f"user{index:02d}@example.test",
                 "has_credentials": True,
                 "has_mailbox": True,
@@ -84,11 +103,26 @@ class PerformanceGateway:
         return len(self.raw_message)
 
 
+@web.middleware
+async def _fixture_session_cookie(
+    request: web.Request,
+    handler: web.RequestHandler,
+) -> web.StreamResponse:
+    """Inject the benchmark session while preserving production authentication."""
+
+    if SESSION_COOKIE_NAME in request.cookies:
+        return await handler(request)
+    headers = request.headers.copy()
+    existing = headers.get("Cookie", "")
+    injected = f"{SESSION_COOKIE_NAME}={SESSION_TOKEN}"
+    headers["Cookie"] = f"{existing}; {injected}" if existing else injected
+    return await handler(request.clone(headers=headers))
+
+
 def main() -> None:
     temp_dir = Path("/tmp/maddyweb-performance-fixture")  # noqa: S108
     temp_dir.mkdir(mode=0o700, exist_ok=True)
     config = {
-        "session_signing_key": secrets.token_bytes(48),
         "server": {
             "allowed_hosts": ("127.0.0.1",),
             "concurrency": 8,
@@ -97,13 +131,17 @@ def main() -> None:
             "temp_dir": temp_dir,
         },
         "security": {
+            "session_signing_key": secrets.token_bytes(48),
             "csrf_ttl_seconds": 900,
-            "cookie_name": "__Host-maddyweb",
+            "csrf_cookie_name": "__Host-maddyweb-performance-csrf",
+            "session_cookie_name": SESSION_COOKIE_NAME,
             "secure_cookies": True,
         },
     }
+    app = create_app(config, PerformanceGateway())  # type: ignore[arg-type]
+    app.middlewares.insert(0, _fixture_session_cookie)
     web.run_app(
-        create_app(config, PerformanceGateway()),  # type: ignore[arg-type]
+        app,
         host="127.0.0.1",
         port=8787,
         backlog=16,

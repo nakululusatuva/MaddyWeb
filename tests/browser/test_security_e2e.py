@@ -17,13 +17,19 @@ import pytest
 from aiohttp import web
 from conftest import (
     ACCOUNT,
+    ACCOUNT_ADDRESS,
     ARCHIVE_MAILBOX,
     CERTIFICATE_FINGERPRINT,
     CERTIFICATE_NAME,
     COOKIE_NAME,
+    LOGIN_CHALLENGE,
+    LOGIN_PASSWORD,
+    LOGIN_TOTP,
     MAILBOX,
     MESSAGE_ID,
     NEW_ACCOUNT,
+    NEW_ACCOUNT_ID,
+    SESSION_COOKIE_NAME,
     TRASH_MAILBOX,
     BrowserSecurityGateway,
     LiveApplication,
@@ -43,7 +49,7 @@ CLIENT_SOURCE_PATH = Path(__file__).resolve().parents[2] / "src" / "maddyweb" / 
 
 async def _allow_loopback_only(route: Route) -> None:
     hostname = urlsplit(route.request.url).hostname
-    if hostname in {"127.0.0.1", "unlisted.invalid"}:
+    if hostname in {"127.0.0.1", "localhost", "unlisted.invalid"}:
         await route.continue_()
     else:
         await route.abort()
@@ -79,13 +85,19 @@ def _message_path() -> str:
     return f"/mail/{MESSAGE_ID}?{query}"
 
 
+def _mailbox_path(mailbox: str = MAILBOX) -> str:
+    query = urlencode({"account": ACCOUNT, "mailbox": mailbox})
+    return f"/mail?{query}"
+
+
 async def _load_inbox(page: Page, live_application: LiveApplication) -> None:
     await page.goto(live_application.base_url + "/mail")
     await page.locator("#mail-account").select_option(ACCOUNT)
     message_link = page.locator("#message-list-body a")
     await message_link.wait_for()
+    assert await page.locator("#mail-account").input_value() == ACCOUNT
     assert await page.locator("#mail-mailbox").input_value() == MAILBOX
-    await page.wait_for_url("**/mail?account=admin%40example.test&mailbox=INBOX")
+    await page.wait_for_url(f"**{_mailbox_path()}")
     assert await page.locator("#message-list-body img").count() == 0
     assert await page.locator("body").get_attribute("data-list-xss") is None
 
@@ -140,11 +152,11 @@ async def test_spa_navigation_loads_each_operational_view_without_document_reloa
 
     await page.locator('a[data-section="accounts"]').click()
     await page.wait_for_url("**/accounts")
-    await page.get_by_text(ACCOUNT, exact=True).wait_for()
+    await page.locator("#accounts-body").get_by_text(ACCOUNT_ADDRESS, exact=True).wait_for()
 
     await page.locator('a[data-section="mail"]').click()
     await page.wait_for_url("**/mail")
-    await page.get_by_role("heading", name="Mailboxes", exact=True).wait_for()
+    await page.get_by_role("heading", name="Mail", exact=True).wait_for()
 
     await page.locator(".compose-action").click()
     await page.wait_for_url("**/compose")
@@ -160,12 +172,107 @@ async def test_spa_navigation_loads_each_operational_view_without_document_reloa
     assert len(document_requests) == 1
 
 
+async def test_anonymous_browser_loads_only_login_then_completes_password_and_totp(
+    page: Page,
+    tmp_path: Path,
+) -> None:
+    gateway = BrowserSecurityGateway()
+    app = create_app(  # type: ignore[arg-type]
+        {
+            "server": {
+                "allowed_hosts": ("localhost",),
+                "concurrency": 4,
+                "max_upload_bytes": 4 * 1024 * 1024,
+                "request_body_timeout_seconds": 5,
+                "page_size": 20,
+                "temp_dir": tmp_path,
+            },
+            "security": {
+                "session_signing_key": secrets.token_bytes(32),
+                "csrf_ttl_seconds": 300,
+                "csrf_cookie_name": "__Host-maddyweb-login-csrf",
+                "session_cookie_name": "__Host-maddyweb-login-session",
+                "secure_cookies": True,
+            },
+        },
+        gateway,
+    )
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    listener, port = _listening_socket()
+    site = web.SockSite(runner, listener)
+    await site.start()
+    requested_paths: list[str] = []
+
+    def capture_request(request: object) -> None:
+        requested_paths.append(urlsplit(getattr(request, "url", "")).path)
+
+    page.on("request", capture_request)
+    await page.context.clear_cookies()
+    base_url = f"http://localhost:{port}"
+    try:
+        await page.goto(base_url + "/")
+        await page.wait_for_url("**/login")
+        await page.get_by_role("heading", name="Sign in to MaddyWeb", exact=True).wait_for()
+        assert "/static/login.js" in requested_paths
+        assert "/static/app.js" not in requested_paths
+        unauthorized = await page.evaluate(
+            """async () => {
+                const response = await fetch("/api/v1/admin/accounts");
+                return response.status;
+            }"""
+        )
+        assert unauthorized == 401
+
+        await page.locator("#login-address").fill(ACCOUNT_ADDRESS)
+        await page.locator("#login-password").fill(LOGIN_PASSWORD)
+        await page.locator("#login-submit").click()
+        await page.locator("#totp-code").wait_for()
+        await page.locator("#totp-code").fill(LOGIN_TOTP)
+        await page.locator("#totp-submit").click()
+
+        await page.wait_for_url(base_url + "/")
+        await page.get_by_role(
+            "heading",
+            name="Administration overview",
+            exact=True,
+        ).wait_for()
+        cookies = {cookie["name"]: cookie for cookie in await page.context.cookies(base_url)}
+        session_cookie = cookies["__Host-maddyweb-login-session"]
+        assert session_cookie["httpOnly"] is True
+        assert session_cookie["secure"] is True
+        assert session_cookie["sameSite"] == "Strict"
+        assert session_cookie["path"] == "/"
+        assert gateway.password_login_attempts == [(ACCOUNT_ADDRESS, LOGIN_PASSWORD, "127.0.0.1")]
+        assert gateway.totp_login_attempts == [(LOGIN_CHALLENGE, LOGIN_TOTP, "127.0.0.1")]
+    finally:
+        await runner.cleanup()
+
+
+async def test_failed_logout_retains_session_and_stays_in_application(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    live_application.gateway.logout_fails = True
+    await page.goto(live_application.base_url + "/security")
+    await page.locator("#security-logout-button").click()
+
+    alert = page.locator("#global-alert")
+    await alert.wait_for(state="visible")
+    assert "Session revocation failed" in await alert.inner_text()
+    assert page.url.endswith("/security")
+    assert await page.locator("#security-logout-button").is_enabled()
+    assert live_application.gateway.logout_attempts == 1
+    cookies = await page.context.cookies(live_application.base_url)
+    assert any(cookie["name"] == SESSION_COOKIE_NAME for cookie in cookies)
+
+
 async def test_account_workflows_use_json_mutations_and_typed_deletion(
     page: Page,
     live_application: LiveApplication,
 ) -> None:
     await page.goto(live_application.base_url + "/accounts")
-    await page.get_by_text(ACCOUNT, exact=True).wait_for()
+    await page.locator("#accounts-body").get_by_text(ACCOUNT_ADDRESS, exact=True).wait_for()
     assert await page.locator("#runtime-badge").inner_text() == "MADDY 0.9.5"
 
     create_form = page.locator("#create-account-form")
@@ -175,13 +282,30 @@ async def test_account_workflows_use_json_mutations_and_typed_deletion(
     new_row = page.locator("#accounts-body tr").filter(has_text=NEW_ACCOUNT)
     await new_row.wait_for()
     assert live_application.gateway.created_accounts == [(NEW_ACCOUNT, "fixture-password-123")]
+    disclosure = page.locator("#credential-disclosure-dialog")
+    await disclosure.wait_for(state="visible")
+    assert await page.locator("#credential-disclosure-account").inner_text() == NEW_ACCOUNT
+    assert (await page.locator("#credential-secret").inner_text()).replace(" ", "") == (
+        "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
+    )
+    assert await page.locator("#credential-recovery-codes li").all_inner_texts() == [
+        "fixture-recovery-code"
+    ]
+    continue_button = page.locator("#credential-disclosure-continue")
+    assert await continue_button.is_disabled()
+    await page.locator("#credential-disclosure-acknowledged").check()
+    assert await continue_button.is_enabled()
+    await continue_button.click()
+    await disclosure.wait_for(state="hidden")
 
     await new_row.get_by_role("button", name="Manage").click()
     password_form = page.locator("#change-password-form")
     await password_form.locator('input[name="password"]').fill("replacement-password-456")
     await password_form.get_by_role("button", name="Change password").click()
     await page.locator("#account-dialog").wait_for(state="hidden")
-    assert live_application.gateway.password_changes == [(NEW_ACCOUNT, "replacement-password-456")]
+    assert live_application.gateway.password_changes == [
+        (NEW_ACCOUNT_ID, "replacement-password-456")
+    ]
 
     await new_row.get_by_role("button", name="Manage").click()
     limit_form = page.locator("#append-limit-form")
@@ -189,7 +313,7 @@ async def test_account_workflows_use_json_mutations_and_typed_deletion(
     await limit_form.get_by_role("button", name="Set limit").click()
     await page.locator("#account-dialog").wait_for(state="hidden")
     await new_row.get_by_text("2,097,152", exact=True).wait_for()
-    assert live_application.gateway.append_limit_changes == [(NEW_ACCOUNT, 2_097_152)]
+    assert live_application.gateway.append_limit_changes == [(NEW_ACCOUNT_ID, 2_097_152)]
 
     await new_row.get_by_role("button", name="Manage").click()
     await page.locator("#disable-credentials").click()
@@ -197,7 +321,7 @@ async def test_account_workflows_use_json_mutations_and_typed_deletion(
     await page.locator("#confirm-action").click()
     await page.locator("#confirm-dialog").wait_for(state="hidden")
     await new_row.get_by_text("Credentials disabled", exact=True).wait_for()
-    assert live_application.gateway.disabled_accounts == [NEW_ACCOUNT]
+    assert live_application.gateway.disabled_accounts == [NEW_ACCOUNT_ID]
 
     await new_row.get_by_role("button", name="Manage").click()
     await page.locator("#delete-account").click()
@@ -212,7 +336,7 @@ async def test_account_workflows_use_json_mutations_and_typed_deletion(
     await typed_action.click()
     await typed_dialog.wait_for(state="hidden")
     await new_row.wait_for(state="detached")
-    assert live_application.gateway.deleted_accounts == [NEW_ACCOUNT]
+    assert live_application.gateway.deleted_accounts == [NEW_ACCOUNT_ID]
 
 
 async def test_certificate_controls_serialize_writes_and_refresh_status(
@@ -255,9 +379,7 @@ async def test_certificate_table_shows_full_fingerprints_and_contains_overflow(
         CERTIFICATE_FINGERPRINT,
         CERTIFICATE_FINGERPRINT,
     ]
-    assert await fingerprints.evaluate_all(
-        "nodes => nodes.map((node) => node.title)"
-    ) == [
+    assert await fingerprints.evaluate_all("nodes => nodes.map((node) => node.title)") == [
         CERTIFICATE_FINGERPRINT,
         CERTIFICATE_FINGERPRINT,
     ]
@@ -357,11 +479,11 @@ async def test_rejects_missing_and_replayed_header_csrf(
     await page.goto(live_application.base_url + "/")
     token = await page.evaluate(
         """async () => {
-            const response = await fetch("/api/v1/session");
+            const response = await fetch("/api/v1/auth/session");
             return (await response.json()).data.csrf_token;
         }"""
     )
-    post_url = f"/api/v1/mail/{MESSAGE_ID}/delete"
+    post_url = f"/api/v1/admin/mail/{MESSAGE_ID}/delete"
     body = {
         "account": ACCOUNT,
         "mailbox": MAILBOX,
@@ -451,7 +573,7 @@ async def test_mailbox_auto_opens_inbox_and_rows_support_pointer_and_keyboard_na
     await page.wait_for_url(f"**{_message_path()}")
 
     await page.set_viewport_size({"width": 320, "height": 844})
-    await _load_inbox(page, live_application)
+    await _load_mailbox(page, live_application, MAILBOX)
     actions = page.locator(".message-row-action")
     assert await actions.count() == 4
     assert await page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
@@ -521,7 +643,7 @@ async def test_forward_as_attachment_does_not_require_a_parseable_message(
 ) -> None:
     malformed = EmailMessage()
     malformed["From"] = "sender@example.test"
-    malformed["To"] = ACCOUNT
+    malformed["To"] = ACCOUNT_ADDRESS
     malformed["Subject"] = "Attachment limit fixture"
     malformed.set_content("Body")
     for index in range(65):
@@ -540,7 +662,7 @@ async def test_forward_as_attachment_does_not_require_a_parseable_message(
           credentials: "same-origin",
           headers: {"Accept": "application/json"},
         })).status""",
-        f"/api/v1/mail/{MESSAGE_ID}?{context}",
+        f"/api/v1/admin/mail/{MESSAGE_ID}?{context}",
     )
     assert detail_status == 422
 
@@ -572,7 +694,7 @@ async def test_mailbox_actions_abort_stale_reads_and_close_pending_confirmations
     await asyncio.wait_for(live_application.gateway.message_read_started.wait(), timeout=2)
     await page.go_back()
     live_application.gateway.message_read_release.set()
-    await page.get_by_role("heading", name="Mailboxes", exact=True).wait_for()
+    await page.get_by_role("heading", name=MAILBOX, exact=True).wait_for()
     await asyncio.sleep(0.1)
     assert live_application.gateway.archive_moves == []
 
@@ -617,9 +739,7 @@ async def test_missing_special_use_targets_disable_move_actions(
     assert await row.get_by_role("button", name="Delete", exact=True).is_disabled()
     assert await row.get_by_role("button", name="Archive", exact=True).is_disabled()
     assert await row.get_by_role("button", name="Forward", exact=True).is_enabled()
-    assert (
-        await row.get_by_role("button", name="Forward as attachment", exact=True).is_enabled()
-    )
+    assert await row.get_by_role("button", name="Forward as attachment", exact=True).is_enabled()
 
 
 async def test_completed_move_posts_do_not_hijack_a_newer_route(
@@ -703,7 +823,7 @@ async def test_message_html_is_sandboxed_and_attachment_filename_is_safe(
 
     async def capture_html_response(response: object) -> None:
         url = getattr(response, "url", "")
-        if "/api/v1/mail/" in url and "/html?" in url:
+        if "/api/v1/admin/mail/" in url and "/html?" in url:
             html_headers.append(await response.all_headers())
 
     page.on("response", capture_html_response)
@@ -718,7 +838,7 @@ async def test_message_html_is_sandboxed_and_attachment_filename_is_safe(
         "images => images.map(image => image.getAttribute('src'))"
     )
     assert all(
-        source is None or (source.startswith("/api/v1/mail/") and "/inline/" in source)
+        source is None or (source.startswith("/api/v1/admin/mail/") and "/inline/" in source)
         for source in image_sources
     )
     assert await frame_element.get_attribute("sandbox") == ""
@@ -745,7 +865,7 @@ async def test_message_html_is_sandboxed_and_attachment_filename_is_safe(
     assert await typed_action.is_enabled()
     await typed_action.click()
     await page.locator("#typed-confirm-dialog").wait_for(state="hidden")
-    await page.wait_for_url("**/mail?account=admin%40example.test&mailbox=INBOX")
+    await page.wait_for_url(f"**{_mailbox_path()}")
     assert live_application.gateway.permanent_deletions == [(ACCOUNT, MAILBOX, MESSAGE_ID)]
 
 
@@ -760,7 +880,7 @@ async def test_move_to_trash_requires_explicit_confirmation(
     assert "current verified identifier" in await page.locator("#confirm-message").inner_text()
     await page.locator("#confirm-action").click()
     await dialog.wait_for(state="hidden")
-    await page.wait_for_url("**/mail?account=admin%40example.test&mailbox=Custom+Trash")
+    await page.wait_for_url(f"**{_mailbox_path(TRASH_MAILBOX)}")
     assert live_application.gateway.trash_moves == [(ACCOUNT, MAILBOX, MESSAGE_ID)]
     assert live_application.gateway.message_location == TRASH_MAILBOX
 
@@ -777,7 +897,7 @@ async def test_compose_shows_spinner_blocks_duplicates_and_reports_success(
         nonlocal post_count
         if (
             getattr(request, "method", "") == "POST"
-            and urlsplit(getattr(request, "url", "")).path == "/api/v1/send"
+            and urlsplit(getattr(request, "url", "")).path == "/api/v1/admin/send"
         ):
             post_count += 1
 
@@ -803,9 +923,7 @@ async def test_compose_shows_spinner_blocks_duplicates_and_reports_success(
     )
     assert await page.locator("#attachment-chips").get_by_text("notes.txt").is_visible()
     await page.locator("#body-preview-tab").click()
-    await page.frame_locator("#html-preview").get_by_text(
-        "A short message.", exact=True
-    ).wait_for()
+    await page.frame_locator("#html-preview").get_by_text("A short message.", exact=True).wait_for()
     button = page.locator("#send-button")
 
     await button.click()
@@ -842,14 +960,14 @@ async def test_compose_shows_spinner_blocks_duplicates_and_reports_success(
     delivered = gateway.deliveries[0]
     parsed = BytesParser(policy=policy.default).parsebytes(delivered["raw"])
     assert parsed["From"].addresses[0].display_name == "Browser Sender"
-    assert parsed["From"].addresses[0].addr_spec == ACCOUNT
+    assert parsed["From"].addresses[0].addr_spec == ACCOUNT_ADDRESS
     plain_body = parsed.get_body(preferencelist=("plain",))
     assert plain_body is not None
     assert plain_body.get_content().strip() == "A short message."
     attachment = next(parsed.iter_attachments())
     assert attachment.get_filename() == "notes.txt"
     assert attachment.get_payload(decode=True) == b"ordinary attachment"
-    assert delivered["envelope_from"] == ACCOUNT
+    assert delivered["envelope_from"] == ACCOUNT_ADDRESS
     assert gateway.deliveries[0]["recipients"] == ("recipient@example.test",)
     assert gateway.sent_saves == 1
 
@@ -889,9 +1007,12 @@ async def test_compose_write_source_preview_modes_and_formatting_stay_synchroniz
     assert await page.locator("#body-preview-tab").evaluate(
         "node => node === document.activeElement"
     )
-    await page.frame_locator("#html-preview").locator("em").get_by_text(
-        "source", exact=True
-    ).wait_for()
+    await (
+        page.frame_locator("#html-preview")
+        .locator("em")
+        .get_by_text("source", exact=True)
+        .wait_for()
+    )
     await page.locator("#body-preview-tab").press("Home")
     assert await write_tab.get_attribute("aria-selected") == "true"
     assert await write_tab.evaluate("node => node === document.activeElement")
@@ -947,7 +1068,7 @@ async def test_compose_empty_body_reports_validation_on_visible_write_editor(
         nonlocal post_count
         if (
             getattr(request, "method", "") == "POST"
-            and urlsplit(getattr(request, "url", "")).path == "/api/v1/send"
+            and urlsplit(getattr(request, "url", "")).path == "/api/v1/admin/send"
         ):
             post_count += 1
 
@@ -998,10 +1119,7 @@ async def test_compose_html_source_preview_is_sandboxed_and_blocks_remote_conten
 
     frame = page.frame_locator("#html-preview")
     await frame.locator("h1").get_by_text("Preview heading", exact=True).wait_for()
-    assert (
-        await page.locator("#html-preview").get_attribute("sandbox")
-        == "allow-same-origin"
-    )
+    assert await page.locator("#html-preview").get_attribute("sandbox") == "allow-same-origin"
     assert await frame.locator("script, form, img").count() == 0
     preview_link = frame.locator("a")
     assert await preview_link.inner_text() == "Safe link text"
@@ -1069,9 +1187,9 @@ async def test_compose_html_source_preview_is_sandboxed_and_blocks_remote_conten
         "() => document.querySelector('#html-preview')?.contentDocument"
         "?.querySelector('img')?.naturalWidth > 0"
     )
-    assert await frame.locator("body").evaluate(
-        "node => getComputedStyle(node).paddingTop"
-    ) == "16px"
+    assert (
+        await frame.locator("body").evaluate("node => getComputedStyle(node).paddingTop") == "16px"
+    )
     assert remote_requests == []
 
     await page.locator("#body-source-tab").click()
@@ -1098,7 +1216,7 @@ async def test_compose_resynchronizes_csrf_after_cookie_expiry(
         nonlocal post_count
         if (
             getattr(request, "method", "") == "POST"
-            and urlsplit(getattr(request, "url", "")).path == "/api/v1/send"
+            and urlsplit(getattr(request, "url", "")).path == "/api/v1/admin/send"
         ):
             post_count += 1
 
@@ -1110,7 +1228,7 @@ async def test_compose_resynchronizes_csrf_after_cookie_expiry(
     await form.locator('input[name="to"]').fill("recipient@example.test")
     await _fill_write_body(page, "body")
 
-    await page.context.clear_cookies()
+    await page.context.clear_cookies(name=COOKIE_NAME)
     await page.locator("#send-button").click()
 
     await (
@@ -1137,7 +1255,7 @@ async def test_compose_resynchronizes_csrf_after_another_tab_rotates_cookie(
         nonlocal post_count
         if (
             getattr(request, "method", "") == "POST"
-            and urlsplit(getattr(request, "url", "")).path == "/api/v1/send"
+            and urlsplit(getattr(request, "url", "")).path == "/api/v1/admin/send"
         ):
             post_count += 1
 
@@ -1154,7 +1272,7 @@ async def test_compose_resynchronizes_csrf_after_another_tab_rotates_cookie(
         await other_page.goto(live_application.base_url + "/")
         rotation = await other_page.evaluate(
             """async () => {
-                const session = await fetch("/api/v1/session");
+                const session = await fetch("/api/v1/auth/session");
                 const token = (await session.json()).data.csrf_token;
                 const response = await fetch("/api/v1/not-real", {
                     method: "POST",
@@ -1208,7 +1326,8 @@ async def test_compose_recovers_from_same_cookie_name_on_another_loopback_port(
             "security": {
                 "session_signing_key": secrets.token_bytes(32),
                 "csrf_ttl_seconds": 300,
-                "cookie_name": COOKIE_NAME,
+                "csrf_cookie_name": COOKIE_NAME,
+                "session_cookie_name": SESSION_COOKIE_NAME,
                 "secure_cookies": True,
             },
         },
@@ -1226,7 +1345,7 @@ async def test_compose_recovers_from_same_cookie_name_on_another_loopback_port(
         nonlocal post_count
         if (
             getattr(request, "method", "") == "POST"
-            and urlsplit(getattr(request, "url", "")).path == "/api/v1/send"
+            and urlsplit(getattr(request, "url", "")).path == "/api/v1/admin/send"
         ):
             post_count += 1
 
@@ -1244,7 +1363,7 @@ async def test_compose_recovers_from_same_cookie_name_on_another_loopback_port(
             await other_page.goto(f"http://127.0.0.1:{other_port}/")
             await other_page.evaluate(
                 """async () => {
-                    const response = await fetch("/api/v1/session");
+                    const response = await fetch("/api/v1/auth/session");
                     return (await response.json()).data.csrf_token;
                 }"""
             )
@@ -1291,7 +1410,7 @@ async def test_compose_never_retries_an_explicit_csrf_rejection(
             ),
         )
 
-    await page.route("**/api/v1/send", reject_submission)
+    await page.route("**/api/v1/admin/send", reject_submission)
     await page.goto(live_application.base_url + "/compose")
     await page.locator("#compose-sender").select_option(ACCOUNT)
     form = page.locator("#compose-form")
@@ -1324,7 +1443,7 @@ async def test_compose_locks_after_an_unverifiable_success_response(
             body='{"ok":true',
         )
 
-    await page.route("**/api/v1/send", truncate_submission_response)
+    await page.route("**/api/v1/admin/send", truncate_submission_response)
     await page.goto(live_application.base_url + "/compose")
     await page.locator("#compose-sender").select_option(ACCOUNT)
     form = page.locator("#compose-form")
@@ -1366,7 +1485,7 @@ async def test_compose_locks_after_a_reused_csrf_token(
             ),
         )
 
-    await page.route("**/api/v1/send", reject_submission)
+    await page.route("**/api/v1/admin/send", reject_submission)
     await page.goto(live_application.base_url + "/compose")
     await page.locator("#compose-sender").select_option(ACCOUNT)
     form = page.locator("#compose-form")
@@ -1396,7 +1515,7 @@ async def test_compose_network_failure_locks_ambiguous_submission(
         post_count += 1
         await route.abort("connectionfailed")
 
-    await page.route("**/api/v1/send", abort_submission)
+    await page.route("**/api/v1/admin/send", abort_submission)
     await page.goto(live_application.base_url + "/compose")
     await page.locator("#compose-sender").select_option(ACCOUNT)
     form = page.locator("#compose-form")
@@ -1454,8 +1573,9 @@ async def test_theme_persists_and_mobile_navigation_has_safe_touch_targets(
     visible_links = page.locator(".primary-nav a:visible")
     assert await visible_links.all_inner_texts() == [
         "Compose",
-        "Overview",
         "Mail",
+        "Security",
+        "Overview",
         "Accounts",
         "Certificates",
     ]

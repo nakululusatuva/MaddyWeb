@@ -60,17 +60,26 @@ def test_decode_converts_excessive_json_nesting_to_protocol_error() -> None:
 
 
 def test_request_and_response_are_versioned_and_closed() -> None:
+    auth_token = "A" * 43
     request = Request.create(
         "messages.append",
-        {"username": "user@example.test", "mailbox": "Sent"},
+        {"target_account_id": "b" * 32, "mailbox": "Sent"},
+        auth_token=auth_token,
         request_id="req-1",
         stream_length=123,
     )
     assert Request.from_payload(request.to_payload()) == request
+    assert request.to_payload()["auth_token"] == auth_token
+    assert "actor" not in request.to_payload()
     with pytest.raises(ProtocolError, match="unknown"):
         Request.from_payload({**request.to_payload(), "surprise": True})
+    with pytest.raises(ProtocolError, match="unknown"):
+        Request.from_payload({**request.to_payload(), "actor": "operator"})
     with pytest.raises(ProtocolError, match="version"):
-        Request.from_payload({**request.to_payload(), "version": 2})
+        Request.from_payload({**request.to_payload(), "version": 1})
+    invalid_token = "-".join(("not", "an", "opaque", "session"))
+    with pytest.raises(ProtocolError, match="authentication token"):
+        Request.create("messages.list", auth_token=invalid_token)
     response = Response.success("req-1", {"stream": True}, stream_length=55)
     assert Response.from_payload(response.to_payload()) == response
     with pytest.raises(ProtocolError):

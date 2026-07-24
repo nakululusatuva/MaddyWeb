@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="light dark">
   <meta name="theme-color" content="#f4f6f9">
-  <meta name="description" content="Private Maddy mail server administration console">
+  <meta name="description" content="MaddyWeb mail workspace and server administration console">
   <title>MaddyWeb</title>
   <link rel="stylesheet" href="/static/app.css?v=9">
   <script src="/static/app.js?v=10" defer></script>
@@ -15,11 +15,15 @@
   <header class="app-header">
     <a class="brand" href="/" data-route>
       <span class="brand-mark" aria-hidden="true">MW</span>
-      <span class="brand-copy"><strong>MaddyWeb</strong><small>Mail operations console</small></span>
+      <span class="brand-copy"><strong>MaddyWeb</strong><small>Mail workspace</small></span>
     </a>
     <div class="header-actions">
       <span id="runtime-badge" class="status-pill status-neutral">Connecting</span>
-      <span class="status-pill status-positive">Loopback only</span>
+      <span id="session-expiry" class="session-expiry" hidden>Session active</span>
+      <span id="account-identity" class="account-identity" hidden>
+        <span id="account-avatar" class="account-avatar" aria-hidden="true">M</span>
+        <span><strong id="account-display-name">Mail account</strong><small id="account-address"></small></span>
+      </span>
       <button id="theme-toggle" class="button button-secondary theme-toggle" type="button" aria-label="Use dark theme">
         <svg class="theme-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
           <circle cx="12" cy="12" r="4"></circle>
@@ -27,42 +31,53 @@
         </svg>
         <span data-theme-label>Dark</span>
       </button>
+      <button id="logout-button" class="button button-secondary" type="button" hidden>Sign out</button>
     </div>
   </header>
 
   <div class="workspace">
     <aside class="sidebar">
       <nav class="primary-nav" aria-label="Main navigation">
-        <a class="compose-action" href="/compose" data-route data-section="compose">
+        <a class="compose-action" href="/compose" data-route data-section="compose" data-capability="mail.send">
           <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4l11-11-4-4L4 16zM13.5 6.5l4 4"></path></svg>
           <span>Compose</span>
         </a>
-        <a class="nav-link" href="/" data-route data-section="overview">
-          <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z"></path></svg>
-          <span>Overview</span>
-        </a>
-        <a class="nav-link" href="/mail" data-route data-section="mail">
+        <a class="nav-link" href="/mail" data-route data-section="mail" data-capability="mail.read">
           <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h18v14H3z"></path><path d="m3 6 9 7 9-7"></path></svg>
           <span>Mail</span>
         </a>
-        <a class="nav-link" href="/accounts" data-route data-section="accounts">
+        <a class="nav-link" href="/security" data-route data-section="security" data-authenticated-only>
+          <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 5 6v5c0 4.6 2.9 8.5 7 10 4.1-1.5 7-5.4 7-10V6z"></path><path d="m9 12 2 2 4-5"></path></svg>
+          <span>Security</span>
+        </a>
+        <p class="nav-section-label" data-role="admin">Administration</p>
+        <a class="nav-link" href="/" data-route data-section="overview" data-role="admin">
+          <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z"></path></svg>
+          <span>Overview</span>
+        </a>
+        <a class="nav-link" href="/accounts" data-route data-section="accounts" data-role="admin">
           <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"></circle><path d="M4 21c0-4 3.6-7 8-7s8 3 8 7"></path></svg>
           <span>Accounts</span>
         </a>
-        <a class="nav-link" href="/certificates" data-route data-section="certificates">
+        <a class="nav-link" href="/certificates" data-route data-section="certificates" data-role="admin">
           <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 5 6v5c0 4.6 2.9 8.5 7 10 4.1-1.5 7-5.4 7-10V6z"></path></svg>
           <span>Certificates</span>
         </a>
       </nav>
       <div class="sidebar-footer">
         <span class="status-dot" aria-hidden="true"></span>
-        <div><strong>Private administration</strong><small>Available through the SSH tunnel</small></div>
+        <div><strong id="sidebar-session-label">Secure session</strong><small id="sidebar-session-detail">Checking access</small></div>
       </div>
     </aside>
 
     <main id="main" class="app-main" tabindex="-1">
       <div id="global-alert" class="notice notice-error" role="alert" hidden></div>
       <div id="loading-status" class="sr-only" role="status" aria-live="polite"></div>
+      <aside id="admin-workspace-indicator" class="admin-workspace-indicator" hidden>
+        <span class="admin-workspace-icon" aria-hidden="true">A</span>
+        <span><strong>Administrator mailbox view</strong><small id="admin-workspace-address">No mailbox selected</small></span>
+        <a class="button button-secondary" href="/accounts" data-route>Return to administration</a>
+      </aside>
 
       <section id="overview-view" class="view" data-view="overview" aria-labelledby="overview-title">
         <div class="page-heading">
@@ -82,50 +97,97 @@
         </div>
       </section>
 
-      <section id="mail-view" class="view" data-view="mail" aria-labelledby="mail-title" hidden>
-        <div class="page-heading"><div><p class="eyebrow">Mailbox operations</p><h1 id="mail-title">Mailboxes</h1><p>Browse messages across enabled local accounts without exposing a public mail interface.</p></div></div>
-        <section class="data-card">
-          <div id="mail-selector" class="card-toolbar mail-selector">
-            <label><span>Account</span><select id="mail-account" name="account" required><option value="">Select an account</option></select></label>
-            <label><span>Mailbox</span><select id="mail-mailbox" name="mailbox"><option value="">Select a mailbox</option></select></label>
+      <section id="mail-workspace" class="mail-workspace" aria-label="Mail workspace" hidden>
+        <aside id="mail-folder-pane" class="mail-folder-pane" data-mail-pane="folders" aria-label="Mailbox folders">
+          <div class="mail-pane-heading">
+            <div>
+              <p class="eyebrow">Mailbox</p>
+              <h2 id="folder-pane-title">Folders</h2>
+            </div>
+            <a class="mail-pane-compose" href="/compose" data-route aria-label="Compose a new message">+</a>
           </div>
-          <div class="table-scroll">
+          <div id="mail-selector" class="mail-selector">
+            <label id="mail-account-field">
+              <span>Account</span>
+              <select id="mail-account" name="account" required><option value="">Select an account</option></select>
+            </label>
+            <label class="mailbox-jump">
+              <span>Jump to folder</span>
+              <select id="mail-mailbox" name="mailbox"><option value="">Select a mailbox</option></select>
+            </label>
+          </div>
+          <p id="current-mailbox-identity" class="current-mailbox-identity"></p>
+          <nav id="mail-folder-list" class="mail-folder-list" aria-labelledby="folder-pane-title"></nav>
+          <div class="folder-pane-footer">
+            <a href="/security" data-route>
+              <span aria-hidden="true">S</span>
+              Account security
+            </a>
+          </div>
+        </aside>
+
+        <section id="mail-view" class="view mail-list-pane" data-view="mail" data-mail-pane="list" aria-labelledby="mail-title">
+          <div class="mail-list-heading">
+            <button id="mobile-folders-button" class="mail-mobile-button" type="button" aria-controls="mail-folder-pane">Folders</button>
+            <div>
+              <p class="eyebrow">Messages</p>
+              <h1 id="mail-title">Inbox</h1>
+              <p id="mail-list-summary">Select a folder to browse messages.</p>
+            </div>
+          </div>
+          <div class="mail-list-table">
             <table class="message-table">
               <thead><tr><th scope="col">Sender</th><th scope="col">Subject</th><th scope="col">Date</th><th scope="col">Actions</th></tr></thead>
               <tbody id="message-list-body"></tbody>
             </table>
           </div>
           <div id="message-empty" class="empty-state">Select an account and mailbox.</div>
-          <nav class="panel-footer pagination" aria-label="Message pagination">
+          <nav class="mail-list-footer pagination" aria-label="Message pagination">
             <a id="mail-previous" class="button button-secondary" href="/mail" data-route hidden>Previous</a>
             <span id="mail-page">Page 1</span>
             <a id="mail-next" class="button button-secondary" href="/mail" data-route hidden>Next</a>
           </nav>
         </section>
-      </section>
 
-      <section id="message-view" class="view" data-view="message" aria-labelledby="message-title" hidden>
-        <div class="page-heading"><div><p class="eyebrow">Message preview</p><h1 id="message-title">Message</h1><p id="message-summary">Loading message metadata.</p></div></div>
-        <nav class="message-toolbar" aria-label="Message actions">
-          <a id="message-back" class="button button-secondary" href="/mail" data-route>Back to mailbox</a>
-          <a id="message-raw" class="button button-secondary" href="#">Download raw .eml</a>
-          <button id="message-trash" class="button button-secondary" type="button">Move to Trash</button>
-          <button id="message-delete" class="button button-danger" type="button">Permanently delete</button>
-        </nav>
-        <article class="data-card message-card">
-          <dl class="message-metadata">
-            <dt>Sender</dt><dd id="message-sender"></dd>
-            <dt>Recipients</dt><dd id="message-recipients"></dd>
-            <dt>Date</dt><dd id="message-date"></dd>
-          </dl>
-          <div id="message-body"></div>
-        </article>
-        <section class="data-card attachment-card"><div class="card-heading"><div><p class="eyebrow">Files</p><h2>Attachments</h2></div></div><ul id="attachment-list" class="attachment-list"></ul></section>
+        <section id="message-placeholder" class="message-placeholder" data-mail-pane="reading" aria-labelledby="message-placeholder-title">
+          <div class="message-placeholder-art" aria-hidden="true">
+            <span></span><span></span><span></span>
+          </div>
+          <h2 id="message-placeholder-title">Select a message to read</h2>
+          <p>Message content opens here without leaving your mailbox.</p>
+        </section>
+
+        <section id="message-view" class="view reading-pane" data-view="message" data-mail-pane="reading" aria-labelledby="message-title" hidden>
+          <div class="reading-pane-heading">
+            <button id="mobile-list-button" class="mail-mobile-button" type="button" aria-controls="mail-view">Back to messages</button>
+            <div><p class="eyebrow">Message</p><h1 id="message-title">Message</h1><p id="message-summary">Loading message metadata.</p></div>
+          </div>
+          <nav class="message-toolbar" aria-label="Message actions">
+            <a id="message-back" class="button button-secondary" href="/mail" data-route>Back to mailbox</a>
+            <a id="message-reply" class="button button-secondary" href="/compose" data-route>Reply</a>
+            <a id="message-reply-all" class="button button-secondary" href="/compose" data-route>Reply all</a>
+            <a id="message-forward" class="button button-secondary" href="/compose" data-route>Forward</a>
+            <a id="message-raw" class="button button-secondary" href="#">Download raw .eml</a>
+            <button id="message-trash" class="button button-secondary" type="button">Move to Trash</button>
+            <button id="message-delete" class="button button-danger" type="button">Permanently delete</button>
+          </nav>
+          <article class="message-card">
+            <dl class="message-metadata">
+              <dt>Sender</dt><dd id="message-sender"></dd>
+              <dt>Recipients</dt><dd id="message-recipients"></dd>
+              <dt>Date</dt><dd id="message-date"></dd>
+            </dl>
+            <div id="message-body"></div>
+          </article>
+          <section class="attachment-card"><div class="card-heading"><div><p class="eyebrow">Files</p><h2>Attachments</h2></div></div><ul id="attachment-list" class="attachment-list"></ul></section>
+        </section>
       </section>
 
       <section id="compose-view" class="view" data-view="compose" aria-labelledby="compose-title" hidden>
         <div class="page-heading"><div><p class="eyebrow">Local submission</p><h1 id="compose-title">Compose</h1><p>Send through Maddy and archive only after SMTP acceptance.</p></div></div>
         <form id="compose-form" class="data-card compose-card" action="/api/v1/send" method="post" enctype="multipart/form-data" autocomplete="off">
+          <input id="compose-in-reply-to" name="in_reply_to" type="hidden" disabled>
+          <input id="compose-references" name="references" type="hidden" disabled>
           <div class="compose-command-bar">
             <button id="send-button" class="button button-primary compose-send" type="submit">Send</button>
             <button id="attach-files-button" class="button button-secondary compose-file-command" type="button">Attach files</button>
@@ -142,11 +204,11 @@
                 <label class="sr-only" for="compose-sender-name">Sender name</label>
                 <input id="compose-sender-name" name="sender_name" maxlength="256" autocomplete="name" placeholder="Sender name (optional)" aria-describedby="sender-name-help">
                 <label class="sr-only" for="compose-sender">Sending account</label>
-                <select id="compose-sender" name="sender" required aria-label="Sending account"></select>
+                <select id="compose-sender" name="sender_account_id" required aria-label="Sending account"></select>
               </div>
               <span id="sender-name-help" class="compose-row-hint">Shown in From</span>
             </div>
-            <div class="compose-row">
+            <div id="compose-password-row" class="compose-row">
               <label class="compose-row-label" for="compose-password">Password</label>
               <input id="compose-password" name="password" type="password" required maxlength="1024" autocomplete="current-password" placeholder="Required for this send" aria-describedby="sending-password-help">
               <span id="sending-password-help" class="compose-row-hint">Never stored</span>
@@ -239,13 +301,58 @@
         <section class="data-card"><div class="card-heading"><div><p class="eyebrow">TLS inventory</p><h2>Certificate status</h2></div></div><div class="table-scroll"><table class="certificate-table"><thead><tr><th scope="col">Name</th><th scope="col">Expiration</th><th scope="col">Source fingerprint</th><th scope="col">Deployed fingerprint</th><th scope="col">Match</th><th scope="col">Actions</th></tr></thead><tbody id="certificates-body"></tbody></table></div><div id="certificates-empty" class="empty-state" hidden>No certificate status.</div></section>
       </section>
 
+      <section id="security-view" class="view" data-view="security" aria-labelledby="security-title" hidden>
+        <div class="page-heading"><div><p class="eyebrow">Account protection</p><h1 id="security-title">Security</h1><p>Review the identity and second-factor status for this browser session.</p></div></div>
+        <div class="security-grid">
+          <section class="data-card security-summary-card">
+            <div class="card-heading"><div><p class="eyebrow">Signed in as</p><h2 id="security-address">Mail account</h2></div><span id="security-role" class="status-pill status-neutral">Mailbox user</span></div>
+            <div id="password-change-required" class="notice notice-warning" role="status" hidden>Your password must be changed before mailbox access is restored.</div>
+            <dl class="security-details">
+              <div><dt>Session status</dt><dd id="security-session-state">Active</dd></div>
+              <div><dt>Absolute expiration</dt><dd id="security-session-expiration">Not provided</dd></div>
+              <div><dt>Idle expiration</dt><dd id="security-idle-expiration">Not provided</dd></div>
+            </dl>
+            <form id="own-password-form" class="stack-form" autocomplete="off">
+              <h3>Change password</h3>
+              <label><span>Current password</span><input name="current_password" type="password" required maxlength="1024" autocomplete="current-password"></label>
+              <label><span>New password</span><input name="new_password" type="password" required minlength="12" maxlength="1024" autocomplete="new-password"></label>
+              <label><span>Confirm new password</span><input name="confirm_password" type="password" required minlength="12" maxlength="1024" autocomplete="new-password"></label>
+              <button class="button button-primary" type="submit">Change password and sign out</button>
+            </form>
+            <button id="security-logout-button" class="button button-secondary" type="button">Sign out of this session</button>
+          </section>
+          <section class="data-card">
+            <div class="card-heading"><div><p class="eyebrow">Two-step verification</p><h2>Authenticator and recovery</h2></div><span id="security-totp-state" class="status-pill status-positive">Enabled</span></div>
+            <p>Your authenticator is required whenever a new browser session is created.</p>
+            <div class="security-recovery-count"><strong id="security-recovery-count">Unknown</strong><span>unused recovery codes</span></div>
+            <p class="field-help">Recovery-code regeneration requires fresh password and second-factor verification. Existing codes become invalid.</p>
+            <form id="regenerate-recovery-form" class="stack-form" autocomplete="off">
+              <label><span>Current password</span><input name="password" type="password" required maxlength="1024" autocomplete="current-password"></label>
+              <label><span>Authenticator code</span><input name="code" type="text" required pattern="[0-9]{6}" maxlength="6" inputmode="numeric" autocomplete="one-time-code" placeholder="000000"></label>
+              <button id="regenerate-recovery-button" class="button button-secondary" type="submit">Regenerate recovery codes and sign out</button>
+            </form>
+          </section>
+        </div>
+      </section>
+
+      <section id="access-denied-view" class="view access-denied-view" data-view="access-denied" aria-labelledby="access-denied-title" hidden>
+        <div class="access-denied-mark" aria-hidden="true">!</div>
+        <p class="eyebrow">Restricted area</p>
+        <h1 id="access-denied-title">Access denied</h1>
+        <p>This account does not have permission to open that part of MaddyWeb.</p>
+        <div class="access-denied-actions">
+          <a class="button button-primary" href="/mail" data-route>Back to mail</a>
+          <button id="access-denied-logout" class="button button-secondary" type="button">Sign out</button>
+        </div>
+      </section>
+
       <section id="not-found-view" class="view" data-view="not-found" aria-labelledby="not-found-title" hidden>
-        <div class="page-heading"><div><p class="eyebrow">Navigation</p><h1 id="not-found-title">Page not found</h1><p>The requested console view does not exist.</p></div></div><a class="button button-primary" href="/" data-route>Return to overview</a>
+        <div class="page-heading"><div><p class="eyebrow">Navigation</p><h1 id="not-found-title">Page not found</h1><p>The requested MaddyWeb view does not exist.</p></div></div><a class="button button-primary" href="/mail" data-route>Return to mail</a>
       </section>
     </main>
   </div>
 
-  <footer class="app-footer"><span>MaddyWeb private administration</span><span>No cross-origin access or public listener.</span></footer>
+  <footer class="app-footer"><span>MaddyWeb secure mail workspace</span><span>Same-origin access with short-lived sessions.</span></footer>
 
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 
@@ -254,7 +361,38 @@
       <div class="dialog-heading"><div><p class="eyebrow">Account controls</p><h2>Manage account</h2><p id="account-dialog-address"></p></div><button class="dialog-close" type="button" data-close-dialog aria-label="Close">&times;</button></div>
       <form id="change-password-form" class="stack-form"><label><span>New password</span><input name="password" type="password" required minlength="12" maxlength="256" autocomplete="new-password"></label><button class="button button-primary" type="submit">Change password</button></form>
       <form id="append-limit-form" class="stack-form"><label><span>APPENDLIMIT (bytes; 0 clears it)</span><input name="limit" type="number" min="0" max="4294967296" required></label><button class="button button-secondary" type="submit">Set limit</button></form>
-      <div class="dialog-actions"><button id="disable-credentials" class="button button-secondary" type="button">Disable credentials</button><button id="delete-account" class="button button-danger" type="button">Permanently delete mailbox</button></div>
+      <div class="dialog-actions"><button id="reset-account-totp" class="button button-secondary" type="button">Reset TOTP</button><button id="disable-credentials" class="button button-secondary" type="button">Disable credentials</button><button id="delete-account" class="button button-danger" type="button">Permanently delete mailbox</button></div>
+    </div>
+  </dialog>
+
+  <dialog id="step-up-dialog">
+    <div class="dialog-card">
+      <div class="dialog-heading"><div><p class="eyebrow">Fresh administrator verification</p><h2>Reset account TOTP</h2><p id="step-up-account"></p></div><button class="dialog-close" type="button" data-close-dialog aria-label="Close">&times;</button></div>
+      <p>Verify your own administrator password and current authenticator code. The target account will immediately lose its existing TOTP and recovery codes.</p>
+      <p id="step-up-error" class="notice notice-error" role="alert" hidden></p>
+      <form id="step-up-form" class="stack-form" autocomplete="off">
+        <label><span>Administrator password</span><input name="password" type="password" required maxlength="1024" autocomplete="current-password"></label>
+        <label><span>Administrator authenticator code</span><input name="code" type="text" required pattern="[0-9]{6}" maxlength="6" inputmode="numeric" autocomplete="one-time-code" placeholder="000000"></label>
+        <div class="dialog-actions"><button class="button button-secondary" type="button" data-close-dialog>Cancel</button><button class="button button-danger" type="submit">Verify and reset TOTP</button></div>
+      </form>
+    </div>
+  </dialog>
+
+  <dialog id="credential-disclosure-dialog">
+    <div class="dialog-card credential-disclosure-card">
+      <div class="dialog-heading"><div><p class="eyebrow">One-time disclosure</p><h2 id="credential-disclosure-title">Save authentication credentials</h2><p id="credential-disclosure-account"></p></div></div>
+      <p id="credential-disclosure-copy">These values cannot be displayed again. Store them securely before continuing.</p>
+      <section id="credential-secret-section" class="secret-block">
+        <span>Manual authenticator setup key</span>
+        <code id="credential-secret"></code>
+      </section>
+      <section>
+        <h3>Recovery codes</h3>
+        <ol id="credential-recovery-codes" class="recovery-code-list"></ol>
+      </section>
+      <div class="dialog-actions"><button id="copy-disclosed-credentials" class="button button-secondary" type="button">Copy</button><button id="download-disclosed-credentials" class="button button-secondary" type="button">Download .txt</button></div>
+      <label class="acknowledgement"><input id="credential-disclosure-acknowledged" type="checkbox"><span>I saved these credentials in a secure place.</span></label>
+      <button id="credential-disclosure-continue" class="button button-primary" type="button" disabled>Continue</button>
     </div>
   </dialog>
 

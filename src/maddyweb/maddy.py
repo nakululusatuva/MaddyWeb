@@ -40,6 +40,10 @@ _SEQSET_RE = re.compile(
 _KEYWORD_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 _SYSTEM_FLAGS = frozenset({"\\Answered", "\\Flagged", "\\Deleted", "\\Seen", "\\Draft"})
 _SPECIAL_USES = frozenset({"archive", "drafts", "junk", "sent", "trash"})
+_PROTECTED_MAILBOX_NAMES = frozenset({"inbox", *_SPECIAL_USES})
+_PROTECTED_SPECIAL_USE_FLAGS = frozenset(
+    {"\\all", "\\archive", "\\drafts", "\\flagged", "\\important", "\\junk", "\\sent", "\\trash"}
+)
 _OFFICIAL_DOCKER_ENV_ASSIGNMENTS = frozenset(
     {
         "$(hostname) = {env:MADDY_HOSTNAME}",
@@ -59,9 +63,7 @@ _SAFE_LEGACY_MACRO_CONTEXT_RE = re.compile(
     r"(?:[ \t]|$)|tls[ \t]+file(?:[ \t]|$))"
 )
 _HEADER_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]+")
-_ENCODED_WORD_RE = re.compile(
-    r"=\?([^?\s]{1,127})\?([BbQq])\?([^?\s]{1,4096})\?="
-)
+_ENCODED_WORD_RE = re.compile(r"=\?([^?\s]{1,127})\?([BbQq])\?([^?\s]{1,4096})\?=")
 _BASE64_WORD_RE = re.compile(r"[A-Za-z0-9+/]+={0,2}\Z")
 _RFC2047_ENVELOPE_FIELDS = frozenset({"from", "to", "cc", "bcc", "subject"})
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
@@ -1072,7 +1074,7 @@ def _decode_encoded_word(match: re.Match[str]) -> str | None:
                 return None
         rendered = raw.decode(charset, errors="strict")
         rendered.encode("utf-8", errors="strict")
-    except (LookupError, UnicodeError, ValueError):
+    except LookupError, UnicodeError, ValueError:
         return None
     return rendered or None
 
@@ -1094,11 +1096,7 @@ def _decode_envelope_header(value: str) -> str:
             return fallback
         decoded = _decode_encoded_word(match)
         separator = value[previous_end : match.start()]
-        if (
-            previous_word_decoded
-            and decoded is not None
-            and separator.strip(" \t") == ""
-        ):
+        if previous_word_decoded and decoded is not None and separator.strip(" \t") == "":
             separator = ""
         pieces.append(separator)
         if decoded is None:
@@ -2016,6 +2014,23 @@ class MaddyService:
             mailboxes.append(record)
         return mailboxes
 
+    def _require_mutable_mailbox(
+        self,
+        username: str,
+        mailbox: str,
+        *,
+        mailboxes: Sequence[Mapping[str, Any]] | None = None,
+    ) -> None:
+        if mailbox.casefold() in _PROTECTED_MAILBOX_NAMES:
+            raise InvalidMaddyArgument("INBOX and SPECIAL-USE mailboxes are protected")
+        records = self.list_mailboxes(username) if mailboxes is None else mailboxes
+        matches = [record for record in records if record.get("name") == mailbox]
+        if len(matches) != 1:
+            raise InvalidMaddyArgument("mailbox does not exist or is ambiguous")
+        attributes = {str(value).casefold() for value in matches[0].get("attributes", ())}
+        if attributes & _PROTECTED_SPECIAL_USE_FLAGS:
+            raise InvalidMaddyArgument("INBOX and SPECIAL-USE mailboxes are protected")
+
     def create_mailbox(self, username: str, mailbox: str, *, special: str | None = None) -> None:
         self._require(Capability.MAILBOX_ADMIN, write=True)
         username = _safe_positional(username, "username", max_length=254)
@@ -2026,6 +2041,12 @@ class MaddyService:
             if special not in _SPECIAL_USES:
                 raise InvalidMaddyArgument("invalid SPECIAL-USE value")
             options.extend(("--special", special))
+        elif mailbox.casefold() in _PROTECTED_MAILBOX_NAMES:
+            raise InvalidMaddyArgument(
+                "INBOX and SPECIAL-USE mailbox names require an explicit SPECIAL-USE value"
+            )
+        if mailbox.casefold() == "inbox":
+            raise InvalidMaddyArgument("INBOX is protected")
         self._invoke(
             (
                 "imap-mboxes",
@@ -2066,6 +2087,7 @@ class MaddyService:
         self._require(Capability.MAILBOX_ADMIN, write=True)
         username = _safe_positional(username, "username", max_length=254)
         mailbox = _safe_positional(mailbox, "mailbox", max_length=255)
+        self._require_mutable_mailbox(username, mailbox)
         self._invoke(
             ("imap-mboxes", "remove", "--cfg-block", self.storage_block, "-y", username, mailbox)
         )
@@ -2077,6 +2099,10 @@ class MaddyService:
         username = _safe_positional(username, "username", max_length=254)
         old_name = _safe_positional(old_name, "old mailbox", max_length=255)
         new_name = _safe_positional(new_name, "new mailbox", max_length=255)
+        mailboxes = self.list_mailboxes(username)
+        self._require_mutable_mailbox(username, old_name, mailboxes=mailboxes)
+        if new_name.casefold() in _PROTECTED_MAILBOX_NAMES:
+            raise InvalidMaddyArgument("INBOX and SPECIAL-USE mailbox names are protected")
         self._invoke(
             (
                 "imap-mboxes",
@@ -2342,7 +2368,28 @@ class MaddyService:
         self._message_transfer("move", username, source, uid_set, target)
 
     def move_message(self, username: str, source: str, uid: str, target: str) -> None:
+        if source == target or (source.casefold() == "inbox" and target.casefold() == "inbox"):
+            raise InvalidMaddyArgument("source and target mailboxes must differ")
         self._message_transfer("move", username, source, _safe_uid(uid), target)
+
+    def set_message_seen(
+        self,
+        username: str,
+        mailbox: str,
+        uid: str,
+        *,
+        seen: bool,
+    ) -> None:
+        if type(seen) is not bool:
+            raise InvalidMaddyArgument("seen state must be a boolean")
+        action = "add-flags" if seen else "rem-flags"
+        self._message_uid_operation(
+            action,
+            username,
+            mailbox,
+            _safe_uid(uid),
+            flags=("\\Seen",),
+        )
 
     def _message_transfer(
         self, action: str, username: str, source: str, uid_set: str, target: str

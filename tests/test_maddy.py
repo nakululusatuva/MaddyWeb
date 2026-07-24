@@ -505,6 +505,139 @@ def test_special_mailbox_resolution_uses_server_attributes_and_custom_names() ->
     )
 
 
+@pytest.mark.parametrize("version", ("0.8.2", "0.9.5"))
+def test_single_message_seen_state_uses_fixed_flag_commands(version: str) -> None:
+    runner = QueueRunner([(b"", b"", 0), (b"", b"", 0)])
+    service = service_with(runner, version=version)
+
+    service.set_message_seen("user@example.test", "INBOX", "42", seen=True)
+    service.set_message_seen("user@example.test", "INBOX", "42", seen=False)
+
+    assert runner.calls[0]["argv"][-5:] == (
+        "--uid",
+        "user@example.test",
+        "INBOX",
+        "42",
+        "\\Seen",
+    )
+    assert "add-flags" in runner.calls[0]["argv"]
+    assert runner.calls[1]["argv"][-5:] == (
+        "--uid",
+        "user@example.test",
+        "INBOX",
+        "42",
+        "\\Seen",
+    )
+    assert "rem-flags" in runner.calls[1]["argv"]
+
+
+def test_single_message_seen_state_rejects_invalid_state_and_uid() -> None:
+    runner = QueueRunner([])
+    service = service_with(runner)
+    with pytest.raises(InvalidMaddyArgument, match="boolean"):
+        service.set_message_seen("user@example.test", "INBOX", "42", seen=1)  # type: ignore[arg-type]
+    with pytest.raises(InvalidMaddyArgument, match="single IMAP UID"):
+        service.set_message_seen("user@example.test", "INBOX", "1:*", seen=True)
+    assert runner.calls == []
+
+
+def test_generic_single_message_move_uses_fixed_target_and_rejects_same_mailbox() -> None:
+    runner = QueueRunner([(b"", b"", 0)])
+    service = service_with(runner)
+
+    service.move_message("user@example.test", "INBOX", "42", "Projects/2026")
+
+    assert runner.calls[0]["argv"][-4:] == (
+        "user@example.test",
+        "INBOX",
+        "42",
+        "Projects/2026",
+    )
+    with pytest.raises(InvalidMaddyArgument, match="must differ"):
+        service.move_message("user@example.test", "INBOX", "42", "inbox")
+    assert len(runner.calls) == 1
+
+
+def test_folder_creation_protects_reserved_names_but_allows_explicit_special_use() -> None:
+    runner = QueueRunner([(b"", b"", 0), (b"Deleted Items\t[\\Trash]\n", b"", 0)])
+    service = service_with(runner)
+
+    with pytest.raises(InvalidMaddyArgument, match="explicit SPECIAL-USE"):
+        service.create_mailbox("user@example.test", "Sent")
+    with pytest.raises(InvalidMaddyArgument, match="INBOX is protected"):
+        service.create_mailbox("user@example.test", "INBOX", special="sent")
+    assert runner.calls == []
+
+    service.create_mailbox(
+        "user@example.test",
+        "Deleted Items",
+        special="trash",
+    )
+    assert "--special" in runner.calls[0]["argv"]
+    assert "trash" in runner.calls[0]["argv"]
+
+
+def test_folder_delete_rejects_inbox_names_and_custom_special_use() -> None:
+    runner = QueueRunner([(b"Deleted Items\t[\\Trash]\n", b"", 0)])
+    service = service_with(runner)
+
+    with pytest.raises(InvalidMaddyArgument, match="protected"):
+        service.delete_mailbox("user@example.test", "INBOX")
+    with pytest.raises(InvalidMaddyArgument, match="protected"):
+        service.delete_mailbox("user@example.test", "Sent")
+    with pytest.raises(InvalidMaddyArgument, match="protected"):
+        service.delete_mailbox("user@example.test", "Deleted Items")
+
+    assert len(runner.calls) == 1
+    assert "list" in runner.calls[0]["argv"]
+
+
+def test_folder_delete_and_rename_verify_mutable_mailboxes() -> None:
+    delete_runner = QueueRunner(
+        [
+            (b"Projects\nINBOX\n", b"", 0),
+            (b"", b"", 0),
+            (b"INBOX\n", b"", 0),
+        ]
+    )
+    service_with(delete_runner).delete_mailbox("user@example.test", "Projects")
+    assert "remove" in delete_runner.calls[1]["argv"]
+
+    rename_runner = QueueRunner(
+        [
+            (b"Old Name\nINBOX\n", b"", 0),
+            (b"", b"", 0),
+            (b"New Name\nINBOX\n", b"", 0),
+        ]
+    )
+    service_with(rename_runner).rename_mailbox(
+        "user@example.test",
+        "Old Name",
+        "New Name",
+    )
+    assert "rename" in rename_runner.calls[1]["argv"]
+
+
+def test_folder_rename_rejects_special_source_and_reserved_target() -> None:
+    special_runner = QueueRunner([(b"Custom Sent\t[\\Sent]\n", b"", 0)])
+    with pytest.raises(InvalidMaddyArgument, match="protected"):
+        service_with(special_runner).rename_mailbox(
+            "user@example.test",
+            "Custom Sent",
+            "Renamed",
+        )
+    assert len(special_runner.calls) == 1
+
+    target_runner = QueueRunner([(b"Projects\n", b"", 0)])
+    with pytest.raises(InvalidMaddyArgument, match="protected"):
+        service_with(target_runner).rename_mailbox(
+            "user@example.test",
+            "Projects",
+            "Trash",
+        )
+    assert len(target_runner.calls) == 1
+
+
 def test_single_message_mutations_reject_uid_sets_before_invocation() -> None:
     runner = QueueRunner([])
     service = service_with(runner)
@@ -559,10 +692,7 @@ Subject: fixture subject
 
 def test_message_list_decodes_rfc2047_words_in_compact_and_full_output() -> None:
     encoded_sender = "=?UTF-8?Q?J=C3=B6rg?= <jorg@example.test>"
-    encoded_subject = (
-        "=?utf-8?B?UmU65ZOI5ZOI5ZOI5ZOI5ZOI5ZOI5ZOI?= "
-        "=?utf-8?B?5ZOI?="
-    )
+    encoded_subject = "=?utf-8?B?UmU65ZOI5ZOI5ZOI5ZOI5ZOI5ZOI5ZOI?= =?utf-8?B?5ZOI?="
     compact = f"UID 9: {encoded_sender} - {encoded_subject}\n"
 
     compact_record = parse_message_list(compact)[0]
@@ -622,8 +752,7 @@ def test_message_list_preserves_raw_unicode_and_malformed_encoded_words() -> Non
         "\u4e2d\u6587 \u4e3b\u9898"
     )
     neighboring = parse_message_list(
-        full_message_record(7, 7, invalid_base64)
-        + full_message_record(8, 8, "neighbor")
+        full_message_record(7, 7, invalid_base64) + full_message_record(8, 8, "neighbor")
     )
     assert [record["subject"] for record in neighboring] == [invalid_base64, "neighbor"]
 
@@ -642,15 +771,9 @@ def test_message_list_bounds_encoded_word_count_and_decoded_length() -> None:
     excessive_input = word + "x" * 4096
     long_payload = base64.b64encode(b"A" * 600).decode("ascii")
 
-    excessive_record = parse_message_list(
-        full_message_record(1, 1, excessive_words)
-    )[0]
-    long_record = parse_message_list(
-        full_message_record(2, 2, f"=?UTF-8?B?{long_payload}?=")
-    )[0]
-    excessive_input_record = parse_message_list(
-        full_message_record(3, 3, excessive_input)
-    )[0]
+    excessive_record = parse_message_list(full_message_record(1, 1, excessive_words))[0]
+    long_record = parse_message_list(full_message_record(2, 2, f"=?UTF-8?B?{long_payload}?="))[0]
+    excessive_input_record = parse_message_list(full_message_record(3, 3, excessive_input))[0]
 
     assert excessive_record["subject"] == excessive_words[:512]
     assert long_record["subject"] == "A" * 512

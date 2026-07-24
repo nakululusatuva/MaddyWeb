@@ -14,7 +14,8 @@ import hmac
 import json
 import secrets
 import time
-from collections.abc import Iterable, Mapping
+from collections import OrderedDict
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Final
 from urllib.parse import urlsplit
@@ -298,12 +299,24 @@ def _csrf_signature(key: bytes, payload: str) -> str:
     return _b64encode(hmac.new(key, payload.encode("ascii"), hashlib.sha256).digest())
 
 
-def new_csrf_token(key: bytes, *, now: int | None = None) -> str:
+def new_csrf_token(
+    key: bytes,
+    *,
+    now: int | None = None,
+    flow_id: str | None = None,
+) -> str:
     """Create a signed token containing version, issued-at and random nonce."""
 
     issued_at = int(time.time()) if now is None else now
+    resolved_flow_id = secrets.token_urlsafe(18) if flow_id is None else flow_id
+    if (
+        not isinstance(resolved_flow_id, str)
+        or not 16 <= len(resolved_flow_id) <= 32
+        or not all(character.isalnum() or character in "_-" for character in resolved_flow_id)
+    ):
+        raise ValueError("CSRF flow identifier is invalid")
     nonce = secrets.token_urlsafe(24)
-    payload = f"v1.{issued_at}.{nonce}"
+    payload = f"v2.{issued_at}.{resolved_flow_id}.{nonce}"
     return f"{payload}.{_csrf_signature(key, payload)}"
 
 
@@ -313,25 +326,31 @@ def verify_csrf_token(
     *,
     max_age: int,
     now: int | None = None,
-) -> tuple[str, int] | None:
-    """Return ``(nonce, issued_at)`` for an authentic, unexpired token."""
+) -> tuple[str, int, str] | None:
+    """Return ``(nonce, issued_at, flow_id)`` for an authentic current token."""
 
     if len(token) > 256 or _contains_forbidden_header_characters(token):
         return None
     try:
-        version, issued_text, nonce, signature = token.split(".", 3)
+        version, issued_text, flow_id, nonce, signature = token.split(".", 4)
         issued_at = int(issued_text)
     except TypeError, ValueError:
         return None
-    if version != "v1" or not nonce or len(nonce) > 64:
+    if (
+        version != "v2"
+        or not 16 <= len(flow_id) <= 32
+        or not all(character.isalnum() or character in "_-" for character in flow_id)
+        or not nonce
+        or len(nonce) > 64
+    ):
         return None
     current = int(time.time()) if now is None else now
     if issued_at > current + 60 or current - issued_at > max_age:
         return None
-    payload = f"{version}.{issued_at}.{nonce}"
+    payload = f"{version}.{issued_at}.{flow_id}.{nonce}"
     if not hmac.compare_digest(signature, _csrf_signature(key, payload)):
         return None
-    return nonce, issued_at
+    return nonce, issued_at, flow_id
 
 
 def csrf_token_for_request(request: web.Request) -> str:
@@ -413,65 +432,185 @@ def _http_exception_response(
     )
 
 
+def security_headers_middleware(config: SecurityConfig) -> web.middleware:
+    """Apply the Host boundary and security headers around every response."""
+
+    @web.middleware
+    async def middleware(
+        request: web.Request,
+        handler: web.RequestHandler,
+    ) -> web.StreamResponse:
+        hosts = request.headers.getall("Host", [])
+        if len(hosts) != 1 or not host_is_allowed(hosts[0], config.allowed_hosts):
+            response: web.StreamResponse = _error_response(
+                request,
+                status=400,
+                code="invalid_host",
+                message="Invalid Host header.",
+            )
+        else:
+            try:
+                response = await handler(request)
+            except web.HTTPException as exc:
+                response = _http_exception_response(request, exc)
+        _apply_security_headers(response)
+        return response
+
+    return middleware
+
+
+@dataclass(frozen=True, slots=True)
+class CsrfScope:
+    """Stable server-derived scope for one browser's rotating CSRF state."""
+
+    identity: str
+    partition_by_flow: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _CsrfCurrent:
+    base: str
+    nonce: str
+    expires_at: float
+
+
 @dataclass(slots=True)
-class NonceStore:
-    """Bounded in-memory reservation/consumption set for one-time CSRF tokens."""
+class CurrentCsrfStore:
+    """Bounded current-token registry partitioned by session or login flow.
+
+    Each scope retains only the nonce that may be used next. Consuming it
+    atomically replaces it, so replay detection does not require an
+    ever-growing global set. Capacity pressure evicts the least-recently used
+    scope; an evicted token is rejected on POST and can recover only through a
+    safe request that receives a newly generated token.
+    """
 
     capacity: int
+    flows_per_identity: int
     ttl: int
-    _entries: dict[str, tuple[float, bool]] = field(init=False, repr=False)
+    _entries: OrderedDict[str, _CsrfCurrent] = field(init=False, repr=False)
     _lock: asyncio.Lock = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        if self.capacity <= 0 or self.ttl <= 0:
-            raise ValueError("nonce store bounds must be positive")
-        self._entries = {}
+        if self.capacity <= 0 or self.flows_per_identity <= 0 or self.ttl <= 0:
+            raise ValueError("CSRF state bounds must be positive")
+        self._entries = OrderedDict()
         self._lock = asyncio.Lock()
 
     def _purge(self, now: float) -> None:
-        for nonce, (expires, _committed) in tuple(self._entries.items()):
-            if expires <= now:
-                del self._entries[nonce]
+        for key, state in tuple(self._entries.items()):
+            if state.expires_at <= now:
+                del self._entries[key]
 
-    async def available(self, nonce: str) -> bool:
+    def _bound_capacity(self, base: str, key: str) -> None:
+        matching = [
+            candidate
+            for candidate, state in self._entries.items()
+            if state.base == base and candidate != key
+        ]
+        while len(matching) >= self.flows_per_identity:
+            del self._entries[matching.pop(0)]
+        while len(self._entries) >= self.capacity and key not in self._entries:
+            self._entries.popitem(last=False)
+
+    async def is_current(self, key: str, nonce: str) -> bool:
         async with self._lock:
             now = time.monotonic()
             self._purge(now)
-            return nonce not in self._entries
-
-    async def reserve(self, nonce: str) -> bool:
-        async with self._lock:
-            now = time.monotonic()
-            self._purge(now)
-            if nonce in self._entries:
+            state = self._entries.get(key)
+            if state is None or not hmac.compare_digest(state.nonce, nonce):
                 return False
-            # Never evict an unexpired consumed nonce: eviction would make a
-            # previously used signed token replayable.  A full store therefore
-            # fails closed until its oldest TTL expires.
-            if len(self._entries) >= self.capacity:
-                return False
-            self._entries[nonce] = (now + self.ttl, False)
+            self._entries.move_to_end(key)
             return True
 
-    async def commit(self, nonce: str) -> None:
+    async def replace(self, base: str, key: str, nonce: str) -> None:
         async with self._lock:
-            if nonce in self._entries:
-                self._entries[nonce] = (time.monotonic() + self.ttl, True)
+            now = time.monotonic()
+            self._purge(now)
+            self._bound_capacity(base, key)
+            self._entries[key] = _CsrfCurrent(base, nonce, now + self.ttl)
+            self._entries.move_to_end(key)
+
+    async def rotate(
+        self,
+        base: str,
+        key: str,
+        expected_nonce: str,
+        replacement_nonce: str,
+    ) -> bool:
+        async with self._lock:
+            now = time.monotonic()
+            self._purge(now)
+            state = self._entries.get(key)
+            if state is None or not hmac.compare_digest(state.nonce, expected_nonce):
+                return False
+            self._entries[key] = _CsrfCurrent(base, replacement_nonce, now + self.ttl)
+            self._entries.move_to_end(key)
+            return True
 
 
-def security_middleware(config: SecurityConfig) -> web.middleware:
+def security_middleware(
+    config: SecurityConfig,
+    *,
+    scope_resolver: Callable[[web.Request], CsrfScope] | None = None,
+    state_capacity: int = 4096,
+    flows_per_identity: int = 8,
+) -> web.middleware:
     """Build middleware enforcing Host, Origin, CSRF and response policies."""
 
-    nonces = NonceStore(capacity=4096, ttl=config.csrf_max_age)
-    # Bind signed tokens to this single Web-process lifetime.  Otherwise a
-    # restart would forget the consumed-nonce set and make a pre-restart POST
-    # token replayable after an ambiguous SMTP outcome.
+    states = CurrentCsrfStore(
+        capacity=state_capacity,
+        flows_per_identity=flows_per_identity,
+        ttl=config.csrf_max_age,
+    )
+    # Bind signed tokens to this process lifetime. A restart therefore rejects
+    # every pre-restart write token and issues a fresh one through a safe
+    # request or an explicit CSRF recovery response.
     boot_nonce = secrets.token_bytes(32)
     csrf_key = hmac.new(
         config.session_signing_key,
-        b"maddyweb-csrf-process-v1\0" + boot_nonce,
+        b"maddyweb-csrf-process-v2\0" + boot_nonce,
         hashlib.sha256,
     ).digest()
+
+    def request_scope(request: web.Request) -> CsrfScope:
+        scope = (
+            scope_resolver(request)
+            if scope_resolver is not None
+            else CsrfScope(f"client:{request.remote or 'unknown'}", True)
+        )
+        if (
+            not isinstance(scope, CsrfScope)
+            or not scope.identity
+            or len(scope.identity) > 512
+            or _contains_forbidden_header_characters(scope.identity)
+        ):
+            raise web.HTTPBadRequest(text="Invalid CSRF scope.")
+        return scope
+
+    def state_identity(scope: CsrfScope, flow_id: str) -> tuple[str, str]:
+        base = hmac.new(
+            csrf_key,
+            b"maddyweb-csrf-scope-v2\0" + scope.identity.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        flow = flow_id if scope.partition_by_flow else "session"
+        key = hmac.new(
+            csrf_key,
+            b"maddyweb-csrf-state-v2\0" + base.encode("ascii") + b"\0" + flow.encode("ascii"),
+            hashlib.sha256,
+        ).hexdigest()
+        return base, key
+
+    def token_parts(token: str) -> tuple[str, str]:
+        verified = verify_csrf_token(
+            token,
+            csrf_key,
+            max_age=config.csrf_max_age,
+        )
+        if verified is None:
+            raise RuntimeError("internally generated CSRF token is invalid")
+        return verified[0], verified[2]
 
     def set_csrf_cookie(response: web.StreamResponse, token: str) -> None:
         response.set_cookie(
@@ -484,20 +623,26 @@ def security_middleware(config: SecurityConfig) -> web.middleware:
             path="/",
         )
 
-    def recoverable_csrf_rejection(
+    async def recoverable_csrf_rejection(
         request: web.Request,
         *,
         message: str,
+        scope: CsrfScope,
+        flow_id: str,
+        code: str = "csrf_failed",
     ) -> web.Response:
         """Reject before the handler while synchronizing the next explicit attempt."""
 
         response = _error_response(
             request,
             status=403,
-            code="csrf_failed",
+            code=code,
             message=message,
         )
-        replacement = new_csrf_token(csrf_key)
+        replacement = new_csrf_token(csrf_key, flow_id=flow_id)
+        replacement_nonce, _replacement_flow = token_parts(replacement)
+        base, state_key = state_identity(scope, flow_id)
+        await states.replace(base, state_key, replacement_nonce)
         request[_CSRF_REQUEST_KEY] = replacement
         set_csrf_cookie(response, replacement)
         response.headers["X-CSRF-Token"] = replacement
@@ -517,6 +662,7 @@ def security_middleware(config: SecurityConfig) -> web.middleware:
             _apply_security_headers(response)
             return response
 
+        scope = request_scope(request)
         cookie_token = request.cookies.get(config.csrf_cookie_name)
         verified_cookie = (
             verify_csrf_token(
@@ -527,12 +673,31 @@ def security_middleware(config: SecurityConfig) -> web.middleware:
             if cookie_token
             else None
         )
-        if verified_cookie and await nonces.available(verified_cookie[0]):
+        if verified_cookie is not None:
+            flow_id = verified_cookie[2]
+        else:
+            flow_id = token_parts(new_csrf_token(csrf_key))[1]
+        base, state_key = state_identity(scope, flow_id)
+
+        if request.method in SAFE_METHODS:
+            if verified_cookie is not None and await states.is_current(
+                state_key,
+                verified_cookie[0],
+            ):
+                request[_CSRF_REQUEST_KEY] = cookie_token
+            else:
+                replacement = new_csrf_token(csrf_key, flow_id=flow_id)
+                replacement_nonce, _replacement_flow = token_parts(replacement)
+                await states.replace(base, state_key, replacement_nonce)
+                request[_CSRF_REQUEST_KEY] = replacement
+                cookie_token = None
+                verified_cookie = None
+        elif verified_cookie is not None:
             request[_CSRF_REQUEST_KEY] = cookie_token
         else:
+            replacement = new_csrf_token(csrf_key, flow_id=flow_id)
+            request[_CSRF_REQUEST_KEY] = replacement
             cookie_token = None
-            verified_cookie = None
-            request[_CSRF_REQUEST_KEY] = new_csrf_token(csrf_key)
 
         if request.method not in SAFE_METHODS and request.method != "POST":
             response = _error_response(
@@ -577,11 +742,17 @@ def security_middleware(config: SecurityConfig) -> web.middleware:
             # pass CSRF validation.  Reject it before reading a potentially
             # unbounded slow request body.
             if cookie_token is None or verified_cookie is None:
-                return recoverable_csrf_rejection(
+                return await recoverable_csrf_rejection(
                     request,
                     message="CSRF check failed; refresh.",
+                    scope=scope,
+                    flow_id=flow_id,
                 )
-            send_upload = request.path == "/api/v1/send"
+            send_upload = request.path in {
+                "/api/v1/send",
+                "/api/v1/me/send",
+                "/api/v1/admin/send",
+            }
             api_json_write = _is_api_path(request.path) and not send_upload
             required_content_type = (
                 "multipart/form-data"
@@ -608,44 +779,47 @@ def security_middleware(config: SecurityConfig) -> web.middleware:
                 _apply_security_headers(response)
                 return response
             if submitted is None or not hmac.compare_digest(cookie_token, submitted):
-                return recoverable_csrf_rejection(
+                return await recoverable_csrf_rejection(
                     request,
                     message="CSRF check failed; refresh.",
+                    scope=scope,
+                    flow_id=flow_id,
                 )
-            nonce = verified_cookie[0]
-            if not await nonces.reserve(nonce):
-                response = _error_response(
+            replacement_token = new_csrf_token(csrf_key, flow_id=flow_id)
+            replacement_nonce, _replacement_flow = token_parts(replacement_token)
+            if not await states.rotate(
+                base,
+                state_key,
+                verified_cookie[0],
+                replacement_nonce,
+            ):
+                return await recoverable_csrf_rejection(
                     request,
-                    status=403,
+                    scope=scope,
+                    flow_id=flow_id,
                     code="csrf_reused",
                     message="CSRF token reused; refresh.",
                 )
-                _apply_security_headers(response)
-                return response
+            request[_CSRF_REQUEST_KEY] = replacement_token
         else:
-            nonce = None
+            replacement_token = None
 
         try:
             response = await handler(request)
         except web.HTTPException as exc:
             response = _http_exception_response(request, exc)
-        except BaseException:
-            if nonce is not None:
-                # Once a write request has passed validation and entered its
-                # handler, fail closed: its token must never become replayable,
-                # even when the handler cannot produce a response.
-                await nonces.commit(nonce)
-            raise
         _apply_security_headers(response)
-        if nonce is not None:
+        if replacement_token is not None:
             # Validation grants exactly one attempt, not one successful
             # attempt.  This prevents ambiguous gateway/SMTP failures from
             # being retried with the same token and duplicating side effects.
-            await nonces.commit(nonce)
-            replacement = new_csrf_token(csrf_key)
-            request[_CSRF_REQUEST_KEY] = replacement
-            set_csrf_cookie(response, replacement)
-            response.headers["X-CSRF-Token"] = replacement
+            post_scope = request_scope(request)
+            if post_scope != scope:
+                post_base, post_key = state_identity(post_scope, flow_id)
+                replacement_nonce, _replacement_flow = token_parts(replacement_token)
+                await states.replace(post_base, post_key, replacement_nonce)
+            set_csrf_cookie(response, replacement_token)
+            response.headers["X-CSRF-Token"] = replacement_token
         elif cookie_token is None and request.method in SAFE_METHODS:
             set_csrf_cookie(response, request[_CSRF_REQUEST_KEY])
         return response
@@ -726,6 +900,8 @@ def email_document_headers() -> dict[str, str]:
 
 __all__ = [
     "DEFAULT_CSP",
+    "CsrfScope",
+    "CurrentCsrfStore",
     "RequestLimiter",
     "SecurityConfig",
     "bounded_concurrency_middleware",
@@ -737,6 +913,7 @@ __all__ = [
     "normalize_origin",
     "origin_is_allowed",
     "referer_is_allowed",
+    "security_headers_middleware",
     "security_middleware",
     "verify_csrf_token",
 ]

@@ -16,23 +16,51 @@ from aiohttp import CookieJar, FormData
 from aiohttp.test_utils import TestClient, TestServer
 
 from maddyweb.mail import DeliveryRejected, MailError, PreparedMessage
-from maddyweb.web import MessagePage, create_app
+from maddyweb.web import MessagePage, _FreshnessStore, create_app
 
 FIXTURE_CREDENTIAL = "-".join(("account", "credential"))
+ADMIN_ACCOUNT_ID = "a" * 32
+DISABLED_ACCOUNT_ID = "d" * 32
+ADMIN_SESSION_TOKEN = "S" * 43
+
+
+def test_freshness_tokens_are_owner_bound_and_evict_without_global_failure() -> None:
+    store = _FreshnessStore(ttl_seconds=60, capacity=4, per_owner_capacity=2)
+    owner_a = "a" * 64
+    owner_b = "b" * 64
+    owner_c = "c" * 64
+
+    first_a = store.issue(owner_a, ADMIN_ACCOUNT_ID, "INBOX", "1", "digest-1")
+    second_a = store.issue(owner_a, ADMIN_ACCOUNT_ID, "INBOX", "2", "digest-2")
+    third_a = store.issue(owner_a, ADMIN_ACCOUNT_ID, "INBOX", "3", "digest-3")
+    assert store.consume(first_a, owner_a) is None
+    assert store.consume(second_a, owner_b) is None
+    assert store.consume(second_a, owner_a) is not None
+
+    first_b = store.issue(owner_b, ADMIN_ACCOUNT_ID, "INBOX", "4", "digest-4")
+    store.issue(owner_b, ADMIN_ACCOUNT_ID, "INBOX", "5", "digest-5")
+    store.issue(owner_c, ADMIN_ACCOUNT_ID, "INBOX", "6", "digest-6")
+    store.issue(owner_c, ADMIN_ACCOUNT_ID, "INBOX", "7", "digest-7")
+    newest = store.issue(owner_c, ADMIN_ACCOUNT_ID, "INBOX", "8", "digest-8")
+
+    assert len(store._entries) == 4
+    assert store.consume(third_a, owner_a) is None
+    assert store.consume(first_b, owner_b) is not None
+    assert store.consume(newest, owner_c) is not None
 
 
 class FakeGateway:
     def __init__(self) -> None:
         self.accounts = [
             {
-                "id": "admin@example.test",
+                "id": ADMIN_ACCOUNT_ID,
                 "address": "admin@example.test",
                 "has_credentials": True,
                 "has_mailbox": True,
                 "append_limit": 1024,
             },
             {
-                "id": "disabled@example.test",
+                "id": DISABLED_ACCOUNT_ID,
                 "address": "disabled@example.test",
                 "has_credentials": False,
                 "has_mailbox": True,
@@ -100,6 +128,19 @@ class FakeGateway:
 
     async def health(self) -> dict[str, object]:
         return self.health_payload
+
+    async def session(self, token: str) -> dict[str, object]:
+        if token != ADMIN_SESSION_TOKEN:
+            raise RuntimeError("invalid fixture session")
+        return {
+            "account_id": ADMIN_ACCOUNT_ID,
+            "email": "admin@example.test",
+            "role": "admin",
+            "password_change_required": False,
+            "enrollment_state": "active",
+            "idle_expires_at": 2_000_000_000,
+            "absolute_expires_at": 2_000_010_000,
+        }
 
     async def list_accounts(self) -> list[dict[str, object]]:
         return self.accounts
@@ -250,7 +291,8 @@ async def web_client(tmp_path: Path) -> tuple[TestClient, FakeGateway]:
         "security": {
             "session_signing_key": b"k" * 32,
             "csrf_ttl_seconds": 300,
-            "cookie_name": "maddyweb-csrf",
+            "csrf_cookie_name": "maddyweb-csrf",
+            "session_cookie_name": "maddyweb-session",
             "secure_cookies": False,
         },
     }
@@ -259,6 +301,10 @@ async def web_client(tmp_path: Path) -> tuple[TestClient, FakeGateway]:
         cookie_jar=CookieJar(unsafe=True),
     )
     await client.start_server()
+    client.session.cookie_jar.update_cookies(
+        {"maddyweb-session": ADMIN_SESSION_TOKEN},
+        response_url=client.make_url("/"),
+    )
     try:
         yield client, gateway
     finally:
@@ -326,8 +372,7 @@ async def test_home_static_assets_and_strict_headers(
     assert 'aria-multiline="true"' in page
     assert 'role="toolbar" aria-label="Message formatting"' in page
     assert (
-        'aria-selected="true" aria-controls="body-write-panel" tabindex="0" '
-        'data-body-mode="write"'
+        'aria-selected="true" aria-controls="body-write-panel" tabindex="0" data-body-mode="write"'
     ) in page
     assert 'id="html-source"' in page
     assert 'name="html"' in page
@@ -410,7 +455,7 @@ async def test_shell_supports_only_known_client_routes(
         assert "https://" not in page
         assert "http://" not in page
         assert " style=" not in page
-    detail = await client.get("/mail/42?account=admin%40example.test&mailbox=INBOX")
+    detail = await client.get(f"/mail/42?account={ADMIN_ACCOUNT_ID}&mailbox=INBOX")
     assert detail.status == 200
     assert "Administration overview" in await detail.text()
     assert (await client.get("/unknown-client-route")).status == 404
@@ -478,37 +523,37 @@ async def test_account_actions_are_separate_and_mailbox_delete_is_confirmed(
     token = await _get_token(client)
     changed = await _post_json(
         client,
-        "/api/v1/accounts/admin@example.test/password",
+        f"/api/v1/accounts/{ADMIN_ACCOUNT_ID}/password",
         token,
         {"password": "changed-password"},
     )
     assert changed.status == 200
-    assert ("change_password", "admin@example.test", "changed-password") in gateway.operations
+    assert ("change_password", ADMIN_ACCOUNT_ID, "changed-password") in gateway.operations
 
     token = await _get_token(client)
     limit = await _post_json(
         client,
-        "/api/v1/accounts/admin@example.test/append-limit",
+        f"/api/v1/accounts/{ADMIN_ACCOUNT_ID}/append-limit",
         token,
         {"limit": 0},
     )
     assert limit.status == 200
-    assert ("set_append_limit", "admin@example.test", 0) in gateway.operations
+    assert ("set_append_limit", ADMIN_ACCOUNT_ID, 0) in gateway.operations
 
     token = await _get_token(client)
     disabled = await _post_json(
         client,
-        "/api/v1/accounts/admin@example.test/credentials/disable",
+        f"/api/v1/accounts/{ADMIN_ACCOUNT_ID}/credentials/disable",
         token,
         {},
     )
     assert disabled.status == 200
-    assert ("disable_credentials", "admin@example.test") in gateway.operations
+    assert ("disable_credentials", ADMIN_ACCOUNT_ID) in gateway.operations
 
     token = await _get_token(client)
     wrong = await _post_json(
         client,
-        "/api/v1/accounts/admin@example.test/delete",
+        f"/api/v1/accounts/{ADMIN_ACCOUNT_ID}/delete",
         token,
         {"confirmation": "wrong@example.test"},
     )
@@ -518,12 +563,12 @@ async def test_account_actions_are_separate_and_mailbox_delete_is_confirmed(
     token = await _get_token(client)
     deleted = await _post_json(
         client,
-        "/api/v1/accounts/admin@example.test/delete",
+        f"/api/v1/accounts/{ADMIN_ACCOUNT_ID}/delete",
         token,
         {"confirmation": "admin@example.test"},
     )
     assert deleted.status == 200
-    assert ("delete_mailbox", "admin@example.test") in gateway.operations
+    assert ("delete_mailbox", ADMIN_ACCOUNT_ID) in gateway.operations
 
 
 @pytest.mark.asyncio
@@ -612,20 +657,20 @@ async def test_mail_requires_account_and_mailbox_context_and_has_two_delete_leve
     assert data["messages"] == []
     assert not any(operation[0] == "list_messages" for operation in gateway.operations)
 
-    context = urlencode({"account": "admin@example.test", "mailbox": "INBOX"})
+    context = urlencode({"account": ADMIN_ACCOUNT_ID, "mailbox": "INBOX"})
     response, data = await _api_data(client, f"/api/v1/mail?{context}")
     assert response.status == 200
     assert data["messages"][0]["subject"] == "Received message"
     assert data["messages"][0]["uid"] == "42"
     assert "message_id" not in data["messages"][0]
-    assert ("list_messages", "admin@example.test", "INBOX", 20, 0) in gateway.operations
+    assert ("list_messages", ADMIN_ACCOUNT_ID, "INBOX", 20, 0) in gateway.operations
 
     detail, detail_data = await _api_data(client, f"/api/v1/mail/42?{context}")
     assert detail.status == 200
     assert detail_data["subject"] == "Received message"
     assert detail_data["has_html"] is True
-    assert detail_data["html_url"].startswith("/api/v1/mail/42/html?")
-    assert detail_data["raw_url"].startswith("/api/v1/mail/42/raw?")
+    assert detail_data["html_url"].startswith("/api/v1/admin/mail/42/html?")
+    assert detail_data["raw_url"].startswith("/api/v1/admin/mail/42/raw?")
     assert detail_data["freshness_token"]
 
     html_body = await client.get(f"/api/v1/mail/42/html?{context}")
@@ -642,7 +687,9 @@ async def test_mail_requires_account_and_mailbox_context_and_has_two_delete_leve
     assert "data:image" not in rendered
     assert "cid:missing" not in rendered
     assert "cid:logo" not in rendered
-    assert "/api/v1/mail/42/inline/0?account=admin%40example.test&amp;mailbox=INBOX" in rendered
+    assert (
+        f"/api/v1/admin/mail/42/inline/0?account={ADMIN_ACCOUNT_ID}&amp;mailbox=INBOX" in rendered
+    )
 
     inline = await client.get(f"/api/v1/mail/42/inline/0?{context}")
     assert inline.status == 200
@@ -660,13 +707,13 @@ async def test_mail_requires_account_and_mailbox_context_and_has_two_delete_leve
         "/api/v1/mail/42/trash",
         token,
         {
-            "account": "admin@example.test",
+            "account": ADMIN_ACCOUNT_ID,
             "mailbox": "INBOX",
             "freshness": detail_data["freshness_token"],
         },
     )
     assert trashed.status == 200
-    assert ("trash", "admin@example.test", "INBOX", "42") in gateway.operations
+    assert ("trash", ADMIN_ACCOUNT_ID, "INBOX", "42") in gateway.operations
 
     _response, fresh_detail = await _api_data(client, f"/api/v1/mail/42?{context}")
     token = await _get_token(client)
@@ -675,7 +722,7 @@ async def test_mail_requires_account_and_mailbox_context_and_has_two_delete_leve
         "/api/v1/mail/42/delete",
         token,
         {
-            "account": "admin@example.test",
+            "account": ADMIN_ACCOUNT_ID,
             "mailbox": "INBOX",
             "freshness": fresh_detail["freshness_token"],
             "confirmation": "Delete",
@@ -698,13 +745,13 @@ async def test_account_only_mail_context_selects_authoritative_inbox(
     gateway.list_mailboxes = case_variant_mailboxes  # type: ignore[method-assign]
     response, data = await _api_data(
         client,
-        "/api/v1/mail?account=admin%40example.test",
+        f"/api/v1/mail?account={ADMIN_ACCOUNT_ID}",
     )
     assert response.status == 200
-    assert data["selected_account"] == "admin@example.test"
+    assert data["selected_account"] == ADMIN_ACCOUNT_ID
     assert data["selected_mailbox"] == "Inbox"
     assert data["messages"][0]["uid"] == "42"
-    assert ("list_messages", "admin@example.test", "Inbox", 20, 0) in gateway.operations
+    assert ("list_messages", ADMIN_ACCOUNT_ID, "Inbox", 20, 0) in gateway.operations
 
 
 @pytest.mark.asyncio
@@ -720,7 +767,7 @@ async def test_account_only_mail_context_does_not_guess_missing_inbox(
     gateway.list_mailboxes = mailboxes_without_inbox  # type: ignore[method-assign]
     response, data = await _api_data(
         client,
-        "/api/v1/mail?account=admin%40example.test",
+        f"/api/v1/mail?account={ADMIN_ACCOUNT_ID}",
     )
     assert response.status == 200
     assert data["selected_mailbox"] == ""
@@ -745,7 +792,7 @@ async def test_mailbox_payload_exposes_validated_special_use_flags(
     gateway.list_mailboxes = special_use_mailboxes  # type: ignore[method-assign]
     response, data = await _api_data(
         client,
-        "/api/v1/mail?account=admin%40example.test",
+        f"/api/v1/mail?account={ADMIN_ACCOUNT_ID}",
     )
 
     assert response.status == 200
@@ -832,7 +879,7 @@ async def test_mailbox_special_targets_match_helper_resolution_semantics(
     gateway.list_mailboxes = listed_mailboxes  # type: ignore[method-assign]
     _response, data = await _api_data(
         client,
-        "/api/v1/mail?account=admin%40example.test",
+        f"/api/v1/mail?account={ADMIN_ACCOUNT_ID}",
     )
 
     assert data["mailboxes"] == expected_mailboxes
@@ -851,7 +898,7 @@ async def test_mailbox_payload_rejects_invalid_special_use_attributes(
         return [{"name": "Trash", "attributes": r"\Trash"}]
 
     gateway.list_mailboxes = invalid_mailboxes  # type: ignore[method-assign]
-    response = await client.get("/api/v1/mail?account=admin%40example.test")
+    response = await client.get(f"/api/v1/mail?account={ADMIN_ACCOUNT_ID}")
     payload = await response.json()
 
     assert response.status == 502
@@ -863,10 +910,10 @@ async def test_archive_requires_and_consumes_a_fresh_message_snapshot(
     web_client: tuple[TestClient, FakeGateway],
 ) -> None:
     client, gateway = web_client
-    context = urlencode({"account": "admin@example.test", "mailbox": "INBOX"})
+    context = urlencode({"account": ADMIN_ACCOUNT_ID, "mailbox": "INBOX"})
     _response, detail = await _api_data(client, f"/api/v1/mail/42?{context}")
     body = {
-        "account": "admin@example.test",
+        "account": ADMIN_ACCOUNT_ID,
         "mailbox": "INBOX",
         "freshness": detail["freshness_token"],
     }
@@ -876,10 +923,10 @@ async def test_archive_requires_and_consumes_a_fresh_message_snapshot(
     assert archived.status == 200
     payload = await archived.json()
     assert payload["data"] == {
-        "account": "admin@example.test",
+        "account": ADMIN_ACCOUNT_ID,
         "mailbox": "Archive",
     }
-    assert ("archive", "admin@example.test", "INBOX", "42") in gateway.operations
+    assert ("archive", ADMIN_ACCOUNT_ID, "INBOX", "42") in gateway.operations
 
     token = await _get_token(client)
     replayed = await _post_json(client, "/api/v1/mail/42/archive", token, body)
@@ -899,7 +946,7 @@ async def test_action_snapshot_does_not_require_mime_preview(
         raise MailError("fixture parser rejection")
 
     monkeypatch.setattr("maddyweb.web.parse_message", reject_preview)
-    context = urlencode({"account": "admin@example.test", "mailbox": "INBOX"})
+    context = urlencode({"account": ADMIN_ACCOUNT_ID, "mailbox": "INBOX"})
 
     detail = await client.get(f"/api/v1/mail/42?{context}")
     assert detail.status == 422
@@ -917,7 +964,7 @@ async def test_action_snapshot_does_not_require_mime_preview(
         "freshness_token",
     }
     assert snapshot["uid"] == "42"
-    assert snapshot["account"] == "admin@example.test"
+    assert snapshot["account"] == ADMIN_ACCOUNT_ID
     assert snapshot["mailbox"] == "INBOX"
     assert snapshot["size"] == len(gateway.raw_message)
     assert snapshot["freshness_token"]
@@ -929,13 +976,13 @@ async def test_action_snapshot_does_not_require_mime_preview(
         "/api/v1/mail/42/archive",
         token,
         {
-            "account": "admin@example.test",
+            "account": ADMIN_ACCOUNT_ID,
             "mailbox": "INBOX",
             "freshness": snapshot["freshness_token"],
         },
     )
     assert archived.status == 200
-    assert ("archive", "admin@example.test", "INBOX", "42") in gateway.operations
+    assert ("archive", ADMIN_ACCOUNT_ID, "INBOX", "42") in gateway.operations
     assert not await asyncio.to_thread(_raw_spool_paths, tmp_path)
 
 
@@ -944,7 +991,7 @@ async def test_single_uid_and_freshness_are_required_for_destructive_mail_action
     web_client: tuple[TestClient, FakeGateway],
 ) -> None:
     client, gateway = web_client
-    context = urlencode({"account": "admin@example.test", "mailbox": "INBOX"})
+    context = urlencode({"account": ADMIN_ACCOUNT_ID, "mailbox": "INBOX"})
 
     for invalid_uid in ("1:*", "1,2", "9" * 100, "\u0661"):
         token = await _get_token(client)
@@ -953,7 +1000,7 @@ async def test_single_uid_and_freshness_are_required_for_destructive_mail_action
             f"/api/v1/mail/{invalid_uid}/delete",
             token,
             {
-                "account": "admin@example.test",
+                "account": ADMIN_ACCOUNT_ID,
                 "mailbox": "INBOX",
                 "freshness": "invalid",
                 "confirmation": "PERMANENTLY DELETE",
@@ -970,7 +1017,7 @@ async def test_single_uid_and_freshness_are_required_for_destructive_mail_action
         "/api/v1/mail/42/trash",
         token,
         {
-            "account": "admin@example.test",
+            "account": ADMIN_ACCOUNT_ID,
             "mailbox": "INBOX",
             "freshness": freshness,
         },
@@ -985,14 +1032,14 @@ async def test_single_uid_and_freshness_are_required_for_destructive_mail_action
         "/api/v1/mail/42/delete",
         token,
         {
-            "account": "admin@example.test",
+            "account": ADMIN_ACCOUNT_ID,
             "mailbox": "INBOX",
             "freshness": changed_detail["freshness_token"],
             "confirmation": "PERMANENTLY DELETE",
         },
     )
     assert deleted.status == 200
-    assert ("delete_message", "admin@example.test", "INBOX", "42") in gateway.operations
+    assert ("delete_message", ADMIN_ACCOUNT_ID, "INBOX", "42") in gateway.operations
 
 
 @pytest.mark.asyncio
@@ -1006,7 +1053,7 @@ async def test_nested_mailbox_name_is_allowed_when_returned_by_maddy(
         return [{"name": "INBOX"}, {"name": "Projects/2026"}]
 
     gateway.list_mailboxes = nested_mailboxes  # type: ignore[method-assign]
-    context = urlencode({"account": "admin@example.test", "mailbox": "Projects/2026"})
+    context = urlencode({"account": ADMIN_ACCOUNT_ID, "mailbox": "Projects/2026"})
     response = await client.get(f"/api/v1/mail?{context}")
     assert response.status == 200
 
@@ -1022,7 +1069,7 @@ async def test_mailbox_pagination_is_bounded_and_preserves_context(
     ]
     gateway.message_initial_offset = 100
     gateway.message_next_offset = 80
-    context = urlencode({"account": "admin@example.test", "mailbox": "INBOX"})
+    context = urlencode({"account": ADMIN_ACCOUNT_ID, "mailbox": "INBOX"})
     first, first_data = await _api_data(client, f"/api/v1/mail?{context}")
     assert first.status == 200
     next_cursor = str(first_data["next_cursor"])
@@ -1030,7 +1077,7 @@ async def test_mailbox_pagination_is_bounded_and_preserves_context(
     assert first_data["previous_cursor"] is None
     next_query = urlencode(
         {
-            "account": "admin@example.test",
+            "account": ADMIN_ACCOUNT_ID,
             "mailbox": "INBOX",
             "cursor": next_cursor,
         }
@@ -1041,18 +1088,18 @@ async def test_mailbox_pagination_is_bounded_and_preserves_context(
     second, second_data = await _api_data(client, next_href)
     assert second.status == 200
     assert second_data["previous_cursor"]
-    assert ("list_messages", "admin@example.test", "INBOX", 20, 80) in gateway.operations
+    assert ("list_messages", ADMIN_ACCOUNT_ID, "INBOX", 20, 80) in gateway.operations
 
     previous_query = urlencode(
         {
-            "account": "admin@example.test",
+            "account": ADMIN_ACCOUNT_ID,
             "mailbox": "INBOX",
             "cursor": str(second_data["previous_cursor"]),
         }
     )
     previous_href = f"/api/v1/mail?{previous_query}"
     await client.get(previous_href)
-    assert ("list_messages", "admin@example.test", "INBOX", 20, 100) in gateway.operations
+    assert ("list_messages", ADMIN_ACCOUNT_ID, "INBOX", 20, 100) in gateway.operations
 
     tampered = next_href.replace("mailbox=INBOX", "mailbox=Sent")
     assert (await client.get(tampered)).status == 409
@@ -1066,7 +1113,7 @@ async def test_mailbox_uses_authoritative_continuation_not_page_length(
     web_client: tuple[TestClient, FakeGateway],
 ) -> None:
     client, gateway = web_client
-    context = urlencode({"account": "admin@example.test", "mailbox": "INBOX"})
+    context = urlencode({"account": ADMIN_ACCOUNT_ID, "mailbox": "INBOX"})
 
     gateway.message_initial_offset = 100
     gateway.message_rows = [{"id": "100", "sender": "sender@example.test", "subject": "Truncated"}]
@@ -1074,7 +1121,7 @@ async def test_mailbox_uses_authoritative_continuation_not_page_length(
     _response, truncated_data = await _api_data(client, f"/api/v1/mail?{context}")
     continuation_query = urlencode(
         {
-            "account": "admin@example.test",
+            "account": ADMIN_ACCOUNT_ID,
             "mailbox": "INBOX",
             "cursor": str(truncated_data["next_cursor"]),
         }
@@ -1085,7 +1132,7 @@ async def test_mailbox_uses_authoritative_continuation_not_page_length(
     gateway.message_next_offset = None
     _response, continued_data = await _api_data(client, continuation)
     assert continued_data["previous_cursor"]
-    assert ("list_messages", "admin@example.test", "INBOX", 20, 99) in gateway.operations
+    assert ("list_messages", ADMIN_ACCOUNT_ID, "INBOX", 20, 99) in gateway.operations
 
     gateway.message_rows = [
         {"id": str(index), "sender": "sender@example.test", "subject": f"Message {index}"}
@@ -1104,12 +1151,12 @@ async def test_oversized_preview_still_allows_streamed_raw_download(
     client, gateway = web_client
     monkeypatch.setattr("maddyweb.web.MAX_RAW_MESSAGE_BYTES", 64)
     gateway.raw_message = b"From: sender@example.test\r\n\r\n" + b"x" * (128 * 1024)
-    context = urlencode({"account": "admin@example.test", "mailbox": "INBOX"})
+    context = urlencode({"account": ADMIN_ACCOUNT_ID, "mailbox": "INBOX"})
     detail, data = await _api_data(client, f"/api/v1/mail/42?{context}")
     assert detail.status == 200
     assert data["preview_too_large"] is True
     assert data["size"] == len(gateway.raw_message)
-    assert data["raw_url"].startswith("/api/v1/mail/42/raw?")
+    assert data["raw_url"].startswith("/api/v1/admin/mail/42/raw?")
     assert "html_url" not in data
 
     raw = await client.get(f"/api/v1/mail/42/raw?{context}")
@@ -1125,7 +1172,7 @@ async def test_heavy_mail_work_is_limited_to_two_and_rejects_third(
 ) -> None:
     client, gateway = web_client
     gateway.spool_gate = asyncio.Event()
-    context = urlencode({"account": "admin@example.test", "mailbox": "INBOX"})
+    context = urlencode({"account": ADMIN_ACCOUNT_ID, "mailbox": "INBOX"})
     first = asyncio.create_task(client.get(f"/api/v1/mail/42?{context}"))
     second = asyncio.create_task(client.get(f"/api/v1/mail/42?{context}"))
     try:
@@ -1159,7 +1206,7 @@ async def test_message_parse_runs_off_event_loop(
         return original(raw)
 
     monkeypatch.setattr(web_module, "parse_message", slow_parse)
-    context = urlencode({"account": "admin@example.test", "mailbox": "INBOX"})
+    context = urlencode({"account": ADMIN_ACCOUNT_ID, "mailbox": "INBOX"})
     detail_task = asyncio.create_task(client.get(f"/api/v1/mail/42?{context}"))
     await asyncio.wait_for(started.wait(), timeout=1)
     health = await asyncio.wait_for(client.get("/healthz"), timeout=0.08)
@@ -1174,11 +1221,12 @@ async def test_compose_uses_enabled_sender_and_streams_cid_mime(
     client, gateway = web_client
     response, data = await _api_data(client, "/api/v1/compose")
     assert response.status == 200
-    assert data["senders"] == ["admin@example.test"]
+    assert data["senders"] == [{"id": ADMIN_ACCOUNT_ID, "address": "admin@example.test"}]
     assert data["max_upload_bytes"] == 4 * 1024 * 1024
     token = await _get_token(client)
 
     form = FormData()
+    form.add_field("sender_account_id", ADMIN_ACCOUNT_ID)
     form.add_field("sender", "admin@example.test")
     form.add_field("sender_name", "Web Console")
     form.add_field("password", FIXTURE_CREDENTIAL)
@@ -1243,6 +1291,7 @@ async def test_smtp_auth_rejection_is_actionable_and_does_not_echo_password(
     token = await _get_token(client)
     form = FormData()
     for name, value in {
+        "sender_account_id": ADMIN_ACCOUNT_ID,
         "sender": "admin@example.test",
         "password": FIXTURE_CREDENTIAL,
         "to": "recipient@example.test",
@@ -1277,6 +1326,7 @@ async def test_invalid_recipient_identifies_field_without_echoing_input(
     token = await _get_token(client)
     form = FormData()
     for name, value in {
+        "sender_account_id": ADMIN_ACCOUNT_ID,
         "sender": "admin@example.test",
         "password": FIXTURE_CREDENTIAL,
         "to": "private-invalid-value",
@@ -1309,6 +1359,7 @@ async def test_fullwidth_recipient_separators_are_normalized(
     token = await _get_token(client)
     form = FormData()
     for name, value in {
+        "sender_account_id": ADMIN_ACCOUNT_ID,
         "sender": "admin@example.test",
         "password": FIXTURE_CREDENTIAL,
         "to": "first@example.test\uff0csecond@example.test\uff1bthird@example.test",
@@ -1348,7 +1399,8 @@ async def test_slow_multipart_upload_times_out_and_releases_request_slot(
         },
         "security": {
             "session_signing_key": b"k" * 32,
-            "cookie_name": "maddyweb-csrf",
+            "csrf_cookie_name": "maddyweb-csrf",
+            "session_cookie_name": "maddyweb-session",
             "secure_cookies": False,
         },
     }
@@ -1357,6 +1409,10 @@ async def test_slow_multipart_upload_times_out_and_releases_request_slot(
         cookie_jar=CookieJar(unsafe=True),
     )
     await client.start_server()
+    client.session.cookie_jar.update_cookies(
+        {"maddyweb-session": ADMIN_SESSION_TOKEN},
+        response_url=client.make_url("/"),
+    )
     try:
         token = await _get_token(client)
         boundary = "maddyweb-slow-boundary"
@@ -1456,6 +1512,7 @@ async def test_sender_name_rejects_duplicates_and_enforces_both_size_bounds(
     token = await _get_token(client)
     character_oversized = FormData()
     for name, value in {
+        "sender_account_id": ADMIN_ACCOUNT_ID,
         "sender": "admin@example.test",
         "sender_name": "x" * 257,
         "password": FIXTURE_CREDENTIAL,
@@ -1486,6 +1543,7 @@ async def test_disabled_sender_is_rejected_server_side(
     token = await _get_token(client)
     form = FormData()
     for name, value in {
+        "sender_account_id": DISABLED_ACCOUNT_ID,
         "sender": "disabled@example.test",
         "to": "recipient@example.test",
         "subject": "x",

@@ -56,11 +56,13 @@ jobs:
           python "${args[@]}" scripts/check-python314t.py \
             --expect-build '${{ matrix.build }}' \
             --expect-gil '${{ matrix.gil }}' \
+            --require-distribution cryptography \
+            --require-distribution segno \
             --import maddyweb.cli \
             --import maddyweb.web \
             --import maddyweb.helper \
             --import maddyweb.docker_certificates \
-            --import aiohttp --import nh3
+            --import aiohttp --import cryptography --import nh3 --import segno
       - name: Run tests
         env:
           PYTHON_ARGS: ${{ matrix.python_args }}

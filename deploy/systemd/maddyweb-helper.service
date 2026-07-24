@@ -15,6 +15,9 @@ RestartSec=3s
 TimeoutStartSec=30s
 TimeoutStopSec=30s
 UMask=0077
+LimitCORE=0
+StateDirectory=maddyweb-auth
+StateDirectoryMode=0700
 
 # The helper remains root only because its allowlisted operations may need to
 # validate Maddy configuration and request a service reload. Its socket is the
@@ -40,7 +43,7 @@ MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
-ReadWritePaths=/var/backups/maddyweb /run/maddyweb
+ReadWritePaths=/var/backups/maddyweb /run/maddyweb /var/lib/maddyweb-auth
 BindReadOnlyPaths=-/run/docker.sock
 
 [Install]

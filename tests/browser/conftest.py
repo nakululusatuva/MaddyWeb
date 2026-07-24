@@ -23,8 +23,10 @@ if TYPE_CHECKING:
     from maddyweb.mail import PreparedMessage
 
 
-ACCOUNT = "admin@example.test"
+ACCOUNT = "a" * 32
+ACCOUNT_ADDRESS = "admin@example.test"
 NEW_ACCOUNT = "new-user@example.test"
+NEW_ACCOUNT_ID = "b" * 32
 MAILBOX = "INBOX"
 TRASH_MAILBOX = "Custom Trash"
 ARCHIVE_MAILBOX = "Custom Archive"
@@ -32,6 +34,11 @@ MESSAGE_ID = "42"
 CERTIFICATE_NAME = "mx.example.test"
 CERTIFICATE_FINGERPRINT = ":".join(f"{value:02X}" for value in range(32))
 COOKIE_NAME = "__Host-maddyweb-browser-csrf"
+SESSION_COOKIE_NAME = "maddyweb-browser-session"
+SESSION_TOKEN = "S" * 43
+LOGIN_CHALLENGE = "C" * 43
+LOGIN_PASSWORD = "fixture-mail-password"  # noqa: S105 - synthetic browser fixture
+LOGIN_TOTP = "123456"
 
 
 class BrowserSecurityGateway:
@@ -40,7 +47,7 @@ class BrowserSecurityGateway:
     def __init__(self) -> None:
         message = EmailMessage()
         message["From"] = "attacker@example.test"
-        message["To"] = ACCOUNT
+        message["To"] = ACCOUNT_ADDRESS
         message["Subject"] = "Browser security fixture"
         message.set_content("plain fallback")
         message.add_alternative(
@@ -71,7 +78,7 @@ class BrowserSecurityGateway:
         self.accounts: list[dict[str, object]] = [
             {
                 "id": ACCOUNT,
-                "address": ACCOUNT,
+                "address": ACCOUNT_ADDRESS,
                 "has_credentials": True,
                 "has_mailbox": True,
                 "append_limit": 1_048_576,
@@ -106,6 +113,23 @@ class BrowserSecurityGateway:
         self.timer_changes: list[bool] = []
         self.certificate_dry_runs: list[str] = []
         self.certificate_renewals: list[str] = []
+        self.logout_attempts = 0
+        self.logout_fails = False
+        self.password_login_attempts: list[tuple[str, str, str]] = []
+        self.totp_login_attempts: list[tuple[str, str, str]] = []
+
+    @staticmethod
+    def _principal() -> dict[str, object]:
+        return {
+            "account_id": ACCOUNT,
+            "email": ACCOUNT_ADDRESS,
+            "role": "admin",
+            "password_change_required": False,
+            "enrollment_state": "active",
+            "idle_expires_at": 2_000_000_000,
+            "absolute_expires_at": 2_000_010_000,
+            "recovery_codes_remaining": 10,
+        }
 
     def _account(self, account_id: str) -> dict[str, object]:
         return next(item for item in self.accounts if item["id"] == account_id)
@@ -121,20 +145,70 @@ class BrowserSecurityGateway:
             "certificate_management_enabled": True,
         }
 
+    async def session(self, token: str) -> dict[str, object]:
+        if token != SESSION_TOKEN:
+            raise RuntimeError("invalid browser fixture session")
+        return self._principal()
+
+    async def begin_password_login(
+        self,
+        email: str,
+        password: str,
+        *,
+        client_ip: str,
+    ) -> dict[str, object]:
+        self.password_login_attempts.append((email, password, client_ip))
+        if email != ACCOUNT_ADDRESS or password != LOGIN_PASSWORD:
+            raise RuntimeError("invalid browser fixture credentials")
+        return {"challenge": LOGIN_CHALLENGE, "next": "totp"}
+
+    async def complete_totp_login(
+        self,
+        challenge: str,
+        code: str,
+        *,
+        client_ip: str,
+    ) -> dict[str, object]:
+        self.totp_login_attempts.append((challenge, code, client_ip))
+        if challenge != LOGIN_CHALLENGE or code != LOGIN_TOTP:
+            raise RuntimeError("invalid browser fixture second factor")
+        return {
+            "session_token": SESSION_TOKEN,
+            "principal": self._principal(),
+            "recovery_codes": [],
+        }
+
+    async def logout(self, token: str) -> None:
+        assert token == SESSION_TOKEN
+        self.logout_attempts += 1
+        if self.logout_fails:
+            raise RuntimeError("fixture logout failure")
+
     async def list_accounts(self) -> list[dict[str, object]]:
         return [dict(account) for account in self.accounts]
 
-    async def create_account(self, username: str, password: str) -> None:
+    async def create_account(self, username: str, password: str) -> dict[str, object]:
         self.created_accounts.append((username, password))
         self.accounts.append(
             {
-                "id": username,
+                "id": NEW_ACCOUNT_ID,
                 "address": username,
                 "has_credentials": True,
                 "has_mailbox": True,
                 "append_limit": None,
             }
         )
+        return {
+            "id": NEW_ACCOUNT_ID,
+            "address": username,
+            "role": "user",
+            "totp_secret": "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+            "totp_uri": (
+                "otpauth://totp/MaddyWeb%3Anew-user%40example.test?"
+                "secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP&issuer=MaddyWeb"
+            ),
+            "recovery_codes": ["fixture-recovery-code"],
+        }
 
     async def change_password(self, account_id: str, password: str) -> None:
         self._account(account_id)
@@ -168,8 +242,7 @@ class BrowserSecurityGateway:
                     "id": MESSAGE_ID,
                     "sender": "attacker@example.test",
                     "subject": (
-                        '<img src=x onerror="document.body.dataset.listXss=1">'
-                        "Security fixture"
+                        '<img src=x onerror="document.body.dataset.listXss=1">Security fixture'
                     ),
                     "date": "2026-07-23 12:00 UTC",
                     "unread": True,
@@ -312,7 +385,8 @@ async def live_application(tmp_path: Path) -> AsyncIterator[LiveApplication]:
             "security": {
                 "session_signing_key": secrets.token_bytes(32),
                 "csrf_ttl_seconds": 300,
-                "cookie_name": COOKIE_NAME,
+                "csrf_cookie_name": COOKIE_NAME,
+                "session_cookie_name": SESSION_COOKIE_NAME,
                 "secure_cookies": True,
             },
         },
@@ -327,6 +401,27 @@ async def live_application(tmp_path: Path) -> AsyncIterator[LiveApplication]:
         yield LiveApplication(f"http://127.0.0.1:{port}", port, gateway)
     finally:
         await runner.cleanup()
+
+
+@pytest.fixture(autouse=True)
+async def authenticated_browser_page(
+    page: object,
+    live_application: LiveApplication,
+) -> None:
+    """Install the fixture session before a real browser test starts."""
+
+    await page.context.add_cookies(
+        [
+            {
+                "name": SESSION_COOKIE_NAME,
+                "value": SESSION_TOKEN,
+                "url": live_application.base_url,
+                "httpOnly": True,
+                "secure": False,
+                "sameSite": "Strict",
+            }
+        ]
+    )
 
 
 @pytest.fixture

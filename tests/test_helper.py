@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import os
+import queue
 import socket
 import threading
 from pathlib import Path
@@ -12,6 +14,15 @@ from typing import Any
 import pytest
 
 import maddyweb.helper as helper_module
+from maddyweb.auth import (
+    AuthStore,
+    InvalidSessionError,
+    LoginRateLimitedError,
+    Role,
+    totp_code,
+)
+from maddyweb.config import AppConfig
+from maddyweb.gateway import HelperGateway, bind_helper_identity
 from maddyweb.helper import (
     ALLOWED_OPERATIONS,
     PrivilegedDispatcher,
@@ -65,18 +76,29 @@ class FakeMaddy:
         self,
         messages: list[dict[str, Any]] | None = None,
         *,
+        accounts: list[dict[str, Any]] | None = None,
         write_safe: bool = True,
     ) -> None:
         self.messages = messages or []
+        self.accounts = accounts or [
+            {
+                "username": "sender@example.test",
+                "has_credentials": True,
+                "has_mailbox": True,
+                "append_limit": None,
+            }
+        ]
         self.account_list_modes: list[bool] = []
         self.append_calls = 0
         self.appended = b""
         self.dump_data = b"From: sender@example.test\r\n\r\ndownload\r\n"
         self.write_safe = write_safe
         self.write_safety_calls: list[Capability] = []
+        self.message_list_args: list[tuple[Any, ...]] = []
         self.message_list_kwargs: list[dict[str, Any]] = []
         self.deleted: list[tuple[str, str, str]] = []
         self.moved: list[tuple[str, str, str, str]] = []
+        self.password_changes: list[tuple[str, str]] = []
 
     def require_write_safety(self, capability: Capability) -> None:
         self.write_safety_calls.append(capability)
@@ -85,19 +107,16 @@ class FakeMaddy:
 
     def list_accounts(self, *, include_append_limits: bool = True) -> list[dict[str, Any]]:
         self.account_list_modes.append(include_append_limits)
-        return [
-            {
-                "username": "sender@example.test",
-                "has_credentials": True,
-                "has_mailbox": True,
-                "append_limit": None,
-            }
-        ]
+        return [dict(account) for account in self.accounts]
 
     def create_account(self, username: str, _password: str) -> dict[str, Any]:
         return {"username": username, "has_credentials": True, "has_mailbox": True}
 
-    def list_message_window(self, *_args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+    def change_password(self, username: str, password: str) -> None:
+        self.password_changes.append((username, password))
+
+    def list_message_window(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        self.message_list_args.append(args)
         self.message_list_kwargs.append(kwargs)
         ordered = sorted(self.messages, key=lambda item: int(item["uid"]), reverse=True)
         cursor_uid = int(kwargs["cursor_uid"])
@@ -162,6 +181,7 @@ def make_dispatcher(
     maddy: Any,
     *,
     smtp: Any = None,
+    auth_store: Any = None,
     audit: Any = None,
 ) -> PrivilegedDispatcher:
     return PrivilegedDispatcher(
@@ -169,8 +189,41 @@ def make_dispatcher(
         SimpleNamespace(),
         spool_dir=tmp_path,
         smtp=smtp,
+        auth_store=auth_store,
         audit=audit or (lambda *_args, **_kwargs: None),
     )
+
+
+_AUTH_CLOCK = 1_700_000_000
+
+
+def make_auth_store(tmp_path: Path, name: str = "auth.db") -> AuthStore:
+    return AuthStore(
+        (tmp_path / name).resolve(),
+        b"K" * 32,
+        "MaddyWeb Test",
+        clock=lambda: _AUTH_CLOCK,
+    )
+
+
+def provision_session(
+    store: AuthStore,
+    email: str,
+    *,
+    role: Role = Role.USER,
+    password_change_required: bool = False,
+) -> tuple[Any, str]:
+    account, enrollment, _recovery_codes = store.provision_active_account(
+        email,
+        role=role,
+        password_change_required=password_change_required,
+    )
+    challenge = store.create_pending_challenge(email)
+    issued = store.complete_totp_challenge(
+        challenge,
+        totp_code(enrollment.secret, timestamp=_AUTH_CLOCK),
+    )
+    return account, issued.token
 
 
 def test_dispatcher_allowlist_and_sensitive_audit(tmp_path: Path) -> None:
@@ -185,12 +238,22 @@ def test_dispatcher_allowlist_and_sensitive_audit(tmp_path: Path) -> None:
         Request.create(
             "accounts.create",
             {"username": "sender@example.test", "password": submitted},
-            actor="operator",
         )
     )
     assert created.response.ok is True
     assert audit_records[-1][2]["params"]["password"] == "[REDACTED]"  # noqa: S105
     assert submitted not in repr(audit_records)
+    assert redact_for_audit(
+        {
+            "challenge": "challenge-value",
+            "code": "123456",
+            "recovery_code": "recovery-value",
+        }
+    ) == {
+        "challenge": "[REDACTED]",
+        "code": "[REDACTED]",
+        "recovery_code": "[REDACTED]",
+    }
 
     denied = dispatcher.dispatch(
         Request.create("accounts.delete", {"username": "sender@example.test"})
@@ -207,6 +270,755 @@ def test_dispatcher_allowlist_and_sensitive_audit(tmp_path: Path) -> None:
     assert "accounts.delete" not in ALLOWED_OPERATIONS
     assert "certificates.install" not in ALLOWED_OPERATIONS
     assert "certificates.upload" not in ALLOWED_OPERATIONS
+
+
+def test_production_auth_store_denies_missing_and_invalid_sessions(tmp_path: Path) -> None:
+    with make_auth_store(tmp_path) as store:
+        dispatcher = make_dispatcher(tmp_path, FakeMaddy(), auth_store=store)
+        missing = dispatcher.dispatch(Request.create("auth.session"))
+        invalid = dispatcher.dispatch(Request.create("auth.session", auth_token="X" * 43))
+
+    assert missing.response.error is not None
+    assert missing.response.error.code == "forbidden"
+    assert invalid.response.error is not None
+    assert invalid.response.error.code == "unauthorized"
+
+
+def test_user_mailbox_scope_accepts_only_the_principal_opaque_target(
+    tmp_path: Path,
+) -> None:
+    accounts = [
+        {
+            "username": "sender@example.test",
+            "has_credentials": True,
+            "has_mailbox": True,
+        },
+        {
+            "username": "target@example.test",
+            "has_credentials": True,
+            "has_mailbox": True,
+        },
+    ]
+    maddy = FakeMaddy(accounts=accounts)
+    with make_auth_store(tmp_path) as store:
+        account, token = provision_session(store, "sender@example.test")
+        target = store.create_account(
+            "target@example.test",
+            password_change_required=False,
+        )
+        dispatcher = make_dispatcher(
+            tmp_path,
+            maddy,
+            auth_store=store,
+        )
+        derived = dispatcher.dispatch(
+            Request.create(
+                "messages.list",
+                {
+                    "username": "target@example.test",
+                    "mailbox": "INBOX",
+                    "limit": 50,
+                    "offset": 0,
+                },
+                auth_token=token,
+            )
+        )
+        cross_account = dispatcher.dispatch(
+            Request.create(
+                "messages.list",
+                {
+                    "target_account_id": target.account_id,
+                    "mailbox": "INBOX",
+                    "limit": 50,
+                    "offset": 0,
+                },
+                auth_token=token,
+            )
+        )
+        explicit_self = dispatcher.dispatch(
+            Request.create(
+                "messages.list",
+                {
+                    "target_account_id": account.account_id,
+                    "mailbox": "INBOX",
+                    "limit": 50,
+                    "offset": 0,
+                },
+                auth_token=token,
+            )
+        )
+
+    assert derived.response.ok is True
+    assert explicit_self.response.ok is True
+    assert maddy.message_list_args == [
+        ("sender@example.test", "INBOX"),
+        ("sender@example.test", "INBOX"),
+    ]
+    assert cross_account.response.error is not None
+    assert cross_account.response.error.code == "forbidden"
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="UNIX helper integration requires POSIX")
+async def test_gateway_and_helper_accept_ordinary_user_own_opaque_id(
+    tmp_path: Path,
+) -> None:
+    socket_path = tmp_path / "helper.sock"
+    ready: queue.Queue[tuple[str, str, FakeMaddy]] = queue.Queue(maxsize=1)
+    server_errors: list[BaseException] = []
+
+    def serve_authenticated_request() -> None:
+        try:
+            with make_auth_store(tmp_path) as store:
+                account, token = provision_session(store, "sender@example.test")
+                maddy = FakeMaddy(
+                    messages=[
+                        {
+                            "uid": 1,
+                            "sender": "source@example.test",
+                            "subject": "Gateway helper integration",
+                            "date": "2026-07-25T00:00:00+00:00",
+                            "flags": [],
+                        }
+                    ]
+                )
+                dispatcher = make_dispatcher(
+                    tmp_path,
+                    maddy,
+                    auth_store=store,
+                )
+                listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    listener.bind(str(socket_path))
+                    listener.listen(1)
+                    ready.put((account.account_id, token, maddy))
+                    connection, _address = listener.accept()
+                    with connection:
+                        _TestUnixHelperServer(
+                            dispatcher,
+                            allowed_peer_uid=0,
+                        ).serve_connection(connection)
+                finally:
+                    listener.close()
+        except BaseException as exc:
+            server_errors.append(exc)
+
+    thread = threading.Thread(target=serve_authenticated_request)
+    thread.start()
+    account_id, token, maddy = await asyncio.to_thread(ready.get, True, 5)
+    application_config = AppConfig.from_dict(
+        {
+            "maddy": {
+                "mode": "docker",
+                "helper_socket": str(socket_path),
+            }
+        }
+    )
+    gateway = HelperGateway(application_config)
+    with bind_helper_identity(token):
+        page = await gateway.list_messages(
+            account_id,
+            "INBOX",
+            limit=50,
+            offset=0,
+        )
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert server_errors == []
+    assert page["items"][0]["uid"] == 1
+    assert maddy.message_list_args == [("sender@example.test", "INBOX")]
+
+
+def test_admin_can_resolve_an_opaque_target_account_id(tmp_path: Path) -> None:
+    accounts = [
+        {
+            "username": "admin@example.test",
+            "has_credentials": True,
+            "has_mailbox": True,
+        },
+        {
+            "username": "target@example.test",
+            "has_credentials": True,
+            "has_mailbox": True,
+        },
+    ]
+    maddy = FakeMaddy(accounts=accounts)
+    with make_auth_store(tmp_path) as store:
+        _admin, token = provision_session(
+            store,
+            "admin@example.test",
+            role=Role.ADMIN,
+        )
+        target = store.create_account(
+            "target@example.test",
+            password_change_required=False,
+        )
+        result = make_dispatcher(
+            tmp_path,
+            maddy,
+            auth_store=store,
+        ).dispatch(
+            Request.create(
+                "messages.list",
+                {
+                    "target_account_id": target.account_id,
+                    "mailbox": "INBOX",
+                    "limit": 50,
+                    "offset": 0,
+                },
+                auth_token=token,
+            )
+        )
+
+    assert result.response.ok is True
+    assert maddy.message_list_args == [("target@example.test", "INBOX")]
+
+
+def test_password_change_gate_and_dangerous_operation_step_up(tmp_path: Path) -> None:
+    with make_auth_store(tmp_path) as required_store:
+        _account, required_token = provision_session(
+            required_store,
+            "sender@example.test",
+            password_change_required=True,
+        )
+        required_dispatcher = make_dispatcher(
+            tmp_path,
+            FakeMaddy(),
+            auth_store=required_store,
+        )
+        session = required_dispatcher.dispatch(
+            Request.create("auth.session", auth_token=required_token)
+        )
+        blocked = required_dispatcher.dispatch(
+            Request.create(
+                "messages.list",
+                {"mailbox": "INBOX", "limit": 50, "offset": 0},
+                auth_token=required_token,
+            )
+        )
+
+    with make_auth_store(tmp_path, "admin-auth.db") as admin_store:
+        _admin, admin_token = provision_session(
+            admin_store,
+            "sender@example.test",
+            role=Role.ADMIN,
+        )
+        dangerous = make_dispatcher(
+            tmp_path,
+            FakeMaddy(),
+            auth_store=admin_store,
+        ).dispatch(
+            Request.create(
+                "accounts.create",
+                {
+                    "username": "new@example.test",
+                    "password": "new-mailbox-password",
+                },
+                auth_token=admin_token,
+            )
+        )
+
+    assert session.response.ok is True
+    assert session.response.result["password_change_required"] is True
+    assert blocked.response.error is not None
+    assert blocked.response.error.code == "password_change_required"
+    assert dangerous.response.error is not None
+    assert dangerous.response.error.code == "step_up_required"
+
+
+def test_password_login_rejection_is_generic_and_never_audits_secret(
+    tmp_path: Path,
+) -> None:
+    class RejectingLoginSMTP:
+        @staticmethod
+        def _validated_password(password: str) -> str:
+            return SMTPSubmissionClient._validated_password(password)
+
+        @staticmethod
+        def authenticate(*, username: str, password: str) -> None:
+            assert username == "sender@example.test"
+            assert password
+            raise SMTPRejected(535, "AUTH")
+
+    audit_records: list[tuple[str, str, dict[str, Any]]] = []
+
+    def audit(action: str, *, outcome: str, fields: dict[str, Any]) -> None:
+        audit_records.append((action, outcome, fields))
+
+    secret = "-".join(("browser", "mailbox", "secret"))
+    with make_auth_store(tmp_path) as store:
+        result = make_dispatcher(
+            tmp_path,
+            FakeMaddy(),
+            smtp=RejectingLoginSMTP(),
+            auth_store=store,
+            audit=audit,
+        ).dispatch(
+            Request.create(
+                "auth.password_begin",
+                {
+                    "email": "sender@example.test",
+                    "password": secret,
+                    "client_ip": "127.0.0.1",
+                },
+            )
+        )
+
+    assert result.response.error is not None
+    assert result.response.error.code == "invalid_credentials"
+    assert result.response.error.message == "Email address or password is invalid"
+    assert audit_records[-1][1] == "invalid_credentials"
+    assert audit_records[-1][2]["actor"] is None
+    assert audit_records[-1][2]["params"]["password"] == "[REDACTED]"  # noqa: S105
+    assert secret not in repr(audit_records)
+
+
+def test_successful_password_totp_and_recovery_audits_are_attributed(
+    tmp_path: Path,
+) -> None:
+    mailbox_password = "-".join(("mailbox", "password"))
+
+    class AcceptingLoginSMTP:
+        @staticmethod
+        def _validated_password(password: str) -> str:
+            return SMTPSubmissionClient._validated_password(password)
+
+        @staticmethod
+        def authenticate(*, username: str, password: str) -> None:
+            assert username == "sender@example.test"
+            assert password == mailbox_password
+
+    audit_records: list[tuple[str, str, dict[str, Any]]] = []
+
+    def audit(action: str, *, outcome: str, fields: dict[str, Any]) -> None:
+        audit_records.append((action, outcome, fields))
+
+    with make_auth_store(tmp_path) as store:
+        account, enrollment, recovery_codes = store.provision_active_account("sender@example.test")
+        dispatcher = make_dispatcher(
+            tmp_path,
+            FakeMaddy(),
+            smtp=AcceptingLoginSMTP(),
+            auth_store=store,
+            audit=audit,
+        )
+        password_result = dispatcher.dispatch(
+            Request.create(
+                "auth.password_begin",
+                {
+                    "email": account.email,
+                    "password": mailbox_password,
+                    "client_ip": "203.0.113.8",
+                },
+            )
+        )
+        challenge = password_result.response.result["challenge"]
+        password_audit = audit_records[-1]
+        assert password_audit[1] == "ok"
+        assert password_audit[2]["actor"] == account.email
+        assert password_audit[2]["role"] == "user"
+        assert password_audit[2]["authentication_method"] == "password"
+        assert password_audit[2]["client_ip"] == "203.0.113.8"
+
+        totp_result = dispatcher.dispatch(
+            Request.create(
+                "auth.totp_complete",
+                {
+                    "challenge": challenge,
+                    "code": totp_code(enrollment.secret, timestamp=_AUTH_CLOCK),
+                    "client_ip": "203.0.113.8",
+                },
+            )
+        )
+        assert totp_result.response.ok is True
+        totp_audit = audit_records[-1]
+        assert totp_audit[2]["actor"] == account.email
+        assert totp_audit[2]["authentication_method"] == "totp"
+
+        recovery_begin = dispatcher.dispatch(
+            Request.create(
+                "auth.password_begin",
+                {
+                    "email": account.email,
+                    "password": mailbox_password,
+                    "client_ip": "203.0.113.8",
+                },
+            )
+        )
+        recovery_result = dispatcher.dispatch(
+            Request.create(
+                "auth.recovery_complete",
+                {
+                    "challenge": recovery_begin.response.result["challenge"],
+                    "recovery_code": recovery_codes[0],
+                    "client_ip": "203.0.113.8",
+                },
+            )
+        )
+        assert recovery_result.response.ok is True
+        recovery_audit = audit_records[-1]
+        assert recovery_audit[2]["actor"] == account.email
+        assert recovery_audit[2]["authentication_method"] == "recovery_code"
+
+    serialized = repr(audit_records)
+    assert mailbox_password not in serialized
+    assert enrollment.secret not in serialized
+    assert recovery_codes[0] not in serialized
+    assert challenge not in serialized
+
+
+def test_successful_enrollment_completion_audit_is_attributed(
+    tmp_path: Path,
+) -> None:
+    audit_records: list[tuple[str, str, dict[str, Any]]] = []
+
+    def audit(action: str, *, outcome: str, fields: dict[str, Any]) -> None:
+        audit_records.append((action, outcome, fields))
+
+    with make_auth_store(tmp_path) as store:
+        account = store.create_account(
+            "sender@example.test",
+            password_change_required=False,
+        )
+        challenge = store.create_pending_challenge(account.email)
+        dispatcher = make_dispatcher(
+            tmp_path,
+            FakeMaddy(),
+            auth_store=store,
+            audit=audit,
+        )
+        beginning = dispatcher.dispatch(
+            Request.create("auth.enrollment_begin", {"challenge": challenge})
+        )
+        secret = beginning.response.result["secret"]
+        completed = dispatcher.dispatch(
+            Request.create(
+                "auth.enrollment_complete",
+                {
+                    "challenge": challenge,
+                    "code": totp_code(secret, timestamp=_AUTH_CLOCK),
+                    "client_ip": "198.51.100.9",
+                },
+            )
+        )
+
+    assert completed.response.ok is True
+    record = audit_records[-1]
+    assert record[1] == "ok"
+    assert record[2]["actor"] == account.email
+    assert record[2]["role"] == "user"
+    assert record[2]["authentication_method"] == "totp_enrollment"
+    assert record[2]["client_ip"] == "198.51.100.9"
+    assert challenge not in repr(record)
+    assert secret not in repr(record)
+
+
+def test_password_login_rejects_identity_without_mailbox(
+    tmp_path: Path,
+) -> None:
+    class AcceptingLoginSMTP:
+        @staticmethod
+        def _validated_password(password: str) -> str:
+            return SMTPSubmissionClient._validated_password(password)
+
+        @staticmethod
+        def authenticate(*, username: str, password: str) -> None:
+            assert username == "sender@example.test"
+            assert password
+
+    maddy = FakeMaddy(
+        accounts=[
+            {
+                "username": "sender@example.test",
+                "has_credentials": True,
+                "has_mailbox": False,
+            }
+        ]
+    )
+    with make_auth_store(tmp_path) as store:
+        result = make_dispatcher(
+            tmp_path,
+            maddy,
+            smtp=AcceptingLoginSMTP(),
+            auth_store=store,
+        ).dispatch(
+            Request.create(
+                "auth.password_begin",
+                {
+                    "email": "sender@example.test",
+                    "password": "mailbox-password",
+                    "client_ip": "127.0.0.1",
+                },
+            )
+        )
+
+    assert result.response.error is not None
+    assert result.response.error.code == "invalid_credentials"
+
+
+def test_self_password_change_revokes_sessions_before_maddy_write(
+    tmp_path: Path,
+) -> None:
+    class AcceptingLoginSMTP:
+        @staticmethod
+        def _validated_password(password: str) -> str:
+            return SMTPSubmissionClient._validated_password(password)
+
+        @staticmethod
+        def authenticate(*, username: str, password: str) -> None:
+            assert username == "sender@example.test"
+            assert password == "-".join(("current", "password"))
+
+    with make_auth_store(tmp_path) as store:
+        account, token = provision_session(store, "sender@example.test")
+
+        class OrderingMaddy(FakeMaddy):
+            def change_password(self, username: str, password: str) -> None:
+                with pytest.raises(InvalidSessionError):
+                    store.authenticate_session(token)
+                super().change_password(username, password)
+
+        maddy = OrderingMaddy()
+        result = make_dispatcher(
+            tmp_path,
+            maddy,
+            smtp=AcceptingLoginSMTP(),
+            auth_store=store,
+        ).dispatch(
+            Request.create(
+                "auth.change_password",
+                {
+                    "current_password": "current-password",
+                    "new_password": "replacement-password",
+                    "client_ip": "203.0.113.50",
+                },
+                auth_token=token,
+            )
+        )
+
+        assert result.response.ok is True
+        assert maddy.password_changes == [("sender@example.test", "replacement-password")]
+        assert store.resolve_account_id(account.account_id).password_change_required is False
+
+
+def test_password_change_stops_before_maddy_if_session_revocation_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class AcceptingLoginSMTP:
+        @staticmethod
+        def _validated_password(password: str) -> str:
+            return SMTPSubmissionClient._validated_password(password)
+
+        @staticmethod
+        def authenticate(*, username: str, password: str) -> None:
+            assert username == "sender@example.test"
+            assert password
+
+    maddy = FakeMaddy()
+    with make_auth_store(tmp_path) as store:
+        _account, token = provision_session(store, "sender@example.test")
+
+        def fail_revocation(_account_id: str) -> None:
+            raise OSError("simulated authentication database failure")
+
+        monkeypatch.setattr(store, "revoke_sessions", fail_revocation)
+        result = make_dispatcher(
+            tmp_path,
+            maddy,
+            smtp=AcceptingLoginSMTP(),
+            auth_store=store,
+        ).dispatch(
+            Request.create(
+                "auth.change_password",
+                {
+                    "current_password": "current-password",
+                    "new_password": "replacement-password",
+                    "client_ip": "203.0.113.50",
+                },
+                auth_token=token,
+            )
+        )
+
+    assert result.response.error is not None
+    assert maddy.password_changes == []
+
+
+@pytest.mark.parametrize(
+    ("operation", "params"),
+    [
+        (
+            "auth.change_password",
+            {
+                "current_password": "current-password",
+                "new_password": "replacement-password",
+                "client_ip": "203.0.113.51",
+            },
+        ),
+        (
+            "auth.recovery_regenerate",
+            {
+                "password": "current-password",
+                "code": "123456",
+                "client_ip": "203.0.113.52",
+            },
+        ),
+        (
+            "auth.step_up",
+            {
+                "password": "current-password",
+                "code": "123456",
+                "client_ip": "203.0.113.53",
+            },
+        ),
+    ],
+)
+def test_authenticated_reverification_honors_helper_rate_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    params: dict[str, str],
+) -> None:
+    class NeverCalledSMTP:
+        @staticmethod
+        def _validated_password(password: str) -> str:
+            return SMTPSubmissionClient._validated_password(password)
+
+        @staticmethod
+        def authenticate(*, username: str, password: str) -> None:
+            raise AssertionError((username, password))
+
+    with make_auth_store(tmp_path, f"{operation.replace('.', '-')}.db") as store:
+        _account, token = provision_session(
+            store,
+            "sender@example.test",
+            role=Role.ADMIN,
+        )
+
+        def reject_rate(_email: str, _client_ip: str) -> None:
+            raise LoginRateLimitedError(60)
+
+        monkeypatch.setattr(store, "check_login_rate", reject_rate)
+        result = make_dispatcher(
+            tmp_path,
+            FakeMaddy(),
+            smtp=NeverCalledSMTP(),
+            auth_store=store,
+        ).dispatch(Request.create(operation, params, auth_token=token))
+
+    assert result.response.error is not None
+    assert result.response.error.code == "rate_limited"
+
+
+def test_admin_password_reset_marks_required_and_revokes_before_maddy_write(
+    tmp_path: Path,
+) -> None:
+    accounts = [
+        {
+            "username": "admin@example.test",
+            "has_credentials": True,
+            "has_mailbox": True,
+        },
+        {
+            "username": "target@example.test",
+            "has_credentials": True,
+            "has_mailbox": True,
+        },
+    ]
+    with make_auth_store(tmp_path) as store:
+        _admin, admin_token = provision_session(
+            store,
+            "admin@example.test",
+            role=Role.ADMIN,
+        )
+        target, target_token = provision_session(store, "target@example.test")
+        store.mark_step_up(admin_token)
+
+        class OrderingMaddy(FakeMaddy):
+            def change_password(self, username: str, password: str) -> None:
+                with pytest.raises(InvalidSessionError):
+                    store.authenticate_session(target_token)
+                assert store.resolve_account_id(target.account_id).password_change_required is True
+                super().change_password(username, password)
+
+        maddy = OrderingMaddy(accounts=accounts)
+        result = make_dispatcher(
+            tmp_path,
+            maddy,
+            auth_store=store,
+        ).dispatch(
+            Request.create(
+                "accounts.change_password",
+                {
+                    "target_account_id": target.account_id,
+                    "password": "administrator-reset-password",
+                },
+                auth_token=admin_token,
+            )
+        )
+
+    assert result.response.ok is True
+    assert maddy.password_changes == [("target@example.test", "administrator-reset-password")]
+
+
+def test_admin_password_reset_stops_before_maddy_if_metadata_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    accounts = [
+        {
+            "username": "admin@example.test",
+            "has_credentials": True,
+            "has_mailbox": True,
+        },
+        {
+            "username": "target@example.test",
+            "has_credentials": True,
+            "has_mailbox": True,
+        },
+    ]
+    maddy = FakeMaddy(accounts=accounts)
+    with make_auth_store(tmp_path) as store:
+        _admin, admin_token = provision_session(
+            store,
+            "admin@example.test",
+            role=Role.ADMIN,
+        )
+        target, _target_token = provision_session(store, "target@example.test")
+        store.mark_step_up(admin_token)
+
+        def fail_metadata_update(
+            _account_id: str,
+            _required: bool,
+            *,
+            revoke_sessions: bool,
+        ) -> None:
+            assert revoke_sessions is True
+            raise OSError("simulated authentication database failure")
+
+        monkeypatch.setattr(
+            store,
+            "set_password_change_required",
+            fail_metadata_update,
+        )
+        result = make_dispatcher(
+            tmp_path,
+            maddy,
+            auth_store=store,
+        ).dispatch(
+            Request.create(
+                "accounts.change_password",
+                {
+                    "target_account_id": target.account_id,
+                    "password": "administrator-reset-password",
+                },
+                auth_token=admin_token,
+            )
+        )
+
+    assert result.response.error is not None
+    assert maddy.password_changes == []
 
 
 def test_accounts_list_appendlimit_mode_is_optional_and_strict(tmp_path: Path) -> None:
@@ -754,6 +1566,32 @@ class TerminatorFailureChannel(ScriptedChannel):
         super().write(data)
 
 
+def test_smtp_authenticate_stops_after_auth_and_quit() -> None:
+    channel = ScriptedChannel(
+        [
+            b"220 ready\r\n",
+            b"250 hello\r\n",
+            b"235 authenticated\r\n",
+            b"221 goodbye\r\n",
+        ]
+    )
+    credential = "-".join(("mailbox", "password"))
+    _ScriptedSMTPClient(channel).authenticate(
+        username="sender@example.test",
+        password=credential,
+    )
+
+    assert channel.writes[0] == b"EHLO maddyweb.local\r\n"
+    assert channel.writes[1].startswith(b"AUTH PLAIN ")
+    assert channel.writes[2] == b"QUIT\r\n"
+    assert len(channel.writes) == 3
+    wire = b"".join(channel.writes)
+    assert b"MAIL FROM" not in wire
+    assert b"RCPT TO" not in wire
+    assert b"DATA\r\n" not in wire
+    assert channel.closed is True
+
+
 def send_scripted(channel: ScriptedChannel) -> dict[str, Any]:
     credential = "-".join(("one", "time", "credential"))
     message = b".first\nsecond\rthird"
@@ -860,6 +1698,39 @@ class _TestUnixHelperServer(UnixHelperServer):
 def _serve_once(server: UnixHelperServer, connection: socket.socket) -> None:
     with connection:
         server.serve_connection(connection)
+
+
+def test_stream_preflight_rejects_unauthorized_request_before_spooling(
+    tmp_path: Path,
+) -> None:
+    with make_auth_store(tmp_path) as store:
+        server = _TestUnixHelperServer(
+            make_dispatcher(
+                tmp_path,
+                FakeMaddy(),
+                auth_store=store,
+            ),
+            allowed_peer_uid=0,
+        )
+        client_socket, server_socket = socket.socketpair()
+        thread = threading.Thread(target=_serve_once, args=(server, server_socket))
+        thread.start()
+        try:
+            request = Request.create(
+                "messages.append",
+                {"mailbox_special": "sent"},
+                stream_length=1024,
+            )
+            send_frame(client_socket, request.to_payload())
+            response = Response.from_payload(receive_frame(client_socket))
+        finally:
+            client_socket.close()
+            thread.join(timeout=2)
+
+    assert response.error is not None
+    assert response.error.code == "forbidden"
+    assert not thread.is_alive()
+    assert list(tmp_path.glob("maddyweb-*.spool")) == []
 
 
 def test_socket_stream_upload_download_and_spool_cleanup(tmp_path: Path) -> None:

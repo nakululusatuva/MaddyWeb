@@ -1,5 +1,12 @@
 # Operations Runbook
 
+Public HTTPS edge operations are intentionally separate from ordinary
+MaddyWeb and mail-certificate operations. Use the
+[Cloudflare public-edge runbook](public-edge.md); never apply the system Nginx
+procedure to the custom `mail_custom` Nginx service.
+Authentication bootstrap, factor handoff, and mailbox identity lifecycle are
+defined in [Authentication and identity operations](authentication.md).
+
 This runbook assumes MaddyWeb is installed at `/opt/maddyweb/current` and production configuration is at
 `/etc/maddyweb/config.toml`. Before any change, confirm the current host, Maddy mode and version,
 backup status, and maintenance window. All scripts default to a dry run; never execute example placeholders unchanged.
@@ -56,6 +63,82 @@ First investigate a possible unauthorized replacement, then restore from trusted
 `server.request_body_timeout_seconds = 15` is the total request-body read timeout, not an ordinary keepalive
 timeout; the production validator accepts only 1..120 seconds. If large attachments repeatedly time out over local SSH, first
 check the link and upload size; do not remove the limit or expand it beyond the accepted range.
+
+## Authentication operations
+
+Every login uses the full mailbox address, that mailbox's current Maddy
+password, and Google Authenticator compatible TOTP. There is no separate Web
+password or administrator identity. Before debugging the UI, confirm that the
+Maddy account has both enabled credentials and an IMAP mailbox and that local
+Submission on `127.0.0.1:1587` still requires real SMTP AUTH.
+
+Inspect authentication service health without reading the database or secret
+files:
+
+```console
+systemctl status maddyweb.service maddyweb-helper.socket maddyweb-helper.service
+journalctl -u maddyweb.service -u maddyweb-helper.service --since today
+sudo stat -c '%U:%G %a links=%h %F %n' \
+  /var/lib/maddyweb-auth \
+  /var/lib/maddyweb-auth/master.key \
+  /var/lib/maddyweb-auth/auth.sqlite3
+```
+
+Stop if the directory is not `root:root 0700`, if the master key is not a
+root-owned regular file with mode `0600`, or if either secret file is a
+symlink or has multiple hard links. Do not use SQLite tooling to edit
+authentication data. Do not copy a password, TOTP value, recovery code,
+session token, challenge, or bootstrap value into a journal query, incident
+note, or command argument.
+
+Only root may assign an administrator role, and the target must already be an
+enabled Maddy mailbox:
+
+```console
+sudo /opt/maddyweb/current/bin/maddyweb auth-role \
+  --config /etc/maddyweb/config.toml \
+  --email administrator@example.net \
+  --role admin
+```
+
+Use `--role user` to demote it. Either transition revokes existing sessions
+and pending login challenges. The Web application cannot grant administrator
+status.
+
+MaddyWeb-created accounts disclose a new TOTP factor and ten recovery codes
+once. CLI-created accounts are forced to enroll after their first successful
+mailbox-password check. For advance enrollment of existing accounts, use only
+the protected offline generator and direct SSH-stdin bootstrap in
+[authentication.md](authentication.md). Never rerun bootstrap from an old
+manifest or retain the one-time JSON after a successful import.
+
+Password changes, role changes, factor resets, recovery-code regeneration,
+credential disable, and account deletion revoke affected authentication
+state. An administrator TOTP reset and other danger operations require a
+fresh password-and-TOTP step-up. Treat the one-time replacement disclosure as
+a secret incident handoff; do not email both factors together. Recovery-code
+login consumes one code and revokes other sessions. A user who loses both
+TOTP and all recovery codes must use the administrator reset workflow after
+independent identity verification.
+
+### External Maddy deletion and address reuse
+
+Never delete and recreate the same address directly with the Maddy CLI.
+After an external deletion, leave the address absent and purge its
+authentication generation as root:
+
+```console
+sudo /opt/maddyweb/current/bin/maddyweb auth-purge \
+  --config /etc/maddyweb/config.toml \
+  --email removed@example.net \
+  --confirm-email removed@example.net
+```
+
+The purge refuses to run while Maddy still reports any record for the
+address. Recreate the mailbox only after it returns `auth_purge=ok`. This
+ordering prevents an old role, session, challenge, TOTP factor, or recovery
+state from attaching to a new mailbox with the same address. Prefer the
+coordinated MaddyWeb deletion path for ordinary operations.
 
 ## Configure the management Submission endpoint
 
@@ -279,6 +362,8 @@ the temporary container and staging. It compares container, image digest, mounts
 
 Each archive contains:
 
+- `auth-state.tar`, its internal SHA-256, and `auth-state.status` recording
+  `absent`, `empty`, or `active`;
 - `maddy-state.tar` and its internal SHA-256;
 - `maddy.conf` and its SHA-256;
 - `maddyweb.toml` and its SHA-256;
@@ -288,9 +373,22 @@ Each archive contains:
 Copy the archive and `.sha256` to controlled storage in a different host failure domain, and periodically rehearse
 recovery in an isolated environment.
 
+An active `auth-state.tar` contains the authentication master key, encrypted
+TOTP seeds, recovery-code digests, roles, and session state. Treat the backup
+as secret material. The master key and database are one inseparable
+generation: verify both internal hashes and restore them together only while
+the Web and helper units are stopped. Never combine a database from one
+archive with a key from another.
+
 ## Application release rollback
 
-Rollback switches only `/opt/maddyweb/current`; it does not downgrade Maddy or restore Maddy data.
+Rollback changes only the application release and, when explicitly requested,
+the exact predecessor application configuration. It does not downgrade Maddy
+or restore Maddy data.
+An installation that used `--replace-config` already restores the previous
+configuration before it restarts the previous release if that installation
+fails. Do not pre-edit the live configuration to work around a closed-schema
+upgrade.
 First independently verify the commit and artifact SHA-256 in the target release's `INSTALL-MANIFEST`:
 
 ```console
@@ -320,14 +418,30 @@ The combined release-rollback-and-remove entry point accepts only native or Dock
 For a Docker named volume, first use the separate `configure-submission.sh --action remove` transaction above
 with `submission-remove` approval and verify it, then run release rollback separately.
 Never pass an internal daemon volume path to the rollback command as though it were a host configuration path.
-Every release rollback first loads the effective `/etc/maddyweb/config.toml`
-with the target release. A target whose closed configuration schema cannot
-represent the active settings is rejected before approval is consumed or any
-service, symlink, or Maddy configuration is changed. Configuration downgrade
-is never automatic.
+Every release rollback first loads the effective configuration with the target
+release. The default is the unchanged live `/etc/maddyweb/config.toml`. For a
+closed-schema predecessor, add `--restore-previous-config` to both the root-run
+dry run and the approved command. The script accepts no configuration path for
+that operation: it reads the root-only record associated with the exact current
+commit, verifies both hashes and file metadata, and requires the requested
+target to be the recorded predecessor.
 
-After a candidate release or smoke failure, the tool reports successful restoration only if the previous symlink, unit states, and release
-smoke result all read back successfully, along with optional Submission configuration, reload, port 1587 listener, and Docker identity.
+A target is considered authentication-capable only when both its immutable
+install manifest and its runtime package report
+`required-unified-mailbox-v1`. Missing or mismatched attestation is treated as
+unauthenticated. Before such a rollback, install and reload the exact reviewed
+503 withdrawal asset as described in [the public-edge runbook](public-edge.md).
+Then add both `--restore-previous-config` and
+`--acknowledge-public-edge-withdrawn`. The acknowledgement is not sufficient
+on its own: the rollback script also compares the installed virtual host with
+the immutable asset, runs the correct Nginx configuration test, and requires
+the public hostname to return HTTP 503 before and immediately before mutation.
+It never edits or reloads Nginx itself.
+
+After a candidate release or smoke failure, the tool reports successful
+restoration only if the previous symlink, exact configuration, unit states,
+and release smoke result all read back successfully, along with optional
+Submission configuration, reload, port 1587 listener, and Docker identity.
 Any incomplete stage reports `CRITICAL` and exits nonzero. At that point,
 stop further operations and handle it as an incident; do not infer recovery from the symlink appearance alone.
 
@@ -403,7 +517,11 @@ plugin intentionally makes the page read-only; never modify existing Nginx to pa
 atomic deployment, Maddy reload, or fingerprint read-back exit nonzero. Find the first failure in the Certbot
 log and journal; do not delete or bypass the hook just to make renewal appear successful.
 
-## SSH forwarding failures
+## Optional SSH forwarding failures
+
+This section applies to an SSH-only deployment or an explicitly retained
+local administration path. Public users should use the reviewed HTTPS
+hostname through Cloudflare and must not bypass its Nginx boundary.
 
 ```console
 ssh -vv -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=yes \
@@ -415,9 +533,13 @@ ssh -vv -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=yes \
   a different local port, such as `8877:127.0.0.1:8787`.
 - On `connect failed`, run smoke and status locally on the server. Do not temporarily change the listener to
   `0.0.0.0:8787`.
-- The browser Host must be `127.0.0.1` or `localhost`; otherwise the allowed-host check rejects it.
+- Open the browser with the `localhost` hostname so Secure, `__Host-` cookies
+  remain valid; `127.0.0.1` stays allowed for non-browser health probes.
+- A successful tunnel does not bypass login. The full mailbox password and
+  TOTP or an unused recovery code are still required.
 - Browser cookies are scoped to the loopback hostname, not the local port. When two MaddyWeb servers may be
-  forwarded at the same time, configure a different `security.cookie_name` with the `__Host-` prefix on each
+  forwarded at the same time, configure different `security.session_cookie_name` and
+  `security.csrf_cookie_name` values with the `__Host-` prefix on each
   server. The SPA synchronizes its process-bound CSRF token immediately before each write, but unique cookie
   names also prevent one remote server from replacing another server's cookie.
 

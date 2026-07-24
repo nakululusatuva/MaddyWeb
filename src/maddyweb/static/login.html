@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#eef3fb">
+  <meta name="description" content="Sign in to the MaddyWeb mail workspace">
+  <title>Sign in - MaddyWeb</title>
+  <link rel="stylesheet" href="/static/login.css?v=2">
+  <script src="/static/login.js?v=2" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#auth-main">Skip to sign in</a>
+  <main id="auth-main" class="auth-shell">
+    <section class="auth-brand" aria-labelledby="brand-title">
+      <div class="brand-lockup">
+        <span class="brand-mark" aria-hidden="true">MW</span>
+        <div>
+          <strong id="brand-title">MaddyWeb</strong>
+          <span>Private mail, available wherever you work.</span>
+        </div>
+      </div>
+      <div class="brand-message">
+        <p class="eyebrow">Secure mail workspace</p>
+        <h1>Your mailbox and server controls in one focused place.</h1>
+        <p>Sign in with your mail account. Every session is protected by a second factor and expires automatically.</p>
+      </div>
+      <ul class="trust-list" aria-label="Security properties">
+        <li><span aria-hidden="true">1</span> Passwords are submitted only to this server.</li>
+        <li><span aria-hidden="true">2</span> Authenticator setup never uses a third-party QR service.</li>
+        <li><span aria-hidden="true">3</span> Recovery codes are disclosed once and never stored by this page.</li>
+      </ul>
+    </section>
+
+    <section class="auth-stage">
+      <div class="auth-card">
+        <div class="mobile-brand" aria-hidden="true">
+          <span class="brand-mark">MW</span>
+          <strong>MaddyWeb</strong>
+        </div>
+
+        <div id="auth-loading" class="auth-view" data-auth-view="loading">
+          <div class="loading-mark" aria-hidden="true"></div>
+          <p class="eyebrow">Secure session</p>
+          <h2>Checking your session</h2>
+          <p class="view-copy">This should take only a moment.</p>
+        </div>
+
+        <div id="login-view" class="auth-view" data-auth-view="anonymous" hidden>
+          <p class="eyebrow">Welcome back</p>
+          <h2>Sign in to MaddyWeb</h2>
+          <p class="view-copy">Use your complete email address and mailbox password.</p>
+          <form id="login-form" class="auth-form" autocomplete="on">
+            <label>
+              <span>Email address</span>
+              <input id="login-address" name="address" type="email" inputmode="email" autocomplete="username" maxlength="254" required autofocus>
+            </label>
+            <label>
+              <span>Password</span>
+              <input id="login-password" name="password" type="password" autocomplete="current-password" maxlength="1024" required>
+            </label>
+            <button id="login-submit" class="primary-action" type="submit">
+              <span>Continue</span>
+              <span aria-hidden="true">&rarr;</span>
+            </button>
+          </form>
+        </div>
+
+        <div id="totp-view" class="auth-view" data-auth-view="totp_required" hidden>
+          <button class="back-button" type="button" data-restart-auth>&larr; Use another account</button>
+          <p class="eyebrow">Two-step verification</p>
+          <h2>Enter your authenticator code</h2>
+          <p class="view-copy">Open your authenticator app and enter the current six-digit code.</p>
+          <form id="totp-form" class="auth-form">
+            <label>
+              <span>Authenticator code</span>
+              <input id="totp-code" name="code" class="code-input" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="000000" required>
+            </label>
+            <button id="totp-submit" class="primary-action" type="submit">Verify and sign in</button>
+          </form>
+          <button id="show-recovery-login" class="text-action" type="button">Use a recovery code instead</button>
+        </div>
+
+        <div id="recovery-login-view" class="auth-view" data-auth-view="recovery_required" hidden>
+          <button id="show-totp-login" class="back-button" type="button">&larr; Use an authenticator code</button>
+          <p class="eyebrow">Account recovery</p>
+          <h2>Use a recovery code</h2>
+          <p class="view-copy">Enter one unused recovery code. It will be consumed after a successful sign-in.</p>
+          <form id="recovery-login-form" class="auth-form">
+            <label>
+              <span>Recovery code</span>
+              <input id="recovery-login-code" name="code" class="recovery-input" type="text" autocomplete="one-time-code" maxlength="64" spellcheck="false" required>
+            </label>
+            <button id="recovery-login-submit" class="primary-action" type="submit">Use recovery code</button>
+          </form>
+        </div>
+
+        <div id="enrollment-view" class="auth-view auth-view-wide" data-auth-view="totp_enrollment_required" hidden>
+          <button class="back-button" type="button" data-restart-auth>&larr; Use another account</button>
+          <p class="eyebrow">Required security setup</p>
+          <h2>Protect your account with an authenticator</h2>
+          <p class="view-copy">Scan the QR code, or enter the setup key manually. You cannot skip this step.</p>
+          <div class="enrollment-layout">
+            <div class="qr-frame">
+              <canvas id="totp-qr-canvas" width="220" height="220" hidden></canvas>
+              <img id="totp-qr-image" width="220" height="220" alt="Authenticator setup QR code" hidden>
+              <div id="totp-qr-unavailable" class="qr-unavailable">
+                <span aria-hidden="true">MW</span>
+                <small>Use the manual setup key</small>
+              </div>
+            </div>
+            <div class="setup-details">
+              <dl>
+                <div><dt>Account</dt><dd id="totp-account-label">Loading</dd></div>
+                <div><dt>Issuer</dt><dd id="totp-issuer">Loading</dd></div>
+              </dl>
+              <div class="secret-block">
+                <span>Manual setup key</span>
+                <div>
+                  <code id="totp-secret">Loading</code>
+                  <button id="copy-totp-secret" class="copy-button" type="button">Copy</button>
+                </div>
+              </div>
+            </div>
+          </div>
+          <form id="enrollment-form" class="auth-form enrollment-form">
+            <label>
+              <span>Confirm with the current six-digit code</span>
+              <input id="enrollment-code" name="code" class="code-input" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="000000" required>
+            </label>
+            <button id="enrollment-submit" class="primary-action" type="submit">Confirm authenticator</button>
+          </form>
+        </div>
+
+        <div id="recovery-codes-view" class="auth-view auth-view-wide" data-auth-view="recovery_ack_required" hidden>
+          <p class="eyebrow">One-time disclosure</p>
+          <h2>Save your recovery codes</h2>
+          <p class="view-copy">Each code works once. Store them somewhere private before continuing.</p>
+          <div class="recovery-toolbar">
+            <button id="copy-recovery-codes" class="secondary-action" type="button">Copy all</button>
+            <button id="download-recovery-codes" class="secondary-action" type="button">Download .txt</button>
+          </div>
+          <ol id="recovery-code-list" class="recovery-code-list" aria-label="Recovery codes"></ol>
+          <label class="acknowledgement">
+            <input id="recovery-acknowledged" type="checkbox">
+            <span>I saved these recovery codes in a secure place.</span>
+          </label>
+          <button id="recovery-continue" class="primary-action" type="button" disabled>Continue to MaddyWeb</button>
+        </div>
+
+        <div id="unavailable-view" class="auth-view" data-auth-view="unavailable" hidden>
+          <p class="eyebrow">Sign-in unavailable</p>
+          <h2>The public authentication service is not ready</h2>
+          <p id="unavailable-message" class="view-copy">Try again later or contact the server administrator.</p>
+          <button id="retry-session" class="primary-action" type="button">Try again</button>
+        </div>
+
+        <p id="auth-notice" class="auth-notice" role="status" aria-live="polite"></p>
+      </div>
+      <footer class="auth-footer">
+        <span>Protected by password and TOTP</span>
+        <span aria-hidden="true">&middot;</span>
+        <span>Same-origin session</span>
+      </footer>
+    </section>
+  </main>
+</body>
+</html>

@@ -11,6 +11,7 @@ from aiohttp import CookieJar, web
 from aiohttp.test_utils import TestClient, TestServer
 
 from maddyweb.security import (
+    CurrentCsrfStore,
     SecurityConfig,
     bounded_concurrency_middleware,
     csrf_token_for_request,
@@ -67,6 +68,40 @@ def test_signed_csrf_token_authenticates_and_expires() -> None:
     assert verify_csrf_token(token + "x", KEY, max_age=300, now=1_200) is None
     assert verify_csrf_token(token, KEY, max_age=300, now=1_301) is None
     assert verify_csrf_token(token, b"x" * 32, max_age=300, now=1_200) is None
+
+
+@pytest.mark.asyncio
+async def test_current_csrf_store_evicts_without_accepting_an_old_nonce() -> None:
+    store = CurrentCsrfStore(capacity=2, flows_per_identity=1, ttl=300)
+    await store.replace("identity-one", "flow-one", "nonce-one")
+    await store.replace("identity-one", "flow-two", "nonce-two")
+    assert not await store.rotate(
+        "identity-one",
+        "flow-one",
+        "nonce-one",
+        "replacement-one",
+    )
+    assert await store.rotate(
+        "identity-one",
+        "flow-two",
+        "nonce-two",
+        "replacement-two",
+    )
+
+    await store.replace("identity-two", "flow-three", "nonce-three")
+    await store.replace("identity-three", "flow-four", "nonce-four")
+    assert not await store.rotate(
+        "identity-one",
+        "flow-two",
+        "replacement-two",
+        "replacement-five",
+    )
+    assert await store.rotate(
+        "identity-three",
+        "flow-four",
+        "nonce-four",
+        "replacement-four",
+    )
 
 
 def test_host_and_origin_normalization_is_exact() -> None:

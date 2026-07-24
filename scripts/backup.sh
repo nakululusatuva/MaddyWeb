@@ -9,6 +9,8 @@ source "$SCRIPT_DIR/lib/common.sh"
 # shellcheck source=lib/backup-unit-state.sh
 source "$SCRIPT_DIR/lib/backup-unit-state.sh"
 
+readonly AUTH_STATE_DIR="/var/lib/maddyweb-auth"
+
 usage() {
     cat <<'EOF'
 Usage: backup.sh --environment development|production --host HOST \
@@ -106,6 +108,8 @@ elif [[ -n "$approval_file" ]]; then
 fi
 
 require_command install
+require_command find
+require_command realpath
 require_command systemctl
 require_command tar
 install -d -o root -g root -m 0700 -- "$destination"
@@ -119,6 +123,93 @@ require_path_below "$staging" "$destination"
 maddy_was_active=false
 source_quiesced=false
 snapshot_helper=""
+auth_state_status=absent
+
+assert_auth_state_file() {
+    local path=${1:?authentication state file is required}
+    local expected_size=${2:-}
+    [[ -f "$path" && ! -L "$path" ]] \
+        || die "authentication state entry must be a regular non-symlink file: $path"
+    [[ "$(stat -c '%u:%g:%a:%h' -- "$path")" == "0:0:600:1" ]] \
+        || die "authentication state file metadata is unsafe: $path"
+    if [[ -n "$expected_size" ]]; then
+        [[ "$(stat -c '%s' -- "$path")" == "$expected_size" ]] \
+            || die "authentication state file has an invalid size: $path"
+    else
+        [[ "$(stat -c '%s' -- "$path")" -gt 0 ]] \
+            || die "authentication database is empty"
+    fi
+}
+
+snapshot_auth_state() {
+    local entries_file="$staging/.auth-state-entries"
+    local key_hash_before="" database_hash_before=""
+    local -a entries=()
+
+    if [[ ! -e "$AUTH_STATE_DIR" && ! -L "$AUTH_STATE_DIR" ]]; then
+        tar --create --file "$staging/auth-state.tar" --files-from /dev/null
+        printf 'status=absent\n' > "$staging/auth-state.status"
+        auth_state_status=absent
+        return
+    fi
+    [[ -d "$AUTH_STATE_DIR" && ! -L "$AUTH_STATE_DIR" ]] \
+        || die "authentication state path must be a real directory"
+    [[ "$(realpath -e -- "$AUTH_STATE_DIR")" == "$AUTH_STATE_DIR" ]] \
+        || die "authentication state directory must be canonical"
+    [[ "$(stat -c '%u:%g:%a' -- "$AUTH_STATE_DIR")" == "0:0:700" ]] \
+        || die "authentication state directory must be root:root 0700"
+
+    find "$AUTH_STATE_DIR" -xdev -mindepth 1 -maxdepth 1 -print0 > "$entries_file" \
+        || die "cannot enumerate authentication state"
+    mapfile -d '' -t entries < "$entries_file"
+    rm -f -- "$entries_file"
+
+    if (( ${#entries[@]} == 0 )); then
+        auth_state_status=empty
+    elif (( ${#entries[@]} == 2 )) \
+        && [[ -e "$AUTH_STATE_DIR/master.key" && -e "$AUTH_STATE_DIR/auth.sqlite3" ]]; then
+        assert_auth_state_file "$AUTH_STATE_DIR/master.key" 32
+        assert_auth_state_file "$AUTH_STATE_DIR/auth.sqlite3"
+        key_hash_before=$(sha256_file "$AUTH_STATE_DIR/master.key")
+        database_hash_before=$(sha256_file "$AUTH_STATE_DIR/auth.sqlite3")
+        auth_state_status=active
+    else
+        die "authentication state contains an incomplete or unexpected entry set"
+    fi
+
+    tar --create --file "$staging/auth-state.tar" \
+        --acls --xattrs --numeric-owner --one-file-system \
+        --directory "$(dirname -- "$AUTH_STATE_DIR")" "$(basename -- "$AUTH_STATE_DIR")"
+
+    [[ "$(stat -c '%u:%g:%a' -- "$AUTH_STATE_DIR")" == "0:0:700" ]] \
+        || die "authentication state directory changed during backup"
+    if [[ "$auth_state_status" == active ]]; then
+        assert_auth_state_file "$AUTH_STATE_DIR/master.key" 32
+        assert_auth_state_file "$AUTH_STATE_DIR/auth.sqlite3"
+        [[ "$(sha256_file "$AUTH_STATE_DIR/master.key")" == "$key_hash_before" ]] \
+            || die "authentication master key changed during backup"
+        [[ "$(sha256_file "$AUTH_STATE_DIR/auth.sqlite3")" == "$database_hash_before" ]] \
+            || die "authentication database changed during backup"
+    else
+        find "$AUTH_STATE_DIR" -xdev -mindepth 1 -maxdepth 1 -print0 > "$entries_file" \
+            || die "cannot re-enumerate authentication state"
+        [[ ! -s "$entries_file" ]] \
+            || die "authentication state changed during backup"
+        rm -f -- "$entries_file"
+    fi
+    printf 'status=%s\n' "$auth_state_status" > "$staging/auth-state.status"
+}
+
+quiesce_all_maddyweb_units_for_snapshot() {
+    local unit active_state
+    for unit in maddyweb.service maddyweb-helper.socket maddyweb-helper.service; do
+        if [[ "${MADDYWEB_BACKUP_UNIT_PRESENT[$unit]}" == true ]]; then
+            systemctl stop "$unit" || return 1
+            active_state=$(systemd_unit_property "$unit" ActiveState) || return 1
+            [[ "$active_state" == inactive ]] || return 1
+        fi
+    done
+}
 
 restore_native_maddy_active_state() {
     local result=0
@@ -188,6 +279,10 @@ trap 'exit 143' TERM
 
 stop_active_maddyweb_units \
     || die "cannot quiesce the active MaddyWeb systemd units"
+quiesce_all_maddyweb_units_for_snapshot \
+    || die "cannot normalize every MaddyWeb unit to inactive for the snapshot"
+
+snapshot_auth_state
 
 if [[ "$mode" == native ]]; then
     systemctl is-active --quiet maddy.service && maddy_was_active=true
@@ -235,10 +330,13 @@ raise SystemExit(any(before.get(key) != after.get(key) for key in keys))' \
 fi
 
 install -o root -g root -m 0600 -- "$app_config" "$staging/maddyweb.toml"
-printf 'format=maddyweb-backup-v1\nhost=%s\ncreated=%s\nmode=%s\ncontainer=%s\n' \
-    "$target_host" "$timestamp" "$mode" "$container" > "$staging/MANIFEST"
+printf 'format=maddyweb-backup-v2\nhost=%s\ncreated=%s\nmode=%s\ncontainer=%s\nauth_state=%s\n' \
+    "$target_host" "$timestamp" "$mode" "$container" "$auth_state_status" \
+    > "$staging/MANIFEST"
 (
     cd -- "$staging"
+    sha256_file auth-state.tar > auth-state.tar.sha256
+    sha256_file auth-state.status > auth-state.status.sha256
     sha256_file maddy-state.tar > maddy-state.tar.sha256
     sha256_file maddy.conf > maddy.conf.sha256
     sha256_file maddyweb.toml > maddyweb.toml.sha256

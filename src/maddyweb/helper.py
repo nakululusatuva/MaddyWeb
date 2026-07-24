@@ -8,6 +8,7 @@ created mode-0600 spools; browser supplied filesystem paths are never accepted.
 from __future__ import annotations
 
 import base64
+import ipaddress
 import json
 import os
 import queue
@@ -22,7 +23,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, BinaryIO, Protocol
+from typing import Any, BinaryIO, Literal, Protocol
 
 from .certificates import CertificateCommandError, CertificateError, CertificateManager
 from .maddy import (
@@ -71,6 +72,8 @@ _SENSITIVE_KEYS = frozenset(
         "message",
         "attachment",
         "authorization",
+        "challenge",
+        "code",
     }
 )
 _EMAIL_RE = re.compile(r"\A[^\s<>@]+@[^\s<>@]+\Z")
@@ -150,6 +153,22 @@ class SMTPOutcomeUnknown(SMTPError):
 
 class SMTPTransportError(SMTPError):
     """Connection failed before the message could have been accepted."""
+
+
+class AuthorizationDenied(RuntimeError):
+    """An authenticated browser identity lacks permission for an operation."""
+
+
+class InvalidCredentials(RuntimeError):
+    """Mailbox credentials were rejected without revealing which field failed."""
+
+
+class PasswordChangeRequired(AuthorizationDenied):
+    """The identity must replace its bootstrap password before continuing."""
+
+
+class StepUpRequired(AuthorizationDenied):
+    """A dangerous administrator operation requires fresh reauthentication."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -736,6 +755,66 @@ class SMTPSubmissionClient:
         if output:
             channel.write(bytes(output))
 
+    @staticmethod
+    def _validated_password(password: str) -> str:
+        if (
+            not isinstance(password, str)
+            or not password
+            or len(password) > 1024
+            or any(char in password for char in "\r\n\0")
+        ):
+            raise ValueError("invalid SMTP password")
+        return password
+
+    def _open_channel(self) -> _SMTPChannel:
+        if self.target.mode.value == "docker":
+            container_id = self._validate_docker_runtime()
+            return self._channel(docker_container=container_id)
+        return self._channel()
+
+    @classmethod
+    def _authenticate_channel(
+        cls,
+        channel: _SMTPChannel,
+        *,
+        username: str,
+        password: str,
+        deadline: float,
+    ) -> None:
+        code, _ = cls._response(channel, deadline)
+        if code != 220:
+            raise SMTPRejected(code, "greeting")
+        cls._command(channel, b"EHLO maddyweb.local", deadline, {250}, "EHLO")
+        auth = base64.b64encode(b"\0" + username.encode() + b"\0" + password.encode())
+        code, _ = cls._command(
+            channel,
+            b"AUTH PLAIN " + auth,
+            deadline,
+            {235, 334},
+            "AUTH",
+        )
+        if code == 334:
+            cls._command(channel, auth, deadline, {235}, "AUTH")
+
+    def authenticate(self, *, username: str, password: str) -> None:
+        """Verify one Maddy credential without starting a mail transaction."""
+
+        username = _email_address(username, "SMTP username")
+        password = self._validated_password(password)
+        channel = self._open_channel()
+        deadline = time.monotonic() + self.timeout
+        try:
+            self._authenticate_channel(
+                channel,
+                username=username,
+                password=password,
+                deadline=deadline,
+            )
+            with suppress(SMTPError):
+                self._command(channel, b"QUIT", deadline, {221}, "QUIT")
+        finally:
+            channel.close()
+
     def send(
         self,
         *,
@@ -751,33 +830,20 @@ class SMTPSubmissionClient:
         recipients = tuple(_email_address(value, "recipient") for value in recipients)
         if not recipients or len(recipients) > 100:
             raise ValueError("SMTP requires between 1 and 100 recipients")
-        if not password or len(password) > 1024 or any(char in password for char in "\r\n\0"):
-            raise ValueError("invalid SMTP password")
+        password = self._validated_password(password)
         if type(message_length) is not int or not 1 <= message_length <= self.max_message_bytes:
             raise ValueError("invalid message length")
 
-        if self.target.mode.value == "docker":
-            container_id = self._validate_docker_runtime()
-            channel = self._channel(docker_container=container_id)
-        else:
-            channel = self._channel()
+        channel = self._open_channel()
         deadline = time.monotonic() + self.timeout
         data_terminator_sent = False
         try:
-            code, _ = self._response(channel, deadline)
-            if code != 220:
-                raise SMTPRejected(code, "greeting")
-            self._command(channel, b"EHLO maddyweb.local", deadline, {250}, "EHLO")
-            auth = base64.b64encode(b"\0" + username.encode() + b"\0" + password.encode())
-            code, _ = self._command(
+            self._authenticate_channel(
                 channel,
-                b"AUTH PLAIN " + auth,
-                deadline,
-                {235, 334},
-                "AUTH",
+                username=username,
+                password=password,
+                deadline=deadline,
             )
-            if code == 334:
-                self._command(channel, auth, deadline, {235}, "AUTH")
             self._command(
                 channel,
                 f"MAIL FROM:<{mail_from}>".encode(),
@@ -851,40 +917,134 @@ class _Operation:
     mutating: bool = False
     stream_in: bool = False
     stream_out: bool = False
+    permission: Literal["public", "session", "admin", "admin_account", "account"] = "admin"
+    step_up: bool = False
 
 
 ALLOWED_OPERATIONS: Mapping[str, _Operation] = {
-    "maddy.health": _Operation("_maddy_health"),
-    "maddy.version": _Operation("_version"),
+    "maddy.health": _Operation("_maddy_health", permission="public"),
+    "maddy.version": _Operation("_version", permission="public"),
     "maddy.verify_config": _Operation("_verify_config"),
+    "auth.password_begin": _Operation("_auth_password_begin", mutating=True, permission="public"),
+    "auth.enrollment_begin": _Operation(
+        "_auth_enrollment_begin",
+        mutating=True,
+        permission="public",
+    ),
+    "auth.enrollment_complete": _Operation(
+        "_auth_enrollment_complete",
+        mutating=True,
+        permission="public",
+    ),
+    "auth.totp_complete": _Operation(
+        "_auth_totp_complete",
+        mutating=True,
+        permission="public",
+    ),
+    "auth.recovery_complete": _Operation(
+        "_auth_recovery_complete",
+        mutating=True,
+        permission="public",
+    ),
+    "auth.session": _Operation("_auth_session", permission="session"),
+    "auth.logout": _Operation("_auth_logout", mutating=True, permission="session"),
+    "auth.change_password": _Operation(
+        "_auth_change_password",
+        mutating=True,
+        permission="session",
+    ),
+    "auth.recovery_regenerate": _Operation(
+        "_auth_recovery_regenerate",
+        mutating=True,
+        permission="session",
+    ),
+    "auth.step_up": _Operation("_auth_step_up", mutating=True, permission="admin"),
+    "auth.admin_rotate_totp": _Operation(
+        "_auth_admin_rotate_totp",
+        mutating=True,
+        permission="admin",
+        step_up=True,
+    ),
     "accounts.list": _Operation("_accounts_list"),
-    "accounts.create": _Operation("_accounts_create", mutating=True),
-    "accounts.change_password": _Operation("_accounts_password", mutating=True),
-    "accounts.disable_credentials": _Operation("_accounts_disable", mutating=True),
-    "accounts.delete_imap_account": _Operation("_accounts_delete_imap", mutating=True),
-    "accounts.get_append_limit": _Operation("_append_limit_get"),
-    "accounts.set_append_limit": _Operation("_append_limit_set", mutating=True),
-    "mailboxes.list": _Operation("_mailboxes_list"),
-    "mailboxes.create": _Operation("_mailboxes_create", mutating=True),
-    "mailboxes.delete": _Operation("_mailboxes_delete", mutating=True),
-    "mailboxes.rename": _Operation("_mailboxes_rename", mutating=True),
-    "messages.list": _Operation("_messages_list"),
-    "messages.get": _Operation("_messages_get", stream_out=True),
-    "messages.append": _Operation("_messages_append", mutating=True, stream_in=True),
-    "messages.delete": _Operation("_messages_delete", mutating=True),
-    "messages.copy": _Operation("_messages_copy", mutating=True),
-    "messages.move": _Operation("_messages_move", mutating=True),
-    "messages.set_flags": _Operation("_messages_set_flags", mutating=True),
-    "messages.add_flags": _Operation("_messages_add_flags", mutating=True),
-    "messages.remove_flags": _Operation("_messages_remove_flags", mutating=True),
-    "messages.send": _Operation("_messages_send", mutating=True, stream_in=True),
+    "accounts.create": _Operation("_accounts_create", mutating=True, step_up=True),
+    "accounts.change_password": _Operation(
+        "_accounts_password",
+        mutating=True,
+        permission="admin_account",
+        step_up=True,
+    ),
+    "accounts.disable_credentials": _Operation(
+        "_accounts_disable",
+        mutating=True,
+        permission="admin_account",
+        step_up=True,
+    ),
+    "accounts.delete_imap_account": _Operation(
+        "_accounts_delete_imap",
+        mutating=True,
+        permission="admin_account",
+        step_up=True,
+    ),
+    "accounts.get_append_limit": _Operation(
+        "_append_limit_get",
+        permission="admin_account",
+    ),
+    "accounts.set_append_limit": _Operation(
+        "_append_limit_set",
+        mutating=True,
+        permission="admin_account",
+    ),
+    "mailboxes.list": _Operation("_mailboxes_list", permission="account"),
+    "mailboxes.create": _Operation("_mailboxes_create", mutating=True, permission="account"),
+    "mailboxes.delete": _Operation("_mailboxes_delete", mutating=True, permission="account"),
+    "mailboxes.rename": _Operation("_mailboxes_rename", mutating=True, permission="account"),
+    "messages.list": _Operation("_messages_list", permission="account"),
+    "messages.get": _Operation("_messages_get", stream_out=True, permission="account"),
+    "messages.append": _Operation(
+        "_messages_append",
+        mutating=True,
+        stream_in=True,
+        permission="account",
+    ),
+    "messages.delete": _Operation("_messages_delete", mutating=True, permission="account"),
+    "messages.copy": _Operation("_messages_copy", mutating=True, permission="account"),
+    "messages.move": _Operation("_messages_move", mutating=True, permission="account"),
+    "messages.set_flags": _Operation(
+        "_messages_set_flags",
+        mutating=True,
+        permission="account",
+    ),
+    "messages.add_flags": _Operation(
+        "_messages_add_flags",
+        mutating=True,
+        permission="account",
+    ),
+    "messages.remove_flags": _Operation(
+        "_messages_remove_flags",
+        mutating=True,
+        permission="account",
+    ),
+    "messages.send": _Operation(
+        "_messages_send",
+        mutating=True,
+        stream_in=True,
+        permission="account",
+    ),
     "certificates.list": _Operation("_certificates_list"),
     "certificates.health": _Operation("_certificates_health"),
     "certificates.status": _Operation("_certificates_status"),
-    "certificates.timer_enable": _Operation("_certificates_timer_enable", mutating=True),
-    "certificates.timer_disable": _Operation("_certificates_timer_disable", mutating=True),
+    "certificates.timer_enable": _Operation(
+        "_certificates_timer_enable",
+        mutating=True,
+        step_up=True,
+    ),
+    "certificates.timer_disable": _Operation(
+        "_certificates_timer_disable",
+        mutating=True,
+        step_up=True,
+    ),
     "certificates.renew_dry_run": _Operation("_certificates_dry_run", mutating=True),
-    "certificates.renew": _Operation("_certificates_renew", mutating=True),
+    "certificates.renew": _Operation("_certificates_renew", mutating=True, step_up=True),
 }
 
 
@@ -921,20 +1081,175 @@ class PrivilegedDispatcher:
         *,
         spool_dir: Path,
         smtp: SMTPSubmissionClient | None = None,
+        auth_store: Any | None = None,
         audit: Callable[..., None] = _default_audit,
     ) -> None:
         self.maddy = maddy
         self.certificates = certificates
         self.smtp = smtp
+        self.auth_store = auth_store
         self.spool_dir = spool_dir
         self.audit = audit
         self._lock = threading.RLock()
+        self._request_context = threading.local()
+
+    def close(self) -> None:
+        close = getattr(self.auth_store, "close", None)
+        if callable(close):
+            close()
+
+    @staticmethod
+    def _role_value(principal: Any) -> str:
+        role = getattr(principal, "role", "")
+        return str(getattr(role, "value", role))
+
+    def _current_principal(self) -> Any:
+        principal = getattr(self._request_context, "principal", None)
+        if principal is None:
+            raise AuthorizationDenied("authenticated principal is unavailable")
+        return principal
+
+    def _maddy_account(self, email: str) -> Mapping[str, Any] | None:
+        normalized = email.casefold()
+        for record in self.maddy.list_accounts(include_append_limits=False):
+            username = record.get("username")
+            if isinstance(username, str) and username.casefold() == normalized:
+                return record
+        return None
+
+    def _require_active_principal(self, principal: Any) -> None:
+        record = self._maddy_account(str(principal.email))
+        if (
+            record is not None
+            and record.get("has_credentials") is True
+            and record.get("has_mailbox") is True
+        ):
+            return
+        self.auth_store.revoke_sessions(principal.account_id)
+        raise AuthorizationDenied("mailbox identity is disabled or incomplete")
+
+    def _set_auth_audit(
+        self,
+        principal: Any,
+        *,
+        method: str,
+        client_ip: str,
+    ) -> None:
+        self._request_context.auth_audit = {
+            "actor": str(principal.email),
+            "role": self._role_value(principal),
+            "authentication_method": method,
+            "client_ip": self._client_ip(client_ip),
+        }
+
+    def _authorize_request(
+        self,
+        request: Request,
+        operation: _Operation,
+        *,
+        touch: bool,
+        audit_fields: dict[str, Any] | None = None,
+    ) -> tuple[Request, Any | None]:
+        # Unit tests can construct a dispatcher without an authentication store.
+        # The production CLI always supplies the root-owned store.
+        if self.auth_store is None:
+            return request, None
+        if operation.permission == "public":
+            return request, None
+        if request.auth_token is None:
+            raise AuthorizationDenied("authentication is required")
+        principal = self.auth_store.authenticate_session(request.auth_token, touch=touch)
+        if audit_fields is not None:
+            audit_fields["actor"] = principal.email
+            audit_fields["role"] = self._role_value(principal)
+        self._require_active_principal(principal)
+        if getattr(principal, "password_change_required", False) and request.operation not in {
+            "auth.session",
+            "auth.logout",
+            "auth.change_password",
+        }:
+            raise PasswordChangeRequired("mailbox password change is required")
+        if (
+            operation.permission in {"admin", "admin_account"}
+            and self._role_value(principal) != "admin"
+        ):
+            raise AuthorizationDenied("administrator role is required")
+        if operation.step_up:
+            try:
+                self.auth_store.require_step_up(request.auth_token)
+            except Exception as exc:
+                if type(exc).__name__ in {
+                    "InvalidSessionError",
+                    "StepUpRequiredError",
+                }:
+                    raise StepUpRequired("fresh administrator authentication is required") from exc
+                raise
+
+        params = dict(request.params)
+        if operation.permission in {"account", "admin_account"}:
+            target_id = params.pop("target_account_id", None)
+            if target_id is not None and not isinstance(target_id, str):
+                raise ValueError("target account identifier must be text")
+            if operation.permission == "admin_account" and target_id is None:
+                raise ValueError("administrator target account is required")
+            if target_id is not None:
+                target = self.auth_store.resolve_account_id(target_id)
+                if (
+                    self._role_value(principal) != "admin"
+                    and target.account_id != principal.account_id
+                ):
+                    raise AuthorizationDenied("cross-account access is forbidden")
+            else:
+                target = self.auth_store.resolve_account_id(principal.account_id)
+            params["username"] = target.email
+            if audit_fields is not None:
+                audit_fields["target"] = target.email
+        elif request.operation == "auth.admin_rotate_totp":
+            target_id = params.get("target_account_id")
+            if not isinstance(target_id, str):
+                raise ValueError("administrator target account is required")
+            target = self.auth_store.resolve_account_id(target_id)
+            if audit_fields is not None:
+                audit_fields["target"] = target.email
+        return (
+            Request(
+                request_id=request.request_id,
+                operation=request.operation,
+                params=params,
+                auth_token=request.auth_token,
+                stream_length=request.stream_length,
+            ),
+            principal,
+        )
+
+    def preflight(self, request: Request) -> Response | None:
+        """Authorize a control frame before receiving any declared upload body."""
+
+        operation = ALLOWED_OPERATIONS.get(request.operation)
+        if operation is None:
+            return Response.failure(
+                request.request_id,
+                "operation_denied",
+                "Operation is not allow-listed",
+            )
+        if operation.stream_in is not (request.stream_length is not None):
+            return Response.failure(
+                request.request_id,
+                "invalid_stream",
+                "Operation stream shape does not match",
+            )
+        try:
+            self._authorize_request(request, operation, touch=False)
+        except Exception as exc:
+            code, message = self._safe_error(exc)
+            return Response.failure(request.request_id, code, message)
+        return None
 
     def dispatch(self, request: Request, input_spool: TrustedSpool | None = None) -> DispatchResult:
         fields = {
             "request_id": request.request_id,
             "operation": request.operation,
-            "actor": request.actor,
+            "actor": None,
             "params": redact_for_audit(request.params),
             "stream_length": input_spool.length if input_spool is not None else 0,
         }
@@ -958,6 +1273,16 @@ class PrivilegedDispatcher:
                 )
             )
         try:
+            request, principal = self._authorize_request(
+                request,
+                operation,
+                touch=True,
+                audit_fields=fields,
+            )
+            if principal is not None:
+                fields["actor"] = principal.email
+                fields["role"] = self._role_value(principal)
+            self._request_context.principal = principal
             handler = getattr(self, operation.method)
             if operation.mutating:
                 with self._lock:
@@ -978,6 +1303,9 @@ class PrivilegedDispatcher:
                 result = DispatchResult(response, value)
             else:
                 result = DispatchResult(Response.success(request.request_id, value))
+            authentication_fields = getattr(self._request_context, "auth_audit", None)
+            if isinstance(authentication_fields, Mapping):
+                fields.update(authentication_fields)
             self.audit("helper.operation", outcome="ok", fields=fields)
             return result
         except Exception as exc:
@@ -988,9 +1316,34 @@ class PrivilegedDispatcher:
                 fields={**fields, "error_type": type(exc).__name__},
             )
             return DispatchResult(Response.failure(request.request_id, code, message))
+        finally:
+            self._request_context.principal = None
+            self._request_context.auth_audit = None
 
     @staticmethod
     def _safe_error(exc: Exception) -> tuple[str, str]:
+        auth_error = type(exc).__name__
+        if auth_error == "LoginRateLimitedError":
+            return "rate_limited", "Authentication rate limit exceeded"
+        if auth_error in {"InvalidSessionError"}:
+            return "unauthorized", "Authentication is required"
+        if auth_error in {"InvalidChallengeError"}:
+            return "invalid_challenge", "Authentication challenge is invalid or expired"
+        if auth_error in {"InvalidSecondFactorError"}:
+            return "invalid_second_factor", "The authentication code is invalid"
+        if auth_error in {"AccountNotFoundError", "EnrollmentStateError"}:
+            return "invalid_credentials", "Email address or password is invalid"
+        if isinstance(exc, InvalidCredentials):
+            return "invalid_credentials", "Email address or password is invalid"
+        if isinstance(exc, PasswordChangeRequired):
+            return "password_change_required", "Mailbox password change is required"
+        if isinstance(exc, StepUpRequired):
+            return "step_up_required", "Fresh administrator authentication is required"
+        if isinstance(exc, AuthorizationDenied):
+            return (
+                "forbidden",
+                "The authenticated identity is not allowed to perform this operation",
+            )
         if isinstance(exc, SMTPOutcomeUnknown):
             return "smtp_outcome_unknown", "Delivery outcome is unknown; do not retry automatically"
         if isinstance(exc, SMTPRejected):
@@ -1031,31 +1384,368 @@ class PrivilegedDispatcher:
     def _maddy_health(self, request: Request, _spool: TrustedSpool | None) -> Any:
         _params(request)
         info = self.maddy.version_info()
+        self.maddy.list_accounts(include_append_limits=False)
         return {
             "available": True,
             "version": info["version"],
             "writes_enabled": info["writes_enabled"],
             "write_block_reason": info["write_block_reason"],
             "mode": info["mode"],
+            "storage_available": True,
         }
 
     def _verify_config(self, request: Request, _spool: TrustedSpool | None) -> Any:
         _params(request)
         return {"output": self.maddy.verify_config()}
 
+    @staticmethod
+    def _client_ip(value: Any) -> str:
+        if not isinstance(value, str) or len(value) > 64:
+            raise ValueError("client IP is invalid")
+        try:
+            return str(ipaddress.ip_address(value))
+        except ValueError as exc:
+            raise ValueError("client IP is invalid") from exc
+
+    def _principal_payload(self, principal: Any) -> dict[str, Any]:
+        if self.auth_store is None:
+            raise RuntimeError("authentication service is unavailable")
+        return {
+            "account_id": principal.account_id,
+            "email": principal.email,
+            "role": self._role_value(principal),
+            "password_change_required": principal.password_change_required,
+            "enrollment_state": str(
+                getattr(principal.enrollment_state, "value", principal.enrollment_state)
+            ),
+            "recovery_codes_remaining": self.auth_store.recovery_code_count(principal.account_id),
+            "idle_expires_at": principal.idle_expires_at,
+            "absolute_expires_at": principal.absolute_expires_at,
+        }
+
+    def _issued_session_payload(
+        self,
+        issued: Any,
+        *,
+        recovery_codes: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        return {
+            "session_token": issued.token,
+            "principal": self._principal_payload(issued.principal),
+            "recovery_codes": list(recovery_codes),
+        }
+
+    def _auth_password_begin(self, request: Request, _spool: TrustedSpool | None) -> Any:
+        if self.auth_store is None or self.smtp is None:
+            raise RuntimeError("authentication service is unavailable")
+        values = _params(
+            request,
+            required={"email", "password", "client_ip"},
+        )
+        email = _email_address(values["email"], "email address").casefold()
+        password = self.smtp._validated_password(values["password"])
+        client_ip = self._client_ip(values["client_ip"])
+        self.auth_store.check_login_rate(email, client_ip)
+        try:
+            self.smtp.authenticate(username=email, password=password)
+        except SMTPRejected as exc:
+            if exc.stage == "AUTH":
+                self.auth_store.record_login_result(email, client_ip, success=False)
+                raise InvalidCredentials("email address or password is invalid") from exc
+            raise
+        account_record = self._maddy_account(email)
+        if (
+            account_record is None
+            or account_record.get("has_credentials") is not True
+            or account_record.get("has_mailbox") is not True
+        ):
+            self.auth_store.record_login_result(email, client_ip, success=False)
+            raise InvalidCredentials("email address or password is invalid")
+        accounts = self.auth_store.sync_accounts(
+            (email,),
+            password_change_required=False,
+        )
+        if len(accounts) != 1:
+            raise RuntimeError("authentication metadata synchronization failed")
+        account = accounts[0]
+        challenge = self.auth_store.create_pending_challenge(email)
+        self._set_auth_audit(account, method="password", client_ip=client_ip)
+        enrollment_state = str(getattr(account.enrollment_state, "value", account.enrollment_state))
+        return {
+            "challenge": challenge,
+            "next": "totp" if enrollment_state == "active" else "enrollment",
+        }
+
+    def _auth_enrollment_begin(self, request: Request, _spool: TrustedSpool | None) -> Any:
+        if self.auth_store is None:
+            raise RuntimeError("authentication service is unavailable")
+        values = _params(request, required={"challenge"})
+        enrollment = self.auth_store.begin_totp_enrollment(values["challenge"])
+        return {
+            "secret": enrollment.secret,
+            "provisioning_uri": enrollment.provisioning_uri,
+        }
+
+    def _auth_enrollment_complete(
+        self,
+        request: Request,
+        _spool: TrustedSpool | None,
+    ) -> Any:
+        if self.auth_store is None:
+            raise RuntimeError("authentication service is unavailable")
+        values = _params(request, required={"challenge", "code", "client_ip"})
+        result = self.auth_store.confirm_totp_enrollment(
+            values["challenge"],
+            values["code"],
+        )
+        client_ip = self._client_ip(values["client_ip"])
+        self.auth_store.record_login_result(
+            result.session.principal.email,
+            client_ip,
+            success=True,
+        )
+        self._set_auth_audit(
+            result.session.principal,
+            method="totp_enrollment",
+            client_ip=client_ip,
+        )
+        return self._issued_session_payload(
+            result.session,
+            recovery_codes=result.recovery_codes,
+        )
+
+    def _auth_totp_complete(self, request: Request, _spool: TrustedSpool | None) -> Any:
+        if self.auth_store is None:
+            raise RuntimeError("authentication service is unavailable")
+        values = _params(request, required={"challenge", "code", "client_ip"})
+        issued = self.auth_store.complete_totp_challenge(
+            values["challenge"],
+            values["code"],
+        )
+        client_ip = self._client_ip(values["client_ip"])
+        self.auth_store.record_login_result(issued.principal.email, client_ip, success=True)
+        self._set_auth_audit(issued.principal, method="totp", client_ip=client_ip)
+        return self._issued_session_payload(issued)
+
+    def _auth_recovery_complete(
+        self,
+        request: Request,
+        _spool: TrustedSpool | None,
+    ) -> Any:
+        if self.auth_store is None:
+            raise RuntimeError("authentication service is unavailable")
+        values = _params(
+            request,
+            required={"challenge", "recovery_code", "client_ip"},
+        )
+        issued = self.auth_store.complete_recovery_challenge(
+            values["challenge"],
+            values["recovery_code"],
+        )
+        client_ip = self._client_ip(values["client_ip"])
+        self.auth_store.record_login_result(issued.principal.email, client_ip, success=True)
+        self._set_auth_audit(
+            issued.principal,
+            method="recovery_code",
+            client_ip=client_ip,
+        )
+        return self._issued_session_payload(issued)
+
+    def _auth_session(self, request: Request, _spool: TrustedSpool | None) -> Any:
+        _params(request)
+        return self._principal_payload(self._current_principal())
+
+    def _auth_logout(self, request: Request, _spool: TrustedSpool | None) -> Any:
+        _params(request)
+        if self.auth_store is None or request.auth_token is None:
+            raise AuthorizationDenied("authentication is required")
+        self.auth_store.revoke_session(request.auth_token)
+        return {"logged_out": True}
+
+    def _auth_change_password(self, request: Request, _spool: TrustedSpool | None) -> Any:
+        if self.auth_store is None or self.smtp is None:
+            raise RuntimeError("authentication service is unavailable")
+        values = _params(
+            request,
+            required={"current_password", "new_password", "client_ip"},
+        )
+        principal = self._current_principal()
+        current_password = self.smtp._validated_password(values["current_password"])
+        new_password = self.smtp._validated_password(values["new_password"])
+        client_ip = self._client_ip(values["client_ip"])
+        self.auth_store.check_login_rate(principal.email, client_ip)
+        try:
+            self.smtp.authenticate(username=principal.email, password=current_password)
+        except SMTPRejected as exc:
+            if exc.stage == "AUTH":
+                self.auth_store.record_login_result(
+                    principal.email,
+                    client_ip,
+                    success=False,
+                )
+                raise InvalidCredentials("email address or password is invalid") from exc
+            raise
+        self.auth_store.revoke_sessions(principal.account_id)
+        self.maddy.change_password(principal.email, new_password)
+        self.auth_store.set_password_change_required(
+            principal.account_id,
+            False,
+            revoke_sessions=False,
+        )
+        self.auth_store.record_login_result(principal.email, client_ip, success=True)
+        return {"changed": True, "reauthenticate": True}
+
+    def _auth_recovery_regenerate(
+        self,
+        request: Request,
+        _spool: TrustedSpool | None,
+    ) -> Any:
+        if self.auth_store is None or self.smtp is None:
+            raise RuntimeError("authentication service is unavailable")
+        values = _params(request, required={"password", "code", "client_ip"})
+        principal = self._current_principal()
+        password = self.smtp._validated_password(values["password"])
+        client_ip = self._client_ip(values["client_ip"])
+        self.auth_store.check_login_rate(principal.email, client_ip)
+        try:
+            self.smtp.authenticate(username=principal.email, password=password)
+        except SMTPRejected as exc:
+            if exc.stage == "AUTH":
+                self.auth_store.record_login_result(
+                    principal.email,
+                    client_ip,
+                    success=False,
+                )
+                raise InvalidCredentials("email address or password is invalid") from exc
+            raise
+        codes = self.auth_store.regenerate_recovery_codes(
+            principal.account_id,
+            values["code"],
+        )
+        self.auth_store.record_login_result(principal.email, client_ip, success=True)
+        return {"recovery_codes": list(codes), "reauthenticate": True}
+
+    def _auth_step_up(self, request: Request, _spool: TrustedSpool | None) -> Any:
+        if self.auth_store is None or self.smtp is None or request.auth_token is None:
+            raise RuntimeError("authentication service is unavailable")
+        values = _params(request, required={"password", "code", "client_ip"})
+        principal = self._current_principal()
+        password = self.smtp._validated_password(values["password"])
+        client_ip = self._client_ip(values["client_ip"])
+        self.auth_store.check_login_rate(principal.email, client_ip)
+        try:
+            self.smtp.authenticate(username=principal.email, password=password)
+        except SMTPRejected as exc:
+            if exc.stage == "AUTH":
+                self.auth_store.record_login_result(
+                    principal.email,
+                    client_ip,
+                    success=False,
+                )
+                raise InvalidCredentials("email address or password is invalid") from exc
+            raise
+        self.auth_store.verify_totp(principal.account_id, values["code"])
+        self.auth_store.mark_step_up(request.auth_token)
+        self.auth_store.record_login_result(principal.email, client_ip, success=True)
+        return {"step_up_expires_in": 300}
+
+    def _auth_admin_rotate_totp(
+        self,
+        request: Request,
+        _spool: TrustedSpool | None,
+    ) -> Any:
+        if self.auth_store is None:
+            raise RuntimeError("authentication service is unavailable")
+        values = _params(request, required={"target_account_id", "confirm"})
+        _confirmed(values)
+        target = self.auth_store.resolve_account_id(values["target_account_id"])
+        enrollment, recovery_codes = self.auth_store.rotate_totp(target.account_id)
+        return {
+            "account_id": target.account_id,
+            "email": target.email,
+            "totp_secret": enrollment.secret,
+            "totp_uri": enrollment.provisioning_uri,
+            "recovery_codes": list(recovery_codes),
+        }
+
     def _accounts_list(self, request: Request, _spool: TrustedSpool | None) -> Any:
         values = _params(request, optional={"include_append_limits"})
         include_append_limits = values.get("include_append_limits", True)
         if type(include_append_limits) is not bool:
             raise ValueError("include_append_limits must be a boolean")
-        return self.maddy.list_accounts(include_append_limits=include_append_limits)
+        records = self.maddy.list_accounts(include_append_limits=include_append_limits)
+        if self.auth_store is None:
+            return records
+        accounts = self.auth_store.sync_accounts(
+            record["username"] for record in records if isinstance(record.get("username"), str)
+        )
+        metadata = {account.email.casefold(): account for account in accounts}
+        result: list[dict[str, Any]] = []
+        for record in records:
+            account = metadata.get(str(record.get("username", "")).casefold())
+            if account is None:
+                raise RuntimeError("authentication metadata synchronization failed")
+            result.append(
+                {
+                    **record,
+                    "id": account.account_id,
+                    "address": account.email,
+                    "role": self._role_value(account),
+                    "enrollment_state": str(
+                        getattr(account.enrollment_state, "value", account.enrollment_state)
+                    ),
+                    "password_change_required": account.password_change_required,
+                }
+            )
+        return result
 
     def _accounts_create(self, request: Request, _spool: TrustedSpool | None) -> Any:
         values = _params(request, required={"username", "password"})
-        return self.maddy.create_account(values["username"], values["password"])
+        created = self.maddy.create_account(values["username"], values["password"])
+        if self.auth_store is None:
+            return created
+        try:
+            account, enrollment, recovery_codes = self.auth_store.provision_active_account(
+                values["username"],
+                password_change_required=False,
+            )
+        except Exception as exc:
+            try:
+                self.maddy.delete_account(values["username"])
+            except Exception as rollback_exc:
+                raise PartialOperationError(
+                    "account authentication setup failed and Maddy rollback was not verified",
+                    completed=("credentials.create", "mailbox.create"),
+                    rollback_succeeded=False,
+                ) from rollback_exc
+            raise PartialOperationError(
+                "account authentication setup failed; Maddy account was rolled back",
+                completed=("credentials.create", "mailbox.create"),
+                rollback_succeeded=True,
+            ) from exc
+        return {
+            **created,
+            "id": account.account_id,
+            "address": account.email,
+            "role": self._role_value(account),
+            "totp_secret": enrollment.secret,
+            "totp_uri": enrollment.provisioning_uri,
+            "recovery_codes": list(recovery_codes),
+        }
 
     def _accounts_password(self, request: Request, _spool: TrustedSpool | None) -> Any:
         values = _params(request, required={"username", "password"})
+        target = (
+            self.auth_store.get_account(values["username"]) if self.auth_store is not None else None
+        )
+        if self.auth_store is not None and target is None:
+            raise RuntimeError("authentication metadata synchronization failed")
+        if self.auth_store is not None and target is not None:
+            self.auth_store.set_password_change_required(
+                target.account_id,
+                True,
+                revoke_sessions=True,
+            )
         self.maddy.change_password(values["username"], values["password"])
         return {"changed": True}
 
@@ -1063,12 +1753,27 @@ class PrivilegedDispatcher:
         values = _params(request, required={"username", "confirm"})
         _confirmed(values)
         self.maddy.disable_credentials(values["username"])
+        if self.auth_store is not None:
+            target = self.auth_store.get_account(values["username"])
+            if target is not None:
+                self.auth_store.revoke_sessions(target.account_id)
         return {"credentials_disabled": True}
 
     def _accounts_delete_imap(self, request: Request, _spool: TrustedSpool | None) -> Any:
         values = _params(request, required={"username", "confirm"})
         _confirmed(values)
-        self.maddy.delete_imap_account(values["username"])
+        account_record = self._maddy_account(values["username"])
+        target = (
+            self.auth_store.get_account(values["username"]) if self.auth_store is not None else None
+        )
+        if account_record is not None and account_record.get("has_credentials") is True:
+            self.maddy.disable_credentials(values["username"])
+            if target is not None:
+                self.auth_store.revoke_sessions(target.account_id)
+        if account_record is not None and account_record.get("has_mailbox") is True:
+            self.maddy.delete_imap_account(values["username"])
+        if self.auth_store is not None and target is not None:
+            self.auth_store.delete_account(target.account_id)
         return {"imap_account_deleted": True}
 
     def _append_limit_get(self, request: Request, _spool: TrustedSpool | None) -> Any:
@@ -1095,6 +1800,12 @@ class PrivilegedDispatcher:
     def _mailboxes_delete(self, request: Request, _spool: TrustedSpool | None) -> Any:
         values = _params(request, required={"username", "mailbox", "confirm"})
         _confirmed(values)
+        if self.maddy.list_message_window(
+            values["username"],
+            values["mailbox"],
+            limit=1,
+        ):
+            raise ValueError("mailbox must be empty before deletion")
         self.maddy.delete_mailbox(values["username"], values["mailbox"])
         return {"deleted": True}
 
@@ -1210,9 +1921,16 @@ class PrivilegedDispatcher:
     def _messages_move(self, request: Request, _spool: TrustedSpool | None) -> Any:
         values = _params(
             request,
-            required={"username", "source", "uid", "target_special"},
+            required={"username", "source", "uid"},
+            optional={"target_special", "target"},
         )
-        target = self.maddy.resolve_special_mailbox(values["username"], values["target_special"])
+        if ("target_special" in values) is ("target" in values):
+            raise ValueError("exactly one message target must be supplied")
+        target = (
+            self.maddy.resolve_special_mailbox(values["username"], values["target_special"])
+            if "target_special" in values
+            else values["target"]
+        )
         self.maddy.move_message(values["username"], values["source"], values["uid"], target)
         return {"moved": True, "target": target}
 
@@ -1252,7 +1970,11 @@ class PrivilegedDispatcher:
             ),
             None,
         )
-        if account is None or account.get("has_credentials") is not True:
+        if (
+            account is None
+            or account.get("has_credentials") is not True
+            or account.get("has_mailbox") is not True
+        ):
             raise ValueError("SMTP account is disabled or missing")
         spool.rewind()
         return self.smtp.send(
@@ -1344,6 +2066,14 @@ class UnixHelperServer:
             request = Request.from_payload(
                 receive_frame(connection, max_bytes=self.max_frame_bytes)
             )
+            preflight_failure = self.dispatcher.preflight(request)
+            if preflight_failure is not None:
+                send_frame(
+                    connection,
+                    preflight_failure.to_payload(),
+                    max_bytes=self.max_frame_bytes,
+                )
+                return
             if request.stream_length is not None:
                 if request.stream_length > self.max_stream_bytes:
                     raise StreamError("request stream exceeds configured limit")

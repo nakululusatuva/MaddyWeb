@@ -10,7 +10,7 @@ import pytest
 
 import maddyweb.gateway as gateway_module
 from maddyweb.config import AppConfig
-from maddyweb.gateway import HelperCallError, HelperGateway
+from maddyweb.gateway import HelperCallError, HelperGateway, bind_helper_identity
 from maddyweb.mail import DeliveryRejected, DeliveryUncertain, PreparedMessage
 from maddyweb.protocol import Request, Response
 
@@ -73,9 +73,14 @@ def gateway_with(client: FakeClient, *, certificates: bool = False) -> HelperGat
 async def test_health_has_fixed_schema_discards_accounts_and_is_cached() -> None:
     client = FakeClient(
         {
-            "maddy.version": Response.success(
+            "maddy.health": Response.success(
                 "template",
-                {"version": "0.9.5", "writes_enabled": True, "mode": "docker"},
+                {
+                    "version": "0.9.5",
+                    "writes_enabled": True,
+                    "mode": "docker",
+                    "storage_available": True,
+                },
             ),
             "accounts.list": Response.success(
                 "template",
@@ -108,12 +113,11 @@ async def test_health_has_fixed_schema_discards_accounts_and_is_cached() -> None
     assert "must-not-leak" not in repr(first)
     assert accounts == ({"username": "must-not-leak@example.test"},)
     assert [request.operation for request in client.requests] == [
-        "maddy.version",
-        "accounts.list",
+        "maddy.health",
         "certificates.health",
         "accounts.list",
     ]
-    account_probe = client.requests[1]
+    account_probe = client.requests[2]
     assert account_probe.params == {"include_append_limits": False}
 
 
@@ -123,20 +127,24 @@ async def test_health_cache_ttl_starts_after_slow_probe(
 ) -> None:
     clock = [0.0]
 
-    class SlowVersionClient(FakeClient):
+    class SlowHealthClient(FakeClient):
         def call(self, request: Request) -> Response:
             response = super().call(request)
-            if request.operation == "maddy.version":
+            if request.operation == "maddy.health":
                 clock[0] += 6.0
             return response
 
-    client = SlowVersionClient(
+    client = SlowHealthClient(
         {
-            "maddy.version": Response.success(
+            "maddy.health": Response.success(
                 "template",
-                {"version": "0.9.5", "writes_enabled": True, "mode": "docker"},
+                {
+                    "version": "0.9.5",
+                    "writes_enabled": True,
+                    "mode": "docker",
+                    "storage_available": True,
+                },
             ),
-            "accounts.list": Response.success("template", []),
         }
     )
     monkeypatch.setattr(gateway_module.time, "monotonic", lambda: clock[0])
@@ -145,7 +153,7 @@ async def test_health_cache_ttl_starts_after_slow_probe(
     clock[0] = 11.0
     second = await gateway.health()
     assert second == first
-    assert [request.operation for request in client.requests].count("maddy.version") == 1
+    assert [request.operation for request in client.requests].count("maddy.health") == 1
 
 
 @pytest.mark.asyncio
@@ -396,9 +404,7 @@ async def test_cancelled_account_mutation_invalidates_after_helper_settles() -> 
     client = CancellationClient({})
     gateway = gateway_with(client)
     try:
-        mutation = asyncio.create_task(
-            gateway.create_account("new@example.test", "secret-value")
-        )
+        mutation = asyncio.create_task(gateway.create_account("new@example.test", "secret-value"))
         assert await asyncio.to_thread(mutation_started.wait, 1.0)
         mutation.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -445,9 +451,7 @@ async def test_cancelled_account_mutation_late_failure_has_no_loop_error() -> No
     loop.set_exception_handler(lambda _loop, context: contexts.append(context))
     gateway = gateway_with(LateTransportFailureClient({}))
     try:
-        mutation = asyncio.create_task(
-            gateway.create_account("new@example.test", "secret-value")
-        )
+        mutation = asyncio.create_task(gateway.create_account("new@example.test", "secret-value"))
         assert await asyncio.to_thread(mutation_started.wait, 1.0)
         mutation.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -468,8 +472,8 @@ async def test_cancelled_account_mutation_late_failure_has_no_loop_error() -> No
 
 
 @pytest.mark.asyncio
-async def test_health_storage_probe_bypasses_account_page_cache() -> None:
-    class FailingSecondAccountRead(FakeClient):
+async def test_health_uses_dedicated_probe_without_reading_account_page_cache() -> None:
+    class CountingAccountRead(FakeClient):
         account_calls = 0
 
         def call(self, request: Request) -> Response:
@@ -477,22 +481,21 @@ async def test_health_storage_probe_bypasses_account_page_cache() -> None:
                 return super().call(request)
             self.requests.append(request)
             self.account_calls += 1
-            if self.account_calls == 1:
-                return Response.success(
-                    request.request_id,
-                    [{"username": "cached@example.test"}],
-                )
-            return Response.failure(
+            return Response.success(
                 request.request_id,
-                "maddy_failed",
-                "storage unavailable",
+                [{"username": "cached@example.test"}],
             )
 
-    client = FailingSecondAccountRead(
+    client = CountingAccountRead(
         {
-            "maddy.version": Response.success(
+            "maddy.health": Response.success(
                 "template",
-                {"version": "0.9.5", "writes_enabled": True, "mode": "docker"},
+                {
+                    "version": "0.9.5",
+                    "writes_enabled": True,
+                    "mode": "docker",
+                    "storage_available": False,
+                },
             ),
         }
     )
@@ -501,18 +504,26 @@ async def test_health_storage_probe_bypasses_account_page_cache() -> None:
     health = await gateway.health()
     assert health["status"] == "degraded"
     assert health["storage_available"] is False
-    assert client.account_calls == 2
+    assert client.account_calls == 1
+    assert [request.operation for request in client.requests] == [
+        "accounts.list",
+        "maddy.health",
+    ]
 
 
 @pytest.mark.asyncio
-async def test_health_preserves_version_when_storage_probe_fails() -> None:
+async def test_health_preserves_version_when_storage_is_unavailable() -> None:
     client = FakeClient(
         {
-            "maddy.version": Response.success(
+            "maddy.health": Response.success(
                 "template",
-                {"version": "0.8.2", "writes_enabled": True, "mode": "docker"},
+                {
+                    "version": "0.8.2",
+                    "writes_enabled": True,
+                    "mode": "docker",
+                    "storage_available": False,
+                },
             ),
-            "accounts.list": Response.failure("template", "maddy_failed", "unavailable"),
         }
     )
     health = await gateway_with(client).health()
@@ -523,6 +534,7 @@ async def test_health_preserves_version_when_storage_probe_fails() -> None:
 
 @pytest.mark.asyncio
 async def test_message_page_preserves_authoritative_continuation() -> None:
+    account_id = "a" * 32
     payload = {
         "items": [{"uid": 90, "subject": "one"}],
         "offset": 100,
@@ -533,18 +545,103 @@ async def test_message_page_preserves_authoritative_continuation() -> None:
     client = FakeClient({"messages.list": Response.success("template", payload)})
     gateway = gateway_with(client)
     result = await gateway.list_messages(
-        "user@example.test",
+        account_id,
         "INBOX",
         limit=50,
         offset=100,
     )
     assert result == payload
+    assert client.requests[0].params["target_account_id"] == account_id
+    assert "username" not in client.requests[0].params
     assert client.requests[0].params["limit"] == 50
     assert client.requests[0].params["offset"] == 100
 
 
 @pytest.mark.asyncio
+async def test_gateway_sends_bound_session_and_keeps_password_login_public() -> None:
+    token = "T" * 43
+    account_id = "a" * 32
+    client = FakeClient(
+        {
+            "messages.list": Response.success(
+                "template",
+                {
+                    "items": [],
+                    "offset": 0,
+                    "limit": 50,
+                    "total": None,
+                    "next_offset": None,
+                },
+            ),
+            "auth.password_begin": Response.success(
+                "template",
+                {"challenge": "C" * 43, "next": "totp"},
+            ),
+        }
+    )
+    gateway = gateway_with(client)
+
+    with bind_helper_identity(token):
+        await gateway.list_messages(account_id, "INBOX", limit=50, offset=0)
+        await gateway.begin_password_login(
+            "user@example.test",
+            "mailbox-password",
+            client_ip="127.0.0.1",
+        )
+
+    assert client.requests[0].auth_token == token
+    assert client.requests[0].params["target_account_id"] == account_id
+    assert client.requests[1].auth_token is None
+
+
+@pytest.mark.asyncio
+async def test_reauthentication_operations_send_the_validated_client_ip() -> None:
+    token = "T" * 43
+    client = FakeClient(
+        {
+            "auth.change_password": Response.success("template", {"changed": True}),
+            "auth.recovery_regenerate": Response.success(
+                "template",
+                {"recovery_codes": ["code"]},
+            ),
+            "auth.step_up": Response.success("template", {"step_up_expires_in": 300}),
+        }
+    )
+    gateway = gateway_with(client)
+
+    with bind_helper_identity(token):
+        await gateway.change_own_password(
+            "current-password",
+            "replacement-password",
+            client_ip="203.0.113.40",
+        )
+        await gateway.regenerate_recovery_codes(
+            "current-password",
+            "123456",
+            client_ip="203.0.113.41",
+        )
+        await gateway.step_up(
+            "current-password",
+            "123456",
+            client_ip="203.0.113.42",
+        )
+
+    assert [request.operation for request in client.requests] == [
+        "auth.change_password",
+        "auth.recovery_regenerate",
+        "auth.step_up",
+    ]
+    assert [request.params["client_ip"] for request in client.requests] == [
+        "203.0.113.40",
+        "203.0.113.41",
+        "203.0.113.42",
+    ]
+    assert all(request.auth_token == token for request in client.requests)
+
+
+@pytest.mark.asyncio
 async def test_archive_move_uses_the_existing_special_mailbox_operation() -> None:
+    account_id = "a" * 32
     client = FakeClient(
         {
             "messages.move": Response.success(
@@ -555,14 +652,14 @@ async def test_archive_move_uses_the_existing_special_mailbox_operation() -> Non
     )
     gateway = gateway_with(client)
     target = await gateway.move_message_to_archive(
-        "user@example.test",
+        account_id,
         "INBOX",
         "42",
     )
     assert target == "Stored Mail"
     assert client.requests[0].operation == "messages.move"
     assert client.requests[0].params == {
-        "username": "user@example.test",
+        "target_account_id": account_id,
         "source": "INBOX",
         "uid": "42",
         "target_special": "archive",
@@ -572,6 +669,7 @@ async def test_archive_move_uses_the_existing_special_mailbox_operation() -> Non
 @pytest.mark.asyncio
 @pytest.mark.skipif(os.name == "nt", reason="POSIX private-file mode and ownership contract")
 async def test_raw_message_is_streamed_into_private_existing_file(tmp_path: Path) -> None:
+    account_id = "a" * 32
     raw = b"From: sender@example.test\r\n\r\nbody\r\n"
     client = FakeClient(
         {
@@ -588,7 +686,7 @@ async def test_raw_message_is_streamed_into_private_existing_file(tmp_path: Path
     destination.touch(mode=0o600)
     os.chmod(destination, 0o600)
     size = await gateway.spool_message(
-        "user@example.test",
+        account_id,
         "INBOX",
         "42",
         destination,
@@ -597,7 +695,7 @@ async def test_raw_message_is_streamed_into_private_existing_file(tmp_path: Path
     assert size == len(raw)
     assert destination.read_bytes() == raw
     assert client.requests[0].params == {
-        "username": "user@example.test",
+        "target_account_id": account_id,
         "mailbox": "INBOX",
         "uid": "42",
     }

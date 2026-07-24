@@ -21,6 +21,7 @@ TimeoutStartSec=30s
 TimeoutStopSec=30s
 KillSignal=SIGTERM
 UMask=0077
+LimitCORE=0
 
 # The web process is intentionally unprivileged and cannot edit Maddy state.
 NoNewPrivileges=yes
@@ -36,6 +37,10 @@ ProtectKernelTunables=yes
 ProtectProc=invisible
 ProtectSystem=strict
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# The public service binds only the documented loopback Web port. Prevent a
+# compromised process from impersonating Maddy's local Submission listener.
+SocketBindAllow=tcp:8787
+SocketBindDeny=any
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes

@@ -54,13 +54,13 @@ awk '
     --url http://127.0.0.1:8787/ \
     --requests 200 --concurrency 8 --max-p95-ms 500
 .venv/bin/python scripts/performance-test.py \
-    --url http://127.0.0.1:8787/api/v1/accounts \
+    --url http://127.0.0.1:8787/api/v1/admin/accounts \
     --requests 200 --concurrency 8 --max-p95-ms 500
 .venv/bin/python scripts/performance-test.py \
-    --url 'http://127.0.0.1:8787/api/v1/mail?account=user00%40example.test&mailbox=INBOX' \
+    --url 'http://127.0.0.1:8787/api/v1/admin/mail?account=00000000000000000000000000000001&mailbox=INBOX' \
     --requests 200 --concurrency 8 --max-p95-ms 500
 .venv/bin/python scripts/performance-test.py \
-    --url 'http://127.0.0.1:8787/api/v1/mail/42?account=user00%40example.test&mailbox=INBOX' \
+    --url 'http://127.0.0.1:8787/api/v1/admin/mail/42?account=00000000000000000000000000000001&mailbox=INBOX' \
     --requests 100 --concurrency 8 --max-p95-ms 500
 
 awk '

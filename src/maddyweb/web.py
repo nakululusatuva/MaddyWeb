@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -19,10 +20,11 @@ from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
-from urllib.parse import quote, urlencode
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 from aiohttp import BodyPartReader, web
 
+from .gateway import HelperCallError, bind_helper_identity
 from .mail import (
     MAX_ATTACHMENT_BYTES,
     MAX_RAW_MESSAGE_BYTES,
@@ -36,29 +38,43 @@ from .mail import (
     PreparedMessage,
     attachment_download_headers,
     deliver_and_save,
+    derive_reply_recipients,
     detect_safe_image_type,
     parse_message,
+    reply_subject,
+    reply_thread_headers,
     rewrite_cid_images,
     safe_filename,
     sandboxed_html_document,
 )
 from .protocol import DEFAULT_MAX_STREAM_BYTES
+from .release_attestation import (
+    SUPPORTED_AUTHENTICATION_CAPABILITIES,
+    SUPPORTED_AUTHENTICATION_PROFILE,
+)
 from .security import (
+    CsrfScope,
     SecurityConfig,
     bounded_concurrency_middleware,
     csrf_token_for_request,
     email_document_headers,
+    security_headers_middleware,
     security_middleware,
 )
 
 LOGGER = logging.getLogger(__name__)
 API_VERSION = "v1"
+AUTHENTICATION_PROFILE = SUPPORTED_AUTHENTICATION_PROFILE
+AUTHENTICATION_CAPABILITIES = SUPPORTED_AUTHENTICATION_CAPABILITIES
 MAX_API_JSON_BYTES = 64 * 1024
 MAX_RAW_DOWNLOAD_BYTES = DEFAULT_MAX_STREAM_BYTES
 MAX_MAILBOX_PAGE = 10_000
 MAX_MESSAGE_CURSOR = (1 << 32) - 1
 MAILBOX_CURSOR_CAPACITY = 4096
-_SPA_PATHS = frozenset({"/", "/accounts", "/certificates", "/compose", "/mail"})
+MESSAGE_FRESHNESS_CAPACITY = 4096
+MESSAGE_FRESHNESS_PER_SESSION = 64
+MAX_TOTP_QR_SVG_CHARS = 256 * 1024
+_SPA_PATHS = frozenset({"/", "/accounts", "/certificates", "/compose", "/mail", "/security"})
 _SPA_MAIL_PATH_RE = re.compile(r"\A/mail/([1-9][0-9]{0,9})\Z")
 
 _GATEWAY_KEY = web.AppKey("gateway", object)
@@ -66,7 +82,15 @@ _SETTINGS_KEY = web.AppKey("web_settings", object)
 _MAIL_WORK_KEY = web.AppKey("mail_work_semaphore", object)
 _MAIL_CURSOR_KEY = web.AppKey("mail_cursor_store", object)
 _FRESHNESS_KEY = web.AppKey("message_freshness_store", object)
+_AUTH_PRINCIPAL_KEY = web.RequestKey("authenticated_principal", object)
+_AUTH_TOKEN_KEY = web.RequestKey("authenticated_session_token", str)
+_CLIENT_IP_KEY = web.RequestKey("authenticated_client_ip", str)
+_SESSION_COOKIE_KEY = web.AppKey("session_cookie_name", str)
+_PUBLIC_ORIGIN_KEY = web.AppKey("public_origin", str)
+_SECURE_COOKIE_KEY = web.AppKey("secure_session_cookie", bool)
+_TOTP_ISSUER_KEY = web.AppKey("totp_issuer", str)
 _ACCOUNT_RE = re.compile(r"\A[^\s@/\\\x00-\x1f\x7f]+@[^\s@/\\\x00-\x1f\x7f]+\Z")
+_ACCOUNT_ID_RE = re.compile(r"\A[0-9a-f]{32}\Z")
 _IMAGE_TYPES = {
     "image/gif",
     "image/jpeg",
@@ -82,6 +106,70 @@ class Gateway(MailGateway, Protocol):
 
     async def list_accounts(self) -> Sequence[object]: ...
 
+    async def begin_password_login(
+        self,
+        email: str,
+        password: str,
+        *,
+        client_ip: str,
+    ) -> Mapping[str, object]: ...
+
+    async def begin_totp_enrollment(self, challenge: str) -> Mapping[str, object]: ...
+
+    async def complete_totp_enrollment(
+        self,
+        challenge: str,
+        code: str,
+        *,
+        client_ip: str,
+    ) -> Mapping[str, object]: ...
+
+    async def complete_totp_login(
+        self,
+        challenge: str,
+        code: str,
+        *,
+        client_ip: str,
+    ) -> Mapping[str, object]: ...
+
+    async def complete_recovery_login(
+        self,
+        challenge: str,
+        recovery_code: str,
+        *,
+        client_ip: str,
+    ) -> Mapping[str, object]: ...
+
+    async def session(self, token: str) -> Mapping[str, object]: ...
+
+    async def logout(self, token: str) -> None: ...
+
+    async def change_own_password(
+        self,
+        current_password: str,
+        new_password: str,
+        *,
+        client_ip: str,
+    ) -> Mapping[str, object]: ...
+
+    async def regenerate_recovery_codes(
+        self,
+        password: str,
+        code: str,
+        *,
+        client_ip: str,
+    ) -> Mapping[str, object]: ...
+
+    async def step_up(
+        self,
+        password: str,
+        code: str,
+        *,
+        client_ip: str,
+    ) -> Mapping[str, object]: ...
+
+    async def rotate_account_totp(self, account_id: str) -> Mapping[str, object]: ...
+
     async def health(self) -> Mapping[str, object]: ...
 
     async def create_account(self, username: str, password: str) -> object: ...
@@ -95,6 +183,17 @@ class Gateway(MailGateway, Protocol):
     async def delete_mailbox(self, account_id: str) -> None: ...
 
     async def list_mailboxes(self, account_id: str) -> Sequence[object]: ...
+
+    async def create_mailbox(self, account_id: str, mailbox: str) -> None: ...
+
+    async def rename_mailbox(
+        self,
+        account_id: str,
+        old_name: str,
+        new_name: str,
+    ) -> None: ...
+
+    async def delete_named_mailbox(self, account_id: str, mailbox: str) -> None: ...
 
     async def list_messages(
         self,
@@ -128,6 +227,23 @@ class Gateway(MailGateway, Protocol):
         mailbox: str,
         message_id: str,
     ) -> str: ...
+
+    async def move_message(
+        self,
+        account_id: str,
+        mailbox: str,
+        message_id: str,
+        target: str,
+    ) -> str: ...
+
+    async def set_message_seen(
+        self,
+        account_id: str,
+        mailbox: str,
+        message_id: str,
+        *,
+        seen: bool,
+    ) -> None: ...
 
     async def delete_message_permanently(
         self,
@@ -250,6 +366,7 @@ class _MailboxCursorStore:
 
 @dataclass(frozen=True, slots=True)
 class _FreshnessEntry:
+    owner: str
     account: str
     mailbox: str
     uid: str
@@ -260,43 +377,84 @@ class _FreshnessEntry:
 class _FreshnessStore:
     """Bounded, one-use message snapshots that make stale UIDs fail closed."""
 
-    def __init__(self, *, ttl_seconds: int, capacity: int = 4096) -> None:
-        if ttl_seconds <= 0 or capacity <= 0:
+    def __init__(
+        self,
+        *,
+        ttl_seconds: int,
+        capacity: int = MESSAGE_FRESHNESS_CAPACITY,
+        per_owner_capacity: int = MESSAGE_FRESHNESS_PER_SESSION,
+    ) -> None:
+        if (
+            ttl_seconds <= 0
+            or capacity <= 0
+            or per_owner_capacity <= 0
+            or per_owner_capacity > capacity
+        ):
             raise ValueError("message freshness limits must be positive")
         self._ttl_seconds = ttl_seconds
         self._capacity = capacity
+        self._per_owner_capacity = per_owner_capacity
         self._entries: OrderedDict[str, _FreshnessEntry] = OrderedDict()
+        self._owners: dict[str, OrderedDict[str, None]] = {}
+
+    def _remove(self, token: str) -> _FreshnessEntry | None:
+        entry = self._entries.pop(token, None)
+        if entry is None:
+            return None
+        owner_entries = self._owners.get(entry.owner)
+        if owner_entries is not None:
+            owner_entries.pop(token, None)
+            if not owner_entries:
+                del self._owners[entry.owner]
+        return entry
 
     def _prune(self, now: float) -> None:
         while self._entries:
             token, entry = next(iter(self._entries.items()))
             if entry.expires_at > now:
                 break
-            del self._entries[token]
+            self._remove(token)
 
-    def issue(self, account: str, mailbox: str, uid: str, digest: str) -> str:
+    def issue(
+        self,
+        owner: str,
+        account: str,
+        mailbox: str,
+        uid: str,
+        digest: str,
+    ) -> str:
         now = time.monotonic()
         self._prune(now)
-        if len(self._entries) >= self._capacity:
-            raise web.HTTPServiceUnavailable(text="Confirmation tokens unavailable; try later.")
+        if re.fullmatch(r"[0-9a-f]{64}", owner) is None:
+            raise ValueError("message freshness owner is invalid")
+        owner_entries = self._owners.setdefault(owner, OrderedDict())
+        while len(owner_entries) >= self._per_owner_capacity:
+            self._remove(next(iter(owner_entries)))
         token = secrets.token_urlsafe(32)
         while token in self._entries:
             token = secrets.token_urlsafe(32)
         self._entries[token] = _FreshnessEntry(
+            owner=owner,
             account=account,
             mailbox=mailbox,
             uid=uid,
             digest=digest,
             expires_at=now + self._ttl_seconds,
         )
+        self._owners.setdefault(owner, OrderedDict())[token] = None
+        while len(self._entries) > self._capacity:
+            self._remove(next(iter(self._entries)))
         return token
 
-    def consume(self, token: str) -> _FreshnessEntry | None:
+    def consume(self, token: str, owner: str) -> _FreshnessEntry | None:
         now = time.monotonic()
         self._prune(now)
         if re.fullmatch(r"[A-Za-z0-9_-]{43}", token) is None:
             return None
-        return self._entries.pop(token, None)
+        entry = self._entries.get(token)
+        if entry is None or not secrets.compare_digest(entry.owner, owner):
+            return None
+        return self._remove(token)
 
 
 def _message_page(value: MessagePage | Mapping[str, object]) -> MessagePage:
@@ -488,6 +646,14 @@ def _freshness_store(request: web.Request) -> _FreshnessStore:
     return store
 
 
+def _freshness_owner(request: web.Request) -> str:
+    token = request.get(_AUTH_TOKEN_KEY)
+    if not isinstance(token, str) or re.fullmatch(r"[A-Za-z0-9_-]{43}", token) is None:
+        raise web.HTTPUnauthorized(text="Authentication is required.")
+    account_id = _principal_account_id(request)
+    return hashlib.sha256(f"{account_id}\0{token}".encode("ascii")).hexdigest()
+
+
 @contextlib.asynccontextmanager
 async def _mail_work_slot(request: web.Request) -> AsyncIterator[None]:
     semaphore = request.app[_MAIL_WORK_KEY]
@@ -656,6 +822,239 @@ def _public_error_message(value: object, fallback: str) -> str:
     return value
 
 
+_ANONYMOUS_PATHS = frozenset(
+    {
+        "/login",
+        "/static/login.css",
+        "/static/login.js",
+        "/api/v1/auth/csrf",
+        "/api/v1/auth/password",
+        "/api/v1/auth/enrollment",
+        "/api/v1/auth/enrollment/confirm",
+        "/api/v1/auth/totp",
+        "/api/v1/auth/recovery",
+    }
+)
+_PASSWORD_CHANGE_PATHS = frozenset(
+    {
+        "/security",
+        "/api/v1/auth/session",
+        "/api/v1/auth/logout",
+        "/api/v1/auth/password/change",
+        "/static/app.css",
+        "/static/app.js",
+        "/static/preview.css",
+    }
+)
+
+
+def _session_cookie_name(request: web.Request) -> str:
+    return request.app[_SESSION_COOKIE_KEY]
+
+
+def _principal(request: web.Request) -> Mapping[str, object]:
+    principal = request.get(_AUTH_PRINCIPAL_KEY)
+    if not isinstance(principal, Mapping):
+        raise web.HTTPUnauthorized(text="Authentication is required.")
+    return principal
+
+
+def _principal_account_id(request: web.Request) -> str:
+    account_id = _principal(request).get("account_id")
+    if not isinstance(account_id, str) or _ACCOUNT_ID_RE.fullmatch(account_id) is None:
+        raise web.HTTPUnauthorized(text="Authenticated account is invalid.")
+    return account_id
+
+
+def _require_admin(request: web.Request) -> Mapping[str, object]:
+    principal = _principal(request)
+    if principal.get("role") != "admin":
+        raise web.HTTPForbidden(text="Administrator role is required.")
+    return principal
+
+
+def _clear_session_cookie(request: web.Request, response: web.StreamResponse) -> None:
+    response.del_cookie(
+        _session_cookie_name(request),
+        path="/",
+        secure=request.app[_SECURE_COOKIE_KEY],
+        httponly=True,
+        samesite="Strict",
+    )
+
+
+def _set_session_cookie(
+    request: web.Request,
+    response: web.StreamResponse,
+    token: str,
+) -> None:
+    request[_AUTH_TOKEN_KEY] = token
+    response.set_cookie(
+        _session_cookie_name(request),
+        token,
+        secure=request.app[_SECURE_COOKIE_KEY],
+        httponly=True,
+        samesite="Strict",
+        path="/",
+        max_age=12 * 60 * 60,
+    )
+
+
+def _request_client_ip(request: web.Request) -> str:
+    remote = request.remote or ""
+    try:
+        remote_ip = str(ipaddress.ip_address(remote))
+    except ValueError as exc:
+        raise web.HTTPBadRequest(text="Invalid proxy peer.") from exc
+    public_origin = request.app[_PUBLIC_ORIGIN_KEY]
+    public_host = urlsplit(public_origin).hostname if public_origin else None
+    request_host = request.host.split(":", 1)[0].rstrip(".").casefold()
+    if public_host and request_host == public_host.casefold():
+        if remote_ip != "127.0.0.1":
+            raise web.HTTPBadRequest(text="Untrusted proxy peer.")
+        forwarded_proto = request.headers.getall("X-Forwarded-Proto", [])
+        real_ips = request.headers.getall("X-Real-IP", [])
+        if forwarded_proto != ["https"] or len(real_ips) != 1:
+            raise web.HTTPBadRequest(text="Invalid trusted proxy headers.")
+        if any(
+            request.headers.getall(name, [])
+            for name in ("Forwarded", "X-Forwarded-Host", "X-Forwarded-For")
+        ):
+            raise web.HTTPBadRequest(text="Unexpected forwarding header.")
+        try:
+            return str(ipaddress.ip_address(real_ips[0]))
+        except ValueError as exc:
+            raise web.HTTPBadRequest(text="Invalid client address.") from exc
+    if any(
+        request.headers.getall(name, [])
+        for name in (
+            "Forwarded",
+            "X-Forwarded-Host",
+            "X-Forwarded-For",
+            "X-Forwarded-Proto",
+            "X-Real-IP",
+        )
+    ):
+        raise web.HTTPBadRequest(text="Forwarding headers are not accepted on this host.")
+    return remote_ip
+
+
+def _authentication_middleware() -> web.middleware:
+    @web.middleware
+    async def middleware(
+        request: web.Request,
+        handler: web.RequestHandler,
+    ) -> web.StreamResponse:
+        try:
+            request[_CLIENT_IP_KEY] = _request_client_ip(request)
+        except web.HTTPException as exc:
+            if request.path.startswith("/api/"):
+                return _api_error("invalid_proxy", exc.text, status=exc.status)
+            raise
+
+        if request.path == "/healthz":
+            if request.remote != "127.0.0.1" or request.host.split(":", 1)[0] != "127.0.0.1":
+                raise web.HTTPNotFound()
+            return await handler(request)
+
+        token = request.cookies.get(_session_cookie_name(request))
+        principal: Mapping[str, object] | None = None
+        invalid_session = bool(token)
+        if token and re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
+            try:
+                principal = await _gateway(request).session(token)
+                invalid_session = False
+            except HelperCallError as exc:
+                if exc.code not in {"unauthorized", "forbidden"}:
+                    LOGGER.warning("authentication session helper unavailable", exc_info=True)
+                    if request.path.startswith("/api/") or request.path.startswith("/static/"):
+                        return _api_error(
+                            "authentication_unavailable",
+                            "Authentication service is temporarily unavailable.",
+                            status=503,
+                        )
+                    return web.Response(
+                        status=503,
+                        text="Authentication service is temporarily unavailable.",
+                        headers={"Retry-After": "5"},
+                    )
+            except Exception:
+                LOGGER.warning("authentication session helper unavailable", exc_info=True)
+                if request.path.startswith("/api/") or request.path.startswith("/static/"):
+                    return _api_error(
+                        "authentication_unavailable",
+                        "Authentication service is temporarily unavailable.",
+                        status=503,
+                    )
+                return web.Response(
+                    status=503,
+                    text="Authentication service is temporarily unavailable.",
+                    headers={"Retry-After": "5"},
+                )
+
+        if request.path in _ANONYMOUS_PATHS:
+            if request.path == "/login" and principal is not None:
+                destination = (
+                    "/security" if principal.get("password_change_required") is True else "/"
+                )
+                raise web.HTTPFound(destination)
+            if principal is not None and token is not None:
+                request[_AUTH_PRINCIPAL_KEY] = principal
+                request[_AUTH_TOKEN_KEY] = token
+                with bind_helper_identity(token):
+                    response = await handler(request)
+            else:
+                response = await handler(request)
+            if invalid_session:
+                _clear_session_cookie(request, response)
+            return response
+
+        if principal is None or token is None:
+            if request.path.startswith("/api/") or request.path.startswith("/static/"):
+                response = _api_error(
+                    "unauthorized",
+                    "Authentication is required.",
+                    status=401,
+                )
+            else:
+                response = web.Response(
+                    status=302,
+                    headers={"Location": "/login"},
+                )
+            if invalid_session:
+                _clear_session_cookie(request, response)
+            return response
+
+        if (
+            principal.get("password_change_required") is True
+            and request.path not in _PASSWORD_CHANGE_PATHS
+        ):
+            if request.path.startswith("/api/"):
+                return _api_error(
+                    "password_change_required",
+                    "Change the mailbox password before continuing.",
+                    status=403,
+                )
+            raise web.HTTPFound("/security")
+
+        request[_AUTH_PRINCIPAL_KEY] = principal
+        request[_AUTH_TOKEN_KEY] = token
+        with bind_helper_identity(token):
+            return await handler(request)
+
+    return middleware
+
+
+def _csrf_scope(request: web.Request) -> CsrfScope:
+    session_token = request.get(_AUTH_TOKEN_KEY)
+    if isinstance(session_token, str):
+        return CsrfScope(f"session:{session_token}", False)
+    client_ip = request.get(_CLIENT_IP_KEY)
+    if not isinstance(client_ip, str):
+        raise web.HTTPBadRequest(text="Client identity is unavailable.")
+    return CsrfScope(f"client:{client_ip}", True)
+
+
 def _valid_identifier(value: str) -> bool:
     return not (
         not value
@@ -669,6 +1068,12 @@ def _valid_identifier(value: str) -> bool:
 def _identifier(value: str, label: str) -> str:
     if not _valid_identifier(value):
         raise web.HTTPBadRequest(text=f"Invalid {label}.")
+    return value
+
+
+def _account_id(value: str) -> str:
+    if _ACCOUNT_ID_RE.fullmatch(value) is None:
+        raise web.HTTPBadRequest(text="Invalid account identifier.")
     return value
 
 
@@ -755,7 +1160,7 @@ def _account_payload(record: object) -> dict[str, object]:
     has_mailbox = _record_value(record, "has_mailbox", default=True)
     if type(has_credentials) is not bool or type(has_mailbox) is not bool:
         raise TypeError("account status flags must be booleans")
-    if not _valid_identifier(identifier):
+    if _ACCOUNT_ID_RE.fullmatch(identifier) is None:
         raise TypeError("account list contains an invalid identifier")
     if len(address) > 254 or _ACCOUNT_RE.fullmatch(address) is None:
         raise TypeError("account list contains an invalid address")
@@ -811,18 +1216,10 @@ def _resolved_special_mailbox(
     special: str,
 ) -> str | None:
     field = f"is_{special}"
-    matches = [
-        str(mailbox["name"])
-        for mailbox in mailboxes
-        if mailbox.get(field) is True
-    ]
+    matches = [str(mailbox["name"]) for mailbox in mailboxes if mailbox.get(field) is True]
     if not matches:
         fallback = special.capitalize()
-        matches = [
-            str(mailbox["name"])
-            for mailbox in mailboxes
-            if mailbox["name"] == fallback
-        ]
+        matches = [str(mailbox["name"]) for mailbox in mailboxes if mailbox["name"] == fallback]
     return matches[0] if len(matches) == 1 else None
 
 
@@ -848,7 +1245,15 @@ def _message_summary_payload(record: object) -> dict[str, object]:
         identifier = _normalized_message_uid(str(_record_value(record, "uid", "id")))
     except ValueError as exc:
         raise TypeError("message summary contains an invalid UID") from exc
-    unread = _record_value(record, "unread", default=False)
+    unread_value = _record_value(record, "unread", default=None)
+    if unread_value is None:
+        raw_flags = _record_value(record, "flags", default=())
+        flags = _backend_sequence(raw_flags, "message flags")
+        if any(not isinstance(flag, str) for flag in flags):
+            raise TypeError("message summary flags must contain text")
+        unread = not any(flag.casefold() == r"\seen" for flag in flags)
+    else:
+        unread = unread_value
     if type(unread) is not bool:
         raise TypeError("message summary unread flag must be a boolean")
     return {
@@ -861,13 +1266,7 @@ def _message_summary_payload(record: object) -> dict[str, object]:
 
 
 def _account_identifiers(records: Sequence[object]) -> set[str]:
-    identifiers: set[str] = set()
-    for record in records:
-        for name in ("id", "address", "username"):
-            value = _record_value(record, name, default="")
-            if value:
-                identifiers.add(str(value))
-    return identifiers
+    return {str(_account_payload(record)["id"]) for record in records}
 
 
 def _mailbox_names(records: Sequence[object]) -> set[str]:
@@ -897,6 +1296,397 @@ async def _gateway_error(_request: web.Request, title: str) -> web.Response:
         "Backend failed; check services and audit log.",
         status=502,
     )
+
+
+def _auth_failure(exc: Exception) -> web.Response:
+    code = exc.code if isinstance(exc, HelperCallError) else "backend_failure"
+    if code == "rate_limited":
+        response = _api_error(
+            "rate_limited",
+            "Too many authentication attempts. Try again later.",
+            status=429,
+        )
+        response.headers["Retry-After"] = "60"
+        return response
+    if code in {
+        "invalid_credentials",
+        "invalid_challenge",
+        "invalid_second_factor",
+        "unauthorized",
+    }:
+        return _api_error(
+            code,
+            "Authentication failed.",
+            status=401,
+        )
+    if code in {"smtp_transport", "timeout"}:
+        return _api_error(
+            "authentication_unavailable",
+            "Authentication service is temporarily unavailable.",
+            status=503,
+        )
+    LOGGER.error(
+        "authentication helper failed",
+        exc_info=(type(exc), exc, exc.__traceback__),
+    )
+    return _api_error(
+        "backend_failure",
+        "Authentication service failed safely.",
+        status=502,
+    )
+
+
+def _bounded_auth_text(
+    values: Mapping[str, object],
+    name: str,
+    *,
+    minimum: int,
+    maximum: int,
+) -> str:
+    value = _json_text(values, name)
+    if not minimum <= len(value) <= maximum or any(char in "\r\n\0" for char in value):
+        raise web.HTTPBadRequest(text=f"Field {name} has an invalid length or character.")
+    return value
+
+
+def _totp_qr_svg(provisioning_uri: str) -> str:
+    import segno
+
+    qr_code = segno.make_qr(
+        provisioning_uri,
+        error="M",
+        boost_error=True,
+    )
+    rendered = qr_code.svg_inline(
+        scale=5,
+        border=4,
+        dark="#162033",
+        light="#ffffff",
+    )
+    if (
+        not isinstance(rendered, str)
+        or not rendered.startswith("<svg ")
+        or len(rendered) > MAX_TOTP_QR_SVG_CHARS
+        or not rendered.isascii()
+    ):
+        raise RuntimeError("local QR renderer returned an invalid SVG")
+    return rendered
+
+
+def _valid_totp_provisioning_uri(
+    provisioning_uri: str,
+    *,
+    secret: str,
+    issuer: str,
+) -> bool:
+    try:
+        parsed = urlsplit(provisioning_uri)
+        query = parse_qs(parsed.query, keep_blank_values=True, strict_parsing=True)
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == "otpauth"
+        and parsed.netloc == "totp"
+        and parsed.path.startswith("/")
+        and parsed.fragment == ""
+        and set(query) == {"secret", "issuer", "algorithm", "digits", "period"}
+        and query["secret"] == [secret]
+        and query["issuer"] == [issuer]
+        and query["algorithm"] == ["SHA1"]
+        and query["digits"] == ["6"]
+        and query["period"] == ["30"]
+    )
+
+
+def _login_response(
+    request: web.Request,
+    result: Mapping[str, object],
+) -> web.Response:
+    token = result.get("session_token")
+    principal = result.get("principal")
+    recovery_codes = result.get("recovery_codes", [])
+    if (
+        not isinstance(token, str)
+        or re.fullmatch(r"[A-Za-z0-9_-]{43}", token) is None
+        or not isinstance(principal, Mapping)
+        or not isinstance(recovery_codes, list)
+        or any(not isinstance(code, str) for code in recovery_codes)
+    ):
+        return _api_error(
+            "invalid_backend_response",
+            "Authentication service returned an invalid response.",
+            status=502,
+        )
+    response = _api_response(
+        data={
+            "principal": dict(principal),
+            "recovery_codes": recovery_codes,
+            "csrf_token": csrf_token_for_request(request),
+        }
+    )
+    _set_session_cookie(request, response, token)
+    return response
+
+
+async def api_auth_csrf(request: web.Request) -> web.Response:
+    _read_query(request, allowed_fields=frozenset())
+    return _api_response(data={"csrf_token": csrf_token_for_request(request)})
+
+
+async def api_auth_password(request: web.Request) -> web.Response:
+    values = await _read_json_object(
+        request,
+        allowed_fields=frozenset({"email", "password"}),
+    )
+    email = _bounded_auth_text(values, "email", minimum=3, maximum=254).strip().casefold()
+    password = _bounded_auth_text(values, "password", minimum=1, maximum=1024)
+    values["password"] = ""
+    if _ACCOUNT_RE.fullmatch(email) is None:
+        return _api_error("invalid_credentials", "Authentication failed.", status=401)
+    try:
+        result = await _gateway(request).begin_password_login(
+            email,
+            password,
+            client_ip=_request_client_ip(request),
+        )
+    except Exception as exc:
+        return _auth_failure(exc)
+    finally:
+        password = ""
+    challenge = result.get("challenge")
+    next_step = result.get("next")
+    if (
+        not isinstance(challenge, str)
+        or re.fullmatch(r"[A-Za-z0-9_-]{43}", challenge) is None
+        or next_step not in {"totp", "enrollment"}
+    ):
+        return _api_error(
+            "invalid_backend_response",
+            "Authentication service returned an invalid response.",
+            status=502,
+        )
+    return _api_response(data={"challenge": challenge, "next": next_step})
+
+
+async def api_auth_enrollment(request: web.Request) -> web.Response:
+    values = await _read_json_object(request, allowed_fields=frozenset({"challenge"}))
+    challenge = _bounded_auth_text(values, "challenge", minimum=43, maximum=43)
+    try:
+        result = await _gateway(request).begin_totp_enrollment(challenge)
+    except Exception as exc:
+        return _auth_failure(exc)
+    secret = result.get("secret")
+    uri = result.get("provisioning_uri")
+    issuer = request.app[_TOTP_ISSUER_KEY]
+    if (
+        not isinstance(secret, str)
+        or re.fullmatch(r"[A-Z2-7]{32}", secret) is None
+        or not isinstance(uri, str)
+        or not uri.startswith("otpauth://totp/")
+        or len(uri) > 1024
+        or not _valid_totp_provisioning_uri(uri, secret=secret, issuer=issuer)
+    ):
+        return _api_error(
+            "invalid_backend_response",
+            "Authentication service returned an invalid enrollment.",
+            status=502,
+        )
+    try:
+        qr_svg = await asyncio.to_thread(_totp_qr_svg, uri)
+    except Exception:
+        LOGGER.error("local TOTP QR generation failed", exc_info=True)
+        return _api_error(
+            "qr_generation_failed",
+            "Authenticator setup could not be rendered safely.",
+            status=503,
+        )
+    return _api_response(
+        data={
+            "secret": secret,
+            "issuer": issuer,
+            "provisioning_uri": uri,
+            "qr_svg": qr_svg,
+        }
+    )
+
+
+async def api_auth_enrollment_confirm(request: web.Request) -> web.Response:
+    values = await _read_json_object(
+        request,
+        allowed_fields=frozenset({"challenge", "code"}),
+    )
+    challenge = _bounded_auth_text(values, "challenge", minimum=43, maximum=43)
+    code = _bounded_auth_text(values, "code", minimum=6, maximum=6)
+    try:
+        result = await _gateway(request).complete_totp_enrollment(
+            challenge,
+            code,
+            client_ip=_request_client_ip(request),
+        )
+    except Exception as exc:
+        return _auth_failure(exc)
+    return _login_response(request, result)
+
+
+async def api_auth_totp(request: web.Request) -> web.Response:
+    values = await _read_json_object(
+        request,
+        allowed_fields=frozenset({"challenge", "code"}),
+    )
+    challenge = _bounded_auth_text(values, "challenge", minimum=43, maximum=43)
+    code = _bounded_auth_text(values, "code", minimum=6, maximum=6)
+    try:
+        result = await _gateway(request).complete_totp_login(
+            challenge,
+            code,
+            client_ip=_request_client_ip(request),
+        )
+    except Exception as exc:
+        return _auth_failure(exc)
+    return _login_response(request, result)
+
+
+async def api_auth_recovery(request: web.Request) -> web.Response:
+    values = await _read_json_object(
+        request,
+        allowed_fields=frozenset({"challenge", "recovery_code"}),
+    )
+    challenge = _bounded_auth_text(values, "challenge", minimum=43, maximum=43)
+    recovery_code = _bounded_auth_text(
+        values,
+        "recovery_code",
+        minimum=8,
+        maximum=64,
+    )
+    try:
+        result = await _gateway(request).complete_recovery_login(
+            challenge,
+            recovery_code,
+            client_ip=_request_client_ip(request),
+        )
+    except Exception as exc:
+        return _auth_failure(exc)
+    return _login_response(request, result)
+
+
+async def api_auth_session(request: web.Request) -> web.Response:
+    _read_query(request, allowed_fields=frozenset())
+    principal = request.get(_AUTH_PRINCIPAL_KEY)
+    if not isinstance(principal, Mapping):
+        return _api_error("unauthorized", "Authentication is required.", status=401)
+    return _api_response(
+        data={
+            "principal": dict(principal),
+            "csrf_token": csrf_token_for_request(request),
+        }
+    )
+
+
+async def api_auth_logout(request: web.Request) -> web.Response:
+    await _read_json_object(request, allowed_fields=frozenset())
+    token = request.get(_AUTH_TOKEN_KEY)
+    if not isinstance(token, str):
+        return _api_error("unauthorized", "Authentication is required.", status=401)
+    try:
+        await _gateway(request).logout(token)
+    except Exception:
+        LOGGER.warning("session logout helper failed", exc_info=True)
+        return _api_error(
+            "logout_failed",
+            "Session revocation failed. Retry before leaving this browser.",
+            status=503,
+        )
+    response = _api_response(message="Signed out.")
+    _clear_session_cookie(request, response)
+    return response
+
+
+async def api_auth_change_password(request: web.Request) -> web.Response:
+    values = await _read_json_object(
+        request,
+        allowed_fields=frozenset({"current_password", "new_password"}),
+    )
+    current_password = _bounded_auth_text(
+        values,
+        "current_password",
+        minimum=1,
+        maximum=1024,
+    )
+    new_password = _bounded_auth_text(
+        values,
+        "new_password",
+        minimum=12,
+        maximum=1024,
+    )
+    values["current_password"] = ""
+    values["new_password"] = ""
+    try:
+        await _gateway(request).change_own_password(
+            current_password,
+            new_password,
+            client_ip=_request_client_ip(request),
+        )
+    except Exception as exc:
+        return _auth_failure(exc)
+    finally:
+        current_password = ""
+        new_password = ""
+    response = _api_response(message="Password changed. Sign in again.")
+    _clear_session_cookie(request, response)
+    return response
+
+
+async def api_auth_recovery_regenerate(request: web.Request) -> web.Response:
+    values = await _read_json_object(
+        request,
+        allowed_fields=frozenset({"password", "code"}),
+    )
+    password = _bounded_auth_text(values, "password", minimum=1, maximum=1024)
+    code = _bounded_auth_text(values, "code", minimum=6, maximum=6)
+    values["password"] = ""
+    try:
+        result = await _gateway(request).regenerate_recovery_codes(
+            password,
+            code,
+            client_ip=_request_client_ip(request),
+        )
+    except Exception as exc:
+        return _auth_failure(exc)
+    finally:
+        password = ""
+    recovery_codes = result.get("recovery_codes")
+    if not isinstance(recovery_codes, list) or any(
+        not isinstance(value, str) for value in recovery_codes
+    ):
+        return _api_error(
+            "invalid_backend_response",
+            "Authentication service returned invalid recovery codes.",
+            status=502,
+        )
+    response = _api_response(data={"recovery_codes": recovery_codes})
+    _clear_session_cookie(request, response)
+    return response
+
+
+async def api_auth_step_up(request: web.Request) -> web.Response:
+    values = await _read_json_object(
+        request,
+        allowed_fields=frozenset({"password", "code"}),
+    )
+    password = _bounded_auth_text(values, "password", minimum=1, maximum=1024)
+    code = _bounded_auth_text(values, "code", minimum=6, maximum=6)
+    values["password"] = ""
+    try:
+        result = await _gateway(request).step_up(
+            password,
+            code,
+            client_ip=_request_client_ip(request),
+        )
+    except Exception as exc:
+        return _auth_failure(exc)
+    finally:
+        password = ""
+    return _api_response(data=dict(result))
 
 
 def _health_version(value: object) -> str:
@@ -945,11 +1735,11 @@ async def api_health(request: web.Request) -> web.Response:
 
 
 async def api_session(request: web.Request) -> web.Response:
-    _read_query(request, allowed_fields=frozenset())
-    return _api_response(data={"csrf_token": csrf_token_for_request(request)})
+    return await api_auth_session(request)
 
 
 async def api_accounts(request: web.Request) -> web.Response:
+    _require_admin(request)
     _read_query(request, allowed_fields=frozenset())
     try:
         raw_values = await _gateway(request).list_accounts()
@@ -969,6 +1759,7 @@ async def api_accounts(request: web.Request) -> web.Response:
 
 
 async def create_account(request: web.Request) -> web.Response:
+    _require_admin(request)
     values = await _read_json_object(
         request,
         allowed_fields=frozenset({"username", "password"}),
@@ -981,16 +1772,27 @@ async def create_account(request: web.Request) -> web.Response:
     if not 12 <= len(password) <= 256 or any(char in "\r\n\0" for char in password):
         raise web.HTTPBadRequest(text="Password must contain 12 to 256 valid characters.")
     try:
-        await _gateway(request).create_account(username, password)
+        created = await _gateway(request).create_account(username, password)
     except Exception:
         return await _gateway_error(request, "Account creation failed")
     finally:
         password = ""  # Avoid retaining the immutable reference in this frame.
-    return _api_response(message="Account created.", status=201)
+    if not isinstance(created, Mapping):
+        return _api_error(
+            "invalid_backend_response",
+            "Backend returned an invalid account enrollment.",
+            status=502,
+        )
+    return _api_response(
+        data=dict(created),
+        message="Account created. Save its TOTP and recovery credentials now.",
+        status=201,
+    )
 
 
 async def change_password(request: web.Request) -> web.Response:
-    account_id = _identifier(request.match_info["account_id"], "account identifier")
+    _require_admin(request)
+    account_id = _account_id(request.match_info["account_id"])
     values = await _read_json_object(request, allowed_fields=frozenset({"password"}))
     password = _json_text(values, "password")
     values["password"] = ""
@@ -1006,7 +1808,8 @@ async def change_password(request: web.Request) -> web.Response:
 
 
 async def set_append_limit(request: web.Request) -> web.Response:
-    account_id = _identifier(request.match_info["account_id"], "account identifier")
+    _require_admin(request)
+    account_id = _account_id(request.match_info["account_id"])
     values = await _read_json_object(request, allowed_fields=frozenset({"limit"}))
     limit = values.get("limit")
     if type(limit) is not int:
@@ -1021,7 +1824,8 @@ async def set_append_limit(request: web.Request) -> web.Response:
 
 
 async def disable_credentials(request: web.Request) -> web.Response:
-    account_id = _identifier(request.match_info["account_id"], "account identifier")
+    _require_admin(request)
+    account_id = _account_id(request.match_info["account_id"])
     await _read_json_object(request, allowed_fields=frozenset())
     try:
         await _gateway(request).disable_credentials(account_id)
@@ -1031,7 +1835,8 @@ async def disable_credentials(request: web.Request) -> web.Response:
 
 
 async def delete_mailbox(request: web.Request) -> web.Response:
-    account_id = _identifier(request.match_info["account_id"], "account identifier")
+    _require_admin(request)
+    account_id = _account_id(request.match_info["account_id"])
     values = await _read_json_object(request, allowed_fields=frozenset({"confirmation"}))
     confirmation = _json_text(values, "confirmation")
     account = await _find_account(request, account_id)
@@ -1044,15 +1849,47 @@ async def delete_mailbox(request: web.Request) -> web.Response:
     return _api_response(message="Mailbox permanently deleted.")
 
 
+async def reset_account_totp(request: web.Request) -> web.Response:
+    _require_admin(request)
+    account_id = _account_id(request.match_info["account_id"])
+    values = await _read_json_object(
+        request,
+        allowed_fields=frozenset({"confirmation"}),
+    )
+    if _json_text(values, "confirmation") != "RESET TOTP":
+        raise web.HTTPBadRequest(text="TOTP reset confirmation does not match.")
+    try:
+        result = await _gateway(request).rotate_account_totp(account_id)
+    except HelperCallError as exc:
+        if exc.code == "step_up_required":
+            return _api_error(
+                "step_up_required",
+                "Fresh administrator authentication is required.",
+                status=403,
+            )
+        return await _gateway_error(request, "Could not reset account TOTP")
+    except Exception:
+        return await _gateway_error(request, "Could not reset account TOTP")
+    return _api_response(
+        data=dict(result),
+        message="TOTP reset. Save the new credentials now.",
+    )
+
+
 async def api_mailbox(request: web.Request) -> web.Response:
+    personal_scope = request.path.startswith("/api/v1/me/")
+    if not personal_scope:
+        _require_admin(request)
     query = _read_query(
         request,
         allowed_fields=frozenset({"account", "mailbox", "cursor", "page"}),
     )
-    account = query.get("account", "")
+    if personal_scope and "account" in query:
+        raise web.HTTPBadRequest(text="Personal mailbox APIs do not accept an account field.")
+    account = _principal_account_id(request) if personal_scope else query.get("account", "")
     mailbox_name = query.get("mailbox", "")
     if account:
-        account = _identifier(account, "account identifier")
+        account = _account_id(account)
     if mailbox_name:
         mailbox_name = _mailbox_name(mailbox_name)
     if "page" in query:
@@ -1061,22 +1898,35 @@ async def api_mailbox(request: web.Request) -> web.Response:
     if cursor_token is not None and (not account or not mailbox_name):
         raise web.HTTPBadRequest(text="Pagination cursor lacks account or mailbox context.")
     page_size = _settings(request).page_size
-    try:
-        raw_account_values = await _gateway(request).list_accounts()
-    except Exception:
-        return await _gateway_error(request, "Could not read accounts")
-    try:
-        account_values = _backend_sequence(raw_account_values, "account list")
-        account_payloads = [_account_payload(value) for value in account_values]
-    except TypeError, ValueError:
-        LOGGER.error("account backend returned an invalid payload", exc_info=True)
-        return _api_error(
-            "invalid_backend_response",
-            "Backend returned an invalid account list.",
-            status=502,
-        )
-    if account and account not in _account_identifiers(account_values):
-        raise web.HTTPBadRequest(text="Account is not in the allowed list.")
+    if personal_scope:
+        principal = _principal(request)
+        account_values: Sequence[object] = ()
+        account_payloads = [
+            {
+                "id": account,
+                "address": str(principal.get("email", "")),
+                "has_credentials": True,
+                "has_mailbox": True,
+                "append_limit": None,
+            }
+        ]
+    else:
+        try:
+            raw_account_values = await _gateway(request).list_accounts()
+        except Exception:
+            return await _gateway_error(request, "Could not read accounts")
+        try:
+            account_values = _backend_sequence(raw_account_values, "account list")
+            account_payloads = [_account_payload(value) for value in account_values]
+        except TypeError, ValueError:
+            LOGGER.error("account backend returned an invalid payload", exc_info=True)
+            return _api_error(
+                "invalid_backend_response",
+                "Backend returned an invalid account list.",
+                status=502,
+            )
+        if account and account not in _account_identifiers(account_values):
+            raise web.HTTPBadRequest(text="Account is not in the allowed list.")
     try:
         raw_mailbox_values = await _gateway(request).list_mailboxes(account) if account else ()
     except Exception:
@@ -1185,10 +2035,19 @@ async def api_mailbox(request: web.Request) -> web.Response:
     return _api_response(data=payload)
 
 
-def _mail_context(values: Mapping[str, Any]) -> tuple[str, str]:
-    account = _identifier(_json_text(values, "account"), "account identifier")
+def _mail_context(request: web.Request, values: Mapping[str, Any]) -> tuple[str, str]:
+    account = _account_context(request, values)
     mailbox_name = _mailbox_name(_json_text(values, "mailbox"))
     return account, mailbox_name
+
+
+def _account_context(request: web.Request, values: Mapping[str, Any]) -> str:
+    if request.path.startswith("/api/v1/me/"):
+        if "account" in values:
+            raise web.HTTPBadRequest(text="Personal mailbox APIs do not accept an account field.")
+        return _principal_account_id(request)
+    _require_admin(request)
+    return _account_id(_json_text(values, "account"))
 
 
 async def _parsed_message(
@@ -1282,14 +2141,19 @@ async def _authorize_mail_context(
     mailbox_name: str,
 ) -> None:
     try:
-        accounts_found = _backend_sequence(
-            await _gateway(request).list_accounts(),
-            "account list",
-        )
-        for account_value in accounts_found:
-            _account_payload(account_value)
-        if account not in _account_identifiers(accounts_found):
-            raise web.HTTPBadRequest(text="Account is not in the allowed list.")
+        if request.path.startswith("/api/v1/me/"):
+            if account != _principal_account_id(request):
+                raise web.HTTPForbidden(text="Cross-account access is forbidden.")
+        else:
+            _require_admin(request)
+            accounts_found = _backend_sequence(
+                await _gateway(request).list_accounts(),
+                "account list",
+            )
+            for account_value in accounts_found:
+                _account_payload(account_value)
+            if account not in _account_identifiers(accounts_found):
+                raise web.HTTPBadRequest(text="Account is not in the allowed list.")
         mailboxes_found = _backend_sequence(
             await _gateway(request).list_mailboxes(account),
             "mailbox list",
@@ -1311,7 +2175,7 @@ async def _verify_message_freshness(
     uid: str,
     token: str,
 ) -> None:
-    entry = _freshness_store(request).consume(token)
+    entry = _freshness_store(request).consume(token, _freshness_owner(request))
     if entry is None or entry.account != account or entry.mailbox != mailbox or entry.uid != uid:
         raise web.HTTPConflict(text="Message confirmation expired; refresh and try again.")
     try:
@@ -1327,13 +2191,21 @@ async def _verify_message_freshness(
 
 
 def _message_download_url(
+    request: web.Request,
     message_id: str,
     account: str,
     mailbox_name: str,
     suffix: str,
 ) -> str:
-    query = urlencode({"account": account, "mailbox": mailbox_name})
-    return f"/api/v1/mail/{quote(message_id, safe='')}/{suffix}?{query}"
+    personal_scope = request.path.startswith("/api/v1/me/")
+    query_values = (
+        {"mailbox": mailbox_name}
+        if personal_scope
+        else {"account": account, "mailbox": mailbox_name}
+    )
+    query = urlencode(query_values)
+    prefix = "/api/v1/me/mail" if personal_scope else "/api/v1/admin/mail"
+    return f"{prefix}/{quote(message_id, safe='')}/{suffix}?{query}"
 
 
 async def api_message_action_snapshot(request: web.Request) -> web.Response:
@@ -1341,7 +2213,7 @@ async def api_message_action_snapshot(request: web.Request) -> web.Response:
         request,
         allowed_fields=frozenset({"account", "mailbox"}),
     )
-    account, mailbox_name = _mail_context(query)
+    account, mailbox_name = _mail_context(request, query)
     message_id = _message_uid(request.match_info["message_id"])
     async with _mail_work_slot(request):
         spool = await _spool_raw_message(request, account, mailbox_name)
@@ -1351,6 +2223,7 @@ async def api_message_action_snapshot(request: web.Request) -> web.Response:
         finally:
             await asyncio.to_thread(spool.cleanup)
         freshness = _freshness_store(request).issue(
+            _freshness_owner(request),
             account,
             mailbox_name,
             message_id,
@@ -1372,14 +2245,18 @@ async def api_message_detail(request: web.Request) -> web.Response:
         request,
         allowed_fields=frozenset({"account", "mailbox"}),
     )
-    account, mailbox_name = _mail_context(query)
+    account, mailbox_name = _mail_context(request, query)
     message_id = _message_uid(request.match_info["message_id"])
     async with _mail_work_slot(request):
         try:
             message, digest = await _parsed_message_snapshot(request, account, mailbox_name)
         except PreviewTooLarge as exc:
             freshness = _freshness_store(request).issue(
-                account, mailbox_name, message_id, exc.digest
+                _freshness_owner(request),
+                account,
+                mailbox_name,
+                message_id,
+                exc.digest,
             )
             return _api_response(
                 data={
@@ -1389,10 +2266,22 @@ async def api_message_detail(request: web.Request) -> web.Response:
                     "preview_too_large": True,
                     "size": exc.size,
                     "freshness_token": freshness,
-                    "raw_url": _message_download_url(message_id, account, mailbox_name, "raw"),
+                    "raw_url": _message_download_url(
+                        request,
+                        message_id,
+                        account,
+                        mailbox_name,
+                        "raw",
+                    ),
                 }
             )
-        freshness = _freshness_store(request).issue(account, mailbox_name, message_id, digest)
+        freshness = _freshness_store(request).issue(
+            _freshness_owner(request),
+            account,
+            mailbox_name,
+            message_id,
+            digest,
+        )
         attachments = [
             {
                 "id": attachment.attachment_id,
@@ -1401,6 +2290,7 @@ async def api_message_detail(request: web.Request) -> web.Response:
                 "size": attachment.size,
                 "inline": attachment.inline,
                 "url": _message_download_url(
+                    request,
                     message_id,
                     account,
                     mailbox_name,
@@ -1417,17 +2307,33 @@ async def api_message_detail(request: web.Request) -> web.Response:
                 "preview_too_large": False,
                 "subject": message.subject,
                 "sender": message.sender,
+                "reply_to": list(message.reply_to),
                 "to": list(message.to),
                 "cc": list(message.cc),
                 "date": message.date,
+                "message_id": message.message_id,
+                "in_reply_to": message.in_reply_to,
+                "references": list(message.references),
                 "text": message.text,
                 "has_html": message.html is not None,
                 "html_url": (
-                    _message_download_url(message_id, account, mailbox_name, "html")
+                    _message_download_url(
+                        request,
+                        message_id,
+                        account,
+                        mailbox_name,
+                        "html",
+                    )
                     if message.html is not None
                     else None
                 ),
-                "raw_url": _message_download_url(message_id, account, mailbox_name, "raw"),
+                "raw_url": _message_download_url(
+                    request,
+                    message_id,
+                    account,
+                    mailbox_name,
+                    "raw",
+                ),
                 "attachments": attachments,
                 "freshness_token": freshness,
             }
@@ -1439,7 +2345,7 @@ async def message_html(request: web.Request) -> web.Response:
         request,
         allowed_fields=frozenset({"account", "mailbox"}),
     )
-    account, mailbox_name = _mail_context(query)
+    account, mailbox_name = _mail_context(request, query)
     async with _mail_work_slot(request):
         message = await _parsed_message(request, account, mailbox_name)
         if message.html is None:
@@ -1448,10 +2354,16 @@ async def message_html(request: web.Request) -> web.Response:
         for attachment in message.attachments:
             if attachment.content_id:
                 cid_counts[attachment.content_id] = cid_counts.get(attachment.content_id, 0) + 1
-        context_query = urlencode({"account": account, "mailbox": mailbox_name})
+        personal_scope = request.path.startswith("/api/v1/me/")
+        context_query = urlencode(
+            {"mailbox": mailbox_name}
+            if personal_scope
+            else {"account": account, "mailbox": mailbox_name}
+        )
+        route_prefix = "/api/v1/me/mail" if personal_scope else "/api/v1/admin/mail"
         cid_urls = {
             attachment.content_id: (
-                f"/api/v1/mail/{quote(request.match_info['message_id'], safe='')}/inline/"
+                f"{route_prefix}/{quote(request.match_info['message_id'], safe='')}/inline/"
                 f"{quote(attachment.attachment_id, safe='')}?{context_query}"
             )
             for attachment in message.attachments
@@ -1479,7 +2391,7 @@ async def inline_image(request: web.Request) -> web.Response:
         request,
         allowed_fields=frozenset({"account", "mailbox"}),
     )
-    account, mailbox_name = _mail_context(query)
+    account, mailbox_name = _mail_context(request, query)
     async with _mail_work_slot(request):
         message = await _parsed_message(request, account, mailbox_name)
         attachment_id = _identifier(request.match_info["attachment_id"], "inline image identifier")
@@ -1511,7 +2423,7 @@ async def raw_message(request: web.Request) -> web.StreamResponse:
         request,
         allowed_fields=frozenset({"account", "mailbox"}),
     )
-    account, mailbox_name = _mail_context(query)
+    account, mailbox_name = _mail_context(request, query)
     spool = await _spool_raw_message(request, account, mailbox_name)
     message_id = _message_uid(request.match_info["message_id"])
     headers = attachment_download_headers(f"message-{message_id}.eml")
@@ -1524,7 +2436,7 @@ async def download_attachment(request: web.Request) -> web.Response:
         request,
         allowed_fields=frozenset({"account", "mailbox"}),
     )
-    account, mailbox_name = _mail_context(query)
+    account, mailbox_name = _mail_context(request, query)
     async with _mail_work_slot(request):
         message = await _parsed_message(request, account, mailbox_name)
         attachment_id = _identifier(request.match_info["attachment_id"], "attachment identifier")
@@ -1545,7 +2457,7 @@ async def move_message_to_trash(request: web.Request) -> web.Response:
         request,
         allowed_fields=frozenset({"account", "mailbox", "freshness"}),
     )
-    account, mailbox_name = _mail_context(values)
+    account, mailbox_name = _mail_context(request, values)
     await _verify_message_freshness(
         request,
         account=account,
@@ -1576,7 +2488,7 @@ async def move_message_to_archive(request: web.Request) -> web.Response:
         request,
         allowed_fields=frozenset({"account", "mailbox", "freshness"}),
     )
-    account, mailbox_name = _mail_context(values)
+    account, mailbox_name = _mail_context(request, values)
     await _verify_message_freshness(
         request,
         account=account,
@@ -1611,7 +2523,7 @@ async def delete_message_permanently(request: web.Request) -> web.Response:
         request,
         allowed_fields=frozenset({"account", "mailbox", "freshness", "confirmation"}),
     )
-    account, mailbox_name = _mail_context(values)
+    account, mailbox_name = _mail_context(request, values)
     if _json_text(values, "confirmation") != "PERMANENTLY DELETE":
         raise web.HTTPBadRequest(text="Confirmation text mismatch; message not deleted.")
     await _verify_message_freshness(
@@ -1628,21 +2540,203 @@ async def delete_message_permanently(request: web.Request) -> web.Response:
     return _api_response(message="Message permanently deleted.")
 
 
+async def api_message_reply(request: web.Request) -> web.Response:
+    query = _read_query(
+        request,
+        allowed_fields=frozenset({"account", "mailbox", "mode"}),
+    )
+    account, mailbox_name = _mail_context(request, query)
+    mode = query.get("mode", "reply")
+    if mode not in {"reply", "reply_all"}:
+        raise web.HTTPBadRequest(text="Reply mode is invalid.")
+    async with _mail_work_slot(request):
+        message = await _parsed_message(request, account, mailbox_name)
+    principal = _principal(request)
+    if account == principal.get("account_id"):
+        self_address = str(principal.get("email", ""))
+    else:
+        try:
+            accounts = _backend_sequence(
+                await _gateway(request).list_accounts(),
+                "account list",
+            )
+            matches = [
+                _account_payload(value)
+                for value in accounts
+                if _account_payload(value)["id"] == account
+            ]
+        except Exception:
+            return await _gateway_error(request, "Could not resolve reply identity")
+        if len(matches) != 1:
+            raise web.HTTPBadRequest(text="Reply identity is unavailable.")
+        self_address = str(matches[0]["address"])
+    try:
+        recipients = derive_reply_recipients(
+            message,
+            self_address,
+            reply_all=mode == "reply_all",
+        )
+        in_reply_to, references = reply_thread_headers(message)
+        subject = reply_subject(message.subject)
+    except MailError as exc:
+        raise web.HTTPUnprocessableEntity(text="Reply metadata is invalid.") from exc
+    quote_source = message.text.strip()
+    quoted = "\n".join(f"> {line}" if line else ">" for line in quote_source.splitlines())
+    if len(quoted) > 128 * 1024:
+        quoted = quoted[: 128 * 1024]
+    body = (
+        f"\n\nOn {message.date or 'an earlier date'}, {message.sender or 'the sender'} wrote:\n"
+        f"{quoted}"
+    )
+    return _api_response(
+        data={
+            "sender_account_id": account,
+            "to": list(recipients.to),
+            "cc": list(recipients.cc),
+            "subject": subject,
+            "text": body,
+            "in_reply_to": in_reply_to,
+            "references": list(references),
+        }
+    )
+
+
+async def set_message_read_state(request: web.Request) -> web.Response:
+    message_id = _message_uid(request.match_info["message_id"])
+    values = await _read_json_object(
+        request,
+        allowed_fields=frozenset({"account", "mailbox", "freshness", "seen"}),
+    )
+    account, mailbox_name = _mail_context(request, values)
+    seen = values.get("seen")
+    if type(seen) is not bool:
+        raise web.HTTPBadRequest(text="Seen state must be a boolean.")
+    await _verify_message_freshness(
+        request,
+        account=account,
+        mailbox=mailbox_name,
+        uid=message_id,
+        token=_json_text(values, "freshness"),
+    )
+    try:
+        await _gateway(request).set_message_seen(
+            account,
+            mailbox_name,
+            message_id,
+            seen=seen,
+        )
+    except Exception:
+        return await _gateway_error(request, "Could not update message read state")
+    return _api_response(message="Message marked read." if seen else "Message marked unread.")
+
+
+async def move_message_to_folder(request: web.Request) -> web.Response:
+    message_id = _message_uid(request.match_info["message_id"])
+    values = await _read_json_object(
+        request,
+        allowed_fields=frozenset({"account", "mailbox", "target_mailbox", "freshness"}),
+    )
+    account, mailbox_name = _mail_context(request, values)
+    target = _mailbox_name(_json_text(values, "target_mailbox"))
+    await _verify_message_freshness(
+        request,
+        account=account,
+        mailbox=mailbox_name,
+        uid=message_id,
+        token=_json_text(values, "freshness"),
+    )
+    try:
+        mailboxes = _backend_sequence(
+            await _gateway(request).list_mailboxes(account),
+            "mailbox list",
+        )
+        if target not in _mailbox_names(mailboxes):
+            raise web.HTTPBadRequest(text="Target mailbox is not in the allowed list.")
+        moved_to = await _gateway(request).move_message(
+            account,
+            mailbox_name,
+            message_id,
+            target,
+        )
+    except web.HTTPException:
+        raise
+    except Exception:
+        return await _gateway_error(request, "Could not move message")
+    return _api_response(
+        data={"account": account, "mailbox": moved_to},
+        message="Message moved.",
+    )
+
+
+async def create_mailbox(request: web.Request) -> web.Response:
+    values = await _read_json_object(
+        request,
+        allowed_fields=frozenset({"account", "name"}),
+    )
+    account = _account_context(request, values)
+    name = _mailbox_name(_json_text(values, "name"))
+    try:
+        await _gateway(request).create_mailbox(account, name)
+    except Exception:
+        return await _gateway_error(request, "Could not create mailbox")
+    return _api_response(data={"name": name}, message="Folder created.", status=201)
+
+
+async def rename_mailbox(request: web.Request) -> web.Response:
+    values = await _read_json_object(
+        request,
+        allowed_fields=frozenset({"account", "old_name", "new_name"}),
+    )
+    account = _account_context(request, values)
+    old_name = _mailbox_name(_json_text(values, "old_name"))
+    new_name = _mailbox_name(_json_text(values, "new_name"))
+    try:
+        await _gateway(request).rename_mailbox(account, old_name, new_name)
+    except Exception:
+        return await _gateway_error(request, "Could not rename mailbox")
+    return _api_response(data={"name": new_name}, message="Folder renamed.")
+
+
+async def delete_named_mailbox(request: web.Request) -> web.Response:
+    values = await _read_json_object(
+        request,
+        allowed_fields=frozenset({"account", "name", "confirmation"}),
+    )
+    account = _account_context(request, values)
+    name = _mailbox_name(_json_text(values, "name"))
+    if _json_text(values, "confirmation") != name:
+        raise web.HTTPBadRequest(text="Folder confirmation does not match.")
+    try:
+        await _gateway(request).delete_named_mailbox(account, name)
+    except Exception:
+        return await _gateway_error(request, "Could not delete empty mailbox")
+    return _api_response(message="Empty folder deleted.")
+
+
 async def api_compose(request: web.Request) -> web.Response:
     _read_query(request, allowed_fields=frozenset())
-    try:
-        raw_account_values = await _gateway(request).list_accounts()
-    except Exception:
-        return await _gateway_error(request, "Could not read sending accounts")
-    try:
-        account_values = _backend_sequence(raw_account_values, "account list")
-        senders = _enabled_senders(account_values)
-    except TypeError, ValueError:
-        LOGGER.error("account backend returned an invalid payload", exc_info=True)
-        return _api_error(
-            "invalid_backend_response",
-            "Backend returned an invalid sending account list.",
-            status=502,
+    principal = _principal(request)
+    if principal.get("role") == "admin":
+        try:
+            raw_account_values = await _gateway(request).list_accounts()
+        except Exception:
+            return await _gateway_error(request, "Could not read sending accounts")
+        try:
+            account_values = _backend_sequence(raw_account_values, "account list")
+            senders = _sender_payloads(account_values)
+        except TypeError, ValueError:
+            LOGGER.error("account backend returned an invalid payload", exc_info=True)
+            return _api_error(
+                "invalid_backend_response",
+                "Backend returned an invalid sending account list.",
+                status=502,
+            )
+    else:
+        senders = (
+            {
+                "id": _principal_account_id(request),
+                "address": str(principal.get("email", "")),
+            },
         )
     return _api_response(
         data={
@@ -1660,6 +2754,21 @@ def _enabled_senders(accounts_found: Sequence[object]) -> tuple[str, ...]:
             continue
         result.append(str(payload["address"]))
     return tuple(dict.fromkeys(result))
+
+
+def _sender_payloads(accounts_found: Sequence[object]) -> tuple[dict[str, str], ...]:
+    result: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for account in _backend_sequence(accounts_found, "account list"):
+        payload = _account_payload(account)
+        if payload["has_credentials"] is not True:
+            continue
+        identifier = str(payload["id"])
+        if identifier in seen:
+            continue
+        seen.add(identifier)
+        result.append({"id": identifier, "address": str(payload["address"])})
+    return tuple(result)
 
 
 def _ensure_temp_directory(settings: WebSettings) -> None:
@@ -1848,6 +2957,7 @@ async def send_message(request: web.Request) -> web.Response:
             scalar_fields=frozenset(
                 {
                     "sender",
+                    "sender_account_id",
                     "sender_name",
                     "password",
                     "to",
@@ -1857,11 +2967,14 @@ async def send_message(request: web.Request) -> web.Response:
                     "text",
                     "html",
                     "inline_cids",
+                    "in_reply_to",
+                    "references",
                 }
             ),
             file_fields=frozenset({"attachments", "inline_images"}),
             scalar_limits={
                 "sender": 1024,
+                "sender_account_id": 128,
                 "sender_name": 1024,
                 "password": 4096,
                 "to": 16 * 1024,
@@ -1871,6 +2984,8 @@ async def send_message(request: web.Request) -> web.Response:
                 "text": 2 * 1024 * 1024,
                 "html": 2 * 1024 * 1024,
                 "inline_cids": 512,
+                "in_reply_to": 1024,
+                "references": 16 * 1024,
             },
             repeatable_scalar_fields=frozenset({"inline_cids"}),
         )
@@ -1898,13 +3013,32 @@ async def send_message(request: web.Request) -> web.Response:
             )
             for upload in files.get("attachments", [])
         )
-        try:
-            allowed_senders = _enabled_senders(await _gateway(request).list_accounts())
-        except Exception:
-            return await _gateway_error(request, "Could not validate sending account")
-        sender = _one(scalars, "sender")
-        if sender not in allowed_senders:
-            raise web.HTTPForbidden(text="Sender is not an enabled account.")
+        principal = _principal(request)
+        selected_account_id = _one(scalars, "sender_account_id")
+        submitted_sender = _one(scalars, "sender")
+        if principal.get("role") == "admin":
+            try:
+                sender_records = _sender_payloads(await _gateway(request).list_accounts())
+            except Exception:
+                return await _gateway_error(request, "Could not validate sending account")
+            sender_by_id = {value["id"]: value["address"] for value in sender_records}
+            if not selected_account_id and submitted_sender:
+                matching_ids = [
+                    identifier
+                    for identifier, address in sender_by_id.items()
+                    if address == submitted_sender
+                ]
+                selected_account_id = matching_ids[0] if len(matching_ids) == 1 else ""
+            sender = sender_by_id.get(selected_account_id, "")
+            if not sender:
+                raise web.HTTPForbidden(text="Sender is not an enabled account.")
+        else:
+            selected_account_id = _principal_account_id(request)
+            sender = str(principal.get("email", ""))
+            if _one(scalars, "sender_account_id") not in {"", selected_account_id}:
+                raise web.HTTPForbidden(text="Cross-account sending is forbidden.")
+            if submitted_sender not in {"", sender}:
+                raise web.HTTPForbidden(text="Cross-account sending is forbidden.")
         submission_password = _one(scalars, "password")
         if (
             not submission_password
@@ -1924,16 +3058,25 @@ async def send_message(request: web.Request) -> web.Response:
             html=html_body or None,
             inline_images=inline_images,
             attachments=attachments,
+            in_reply_to=_one(scalars, "in_reply_to"),
+            references=tuple(_one(scalars, "references").split()),
         )
         _ensure_temp_directory(_settings(request))
         try:
             async with _mail_work_slot(request):
-                result: DeliveryResult = await deliver_and_save(
-                    _gateway(request),
-                    outgoing,
-                    submission_password=submission_password,
-                    spool_directory=_settings(request).temp_dir,
-                )
+                auth_token = request.get(_AUTH_TOKEN_KEY)
+                if not isinstance(auth_token, str):
+                    raise web.HTTPUnauthorized(text="Authentication is required.")
+                with bind_helper_identity(
+                    auth_token,
+                    target_account_id=selected_account_id,
+                ):
+                    result: DeliveryResult = await deliver_and_save(
+                        _gateway(request),
+                        outgoing,
+                        submission_password=submission_password,
+                        spool_directory=_settings(request).temp_dir,
+                    )
             submission_password = ""
         except MailError as exc:
             LOGGER.info("invalid outgoing message: %s", exc)
@@ -2015,6 +3158,7 @@ def _certificate_payload(certificate: object) -> dict[str, object]:
 
 
 async def api_certificates(request: web.Request) -> web.Response:
+    _require_admin(request)
     _read_query(request, allowed_fields=frozenset())
     try:
         status = await _gateway(request).certificate_status()
@@ -2068,6 +3212,7 @@ async def api_certificates(request: web.Request) -> web.Response:
 
 
 async def set_certificate_timer(request: web.Request) -> web.Response:
+    _require_admin(request)
     values = await _read_json_object(request, allowed_fields=frozenset({"action"}))
     action = _json_text(values, "action")
     if action not in {"enable", "disable"}:
@@ -2085,6 +3230,7 @@ async def set_certificate_timer(request: web.Request) -> web.Response:
 
 
 async def certificate_dry_run(request: web.Request) -> web.Response:
+    _require_admin(request)
     certificate_name = await _allowed_certificate_name(request)
     try:
         await _gateway(request).certificate_dry_run(certificate_name)
@@ -2094,6 +3240,7 @@ async def certificate_dry_run(request: web.Request) -> web.Response:
 
 
 async def renew_certificate_if_due(request: web.Request) -> web.Response:
+    _require_admin(request)
     certificate_name = await _allowed_certificate_name(request)
     try:
         await _gateway(request).renew_certificate_if_due(certificate_name)
@@ -2147,22 +3294,36 @@ async def app_shell(_request: web.Request) -> web.Response:
     )
 
 
+async def login_shell(_request: web.Request) -> web.Response:
+    return web.Response(
+        body=_static_body("login.html"),
+        content_type="text/html",
+        charset="utf-8",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 async def static_asset(request: web.Request) -> web.Response:
     name = request.match_info["name"]
     content_types = {
         "app.css": "text/css",
         "app.js": "application/javascript",
         "preview.css": "text/css",
+        "login.css": "text/css",
+        "login.js": "application/javascript",
     }
     content_type = content_types.get(name)
     if content_type is None:
         raise web.HTTPNotFound()
+    cache_control = (
+        "public, max-age=3600" if name in {"login.css", "login.js"} else "private, no-store"
+    )
     return web.Response(
         body=_static_body(name),
         content_type=content_type,
         charset="utf-8",
         headers={
-            "Cache-Control": "public, max-age=3600",
+            "Cache-Control": cache_control,
             "X-Content-Type-Options": "nosniff",
         },
     )
@@ -2212,11 +3373,27 @@ def create_app(config: object, gateway: Gateway) -> web.Application:
         )
     )
     csrf_ttl = int(_config_value(config, "security.csrf_ttl_seconds", 900))
-    cookie_name = str(_config_value(config, "security.cookie_name", "__Host-maddyweb"))
+    csrf_cookie_name = str(
+        _config_value(
+            config,
+            "security.csrf_cookie_name",
+            _config_value(config, "security.cookie_name", "__Host-maddyweb-csrf"),
+        )
+    )
+    session_cookie_name = str(
+        _config_value(
+            config,
+            "security.session_cookie_name",
+            "__Host-maddyweb-session",
+        )
+    )
     secure_cookies = bool(_config_value(config, "security.secure_cookies", True))
-    public_origins = tuple(
+    public_origin = str(_config_value(config, "security.public_origin", ""))
+    totp_issuer = str(_config_value(config, "security.totp_issuer", "MaddyWeb"))
+    configured_origins = tuple(
         str(value) for value in _config_value(config, "security.public_origins", ())
     )
+    public_origins = (public_origin,) if public_origin else configured_origins
     signing_key = _session_key(config)
 
     browser_security = SecurityConfig(
@@ -2224,7 +3401,7 @@ def create_app(config: object, gateway: Gateway) -> web.Application:
         session_signing_key=signing_key,
         public_origins=public_origins,
         secure_cookies=secure_cookies,
-        csrf_cookie_name=cookie_name,
+        csrf_cookie_name=csrf_cookie_name,
         csrf_max_age=csrf_ttl,
         request_body_timeout_seconds=request_body_timeout,
     )
@@ -2236,8 +3413,13 @@ def create_app(config: object, gateway: Gateway) -> web.Application:
     )
     app = web.Application(
         middlewares=[
+            security_headers_middleware(browser_security),
             bounded_concurrency_middleware(concurrency),
-            security_middleware(browser_security),
+            _authentication_middleware(),
+            security_middleware(
+                browser_security,
+                scope_resolver=_csrf_scope,
+            ),
         ],
         client_max_size=max_upload,
         handler_args={
@@ -2250,12 +3432,37 @@ def create_app(config: object, gateway: Gateway) -> web.Application:
     app[_MAIL_WORK_KEY] = asyncio.Semaphore(2)
     app[_MAIL_CURSOR_KEY] = _MailboxCursorStore(ttl_seconds=csrf_ttl)
     app[_FRESHNESS_KEY] = _FreshnessStore(ttl_seconds=csrf_ttl)
+    app[_SESSION_COOKIE_KEY] = session_cookie_name
+    app[_PUBLIC_ORIGIN_KEY] = public_origin
+    app[_SECURE_COOKIE_KEY] = secure_cookies
+    app[_TOTP_ISSUER_KEY] = totp_issuer
     app.add_routes(
         [
             web.get("/", app_shell),
+            web.get("/login", login_shell),
             web.get("/healthz", healthz),
             web.get("/api/v1/health", api_health),
             web.get("/api/v1/session", api_session),
+            web.get("/api/v1/auth/csrf", api_auth_csrf),
+            web.post("/api/v1/auth/password", api_auth_password),
+            web.post("/api/v1/auth/enrollment", api_auth_enrollment),
+            web.post(
+                "/api/v1/auth/enrollment/confirm",
+                api_auth_enrollment_confirm,
+            ),
+            web.post("/api/v1/auth/totp", api_auth_totp),
+            web.post("/api/v1/auth/recovery", api_auth_recovery),
+            web.get("/api/v1/auth/session", api_auth_session),
+            web.post("/api/v1/auth/logout", api_auth_logout),
+            web.post(
+                "/api/v1/auth/password/change",
+                api_auth_change_password,
+            ),
+            web.post(
+                "/api/v1/auth/recovery-codes/regenerate",
+                api_auth_recovery_regenerate,
+            ),
+            web.post("/api/v1/auth/step-up", api_auth_step_up),
             web.get("/api/v1/accounts", api_accounts),
             web.post("/api/v1/accounts", create_account),
             web.post("/api/v1/accounts/{account_id}/password", change_password),
@@ -2288,6 +3495,113 @@ def create_app(config: object, gateway: Gateway) -> web.Application:
             web.post("/api/v1/certificates/dry-run", certificate_dry_run),
             web.post(
                 "/api/v1/certificates/renew-if-due",
+                renew_certificate_if_due,
+            ),
+            web.get("/api/v1/me/mail", api_mailbox),
+            web.get("/api/v1/me/mail/{message_id}/html", message_html),
+            web.get(
+                "/api/v1/me/mail/{message_id}/inline/{attachment_id}",
+                inline_image,
+            ),
+            web.get(
+                "/api/v1/me/mail/{message_id}/attachments/{attachment_id}",
+                download_attachment,
+            ),
+            web.get("/api/v1/me/mail/{message_id}/raw", raw_message),
+            web.get(
+                "/api/v1/me/mail/{message_id}/action-snapshot",
+                api_message_action_snapshot,
+            ),
+            web.get("/api/v1/me/mail/{message_id}/reply", api_message_reply),
+            web.post(
+                "/api/v1/me/mail/{message_id}/read-state",
+                set_message_read_state,
+            ),
+            web.post("/api/v1/me/mail/{message_id}/move", move_message_to_folder),
+            web.post("/api/v1/me/mail/{message_id}/trash", move_message_to_trash),
+            web.post("/api/v1/me/mail/{message_id}/archive", move_message_to_archive),
+            web.post("/api/v1/me/mail/{message_id}/delete", delete_message_permanently),
+            web.get("/api/v1/me/mail/{message_id}", api_message_detail),
+            web.post("/api/v1/me/mailboxes", create_mailbox),
+            web.post("/api/v1/me/mailboxes/rename", rename_mailbox),
+            web.post("/api/v1/me/mailboxes/delete", delete_named_mailbox),
+            web.get("/api/v1/me/compose", api_compose),
+            web.post("/api/v1/me/send", send_message),
+            web.get("/api/v1/admin/accounts", api_accounts),
+            web.post("/api/v1/admin/accounts", create_account),
+            web.post(
+                "/api/v1/admin/accounts/{account_id}/password",
+                change_password,
+            ),
+            web.post(
+                "/api/v1/admin/accounts/{account_id}/append-limit",
+                set_append_limit,
+            ),
+            web.post(
+                "/api/v1/admin/accounts/{account_id}/credentials/disable",
+                disable_credentials,
+            ),
+            web.post(
+                "/api/v1/admin/accounts/{account_id}/delete",
+                delete_mailbox,
+            ),
+            web.post(
+                "/api/v1/admin/accounts/{account_id}/totp/reset",
+                reset_account_totp,
+            ),
+            web.get("/api/v1/admin/mail", api_mailbox),
+            web.get("/api/v1/admin/mail/{message_id}/html", message_html),
+            web.get(
+                "/api/v1/admin/mail/{message_id}/inline/{attachment_id}",
+                inline_image,
+            ),
+            web.get(
+                "/api/v1/admin/mail/{message_id}/attachments/{attachment_id}",
+                download_attachment,
+            ),
+            web.get("/api/v1/admin/mail/{message_id}/raw", raw_message),
+            web.get(
+                "/api/v1/admin/mail/{message_id}/action-snapshot",
+                api_message_action_snapshot,
+            ),
+            web.get("/api/v1/admin/mail/{message_id}/reply", api_message_reply),
+            web.post(
+                "/api/v1/admin/mail/{message_id}/read-state",
+                set_message_read_state,
+            ),
+            web.post(
+                "/api/v1/admin/mail/{message_id}/move",
+                move_message_to_folder,
+            ),
+            web.post(
+                "/api/v1/admin/mail/{message_id}/trash",
+                move_message_to_trash,
+            ),
+            web.post(
+                "/api/v1/admin/mail/{message_id}/archive",
+                move_message_to_archive,
+            ),
+            web.post(
+                "/api/v1/admin/mail/{message_id}/delete",
+                delete_message_permanently,
+            ),
+            web.get("/api/v1/admin/mail/{message_id}", api_message_detail),
+            web.post("/api/v1/admin/mailboxes", create_mailbox),
+            web.post("/api/v1/admin/mailboxes/rename", rename_mailbox),
+            web.post("/api/v1/admin/mailboxes/delete", delete_named_mailbox),
+            web.get("/api/v1/admin/compose", api_compose),
+            web.post("/api/v1/admin/send", send_message),
+            web.get("/api/v1/admin/certificates", api_certificates),
+            web.post(
+                "/api/v1/admin/certificates/timer",
+                set_certificate_timer,
+            ),
+            web.post(
+                "/api/v1/admin/certificates/dry-run",
+                certificate_dry_run,
+            ),
+            web.post(
+                "/api/v1/admin/certificates/renew-if-due",
                 renew_certificate_if_due,
             ),
             web.get("/static/{name}", static_asset),

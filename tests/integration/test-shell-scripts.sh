@@ -13,16 +13,22 @@ fail() {
 while IFS= read -r -d '' script; do
     bash -n -- "$script" || fail "syntax error: $script"
 done < <(find "$ROOT/scripts" "$ROOT/tests/integration" -type f -name '*.sh' -print0)
+bash -n -- "$ROOT/deploy/public-edge/check-public-edge.sh" \
+    || fail "syntax error: deploy/public-edge/check-public-edge.sh"
 
 grep -Fq 'ListenStream=/run/maddyweb/helper.sock' "$ROOT/deploy/systemd/maddyweb-helper.socket" || fail "helper socket path changed"
 grep -Fq 'SocketMode=0660' "$ROOT/deploy/systemd/maddyweb-helper.socket" || fail "helper socket mode changed"
 grep -Eq '^RestrictAddressFamilies=.*AF_UNIX.*AF_INET' "$ROOT/deploy/systemd/maddyweb-helper.service" || fail "helper cannot reach loopback submission"
 grep -Fq 'PrivateTmp=yes' "$ROOT/deploy/systemd/maddyweb.service" || fail "web private temp isolation is disabled"
+grep -Fq 'LimitCORE=0' "$ROOT/deploy/systemd/maddyweb.service" || fail "web core dumps are not disabled"
+grep -Fq 'SocketBindAllow=tcp:8787' "$ROOT/deploy/systemd/maddyweb.service" || fail "web bind allow-list is missing"
+grep -Fq 'SocketBindDeny=any' "$ROOT/deploy/systemd/maddyweb.service" || fail "web bind deny policy is missing"
+grep -Fq 'LimitCORE=0' "$ROOT/deploy/systemd/maddyweb-helper.service" || fail "helper core dumps are not disabled"
 if grep -Fq 'ReadWritePaths=/var/tmp/maddyweb' "$ROOT/deploy/systemd/maddyweb.service"; then
     fail "web private temp directory must not be a host path allow-list"
 fi
 helper_write_paths=$(sed -n 's/^ReadWritePaths=//p' "$ROOT/deploy/systemd/maddyweb-helper.service")
-expected_helper_write_paths='/var/backups/maddyweb /run/maddyweb'
+expected_helper_write_paths='/var/backups/maddyweb /run/maddyweb /var/lib/maddyweb-auth'
 [[ "$helper_write_paths" == "$expected_helper_write_paths" ]] \
     || fail "base helper write allow-list changed or gained native Maddy paths"
 grep -Fq 'd /run/maddyweb         0750 root     maddyweb -' "$ROOT/deploy/systemd/maddyweb.tmpfiles" || fail "helper socket parent ownership changed"
@@ -54,14 +60,22 @@ if (assert_maddy_082_help_profile "$fake_maddy" >/dev/null 2>&1); then
     fail "tampered Maddy 0.8.2 help output matched the verified fingerprint"
 fi
 
-if grep -RIEq '(password[[:space:]]*=|--password|0\.0\.0\.0:8787)' \
+if grep -RIEq --exclude=generate-auth-bootstrap.py \
+    '((^|[^[:alnum:]_])password[[:space:]]*=|--password|0\.0\.0\.0:8787)' \
     "$ROOT/deploy" "$ROOT/docker" "$ROOT/scripts"; then
     fail "an operational artifact contains a forbidden password/public-listener pattern"
 fi
 
-if grep -RIEq '(nginx[[:space:]]+(-s|reload)|systemctl[[:space:]]+(reload|restart)[[:space:]]+nginx|/etc/nginx)' \
+if grep -RIEq --exclude-dir=public-edge \
+    '(nginx[[:space:]]+(-s|reload)|systemctl[[:space:]]+(reload|restart)[[:space:]]+nginx)' \
     "$ROOT/deploy" "$ROOT/docker" "$ROOT/scripts"; then
     fail "an operational script appears to modify Nginx"
 fi
+grep -Fq 'nginx_test=(/usr/bin/nginx -t -c /etc/nginx/nginx.conf)' \
+    "$ROOT/scripts/rollback.sh" \
+    || fail "rollback no longer performs the standalone Nginx read-only test"
+grep -Fq 'nginx_test=(/usr/bin/nginx -t -c /etc/custom-acme/nginx.conf)' \
+    "$ROOT/scripts/rollback.sh" \
+    || fail "rollback no longer performs the Custom Nginx read-only test"
 
 printf 'shell-contracts=ok\n'

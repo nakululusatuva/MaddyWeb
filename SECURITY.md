@@ -2,10 +2,21 @@
 
 ## Security boundary
 
-MaddyWeb is not a public Web application. The only supported Web listener is
-`127.0.0.1:8787`, and the only supported privileged entry point is
-`/run/maddyweb/helper.sock`. Remote operators connect through SSH local forwarding after verifying the host key;
-the administration interface must not be exposed through a public listener, reverse proxy, or Docker port publishing.
+The MaddyWeb application listens only on `127.0.0.1:8787`, and its only
+privileged entry point is `/run/maddyweb/helper.sock`. Internet access is
+supported only through the reviewed Cloudflare-only Nginx edge: Cloudflare
+terminates the visitor connection, the origin Nginx virtual host accepts only
+pinned Cloudflare source ranges and terminates origin TLS, and Nginx connects
+to the loopback application. SSH local forwarding remains an optional
+alternative for a deployment without the public edge. A public application
+listener, Docker port publication, or arbitrary reverse proxy is unsupported.
+
+Public Nginx overwrites `Host`, `X-Real-IP`, and `X-Forwarded-Proto`, clears
+all other forwarding headers, and never exposes `/healthz`. The application
+trusts public-host proxy headers only from a loopback peer, requires the exact
+configured HTTPS origin, and independently enforces Host, Origin or Referer,
+CSRF, and fetch-site checks. Direct origin requests and unlisted proxy peers
+fail closed.
 
 The systemd units demote the Web process to the `maddyweb` user and deny it access to the Docker socket,
 while allowing only loopback networking. Socket activation starts the root helper through a
@@ -27,8 +38,21 @@ helper does not receive Docker socket permission, and the Web process still expl
 - The Web session key is always read from `/var/lib/maddyweb/session.key`. The installer
   atomically creates 48 random bytes as `0600 maddyweb:maddyweb`; existing files are not overwritten,
   but their type, owner, mode, and minimum length are revalidated.
-- Maddy passwords travel from the UI to the local helper and enter the Maddy subprocess through stdin. Logs and
-  audit records contain only the operation category and result, never passwords or message bodies.
+- The root helper keeps authentication state in
+  `/var/lib/maddyweb-auth/auth.sqlite3` under a root-owned `0700` directory.
+  TOTP seeds use AES-256-GCM under the separate root-owned `0600`
+  `/var/lib/maddyweb-auth/master.key`; the Web process cannot read either
+  file.
+- Maddy passwords travel from the UI to the local helper and are used only
+  for the required local SMTP AUTH or fixed Maddy password operation. Logs and
+  audit records contain only trusted operation, actor, target, method, client
+  address, and result fields, never passwords, TOTP values, recovery codes,
+  session tokens, bootstrap data, message bodies, or attachments.
+- Generate initial TOTP and recovery material only through the offline
+  handoff procedure in [docs/authentication.md](docs/authentication.md).
+  Secrets travel to root only through SSH standard input; they never enter
+  arguments, environment variables, remote temporary files, `scp`, stdout,
+  journals, or the repository.
 - Private keys may be read only from allow-listed Certbot live paths in the configuration and cannot be exported through the API,
   uploaded, revoked, deleted, or issued arbitrarily.
 - `/etc/maddyweb/maddyweb.env` may contain only non-secret configuration; by default it contains only the configuration file path.
@@ -40,6 +64,57 @@ does not read an EnvironmentFile. Both the Web and helper interpreters use `-I` 
 
 If a session key, SSH key, or Maddy credential may have leaked, first isolate the host and revoke the affected credentials,
 then rotate them during a controlled outage window. Do not copy secrets into vulnerability reports.
+
+## Authentication and authorization
+
+The Web and mailbox identities are the same canonical full email address.
+There is no independent Web credential database. Password login succeeds only
+after Maddy accepts SMTP AUTH for an enabled account that also has an IMAP
+mailbox. Unknown accounts, disabled credentials, missing mailboxes, and wrong
+passwords return the same external error.
+
+Every account then requires a Google Authenticator compatible RFC 6238
+factor: HMAC-SHA-1, six digits, a 30-second period, and a unique 160-bit
+Base32 seed. A one-step clock-skew window is accepted, but each accepted
+counter is persisted transactionally to prohibit replay. Pending password
+challenges expire after five minutes, and five failed second-factor attempts
+invalidate the challenge. Durable limits cover the client address, account,
+address/account pair, and service-wide attempt rate.
+
+Maddy CLI-created accounts synchronize as ordinary users and must complete
+TOTP enrollment before reaching the application. MaddyWeb-created accounts
+receive an active TOTP factor and ten one-time recovery codes in the account
+creation transaction; those credentials are displayed once. Only keyed
+digests of recovery codes are stored. Recovery login consumes one code and
+revokes other sessions. TOTP reset and recovery-code regeneration replace the
+old material, revoke authentication state, and disclose the replacement only
+once.
+
+Sessions use random 256-bit opaque tokens in Secure, HttpOnly,
+SameSite=Strict, path-rooted `__Host-` cookies. The browser does not store
+identity secrets in URLs, `localStorage`, or `sessionStorage`. The idle limit
+is 30 minutes, the absolute limit is 12 hours, and each account may have at
+most five sessions. Role, password, TOTP, recovery, disable, and delete
+transitions revoke affected sessions and pending challenges. Administrator
+danger operations require a password-and-TOTP step-up valid for five minutes.
+
+Unauthenticated clients can load only the login shell, its local assets, and
+the authentication flow. All application pages redirect to `/login`; all
+protected APIs and application assets reject with 401. Ordinary user
+operations derive the only permitted mailbox from the helper session and do
+not accept a target account. An administrator is itself a real Maddy mailbox
+whose role can be assigned only by the root `maddyweb auth-role` command.
+The Web interface cannot self-elevate. Every send, including administrator
+impersonation of another mailbox, re-verifies the selected sender mailbox's
+current password.
+
+An address deleted with an external Maddy CLI must remain absent until root
+runs `maddyweb auth-purge` for that exact address. Recreating it first is
+prohibited because existing authentication metadata must never carry across
+mailbox identity generations. The coordinated MaddyWeb delete path removes
+both mailbox and authentication metadata. See
+[Authentication and identity operations](docs/authentication.md) for the
+mandatory lifecycle and bootstrap procedures.
 
 ## Production change authorization
 
@@ -171,13 +246,14 @@ Loopback is not an authentication boundary: other local processes on the same VP
 is used only for that SMTP AUTH attempt, passes briefly through a local socket and subprocess stdin, and is never persisted or
 written to the audit log.
 
-Likewise, `127.0.0.1:8787` prevents direct remote network access but does not distinguish an SSH tunnel from other
-local clients on the VPS. Version 1 omits a Web login by explicit requirement. It is therefore supported only without untrusted
-local users, untrusted containers that can reach host loopback, or tenants able to execute arbitrary local requests on a
-single-tenant VPS. If the host does not
-meet this trust boundary, do not deploy; first add independent authentication or use a Unix-socket administration entry point with peer credentials.
-Host, Origin, and CSRF checks are browser-side defense in depth and must not be mistaken for
-local-client authentication.
+Likewise, `127.0.0.1:8787` prevents direct remote network access but does not
+distinguish an SSH tunnel, Nginx, and another local process. Mailbox password,
+TOTP, opaque server-side sessions, authorization in the root helper, Host,
+Origin, and CSRF checks therefore remain mandatory even on loopback.
+Untrusted local root access is outside this boundary: root can read
+authentication storage, alter Maddy, or replace the service. Do not deploy
+multiple mutually untrusted tenants on the same host and treat application
+authentication as protection from host root.
 
 ## Security scan gates
 

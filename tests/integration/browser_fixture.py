@@ -12,12 +12,17 @@ from aiohttp import web
 
 from maddyweb.web import MessagePage, create_app
 
+ACCOUNT_ID = "a" * 32
+ACCOUNT_ADDRESS = "admin@example.test"
+SESSION_COOKIE_NAME = "__Host-maddyweb-browser-session"
+SESSION_TOKEN = "S" * 43
+
 
 class BrowserGateway:
     def __init__(self) -> None:
         message = EmailMessage()
         message["From"] = "attacker@example.test"
-        message["To"] = "admin@example.test"
+        message["To"] = ACCOUNT_ADDRESS
         message["Subject"] = "Browser security fixture"
         message.set_content("plain fallback")
         message.add_alternative(
@@ -55,11 +60,25 @@ class BrowserGateway:
             "certificate_management_enabled": True,
         }
 
+    async def session(self, token: str) -> dict[str, object]:
+        if token != SESSION_TOKEN:
+            raise RuntimeError("invalid browser fixture session")
+        return {
+            "account_id": ACCOUNT_ID,
+            "email": ACCOUNT_ADDRESS,
+            "role": "admin",
+            "password_change_required": False,
+            "enrollment_state": "active",
+            "idle_expires_at": 2_000_000_000,
+            "absolute_expires_at": 2_000_010_000,
+            "recovery_codes_remaining": 10,
+        }
+
     async def list_accounts(self) -> list[dict[str, object]]:
         return [
             {
-                "id": "admin@example.test",
-                "address": "admin@example.test",
+                "id": ACCOUNT_ID,
+                "address": ACCOUNT_ADDRESS,
                 "has_credentials": True,
                 "has_mailbox": True,
             }
@@ -104,6 +123,22 @@ class BrowserGateway:
         return None
 
 
+@web.middleware
+async def _fixture_session_cookie(
+    request: web.Request,
+    handler: web.RequestHandler,
+) -> web.StreamResponse:
+    """Add the fixture session before production authentication middleware."""
+
+    if SESSION_COOKIE_NAME in request.cookies:
+        return await handler(request)
+    headers = request.headers.copy()
+    existing = headers.get("Cookie", "")
+    injected = f"{SESSION_COOKIE_NAME}={SESSION_TOKEN}"
+    headers["Cookie"] = f"{existing}; {injected}" if existing else injected
+    return await handler(request.clone(headers=headers))
+
+
 def main() -> None:
     temp_dir = Path("/tmp/maddyweb-browser-fixture")  # noqa: S108
     temp_dir.mkdir(mode=0o700, exist_ok=True)
@@ -119,12 +154,15 @@ def main() -> None:
         "security": {
             "session_signing_key": b"browser-fixture-process-key-0001",
             "csrf_ttl_seconds": 300,
-            "cookie_name": "__Host-maddyweb",
+            "csrf_cookie_name": "__Host-maddyweb-browser-csrf",
+            "session_cookie_name": SESSION_COOKIE_NAME,
             "secure_cookies": True,
         },
     }
+    app = create_app(config, BrowserGateway())  # type: ignore[arg-type]
+    app.middlewares.insert(0, _fixture_session_cookie)
     web.run_app(
-        create_app(config, BrowserGateway()),  # type: ignore[arg-type]
+        app,
         host="127.0.0.1",
         port=8790,
         access_log=None,

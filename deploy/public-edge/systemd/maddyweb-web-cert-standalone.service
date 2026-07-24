@@ -1,0 +1,40 @@
+[Unit]
+Description=Renew the dedicated maddy.standalone.example.test Web certificate
+Documentation=file:/opt/maddyweb/current/public-edge/public-edge.md
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/var/lib/maddyweb-web-cert/config/renewal/maddy.standalone.example.test.conf
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+LimitCORE=0
+ExecStartPre=/usr/bin/nginx -t -c /etc/nginx/nginx.conf
+ExecStart=/usr/bin/certbot --config /dev/null renew --cert-name maddy.standalone.example.test --non-interactive --no-directory-hooks --config-dir /var/lib/maddyweb-web-cert/config --work-dir /var/lib/maddyweb-web-cert/work --logs-dir /var/lib/maddyweb-web-cert/logs
+ExecStartPost=/usr/bin/nginx -t -c /etc/nginx/nginx.conf
+ExecStartPost=/usr/bin/nginx -s reload
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ReadWritePaths=/var/lib/maddyweb-web-cert
+ReadWritePaths=/var/www/maddyweb-web-acme
+ReadWritePaths=-/var/log/nginx
