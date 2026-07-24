@@ -57,6 +57,12 @@ Copy the template for the selected mode and review every absolute path. After pr
 `/etc/maddyweb/config.toml`, which must be `root:maddyweb 0640`; unknown tables or keys,
 missing keys, non-loopback addresses, and out-of-range values are rejected.
 
+The default MaddyWeb HTTP listener is `127.0.0.1:8787`. Omitting
+`server.listen` selects that default, while all production templates state it
+explicitly so the deployed endpoint remains visible during review. This is the
+Web and API port; the internal Maddy management Submission endpoint uses
+`127.0.0.1:1587` and serves SMTP rather than HTTP.
+
 The following network fields must remain in place:
 
 ```toml

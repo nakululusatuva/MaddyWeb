@@ -39,6 +39,10 @@ _NATIVE_DEPLOYED_CERT = PurePosixPath("/var/lib/maddy/tls/fullchain.pem")
 _NATIVE_DEPLOYED_KEY = PurePosixPath("/var/lib/maddy/tls/privkey.pem")
 _DEFAULT_SESSION_KEY = PurePosixPath("/var/lib/maddyweb/session.key")
 
+DEFAULT_WEB_HOST = "127.0.0.1"
+DEFAULT_WEB_PORT = 8787
+DEFAULT_WEB_LISTEN = f"{DEFAULT_WEB_HOST}:{DEFAULT_WEB_PORT}"
+
 
 class ConfigError(ValueError):
     """Raised when configuration is unsafe or malformed."""
@@ -109,7 +113,7 @@ def _absolute(value: str, name: str) -> PurePosixPath:
 
 @dataclass(frozen=True, slots=True)
 class ServerConfig:
-    listen: str = "127.0.0.1:8787"
+    listen: str = DEFAULT_WEB_LISTEN
     allowed_hosts: tuple[str, ...] = ("127.0.0.1", "localhost")
     concurrency: int = 8
     backlog: int = 16
@@ -141,8 +145,8 @@ class ServerConfig:
             address = ipaddress.ip_address(host)
         except (ValueError, TypeError) as exc:
             raise ConfigError("server.listen must be an IPv4 address and port") from exc
-        if str(address) != "127.0.0.1":
-            raise ConfigError("server.listen must use exactly 127.0.0.1")
+        if str(address) != DEFAULT_WEB_HOST:
+            raise ConfigError(f"server.listen must use exactly {DEFAULT_WEB_HOST}")
         if not 1 <= port <= 65535:
             raise ConfigError("server.listen port is out of range")
         hosts = tuple(
@@ -190,7 +194,7 @@ class ServerConfig:
         if not 1 <= page_size <= 200:
             raise ConfigError("server.page_size must be between 1 and 200")
         return cls(
-            listen=f"127.0.0.1:{port}",
+            listen=f"{DEFAULT_WEB_HOST}:{port}",
             allowed_hosts=hosts,
             concurrency=concurrency,
             backlog=backlog,
