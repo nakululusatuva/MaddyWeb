@@ -74,6 +74,34 @@ _SENSITIVE_KEYS = frozenset(
     }
 )
 _EMAIL_RE = re.compile(r"\A[^\s<>@]+@[^\s<>@]+\Z")
+_DOCKER_NETWORK_MODE_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+_CONTAINER_ID_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+_PROC_NET_ROW_RE = re.compile(
+    r"\A\s*\d+:\s+"
+    r"([0-9A-Fa-f]+):([0-9A-Fa-f]{4})\s+"
+    r"([0-9A-Fa-f]+):([0-9A-Fa-f]{4})\s+"
+    r"([0-9A-Fa-f]{2})(?:\s+.*)?\Z"
+)
+_SUBMISSION_PORT = 1587
+_SUBMISSION_PORT_HEX = "0633"
+_IPV4_LOOPBACK_PROC_HEX = "0100007F"
+_DOCKER_LOCAL_HOST_ARG = "--host=unix:///var/run/docker.sock"
+_DOCKER_INSPECT_MAX_OUTPUT = 256 * 1024
+_PROC_NET_MAX_OUTPUT = 4 * 1024 * 1024
+_PROC_NET_COMBINED_MAX_OUTPUT = 2 * _PROC_NET_MAX_OUTPUT
+_DOCKER_INSPECT_TEMPLATE = (
+    '{"id":{{json .Id}},'
+    '"running":{{json .State.Running}},'
+    '"paused":{{json .State.Paused}},'
+    '"network_mode":{{json .HostConfig.NetworkMode}},'
+    '"port_bindings":{{json .HostConfig.PortBindings}},'
+    '"runtime_ports":{{json .NetworkSettings.Ports}}}'
+)
+_FIXED_SUBPROCESS_ENV = {
+    "LANG": "C",
+    "LC_ALL": "C",
+    "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+}
 
 
 def redact_for_audit(value: Any, *, key: str = "") -> Any:
@@ -122,6 +150,257 @@ class SMTPOutcomeUnknown(SMTPError):
 
 class SMTPTransportError(SMTPError):
     """Connection failed before the message could have been accepted."""
+
+
+@dataclass(frozen=True, slots=True)
+class _DockerSubmissionRuntime:
+    container_id: str
+    network_mode: str
+
+
+def _bounded_command_output(
+    argv: Sequence[str],
+    *,
+    timeout: float,
+    maximum: int,
+) -> bytes:
+    """Run one fixed command while bounding time and captured output."""
+
+    if timeout <= 0 or maximum <= 0:
+        raise SMTPTransportError("Docker Submission runtime check limits are invalid")
+    try:
+        process = subprocess.Popen(  # noqa: S603
+            tuple(argv),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+            start_new_session=os.name == "posix",
+            env=dict(_FIXED_SUBPROCESS_ENV),
+        )
+    except OSError as exc:
+        raise SMTPTransportError("Docker Submission runtime check failed") from exc
+
+    stdout = process.stdout
+    stderr = process.stderr
+    if stdout is None or stderr is None:
+        with suppress(OSError):
+            process.kill()
+        raise SMTPTransportError("Docker Submission runtime check failed")
+
+    captured = (bytearray(), bytearray())
+    overflow = threading.Event()
+    reader_failed = threading.Event()
+
+    def consume(stream: BinaryIO, destination: bytearray) -> None:
+        try:
+            while chunk := stream.read(8192):
+                remaining = maximum - len(destination)
+                if remaining > 0:
+                    destination.extend(chunk[:remaining])
+                if len(chunk) > remaining:
+                    overflow.set()
+                    with suppress(OSError):
+                        process.kill()
+        except OSError:
+            reader_failed.set()
+            with suppress(OSError):
+                process.kill()
+
+    readers = (
+        threading.Thread(target=consume, args=(stdout, captured[0]), daemon=True),
+        threading.Thread(target=consume, args=(stderr, captured[1]), daemon=True),
+    )
+    for reader in readers:
+        reader.start()
+
+    failed = False
+    try:
+        return_code = process.wait(timeout=timeout)
+    except OSError, subprocess.TimeoutExpired:
+        failed = True
+        with suppress(OSError):
+            process.kill()
+        with suppress(OSError, subprocess.TimeoutExpired):
+            process.wait(timeout=1.0)
+        return_code = None
+    finally:
+        for reader in readers:
+            reader.join(timeout=1.0)
+        with suppress(OSError):
+            stdout.close()
+        with suppress(OSError):
+            stderr.close()
+
+    if (
+        failed
+        or return_code != 0
+        or overflow.is_set()
+        or reader_failed.is_set()
+        or any(reader.is_alive() for reader in readers)
+    ):
+        raise SMTPTransportError("Docker Submission runtime check failed")
+    return bytes(captured[0])
+
+
+def _parse_proc_net_table(table: bytes, *, ipv6: bool) -> tuple[str, ...]:
+    """Return LISTEN addresses for port 1587 from one procfs TCP table."""
+
+    if not table or len(table) > _PROC_NET_MAX_OUTPUT:
+        raise SMTPTransportError("Docker Submission socket table is invalid")
+    try:
+        lines = table.decode("ascii").splitlines()
+    except UnicodeDecodeError as exc:
+        raise SMTPTransportError("Docker Submission socket table is invalid") from exc
+    if not lines or not _is_proc_net_header(lines[0]):
+        raise SMTPTransportError("Docker Submission socket table is invalid")
+
+    address_length = 32 if ipv6 else 8
+    listeners: list[str] = []
+    for line in lines[1:]:
+        if not line.strip():
+            continue
+        match = _PROC_NET_ROW_RE.fullmatch(line)
+        if (
+            match is None
+            or len(match.group(1)) != address_length
+            or len(match.group(3)) != address_length
+        ):
+            raise SMTPTransportError("Docker Submission socket table is invalid")
+        local_address, local_port, _remote_address, _remote_port, state = (
+            value.upper() for value in match.groups()
+        )
+        if state == "0A" and local_port == _SUBMISSION_PORT_HEX:
+            listeners.append(local_address)
+    return tuple(listeners)
+
+
+def _is_proc_net_header(line: str) -> bool:
+    fields = line.split()[:4]
+    return (
+        len(fields) == 4
+        and fields[0] == "sl"
+        and fields[1] == "local_address"
+        and fields[2] in {"rem_address", "remote_address"}
+        and fields[3] == "st"
+    )
+
+
+def _split_proc_net_tables(payload: bytes) -> tuple[bytes, bytes]:
+    """Split one fixed cat of the IPv4 and IPv6 procfs TCP tables."""
+
+    if not payload or len(payload) > _PROC_NET_COMBINED_MAX_OUTPUT:
+        raise SMTPTransportError("Docker Submission socket tables are invalid")
+    try:
+        lines = payload.decode("ascii").splitlines()
+    except UnicodeDecodeError as exc:
+        raise SMTPTransportError("Docker Submission socket tables are invalid") from exc
+    header_indexes = [index for index, line in enumerate(lines) if _is_proc_net_header(line)]
+    if len(header_indexes) != 2 or header_indexes[0] != 0:
+        raise SMTPTransportError("Docker Submission socket tables are invalid")
+    boundary = header_indexes[1]
+    ipv4 = ("\n".join(lines[:boundary]) + "\n").encode("ascii")
+    ipv6 = ("\n".join(lines[boundary:]) + "\n").encode("ascii")
+    return ipv4, ipv6
+
+
+def _submission_listeners(ipv4_table: bytes, ipv6_table: bytes) -> tuple[tuple[str, str], ...]:
+    ipv4 = (("ipv4", address) for address in _parse_proc_net_table(ipv4_table, ipv6=False))
+    ipv6 = (("ipv6", address) for address in _parse_proc_net_table(ipv6_table, ipv6=True))
+    return (*ipv4, *ipv6)
+
+
+def _require_submission_listener(
+    ipv4_table: bytes,
+    ipv6_table: bytes,
+    *,
+    present: bool,
+) -> None:
+    listeners = _submission_listeners(ipv4_table, ipv6_table)
+    expected = (("ipv4", _IPV4_LOOPBACK_PROC_HEX),) if present else ()
+    if listeners != expected:
+        raise SMTPTransportError("Docker Submission listener state is unsafe")
+
+
+def _port_metadata_is_safe(value: Any) -> bool:
+    if value is None:
+        return True
+    if not isinstance(value, dict):
+        return False
+    for container_port, records in value.items():
+        if not isinstance(container_port, str):
+            return False
+        container_port_number = container_port.split("/", 1)[0]
+        if container_port_number.isdecimal() and int(container_port_number) == _SUBMISSION_PORT:
+            return False
+        if records is None:
+            continue
+        if not isinstance(records, list):
+            return False
+        for record in records:
+            if not isinstance(record, dict):
+                return False
+            host_port = record.get("HostPort")
+            if host_port is not None and type(host_port) not in {str, int}:
+                return False
+            host_port_number = str(host_port)
+            if host_port_number.isdecimal() and int(host_port_number) == _SUBMISSION_PORT:
+                return False
+    return True
+
+
+def _parse_docker_submission_runtime(
+    payload: bytes,
+    *,
+    scope: str,
+) -> _DockerSubmissionRuntime:
+    if scope not in {"container", "host-loopback"}:
+        raise SMTPTransportError("Docker Submission scope is invalid")
+    try:
+        metadata = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SMTPTransportError("Docker Submission runtime metadata is invalid") from exc
+    expected_fields = {
+        "id",
+        "running",
+        "paused",
+        "network_mode",
+        "port_bindings",
+        "runtime_ports",
+    }
+    if not isinstance(metadata, dict) or set(metadata) != expected_fields:
+        raise SMTPTransportError("Docker Submission runtime metadata is invalid")
+
+    container_id = metadata["id"]
+    running = metadata["running"]
+    paused = metadata["paused"]
+    network_mode = metadata["network_mode"]
+    if (
+        not isinstance(container_id, str)
+        or _CONTAINER_ID_RE.fullmatch(container_id) is None
+        or type(running) is not bool
+        or type(paused) is not bool
+        or running is not True
+        or paused is not False
+    ):
+        raise SMTPTransportError("Docker Submission container is not running safely")
+    if (
+        not isinstance(network_mode, str)
+        or _DOCKER_NETWORK_MODE_RE.fullmatch(network_mode) is None
+        or network_mode == "none"
+        or network_mode.startswith("container:")
+    ):
+        raise SMTPTransportError("Docker Submission network mode is invalid")
+    if (scope == "container" and network_mode == "host") or (
+        scope == "host-loopback" and network_mode != "host"
+    ):
+        raise SMTPTransportError("Docker Submission network scope changed")
+    if not (
+        _port_metadata_is_safe(metadata["port_bindings"])
+        and _port_metadata_is_safe(metadata["runtime_ports"])
+    ):
+        raise SMTPTransportError("Docker Submission port publication is unsafe")
+    return _DockerSubmissionRuntime(container_id, network_mode)
 
 
 class _SMTPChannel(Protocol):
@@ -260,16 +539,20 @@ class SMTPSubmissionClient:
         *,
         host: str = "127.0.0.1",
         port: int = 1587,
+        docker_submission_scope: str = "container",
         timeout: float = 15.0,
         max_message_bytes: int = 32 * 1024 * 1024,
     ) -> None:
-        if host != "127.0.0.1" or not 1 <= port <= 65535:
-            raise ValueError("SMTP submission must use configured IPv4 loopback")
+        if host != "127.0.0.1" or port != _SUBMISSION_PORT:
+            raise ValueError("SMTP submission must use exactly 127.0.0.1:1587")
+        if docker_submission_scope not in {"container", "host-loopback"}:
+            raise ValueError("invalid Docker Submission scope")
         if timeout <= 0 or max_message_bytes <= 0:
             raise ValueError("SMTP limits must be positive")
         self.target = target
         self.host = host
         self.port = port
+        self.docker_submission_scope = docker_submission_scope
         self.timeout = timeout
         self.max_message_bytes = max_message_bytes
 
@@ -279,23 +562,91 @@ class SMTPSubmissionClient:
             MaddyTarget.from_config(config),
             host=str(config.submission_host),
             port=int(config.submission_port),
+            docker_submission_scope=str(config.docker_submission_scope),
             timeout=float(config.command_timeout_seconds),
         )
 
-    def _channel(self) -> _SMTPChannel:
+    def _channel(self, *, docker_container: str | None = None) -> _SMTPChannel:
         if self.target.mode.value == "native":
+            if docker_container is not None:
+                raise SMTPTransportError("native SMTP transport received a Docker identity")
             return _SocketChannel(self.host, self.port, self.timeout)
+        if docker_container is None or _CONTAINER_ID_RE.fullmatch(docker_container) is None:
+            raise SMTPTransportError("Docker SMTP transport lacks a validated container identity")
         return _ProcessChannel(
             (
                 self.target.docker_executable,
+                _DOCKER_LOCAL_HOST_ARG,
                 "exec",
                 "-i",
-                str(self.target.container),
+                docker_container,
                 "/usr/bin/nc",
                 self.host,
                 str(self.port),
             )
         )
+
+    def _guard_command(self, suffix: Sequence[str], *, maximum: int) -> bytes:
+        return _bounded_command_output(
+            (self.target.docker_executable, _DOCKER_LOCAL_HOST_ARG, *suffix),
+            timeout=min(self.timeout, 5.0),
+            maximum=maximum,
+        )
+
+    @staticmethod
+    def _host_socket_tables() -> tuple[bytes, bytes]:
+        tables: list[bytes] = []
+        for name in ("/proc/net/tcp", "/proc/net/tcp6"):
+            try:
+                with open(name, "rb") as handle:
+                    table = handle.read(_PROC_NET_MAX_OUTPUT + 1)
+            except OSError as exc:
+                raise SMTPTransportError(
+                    "Docker Submission host socket table is unavailable"
+                ) from exc
+            if not table or len(table) > _PROC_NET_MAX_OUTPUT:
+                raise SMTPTransportError("Docker Submission host socket table is invalid")
+            tables.append(table)
+        return tables[0], tables[1]
+
+    def _validate_docker_runtime(self) -> str:
+        if self.host != "127.0.0.1" or self.port != _SUBMISSION_PORT:
+            raise SMTPTransportError("Docker Submission endpoint changed")
+        container = str(self.target.container)
+        metadata = self._guard_command(
+            (
+                "container",
+                "inspect",
+                "--format",
+                _DOCKER_INSPECT_TEMPLATE,
+                container,
+            ),
+            maximum=_DOCKER_INSPECT_MAX_OUTPUT,
+        )
+        runtime = _parse_docker_submission_runtime(
+            metadata,
+            scope=self.docker_submission_scope,
+        )
+        socket_tables = self._guard_command(
+            (
+                "exec",
+                runtime.container_id,
+                "/bin/cat",
+                "/proc/net/tcp",
+                "/proc/net/tcp6",
+            ),
+            maximum=_PROC_NET_COMBINED_MAX_OUTPUT,
+        )
+        ipv4_table, ipv6_table = _split_proc_net_tables(socket_tables)
+        _require_submission_listener(ipv4_table, ipv6_table, present=True)
+
+        host_ipv4, host_ipv6 = self._host_socket_tables()
+        _require_submission_listener(
+            host_ipv4,
+            host_ipv6,
+            present=self.docker_submission_scope == "host-loopback",
+        )
+        return runtime.container_id
 
     @staticmethod
     def _response(channel: _SMTPChannel, deadline: float) -> tuple[int, str]:
@@ -405,7 +756,11 @@ class SMTPSubmissionClient:
         if type(message_length) is not int or not 1 <= message_length <= self.max_message_bytes:
             raise ValueError("invalid message length")
 
-        channel = self._channel()
+        if self.target.mode.value == "docker":
+            container_id = self._validate_docker_runtime()
+            channel = self._channel(docker_container=container_id)
+        else:
+            channel = self._channel()
         deadline = time.monotonic() + self.timeout
         data_terminator_sent = False
         try:

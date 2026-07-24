@@ -25,6 +25,7 @@ SCHEMA: dict[str, set[str]] = {
     },
     "maddy": {
         "mode",
+        "docker_submission_scope",
         "container",
         "binary",
         "config_path",
@@ -52,7 +53,10 @@ SCHEMA: dict[str, set[str]] = {
     "security": {"session_key_file", "csrf_ttl_seconds", "cookie_name"},
     "logging": {"level"},
 }
-OPTIONAL_KEYS: dict[str, set[str]] = {"certificates": {"webroot_roots"}}
+OPTIONAL_KEYS: dict[str, set[str]] = {
+    "maddy": {"docker_submission_scope"},
+    "certificates": {"webroot_roots"},
+}
 CONTAINER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 SERVICE_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 TIMER_UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@-]*\.timer$")
@@ -170,6 +174,14 @@ def validate(
         fail("maddy.mode must be native or docker")
     if expected_maddy_mode is not None and mode != expected_maddy_mode:
         fail(f"maddy.mode must be {expected_maddy_mode} for this deployment")
+    docker_submission_scope = string(
+        maddy.get("docker_submission_scope", "container"),
+        "maddy.docker_submission_scope",
+    )
+    if docker_submission_scope not in {"container", "host-loopback"}:
+        fail("maddy.docker_submission_scope must be container or host-loopback")
+    if mode == "native" and docker_submission_scope == "host-loopback":
+        fail("maddy.docker_submission_scope cannot be host-loopback when maddy.mode is native")
     container = string(maddy["container"], "maddy.container")
     if CONTAINER_RE.fullmatch(container) is None:
         fail("maddy.container is invalid")
@@ -193,12 +205,11 @@ def validate(
     if helper_socket != "/run/maddyweb/helper.sock":
         fail("maddy.helper_socket must be /run/maddyweb/helper.sock")
     submission_host = string(maddy["submission_host"], "maddy.submission_host")
-    try:
-        if not ipaddress.ip_address(submission_host).is_loopback:
-            fail("maddy.submission_host must be a literal loopback address")
-    except ValueError:
-        fail("maddy.submission_host must be a literal IP address")
-    integer(maddy["submission_port"], "maddy.submission_port", 1, 65535)
+    if submission_host != "127.0.0.1":
+        fail("maddy.submission_host must be exactly 127.0.0.1")
+    submission_port = integer(maddy["submission_port"], "maddy.submission_port", 1, 65535)
+    if submission_port != 1587:
+        fail("maddy.submission_port must be exactly 1587")
     number(maddy["command_timeout_seconds"], "maddy.command_timeout_seconds", 1, 120)
 
     certificates = table(config, "certificates")

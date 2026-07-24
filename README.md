@@ -88,9 +88,19 @@ may scan lineages outside the allow-list or inherit drop-ins and hooks, so a sin
 Enable fails closed until a dedicated managed renewal service is implemented. The page still displays certificates, fingerprints, and
 timer status; unsafe lineages do not display dry-run or renewal write controls.
 
-Docker SMTP does not publish a host port. The helper always runs
-`docker exec -i <configured-container> /usr/bin/nc 127.0.0.1 1587` inside the container's own
-network namespace to connect to the loopback Submission endpoint.
+Docker SMTP never uses a Docker port publication. Before every send, the
+helper uses only the fixed local Docker socket to inspect the configured name,
+requires a running unpaused container with the configured network scope and
+safe port metadata, validates the exact IPv4 listener in both container and
+host socket tables, and pins the resulting full container ID. Only then does
+it run `docker --host=unix:///var/run/docker.sock exec -i <validated-id> /usr/bin/nc 127.0.0.1 1587`
+to connect to the authenticated loopback
+Submission endpoint. The default
+`maddy.docker_submission_scope = "container"` requires an isolated container
+network namespace and leaves no host listener. Existing host-network Maddy
+containers require the explicit `"host-loopback"` scope; that mode permits
+exactly one host listener at `127.0.0.1:1587` and rejects wildcard, IPv6, and
+duplicate listeners.
 
 Docker `/data` supports both bind mounts and exclusive local named volumes. Named-volume
 configuration editing neither reads nor guesses Docker daemon internal paths. Dry-run is read-only; apply uses a one-shot
@@ -103,6 +113,14 @@ ID, content hash, owner and mode, and failure rollback gates protecting the tran
 uv sync --python 3.14
 uv run pytest -q
 uv run ruff check .
+```
+
+On an isolated WSL Docker host with the locked Maddy 0.8.2 image already
+available and host port 1587 free, run the real host-network Submission gate:
+
+```console
+sudo bash tests/integration/test-host-network-submission.sh \
+  "$(pwd)" "$(pwd)/.venv/bin/python"
 ```
 
 Command entry points:

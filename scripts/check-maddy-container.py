@@ -13,6 +13,8 @@ import sys
 from pathlib import Path
 from typing import Any, Never
 
+NETWORK_MODE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+
 
 def fail(message: str) -> Never:
     print(f"Maddy container check failed: {message}", file=sys.stderr)
@@ -25,6 +27,16 @@ def canonical(value: Any) -> str:
 
 def digest(value: Any) -> str:
     return hashlib.sha256(canonical(value).encode("utf-8")).hexdigest()
+
+
+def validated_network_mode(value: Any) -> str:
+    if not isinstance(value, str) or not value:
+        fail("Docker network mode is missing or invalid")
+    if value == "none" or value.startswith("container:"):
+        fail(f"Docker network mode {value!r} is unsupported")
+    if value not in {"host", "bridge", "default"} and NETWORK_MODE_RE.fullmatch(value) is None:
+        fail("Docker network mode is unsafe or unsupported")
+    return value
 
 
 def docker_output(argv: list[str], maximum: int = 4 * 1024 * 1024) -> bytes:
@@ -61,7 +73,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--docker", type=Path, required=True)
     parser.add_argument("--container", required=True)
-    parser.add_argument("--host-config", type=Path, required=True)
+    config_group = parser.add_mutually_exclusive_group(required=True)
+    config_group.add_argument("--host-config", type=Path)
+    config_group.add_argument("--container-config", type=Path)
     args = parser.parse_args()
 
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", args.container) is None:
@@ -98,6 +112,7 @@ def main() -> None:
     container_id = record.get("Id")
     if not isinstance(container_id, str) or re.fullmatch(r"[0-9a-f]{64}", container_id) is None:
         fail("container ID is invalid")
+    network_mode = validated_network_mode(host_config.get("NetworkMode"))
 
     data_mounts = []
     for mount in mounts:
@@ -121,18 +136,34 @@ def main() -> None:
             fail("configuration mount source is invalid")
         try:
             mounted_data = Path(source).resolve(strict=True)
-            expected_config = args.host_config.resolve(strict=True)
+            mounted_config = mounted_data / "maddy.conf"
+            if args.container_config is not None:
+                if str(args.container_config) != "/data/maddy.conf":
+                    fail("--container-config must be exactly /data/maddy.conf")
+                expected_config = mounted_config.resolve(strict=True)
+            elif args.host_config is not None:
+                expected_config = args.host_config.resolve(strict=True)
+            else:  # pragma: no cover - argparse enforces mutual exclusivity
+                fail("one configuration path contract is required")
         except OSError:
             fail("configuration mount source cannot be resolved")
-        if not mounted_data.is_dir() or mounted_data / "maddy.conf" != expected_config:
-            fail("--host-config must be the maddy.conf inside the directory bound to /data")
+        if (
+            not mounted_data.is_dir()
+            or not mounted_config.is_file()
+            or mounted_config.is_symlink()
+            or mounted_config != expected_config
+        ):
+            fail("Maddy config must be the maddy.conf inside the directory bound to /data")
         config_source = str(expected_config)
         config_kind = "bind"
     elif mount_type == "volume":
         # Named-volume operation never accepts a Docker daemon host path.  The
         # only supported configuration location is the image contract path.
-        if str(args.host_config) != "/data/maddy.conf":
-            fail("named-volume mode requires --host-config exactly /data/maddy.conf")
+        selected_config = args.container_config or args.host_config
+        if selected_config is None:  # pragma: no cover - argparse enforces this
+            fail("one configuration path contract is required")
+        if str(selected_config) != "/data/maddy.conf":
+            fail("named-volume mode requires the config path exactly /data/maddy.conf")
         name = data_mount.get("Name")
         if (
             not isinstance(name, str)
@@ -215,6 +246,7 @@ def main() -> None:
         "id": record.get("Id"),
         "running": True,
         "health": health_status,
+        "network_mode": network_mode,
         "mounts_sha256": digest(mounts),
         "ports_sha256": digest({"configured": port_bindings, "runtime": runtime_ports}),
         "restart_policy_sha256": digest(host_config.get("RestartPolicy")),

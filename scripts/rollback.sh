@@ -17,11 +17,13 @@ usage() {
     cat <<'EOF'
 Usage: rollback.sh --environment development|production --host HOST \
   --release /opt/maddyweb/releases/<40-char-commit> --artifact-sha256 HEX \
-  [--approval-file PATH] [--apply]
+  [--app-config /etc/maddyweb/config.toml] [--approval-file PATH] [--apply]
 
 Optional managed-listener rollback (performed under the same approval):
   --remove-managed-submission --maddy-mode native|docker \
   --maddy-config /absolute/host/maddy.conf [mode-specific Maddy options]
+  Docker host networking also requires:
+  --docker-submission-scope host-loopback
 
 Rolls back only the MaddyWeb release symlink. It never downgrades Maddy or
 restores Maddy state automatically because newer Maddy releases may migrate
@@ -34,12 +36,14 @@ target_host=""
 release=""
 expected_sha256=""
 approval_file=""
+app_config="/etc/maddyweb/config.toml"
 remove_submission=false
 maddy_mode=""
 maddy_config=""
 maddy_binary=""
 docker_binary="$(command -v docker || true)"
 container=""
+docker_submission_scope="container"
 submission_backup_dir="/var/backups/maddyweb/submission"
 allow_downtime=false
 apply=false
@@ -50,6 +54,7 @@ while (($#)); do
         --host) (($# >= 2)) || die "--host requires a value"; target_host=$2; shift 2 ;;
         --release) (($# >= 2)) || die "--release requires a value"; release=$2; shift 2 ;;
         --artifact-sha256) (($# >= 2)) || die "--artifact-sha256 requires a value"; expected_sha256=${2,,}; shift 2 ;;
+        --app-config) (($# >= 2)) || die "--app-config requires a value"; app_config=$2; shift 2 ;;
         --approval-file) (($# >= 2)) || die "--approval-file requires a value"; approval_file=$2; shift 2 ;;
         --remove-managed-submission) remove_submission=true; shift ;;
         --maddy-mode) (($# >= 2)) || die "--maddy-mode requires a value"; maddy_mode=$2; shift 2 ;;
@@ -57,6 +62,7 @@ while (($#)); do
         --maddy-binary) (($# >= 2)) || die "--maddy-binary requires a value"; maddy_binary=$2; shift 2 ;;
         --docker-binary) (($# >= 2)) || die "--docker-binary requires a value"; docker_binary=$2; shift 2 ;;
         --container) (($# >= 2)) || die "--container requires a value"; container=$2; shift 2 ;;
+        --docker-submission-scope) (($# >= 2)) || die "--docker-submission-scope requires a value"; docker_submission_scope=$2; shift 2 ;;
         --submission-backup-dir) (($# >= 2)) || die "--submission-backup-dir requires a value"; submission_backup_dir=$2; shift 2 ;;
         --allow-downtime) allow_downtime=true; shift ;;
         --apply) apply=true; shift ;;
@@ -66,6 +72,10 @@ while (($#)); do
 done
 
 case "$environment" in development|production) ;; *) die "--environment must be development or production" ;; esac
+case "$docker_submission_scope" in
+    container|host-loopback) ;;
+    *) die "--docker-submission-scope must be container or host-loopback" ;;
+esac
 [[ -n "$target_host" && "$target_host" == "$(hostname)" ]] || die "--host must exactly match $(hostname)"
 [[ "$expected_sha256" =~ ^[0-9a-f]{64}$ ]] || die "--artifact-sha256 must be 64 lowercase hexadecimal characters"
 require_directory "$release" "rollback release"
@@ -73,12 +83,27 @@ require_path_below "$release" "$RELEASE_ROOT"
 release_commit=$(basename -- "$release")
 [[ "$release_commit" =~ ^[0-9a-f]{40}$ ]] || die "rollback release directory must be a full lowercase commit"
 [[ -x "$release/bin/python" ]] || die "rollback release has no executable Python"
+require_regular_file "$app_config" "MaddyWeb config"
+assert_private_file_mode "$app_config"
+require_command realpath
+[[ "$(realpath -e -- "$app_config")" == "$app_config" ]] \
+    || die "MaddyWeb config path must be canonical and traverse no symbolic link"
+if [[ "$environment" == production ]]; then
+    [[ "$app_config" == /etc/maddyweb/config.toml ]] \
+        || die "production requires --app-config exactly /etc/maddyweb/config.toml"
+    [[ "$(stat -c '%u:%a:%h' -- "$app_config")" == "0:640:1" ]] \
+        || die "production MaddyWeb config must be single-link root-owned mode 0640"
+fi
 require_regular_file "$release/INSTALL-MANIFEST" "release manifest"
 manifest_sha=$(awk -F= '$1 == "sha256" {print $2}' "$release/INSTALL-MANIFEST")
 manifest_commit=$(awk -F= '$1 == "commit" {print $2}' "$release/INSTALL-MANIFEST")
 [[ "$manifest_sha" == "$expected_sha256" ]] || die "release manifest checksum does not match explicit artifact checksum"
 [[ "$manifest_commit" == "$release_commit" ]] || die "release manifest commit does not match its directory"
 "$release/bin/python" -m maddyweb --help >/dev/null || die "rollback release cannot import maddyweb"
+"$release/bin/python" -I -c \
+    'import sys; from maddyweb.config import load_config; load_config(sys.argv[1])' \
+    "$app_config" \
+    || die "rollback release cannot load the effective MaddyWeb configuration"
 
 if [[ -f "$CERTBOT_DEPLOY_HOOK" && ! -L "$CERTBOT_DEPLOY_HOOK" ]]; then
     hook_lines=()
@@ -102,36 +127,75 @@ fi
 
 submission_version=""
 container_before=""
+container_id=""
 if [[ "$remove_submission" == true ]]; then
     case "$maddy_mode" in native|docker) ;; *) die "managed removal requires --maddy-mode native or docker" ;; esac
     require_absolute_path "$submission_backup_dir" "submission backup directory"
     if [[ "$maddy_mode" == native ]]; then
+        [[ "$docker_submission_scope" == container ]] \
+            || die "--docker-submission-scope is valid only in docker mode"
         require_regular_file "$maddy_config" "host Maddy config"
         "$release/bin/python" "$SCRIPT_DIR/manage-submission.py" \
             --action check-remove --config "$maddy_config" >/dev/null
         [[ -n "$maddy_binary" && -z "$container" ]] || die "native managed removal requires --maddy-binary and no container"
         submission_version=$(assert_supported_maddy "$maddy_binary")
+        "$release/bin/python" "$SCRIPT_DIR/validate-config.py" \
+            --config "$app_config" --expected-host 127.0.0.1 --expected-port 8787 \
+            --expected-maddy-mode native --expected-maddy-binary "$maddy_binary" \
+            --expected-maddy-config "$maddy_config" >/dev/null
     else
         [[ "$container" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || die "Docker managed removal requires a safe container"
         require_absolute_path "$docker_binary" "Docker binary"
         container_before=$("$release/bin/python" "$SCRIPT_DIR/check-maddy-container.py" \
             --docker "$docker_binary" --container "$container" --host-config "$maddy_config")
+        container_id=$("$release/bin/python" -c \
+            'import json,sys; print(json.loads(sys.argv[1])["id"])' \
+            "$container_before")
+        [[ "$container_id" =~ ^[0-9a-f]{64}$ ]] \
+            || die "container inspection returned an invalid container ID"
         rollback_config_kind=$("$release/bin/python" -c \
             'import json,sys; print(json.loads(sys.argv[1])["config_kind"])' \
             "$container_before")
+        network_mode=$("$release/bin/python" -c \
+            'import json,sys; print(json.loads(sys.argv[1])["network_mode"])' \
+            "$container_before")
+        if [[ "$docker_submission_scope" == host-loopback ]]; then
+            [[ "$network_mode" == host ]] \
+                || die "host-loopback scope requires Docker host networking"
+        else
+            [[ "$network_mode" != host && "$network_mode" != container:* ]] \
+                || die "container scope requires an isolated Docker network namespace"
+        fi
         [[ "$rollback_config_kind" == bind ]] \
             || die "combined rollback only supports a host-bind Maddy config; remove named-volume Submission separately"
         require_regular_file "$maddy_config" "host Maddy config"
         "$release/bin/python" "$SCRIPT_DIR/manage-submission.py" \
             --action check-remove --config "$maddy_config" >/dev/null
-        version_output=$("$docker_binary" exec "$container" /bin/maddy version 2>&1) || die "container Maddy version failed"
+        version_output=$("$docker_binary" exec "$container_id" /bin/maddy version 2>&1) || die "container Maddy version failed"
         submission_version=$(extract_maddy_version "$version_output")
         version_in_supported_range "$submission_version" || die "unsupported container Maddy version"
+        "$release/bin/python" "$SCRIPT_DIR/validate-config.py" \
+            --config "$app_config" --expected-host 127.0.0.1 --expected-port 8787 \
+            --expected-maddy-mode docker --expected-container "$container" \
+            --expected-maddy-config /data/maddy.conf --expected-maddy-data /data \
+            >/dev/null
+        configured_submission_scope=$("$release/bin/python" - "$app_config" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as handle:
+    config = tomllib.load(handle)
+print(config["maddy"].get("docker_submission_scope", "container"))
+PY
+) || die "cannot read Docker Submission scope from validated config"
+        [[ "$configured_submission_scope" == "$docker_submission_scope" ]] \
+            || die "--docker-submission-scope must match maddy.docker_submission_scope"
     fi
     if [[ "$submission_version" == 0.8.2 && "$apply" == true && "$allow_downtime" != true ]]; then
         die "Maddy 0.8.2 managed removal requires --allow-downtime for a short restart"
     fi
-elif [[ -n "$maddy_mode$maddy_config$maddy_binary$container" ]]; then
+elif [[ -n "$maddy_mode$maddy_config$maddy_binary$container" \
+    || "$docker_submission_scope" != container ]]; then
     die "managed Maddy options require --remove-managed-submission"
 fi
 
@@ -139,8 +203,10 @@ fi
 current=$(readlink -f -- "$CURRENT_LINK")
 require_path_below "$current" "$RELEASE_ROOT"
 [[ "$current" != "$release" ]] || die "requested release is already current"
-printf 'environment=%s\nhost=%s\nfrom=%s\nto=%s\ncommit=%s\nartifact_sha256=%s\nremove_managed_submission=%s\n' \
-    "$environment" "$target_host" "$current" "$release" "$release_commit" "$expected_sha256" "$remove_submission"
+printf 'environment=%s\nhost=%s\nfrom=%s\nto=%s\ncommit=%s\nartifact_sha256=%s\nremove_managed_submission=%s\ndocker_submission_scope=%s\nnetwork_mode=%s\n' \
+    "$environment" "$target_host" "$current" "$release" "$release_commit" \
+    "$expected_sha256" "$remove_submission" "$docker_submission_scope" \
+    "${network_mode:-native}"
 
 if [[ "$apply" != true ]]; then
     log "dry-run complete; pass --apply only after reviewing the plan"
@@ -174,35 +240,46 @@ container_snapshot_matches() {
     local after=${1:?container snapshot is required}
     "$release/bin/python" -c 'import json,sys
 before, after = map(json.loads, sys.argv[1:])
-keys=("id","mounts_sha256","ports_sha256","restart_policy_sha256","config_source")
+keys=("id","mounts_sha256","ports_sha256","restart_policy_sha256",
+      "network_mode","config_source")
 raise SystemExit(any(before.get(k) != after.get(k) for k in keys))' \
         "$container_before" "$after"
 }
 
 managed_listener_gate() {
     local expected=${1:?expected listener state is required}
-    if [[ "$maddy_mode" == native ]]; then
-        local listeners
-        listeners=$(ss -H -ltn 'sport = :1587' 2>/dev/null | awk '{print $4}')
+    local listeners
+    listeners=$(ss -H -ltn 'sport = :1587' 2>/dev/null | awk '{print $4}')
+    if [[ "$maddy_mode" == native \
+        || "$docker_submission_scope" == host-loopback ]]; then
         if [[ "$expected" == present ]]; then
             [[ "$listeners" == "127.0.0.1:1587" ]]
         else
             [[ -z "$listeners" ]]
         fi
     else
-        local table found=false
-        table=$("$docker_binary" exec "$container" /bin/cat /proc/net/tcp 2>/dev/null) \
-            || return 1
-        if printf '%s\n' "$table" \
-            | awk '$2 == "0100007F:0633" && $4 == "0A" {found=1} END {exit !found}'; then
-            found=true
-        fi
+        [[ -z "$listeners" ]]
+    fi
+    if [[ "$maddy_mode" == docker ]]; then
+        local table listener_summary
+        table=$(
+            "$docker_binary" exec "$container_id" \
+                /bin/cat /proc/net/tcp /proc/net/tcp6 2>/dev/null
+        ) || return 1
+        listener_summary=$(
+            printf '%s\n' "$table" \
+                | awk '$2 ~ /:0633$/ && $4 == "0A" {
+                    count += 1
+                    if ($2 == "0100007F:0633") exact += 1
+                }
+                END {print count + 0 ":" exact + 0}'
+        )
         if [[ "$expected" == present ]]; then
-            [[ "$found" == true ]] || return 1
-            "$docker_binary" exec "$container" /usr/bin/nc -z -w 2 127.0.0.1 1587 \
+            [[ "$listener_summary" == 1:1 ]] || return 1
+            "$docker_binary" exec "$container_id" /usr/bin/nc -z -w 2 127.0.0.1 1587 \
                 >/dev/null 2>&1
         else
-            [[ "$found" == false ]]
+            [[ "$listener_summary" == 0:0 ]]
         fi
     fi
 }
@@ -212,7 +289,7 @@ verify_submission_config() {
     if [[ "$maddy_mode" == native ]]; then
         "$maddy_binary" -config "$maddy_config" verify-config >/dev/null 2>&1
     else
-        "$docker_binary" exec "$container" /bin/maddy -config /data/maddy.conf \
+        "$docker_binary" exec "$container_id" /bin/maddy -config /data/maddy.conf \
             verify-config >/dev/null 2>&1
     fi
 }
@@ -225,9 +302,9 @@ reload_submission_config() {
             systemctl kill --kill-who=main --signal=SIGUSR2 maddy.service
         fi
     elif [[ "$submission_version" == 0.8.2 ]]; then
-        "$docker_binary" restart --time 10 "$container" >/dev/null
+        "$docker_binary" restart --time 10 "$container_id" >/dev/null
     else
-        "$docker_binary" kill --signal=SIGUSR2 "$container" >/dev/null
+        "$docker_binary" kill --signal=SIGUSR2 "$container_id" >/dev/null
     fi
 }
 
@@ -244,7 +321,7 @@ maddy_state_gate() {
         local after="" health version_output
         for _ in {1..50}; do
             after=$("$release/bin/python" "$SCRIPT_DIR/check-maddy-container.py" \
-                --docker "$docker_binary" --container "$container" \
+                --docker "$docker_binary" --container "$container_id" \
                 --host-config "$maddy_config" 2>/dev/null) && break
             sleep 0.2
         done
@@ -254,7 +331,7 @@ maddy_state_gate() {
             'import json,sys; print(json.loads(sys.argv[1]).get("health") or "none")' \
             "$after") || return 1
         [[ "$health" == none || "$health" == healthy ]] || return 1
-        version_output=$("$docker_binary" exec "$container" /bin/maddy version 2>&1) \
+        version_output=$("$docker_binary" exec "$container_id" /bin/maddy version 2>&1) \
             || return 1
         [[ "$(extract_maddy_version "$version_output")" == "$submission_version" ]]
     fi
@@ -337,8 +414,10 @@ if [[ "$remove_submission" == true ]]; then
         native_pid_before=$(systemctl show --property MainPID --value maddy.service)
         [[ "$native_pid_before" =~ ^[1-9][0-9]*$ ]] || die "maddy.service MainPID is invalid"
     else
-        container_before=$("$release/bin/python" "$SCRIPT_DIR/check-maddy-container.py" \
+        container_after_approval=$("$release/bin/python" "$SCRIPT_DIR/check-maddy-container.py" \
             --docker "$docker_binary" --container "$container" --host-config "$maddy_config")
+        container_snapshot_matches "$container_after_approval" \
+            || die "Maddy container identity changed after the reviewed rollback plan"
     fi
     managed_listener_gate present \
         || die "managed Submission is not active on exactly its loopback endpoint"

@@ -225,6 +225,7 @@ def test_example_config_is_accepted_by_application_and_deploy_validator(path: Pa
     assert config.server.listen == "127.0.0.1:8787"
     assert config.server.request_body_timeout_seconds == 15
     assert config.maddy.helper_socket == PurePosixPath("/run/maddyweb/helper.sock")
+    assert config.maddy.docker_submission_scope == "container"
     assert config.certificates.command_timeout_seconds == 300
     subprocess.run(  # noqa: S603
         [
@@ -260,6 +261,123 @@ def test_deploy_validator_defaults_missing_webroot_roots_to_read_only(tmp_path: 
         capture_output=True,
         text=True,
     )
+
+
+def test_deploy_validator_defaults_missing_docker_submission_scope_to_container(
+    tmp_path: Path,
+) -> None:
+    source = (ROOT / "docker/config.toml").read_text(encoding="utf-8")
+    source = re.sub(
+        r'^docker_submission_scope = "container"\n',
+        "",
+        source,
+        flags=re.MULTILINE,
+    )
+    candidate = tmp_path / "config.toml"
+    candidate.write_text(source, encoding="utf-8")
+    assert load_config(candidate).maddy.docker_submission_scope == "container"
+    subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            str(ROOT / "scripts/validate-config.py"),
+            "--config",
+            str(candidate),
+            "--expected-maddy-mode",
+            "docker",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("path", "scope", "expected_mode", "message"),
+    (
+        (
+            ROOT / "docker/config.toml",
+            "host",
+            "docker",
+            "must be container or host-loopback",
+        ),
+        (
+            ROOT / "deploy/examples/config.native.toml",
+            "host-loopback",
+            "native",
+            "when maddy.mode is native",
+        ),
+    ),
+)
+def test_deploy_validator_rejects_unsafe_docker_submission_scope(
+    tmp_path: Path,
+    path: Path,
+    scope: str,
+    expected_mode: str,
+    message: str,
+) -> None:
+    source = path.read_text(encoding="utf-8")
+    candidate = tmp_path / "config.toml"
+    candidate.write_text(
+        source.replace(
+            'docker_submission_scope = "container"',
+            f'docker_submission_scope = "{scope}"',
+        ),
+        encoding="utf-8",
+    )
+    result = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            str(ROOT / "scripts/validate-config.py"),
+            "--config",
+            str(candidate),
+            "--expected-maddy-mode",
+            expected_mode,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert message in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "message"),
+    (
+        (
+            'submission_host = "127.0.0.1"',
+            'submission_host = "::1"',
+            "must be exactly 127.0.0.1",
+        ),
+        (
+            "submission_port = 1587",
+            "submission_port = 587",
+            "must be exactly 1587",
+        ),
+    ),
+)
+def test_deploy_validator_requires_the_fixed_submission_endpoint(
+    tmp_path: Path,
+    old: str,
+    new: str,
+    message: str,
+) -> None:
+    source = (ROOT / "docker/config.toml").read_text(encoding="utf-8")
+    candidate = tmp_path / "config.toml"
+    candidate.write_text(source.replace(old, new), encoding="utf-8")
+    result = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            str(ROOT / "scripts/validate-config.py"),
+            "--config",
+            str(candidate),
+            "--expected-maddy-mode",
+            "docker",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert message in result.stderr
 
 
 @pytest.mark.parametrize("timeout", (29, 901))
@@ -668,10 +786,84 @@ def test_mutating_scripts_are_dry_run_and_approval_gated() -> None:
     assert "assert_config_root_metadata" in install_source
     assert 'assert_managed_config_file "$CONFIG_ROOT/config.toml"' in install_source
     assert 'assert_managed_config_file "$CONFIG_ROOT/maddyweb.env"' in install_source
+    assert 'preflight_config="$CONFIG_ROOT/config.toml"' in install_source
+    assert 'run_preflight "$preflight_config"' in install_source
+    assert 'run_preflight "$CONFIG_ROOT/config.toml"' in install_source
     assert "--artifact-sha256" in rollback_source
     preflight_source = (ROOT / "scripts/preflight.sh").read_text(encoding="utf-8")
     assert "Docker must not publish MaddyWeb's managed port 1587" in preflight_source
     assert "/usr/bin/nc" in preflight_source
+
+
+@pytest.mark.parametrize(
+    "network_mode",
+    ("host", "bridge", "default", "maddy_private"),
+)
+def test_container_inspectors_accept_supported_network_modes(network_mode: str) -> None:
+    for script in ("check-maddy-container.py", "inspect-maddy-container.py"):
+        namespace = runpy.run_path(str(ROOT / "scripts" / script))
+        assert namespace["validated_network_mode"](network_mode) == network_mode
+
+
+@pytest.mark.parametrize(
+    "network_mode",
+    (None, "", "none", "container:maddy", "unsafe network"),
+)
+def test_container_inspectors_reject_unsupported_network_modes(
+    network_mode: object,
+) -> None:
+    for script in ("check-maddy-container.py", "inspect-maddy-container.py"):
+        namespace = runpy.run_path(str(ROOT / "scripts" / script))
+        with pytest.raises(SystemExit):
+            namespace["validated_network_mode"](network_mode)
+
+
+def test_preflight_binds_submission_scope_to_docker_network_mode() -> None:
+    source = (ROOT / "scripts/preflight.sh").read_text(encoding="utf-8")
+    validation = '"$python_binary" "$SCRIPT_DIR/validate-config.py" "${validate_args[@]}"'
+    scope_read = 'config["maddy"].get("docker_submission_scope", "container")'
+
+    assert source.index(validation) < source.index(scope_read)
+    assert '--container-config "$maddy_config"' in source
+    assert "container Submission scope requires a non-host Docker network mode" in source
+    assert "host-loopback Submission scope requires Docker network mode host" in source
+    assert "Docker must not publish MaddyWeb's managed port 1587" in source
+    assert "network_mode=%s" in source
+    assert "docker_submission_scope=%s" in source
+
+
+def test_submission_transactions_enforce_scope_and_network_mode() -> None:
+    configure = (ROOT / "scripts/configure-submission.sh").read_text(encoding="utf-8")
+    rollback = (ROOT / "scripts/rollback.sh").read_text(encoding="utf-8")
+    backup = (ROOT / "scripts/backup.sh").read_text(encoding="utf-8")
+
+    for source in (configure, rollback):
+        assert "--app-config" in source
+        assert "production requires --app-config exactly /etc/maddyweb/config.toml" in source
+        assert "production MaddyWeb config must be single-link root-owned mode 0640" in source
+        assert "--docker-submission-scope" in source
+        assert "--docker-submission-scope must match maddy.docker_submission_scope" in source
+        assert "host-loopback scope requires Docker host networking" in source
+        assert "container scope requires an isolated Docker network namespace" in source
+        assert '"network_mode"' in source
+        assert "/proc/net/tcp /proc/net/tcp6" in source
+        assert '[[ "$listener_summary" == 1:1 ]]' in source
+        assert '[[ "$listener_summary" == 0:0 ]]' in source
+        assert '[[ "$listeners" == "127.0.0.1:1587" ]]' in source
+
+    assert "managed host-network listener is not exactly 127.0.0.1:1587" in configure
+    assert '"network_mode", "config_kind"' in configure
+    assert '"restart_policy_sha256", "network_mode")' in backup
+    assert "rollback release cannot load the effective MaddyWeb configuration" in rollback
+    compatibility_gate = (
+        "'import sys; from maddyweb.config import load_config; "
+        "load_config(sys.argv[1])'"
+    )
+    assert compatibility_gate in rollback
+    assert '["id"])' in rollback
+    assert '--container "$container_id"' in rollback
+    assert 'container_snapshot_matches "$container_after_approval"' in rollback
+    assert "Maddy container identity changed after the reviewed rollback plan" in rollback
 
 
 def test_install_activation_is_transactional() -> None:
@@ -918,7 +1110,11 @@ def test_named_volume_submission_is_identity_bound_and_has_no_volume_argument() 
     volume_tool = (ROOT / "scripts/docker-volume-config.py").read_text(encoding="utf-8")
     configure = (ROOT / "scripts/configure-submission.sh").read_text(encoding="utf-8")
 
-    assert 'str(args.host_config) != "/data/maddy.conf"' in checker
+    assert 'str(selected_config) != "/data/maddy.conf"' in checker
+    assert 'config_group.add_argument("--host-config"' in checker
+    assert 'config_group.add_argument("--container-config"' in checker
+    assert "not mounted_config.is_file()" in checker
+    assert "mounted_config.is_symlink()" in checker
     assert 'data_mount.get("Source") != mountpoint' in checker
     assert 'data_mount.get("Source") != mountpoint' in volume_tool
     assert "named volume must be referenced only by the selected Maddy container" in checker
@@ -927,7 +1123,19 @@ def test_named_volume_submission_is_identity_bound_and_has_no_volume_argument() 
     assert "--docker-data-volume" not in configure
     assert "expected_container_id: str" in volume_tool
     assert "container_id != expected_container_id" in volume_tool
-    assert '"config_kind", "config_source", "volume_name", "volume_sha256"' in configure
+    snapshot = configure[
+        configure.index("container_snapshot_matches()") : configure.index(
+            "named_volume_snapshot()"
+        )
+    ]
+    for key in (
+        "network_mode",
+        "config_kind",
+        "config_source",
+        "volume_name",
+        "volume_sha256",
+    ):
+        assert f'"{key}"' in snapshot
 
 
 def test_named_volume_dry_run_uses_only_fixed_read_only_execs() -> None:

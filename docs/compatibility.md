@@ -55,6 +55,13 @@ DKIM, and remote queue rules, changing only the following:
 Markers surround this copy in every supported version. Before and after adding or removing it, the workflow reads back structure, hash, and metadata,
 listeners, container identity, and logs. Any unexpected content prevents ambiguous edits.
 
+Docker deployments default to `docker_submission_scope = "container"`, which
+requires an isolated network namespace and no host listener. The explicit
+`"host-loopback"` scope supports an existing container in exact Docker
+network mode `host`; it permits only one IPv4 host listener at
+`127.0.0.1:1587`. Both scopes prohibit Docker port publication, wildcard or
+IPv6 listeners, shared `container:` namespaces, and network-mode drift.
+
 ## Docker image lock
 
 `tests/integration/maddy-image-lock.json` stores the complete reference for each release:
@@ -73,6 +80,18 @@ A separate Docker named-volume Submission transaction test uses the locked `0.8.
 preservation of a non-root `0600` owner and mode, atomic replacement while paused or stopped, and stale
 hashes, exclusive attachment, the fixed local Docker context, `--allow-downtime`, and concurrent flock behavior,
 plus restoration of the original hash after a listener fault and read-back of running and unpaused state.
+
+The host-network release gate uses the same locked `0.8.2` image in a
+disposable WSL fixture. It functionally checks bind-mounted `/data` preflight,
+successful managed endpoint add/remove, exact host and container
+`127.0.0.1:1587` listener state, per-send runtime inspection, failed and
+successful SMTP AUTH, local-only delivery, and exact configuration and
+container-state restoration:
+
+```console
+sudo bash tests/integration/test-host-network-submission.sh \
+  "$(pwd)" "$(pwd)/.venv/bin/python"
+```
 
 Run the matrix with:
 

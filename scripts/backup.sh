@@ -227,7 +227,8 @@ else
         --docker "$docker_binary" --container "$container")
     "$python_binary" -c 'import json,sys
 before, after = map(json.loads, sys.argv[1:])
-keys = ("container_id", "image_id", "image_digest", "mounts_sha256", "ports_sha256", "restart_policy_sha256")
+keys = ("container_id", "image_id", "image_digest", "mounts_sha256",
+        "ports_sha256", "restart_policy_sha256", "network_mode")
 raise SystemExit(any(before.get(key) != after.get(key) for key in keys))' \
         "$container_before" "$container_after" || die "Maddy container identity changed during backup"
     source_quiesced=false

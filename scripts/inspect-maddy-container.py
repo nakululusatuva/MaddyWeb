@@ -13,6 +13,8 @@ import sys
 from pathlib import Path
 from typing import Any, Never
 
+NETWORK_MODE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+
 
 def fail(message: str) -> Never:
     print(f"Maddy container inspection failed: {message}", file=sys.stderr)
@@ -49,6 +51,16 @@ def canonical_hash(value: Any) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def validated_network_mode(value: Any) -> str:
+    if not isinstance(value, str) or not value:
+        fail("Docker network mode is missing or invalid")
+    if value == "none" or value.startswith("container:"):
+        fail(f"Docker network mode {value!r} is unsupported")
+    if value not in {"host", "bridge", "default"} and NETWORK_MODE_RE.fullmatch(value) is None:
+        fail("Docker network mode is unsafe or unsupported")
+    return value
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--docker", type=Path, required=True)
@@ -80,6 +92,7 @@ def main() -> None:
         or state.get("Paused") is True
     ):
         fail("container must be running and unpaused")
+    network_mode = validated_network_mode(host_config.get("NetworkMode"))
     data_mounts = [
         item for item in mounts if isinstance(item, dict) and item.get("Destination") == "/data"
     ]
@@ -135,6 +148,7 @@ def main() -> None:
         "ports_sha256": canonical_hash({"configured": port_bindings, "runtime": runtime_ports}),
         "restart_policy": host_config.get("RestartPolicy"),
         "restart_policy_sha256": canonical_hash(host_config.get("RestartPolicy")),
+        "network_mode": network_mode,
         "health": (
             state.get("Health", {}).get("Status") if isinstance(state.get("Health"), dict) else None
         ),

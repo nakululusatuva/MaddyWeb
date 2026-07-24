@@ -75,10 +75,23 @@ and fails closed with `CRITICAL` and a nonzero status if it cannot restore them 
 ## Docker mode
 
 Docker mode manages only an existing Maddy container; the MaddyWeb Web and helper processes remain native systemd
-services. The helper does not connect to the container over host TCP and instead always runs
-`docker exec -i <configured-container> /usr/bin/nc 127.0.0.1 1587`, so the connection occurs
-inside the container's own network namespace. The container must provide the fixed `/usr/bin/nc`; operational checks
-reject any Docker publication of container port or host port `1587`.
+services. Before every SMTP send, the helper inspects the configured name
+through only `unix:///var/run/docker.sock`, verifies running and paused state,
+network scope, port metadata, and exact container and host listener tables,
+then pins the returned full container ID. Only that validated ID may be used
+for `docker --host=unix:///var/run/docker.sock exec -i <validated-id> /usr/bin/nc 127.0.0.1 1587`;
+credentials are not sent if any check fails. It
+never uses a Docker port publication. The container must provide the fixed
+`/usr/bin/nc`, and operational checks reject every publication of container
+port or host port `1587`.
+
+`maddy.docker_submission_scope` is a closed, default-deny boundary. Its default value, `container`, rejects Docker
+host networking and requires the listener to exist only in an isolated container network namespace. The explicit
+`host-loopback` value is accepted only when Docker reports exact network mode `host`; it permits exactly one host
+listener at IPv4 `127.0.0.1:1587`. Wildcard, IPv6, duplicate, and non-loopback listeners fail closed before or after
+every change. This opt-in has the same trusted-local-user boundary as native Maddy mode: local processes can reach the
+socket, but Maddy still requires the selected mailbox account's real SMTP credentials. Container network mode is
+included in all transaction snapshots and rollback comparisons.
 
 The Docker socket is equivalent to host root access, so only the root helper may access it; the Web
 process explicitly cannot see it. Container name, image ID, mounts, port bindings, restart policy, and

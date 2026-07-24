@@ -32,6 +32,8 @@ maddy_state=""
 container=""
 docker_binary="$(command -v docker || true)"
 python_binary="$(command -v python3 || true)"
+network_mode="not-applicable"
+docker_submission_scope="not-applicable"
 
 while (($#)); do
     case "$1" in
@@ -74,8 +76,16 @@ if [[ "$mode" == "container" ]]; then
     [[ -n "$docker_binary" ]] || die "--docker-binary is required in container mode"
     require_absolute_path "$docker_binary" "Docker binary"
     [[ -x "$docker_binary" ]] || die "Docker binary is not executable"
-    running=$("$docker_binary" inspect --format '{{.State.Running}}' "$container" 2>/dev/null) || die "cannot inspect container: $container"
-    [[ "$running" == "true" ]] || die "Maddy container is not running"
+    container_report=$(
+        "$python_binary" "$SCRIPT_DIR/check-maddy-container.py" \
+            --docker "$docker_binary" --container "$container" \
+            --container-config "$maddy_config"
+    ) || die "cannot validate Maddy container identity"
+    network_mode=$(
+        "$python_binary" -c \
+            'import json,sys; print(json.loads(sys.argv[1])["network_mode"])' \
+            "$container_report"
+    ) || die "cannot read validated container network mode"
     published_ports=$("$docker_binary" port "$container" 2>/dev/null) \
         || die "cannot inspect container port publications"
     if printf '%s\n' "$published_ports" | grep -Eq '(^|[[:space:]])1587/(tcp|udp)[[:space:]]|:1587$'; then
@@ -128,6 +138,29 @@ else
 fi
 "$python_binary" "$SCRIPT_DIR/validate-config.py" "${validate_args[@]}"
 
+if [[ "$expected_maddy_mode" == docker ]]; then
+    docker_submission_scope=$("$python_binary" - "$app_config" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as handle:
+    config = tomllib.load(handle)
+print(config["maddy"].get("docker_submission_scope", "container"))
+PY
+) || die "cannot read Docker Submission scope from validated config"
+    case "$docker_submission_scope" in
+        container)
+            [[ "$network_mode" != host ]] \
+                || die "container Submission scope requires a non-host Docker network mode"
+            ;;
+        host-loopback)
+            [[ "$network_mode" == host ]] \
+                || die "host-loopback Submission scope requires Docker network mode host"
+            ;;
+        *) die "validated Docker Submission scope is invalid" ;;
+    esac
+fi
+
 if [[ "$expected_maddy_mode" == native ]]; then
     require_command realpath
     [[ "$(realpath -e -- "$maddy_config")" == "$maddy_config" ]] \
@@ -167,5 +200,5 @@ if [[ "$mode" == "native" ]] && command -v systemctl >/dev/null 2>&1; then
     systemctl show-environment >/dev/null 2>&1 || die "systemd is installed but not operational"
 fi
 
-printf 'preflight=ok\nmode=%s\npython=%s\npy_gil_disabled=%s\ngil_enabled=%s\nmaddy=%s\nconfig_validation=%s\nlegacy_help_fingerprint=%s\n' \
-    "$mode" "$python_version" "$py_gil_disabled" "$gil_enabled" "$maddy_version" "$config_validation" "$legacy_help_fingerprint"
+printf 'preflight=ok\nmode=%s\npython=%s\npy_gil_disabled=%s\ngil_enabled=%s\nmaddy=%s\nconfig_validation=%s\nlegacy_help_fingerprint=%s\nnetwork_mode=%s\ndocker_submission_scope=%s\n' \
+    "$mode" "$python_version" "$py_gil_disabled" "$gil_enabled" "$maddy_version" "$config_validation" "$legacy_help_fingerprint" "$network_mode" "$docker_submission_scope"
