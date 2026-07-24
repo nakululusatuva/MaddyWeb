@@ -3,7 +3,14 @@ from pathlib import Path
 
 import pytest
 
-from maddyweb.config import AppConfig, ConfigError, load_config
+from maddyweb.config import (
+    DEFAULT_WEB_HOST,
+    DEFAULT_WEB_LISTEN,
+    DEFAULT_WEB_PORT,
+    AppConfig,
+    ConfigError,
+    load_config,
+)
 
 
 def _config(document: dict[str, object] | None = None) -> AppConfig:
@@ -18,7 +25,11 @@ def _config(document: dict[str, object] | None = None) -> AppConfig:
 
 def test_safe_defaults_are_loopback_and_small_after_explicit_mode() -> None:
     config = _config()
-    assert config.server.host_port == ("127.0.0.1", 8787)
+    assert DEFAULT_WEB_HOST == "127.0.0.1"
+    assert DEFAULT_WEB_PORT == 8787
+    assert DEFAULT_WEB_LISTEN == "127.0.0.1:8787"
+    assert config.server.listen == DEFAULT_WEB_LISTEN
+    assert config.server.host_port == (DEFAULT_WEB_HOST, DEFAULT_WEB_PORT)
     assert config.server.concurrency == 8
     assert config.server.request_body_timeout_seconds == 15
     assert config.server.max_upload_bytes == 20 * 1024 * 1024

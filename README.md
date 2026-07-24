@@ -12,6 +12,23 @@ topology, or helper health does not match a tested contract, write operations ar
 
 <p align="center"><em>MaddyWeb administration overview - private mail operations through a loopback-only console.</em></p>
 
+## Default Web listener
+
+MaddyWeb's default and production listener is **`127.0.0.1:8787`**. If
+`server.listen` is omitted, the application uses this value; every supplied
+configuration template also pins it explicitly. Port `8787` is the MaddyWeb
+HTTP interface, while port `1587` is the separate Maddy management Submission
+endpoint and is not a Web port.
+
+Remote access should forward the default listener over SSH:
+
+```console
+ssh -N -L 127.0.0.1:8787:127.0.0.1:8787 admin@mail.example.net
+```
+
+Both ends of the forwarding rule are intentionally loopback-only. Do not bind
+the service to a public address or publish it through Docker or Nginx.
+
 ## Browser architecture
 
 The administration console is a static single-page application: one fixed HTML shell, one local stylesheet,
