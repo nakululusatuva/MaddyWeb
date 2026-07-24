@@ -15,6 +15,7 @@ readonly SYSTEMD_ROOT="/etc/systemd/system"
 readonly CONFIG_ROOT="/etc/maddyweb"
 readonly CONFIG_HISTORY_ROOT="/var/lib/maddyweb-config-history"
 readonly DEPENDENCY_LOCK="$REPO_ROOT/requirements.lock"
+readonly CLI_WRAPPER="$REPO_ROOT/deploy/maddyweb-cli"
 readonly CERTBOT_ROOT="/etc/letsencrypt"
 readonly CERTBOT_RENEWAL_HOOKS="$CERTBOT_ROOT/renewal-hooks"
 readonly CERTBOT_DEPLOY_HOOKS="$CERTBOT_RENEWAL_HOOKS/deploy"
@@ -195,6 +196,7 @@ fi
 require_regular_file "$artifact" "application artifact"
 require_regular_file "$artifact_manifest" "artifact manifest"
 require_regular_file "$DEPENDENCY_LOCK" "dependency lock"
+require_regular_file "$CLI_WRAPPER" "release-local CLI wrapper"
 require_directory "$wheelhouse" "offline wheelhouse"
 require_path_below "$artifact" "$wheelhouse"
 require_absolute_path "$python_binary" "Python binary"
@@ -409,7 +411,8 @@ staged_commit=$("$python_binary" -c \
     --no-index --find-links "$wheelhouse" --only-binary=:all: --require-hashes \
     --requirement "$staging/REQUIREMENTS.lock"
 "$staging/bin/python" -m pip install --no-index --no-deps -- "$artifact_copy"
-"$staging/bin/python" -I -m maddyweb --help >/dev/null
+install -o root -g root -m 0555 -- "$CLI_WRAPPER" "$staging/bin/maddyweb"
+"$staging/bin/maddyweb" --help >/dev/null
 authentication_profile=unauthenticated
 reported_authentication_profile=$(
     "$staging/bin/python" -I -m maddyweb.release_attestation 2>/dev/null
@@ -477,7 +480,6 @@ printf 'format=maddyweb-install-v2\ncommit=%s\nartifact=%s\nsha256=%s\ndependenc
     "$maddy_mode" "$container" \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$staging/INSTALL-MANIFEST"
 chmod -R u=rwX,go=rX -- "$staging"
-mv -- "$staging" "$release_path"
 
 unit_backup=""
 cleanup_pretransaction() {
@@ -515,6 +517,10 @@ cleanup_pretransaction() {
 trap cleanup_pretransaction EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+mv -- "$staging" "$release_path"
+"$release_path/bin/maddyweb" --help >/dev/null \
+    || die "release-local CLI wrapper failed after the final release move"
 
 previous=""
 if [[ -L "$CURRENT_LINK" ]]; then

@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+
+self=$0
+case "$self" in
+    */*) ;;
+    *)
+        self=$(command -v "$self") || {
+            printf '%s\n' "MaddyWeb CLI path cannot be resolved." >&2
+            exit 126
+        }
+        ;;
+esac
+
+script_dir=$(CDPATH='' cd -P -- "$(dirname -- "$self")" && pwd)
+exec "$script_dir/python" -I -m maddyweb "$@"

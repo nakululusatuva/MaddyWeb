@@ -779,6 +779,14 @@ def test_mutating_scripts_are_dry_run_and_approval_gated() -> None:
     assert "--only-binary=:all:" in install_source
     assert '--requirement "$staging/REQUIREMENTS.lock"' in install_source
     assert "--no-index --no-deps" in install_source
+    assert 'install -o root -g root -m 0555 -- "$CLI_WRAPPER" "$staging/bin/maddyweb"' in (
+        install_source
+    )
+    assert '"$staging/bin/maddyweb" --help' in install_source
+    assert '"$release_path/bin/maddyweb" --help' in install_source
+    final_move = install_source.index('mv -- "$staging" "$release_path"')
+    final_cli_check = install_source.index('"$release_path/bin/maddyweb" --help')
+    assert install_source.index("trap cleanup_pretransaction EXIT") < final_move < final_cli_check
     assert '--copy-to "$artifact_copy"' in install_source
     assert "staged artifact checksum changed after secure copy" in install_source
     assert "assert_config_root_metadata" in install_source
@@ -791,6 +799,43 @@ def test_mutating_scripts_are_dry_run_and_approval_gated() -> None:
     preflight_source = (ROOT / "scripts/preflight.sh").read_text(encoding="utf-8")
     assert "Docker must not publish MaddyWeb's managed port 1587" in preflight_source
     assert "/usr/bin/nc" in preflight_source
+
+
+@pytest.mark.skipif(os.name != "posix", reason="the production CLI wrapper is POSIX-only")
+def test_release_local_cli_wrapper_survives_final_directory_move(tmp_path: Path) -> None:
+    staging = tmp_path / ".staging-release"
+    final = tmp_path / "release"
+    bin_dir = staging / "bin"
+    bin_dir.mkdir(parents=True)
+    wrapper = bin_dir / "maddyweb"
+    shutil.copyfile(ROOT / "deploy/maddyweb-cli", wrapper)
+    wrapper.chmod(0o555)
+    interpreter = bin_dir / "python"
+    interpreter.write_text(
+        '#!/bin/sh\nset -eu\nprintf "%s\\n" "$@" >"$MADDYWEB_WRAPPER_ARGS"\n',
+        encoding="ascii",
+    )
+    interpreter.chmod(0o555)
+    staging.rename(final)
+    arguments = tmp_path / "arguments"
+    environment = os.environ.copy()
+    environment["MADDYWEB_WRAPPER_ARGS"] = str(arguments)
+
+    subprocess.run(  # noqa: S603 - repository-owned wrapper in a private test directory
+        [str(final / "bin/maddyweb"), "auth-role", "--email", "admin@example.test"],
+        check=True,
+        env=environment,
+        timeout=10,
+    )
+
+    assert arguments.read_text(encoding="ascii").splitlines() == [
+        "-I",
+        "-m",
+        "maddyweb",
+        "auth-role",
+        "--email",
+        "admin@example.test",
+    ]
 
 
 @pytest.mark.parametrize(

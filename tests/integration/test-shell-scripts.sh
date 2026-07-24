@@ -15,6 +15,8 @@ while IFS= read -r -d '' script; do
 done < <(find "$ROOT/scripts" "$ROOT/tests/integration" -type f -name '*.sh' -print0)
 bash -n -- "$ROOT/deploy/public-edge/check-public-edge.sh" \
     || fail "syntax error: deploy/public-edge/check-public-edge.sh"
+bash -n -- "$ROOT/deploy/maddyweb-cli" \
+    || fail "syntax error: deploy/maddyweb-cli"
 
 grep -Fq 'ListenStream=/run/maddyweb/helper.sock' "$ROOT/deploy/systemd/maddyweb-helper.socket" || fail "helper socket path changed"
 grep -Fq 'SocketMode=0660' "$ROOT/deploy/systemd/maddyweb-helper.socket" || fail "helper socket mode changed"
@@ -35,6 +37,8 @@ grep -Fq 'd /run/maddyweb         0750 root     maddyweb -' "$ROOT/deploy/system
 grep -Fq 'd /run/maddyweb-approval 0700 root     root     -' "$ROOT/deploy/systemd/maddyweb.tmpfiles" || fail "approval directory is not isolated"
 grep -Fq 'MADDYWEB_APPROVAL_ROOT="/run/maddyweb-approval"' "$ROOT/scripts/lib/common.sh" || fail "approval root is not isolated"
 grep -Fq 'unexpectedly advertises verify-config' "$ROOT/scripts/lib/common.sh" || fail "0.8.2 verify-config guard is missing"
+grep -Fq 'exec "$script_dir/python" -I -m maddyweb "$@"' "$ROOT/deploy/maddyweb-cli" \
+    || fail "release-local CLI wrapper no longer invokes its own interpreter"
 grep -Fq "IFS=\$' \t' read -r python_version py_gil_disabled gil_enabled" \
     "$ROOT/scripts/preflight.sh" || fail "Python diagnostics parser ignores spaces"
 
