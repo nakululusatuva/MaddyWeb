@@ -7,8 +7,8 @@
   <meta name="theme-color" content="#f4f6f9">
   <meta name="description" content="Private Maddy mail server administration console">
   <title>MaddyWeb</title>
-  <link rel="stylesheet" href="/static/app.css?v=8">
-  <script src="/static/app.js?v=9" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=9">
+  <script src="/static/app.js?v=10" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to main content</a>
@@ -85,14 +85,13 @@
       <section id="mail-view" class="view" data-view="mail" aria-labelledby="mail-title" hidden>
         <div class="page-heading"><div><p class="eyebrow">Mailbox operations</p><h1 id="mail-title">Mailboxes</h1><p>Browse messages across enabled local accounts without exposing a public mail interface.</p></div></div>
         <section class="data-card">
-          <form id="mail-selector" class="card-toolbar mail-selector" action="/mail" method="get">
+          <div id="mail-selector" class="card-toolbar mail-selector">
             <label><span>Account</span><select id="mail-account" name="account" required><option value="">Select an account</option></select></label>
             <label><span>Mailbox</span><select id="mail-mailbox" name="mailbox"><option value="">Select a mailbox</option></select></label>
-            <button class="button button-primary" type="submit">Open</button>
-          </form>
+          </div>
           <div class="table-scroll">
             <table class="message-table">
-              <thead><tr><th scope="col">Sender</th><th scope="col">Subject</th><th scope="col">Date</th></tr></thead>
+              <thead><tr><th scope="col">Sender</th><th scope="col">Subject</th><th scope="col">Date</th><th scope="col">Actions</th></tr></thead>
               <tbody id="message-list-body"></tbody>
             </table>
           </div>

@@ -3,6 +3,7 @@
 (() => {
   const API_ROOT = "/api/v1";
   const DELETE_MESSAGE_CONFIRMATION = "PERMANENTLY DELETE";
+  const FORWARD_FORM_RESERVE_BYTES = 128 * 1024;
   const ALLOWED_PREVIEW_TAGS = new Set([
     "A", "ABBR", "B", "BLOCKQUOTE", "BR", "CAPTION", "CODE", "COL", "COLGROUP",
     "DD", "DEL", "DIV", "DL", "DT", "EM", "H1", "H2", "H3", "H4", "H5", "H6",
@@ -91,6 +92,7 @@
     writeImageCids: new WeakMap(),
     previewUrl: null,
     sendLocked: false,
+    pendingForwardSubject: null,
     theme: "light",
   };
 
@@ -192,8 +194,8 @@
     return objectValue(payload.data);
   };
 
-  const refreshSession = async () => {
-    const data = await apiData("/session");
+  const refreshSession = async (signal = undefined) => {
+    const data = await apiData("/session", signal ? {signal} : {});
     const token = stringValue(data.csrf_token);
     if (!token) throw new ApiError("The server did not provide a CSRF token.");
     state.csrfToken = token;
@@ -205,7 +207,11 @@
     // restart, or be rotated by another tab. Synchronize immediately before
     // every serialized write so the header and HttpOnly cookie still match.
     // A rejected write is never retried automatically.
-    await refreshSession();
+    const guardSignal = options.guardSignal instanceof AbortSignal
+      ? options.guardSignal
+      : null;
+    await refreshSession(guardSignal || undefined);
+    if (guardSignal) guardSignal.throwIfAborted();
     const headers = {
       "Accept": "application/json",
       "X-CSRF-Token": state.csrfToken,
@@ -530,12 +536,160 @@
     return `${url.pathname}${url.search}`;
   };
 
+  const buildForwardUrl = ({account, mailbox, uid, mode}) => {
+    const url = new URL("/compose", window.location.origin);
+    url.searchParams.set("forward", mode);
+    url.searchParams.set("account", account);
+    url.searchParams.set("mailbox", mailbox);
+    url.searchParams.set("uid", uid);
+    return `${url.pathname}${url.search}`;
+  };
+
+  const messageApiQuery = (context) => new URLSearchParams({
+    account: context.account,
+    mailbox: context.mailbox,
+  });
+
+  const loadMessageActionSnapshot = async (context, signal) => {
+    signal.throwIfAborted();
+    const detail = await apiData(
+      `/mail/${encodeURIComponent(context.uid)}/action-snapshot?${
+        messageApiQuery(context).toString()
+      }`,
+      {signal},
+    );
+    signal.throwIfAborted();
+    if (
+      stringValue(detail.uid) !== context.uid
+      || stringValue(detail.account) !== context.account
+      || stringValue(detail.mailbox) !== context.mailbox
+      || !Number.isSafeInteger(detail.size)
+      || detail.size <= 0
+      || !stringValue(detail.freshness_token)
+    ) {
+      throw new ApiError("The message changed; refresh the mailbox and try again.");
+    }
+    return detail;
+  };
+
+  const setMessageRowBusy = (row, busy) => {
+    if (busy) row.setAttribute("aria-busy", "true");
+    else row.removeAttribute("aria-busy");
+    for (const button of row.querySelectorAll(".message-row-action")) {
+      if (button instanceof HTMLButtonElement) {
+        button.disabled = busy || button.dataset.unavailable === "true";
+      }
+    }
+  };
+
+  const refreshMessageList = (context) => {
+    navigate(buildMailUrl({
+      account: context.account,
+      mailbox: context.mailbox,
+    }), {replace: true, focus: false});
+  };
+
+  const messageActionButton = (label, context, handler) => {
+    const button = element("button", {
+      className: "message-row-action",
+      text: label,
+      title: `${label}: ${context.subject}`,
+      type: "button",
+    });
+    button.setAttribute("aria-label", label);
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      void handler(button);
+    });
+    return button;
+  };
+
+  const archiveMessageFromRow = async (context, row, button) => {
+    const signal = state.routeController?.signal;
+    if (!(signal instanceof AbortSignal)) return;
+    setMessageRowBusy(row, true);
+    clearAlert();
+    try {
+      const detail = await loadMessageActionSnapshot(context, signal);
+      signal.throwIfAborted();
+      const payload = await mutate(`/mail/${encodeURIComponent(context.uid)}/archive`, {
+        guardSignal: signal,
+        json: {
+          account: context.account,
+          mailbox: context.mailbox,
+          freshness: stringValue(detail.freshness_token),
+        },
+      });
+      if (signal.aborted) return;
+      finishAction(payload, "Message archived.");
+      refreshMessageList(context);
+    } catch (error) {
+      if (!signal.aborted) {
+        handleError(error);
+        if (error instanceof ApiError && error.status === 409) refreshMessageList(context);
+      }
+    } finally {
+      setMessageRowBusy(row, false);
+      if (!signal.aborted && document.contains(button)) button.focus();
+    }
+  };
+
+  const deleteMessageFromRow = (context, row, button) => {
+    const signal = state.routeController?.signal;
+    if (!(signal instanceof AbortSignal)) return;
+    clearAlert();
+    openConfirm({
+      title: "Move message to Trash?",
+      message: "The message will be rechecked, then moved to Trash.",
+      label: "Move to Trash",
+      danger: true,
+      opener: button,
+      action: async () => {
+        signal.throwIfAborted();
+        setMessageRowBusy(row, true);
+        try {
+          const detail = await loadMessageActionSnapshot(context, signal);
+          signal.throwIfAborted();
+          let payload;
+          try {
+            payload = await mutate(
+              `/mail/${encodeURIComponent(context.uid)}/trash`,
+              {
+                guardSignal: signal,
+                json: {
+                  account: context.account,
+                  mailbox: context.mailbox,
+                  freshness: stringValue(detail.freshness_token),
+                },
+              },
+            );
+          } catch (error) {
+            if (signal.aborted) return;
+            throw error;
+          }
+          if (signal.aborted) return;
+          finishAction(payload, "Message moved to Trash.");
+          refreshMessageList(context);
+        } finally {
+          setMessageRowBusy(row, false);
+        }
+      },
+    });
+  };
+
   const renderMail = (mail) => {
     const account = stringValue(mail.selected_account);
     const mailbox = stringValue(mail.selected_mailbox);
     const accounts = arrayValue(mail.accounts).map(objectValue);
     const mailboxes = arrayValue(mail.mailboxes).map(objectValue);
     const messages = arrayValue(mail.messages).map(objectValue);
+    const selectedMailbox = mailboxes.find(
+      (item) => stringValue(item.name) === mailbox,
+    );
+    const currentIsTrash = objectValue(selectedMailbox).is_trash === true;
+    const currentIsArchive = objectValue(selectedMailbox).is_archive === true;
+    const trashAvailable = mail.trash_available === true;
+    const archiveAvailable = mail.archive_available === true;
 
     populateSelect(
       byId("mail-account"),
@@ -557,28 +711,108 @@
     );
     byId("mail-mailbox").disabled = !account;
 
+    const currentQuery = new URLSearchParams(window.location.search);
+    if (
+      account
+      && mailbox
+      && currentQuery.get("account") === account
+      && !currentQuery.get("mailbox")
+    ) {
+      window.history.replaceState(null, "", buildMailUrl({account, mailbox}));
+    }
+
     const fragment = document.createDocumentFragment();
     for (const message of messages) {
       const uid = stringValue(message.uid);
       const url = new URL(`/mail/${encodeURIComponent(uid)}`, window.location.origin);
       url.searchParams.set("account", account);
       url.searchParams.set("mailbox", mailbox);
+      const sender = stringValue(message.sender, "Unknown sender");
+      const subject = stringValue(message.subject, "(No subject)");
+      const context = {account, mailbox, uid, sender, subject};
       const row = element("tr", {
         className: message.unread === true ? "message-unread" : "",
       });
+      row.tabIndex = 0;
+      row.setAttribute("aria-label", `Open message from ${sender}: ${subject}`);
+      row.title = `Open message: ${subject}`;
+      const openRow = () => navigate(`${url.pathname}${url.search}`);
+      row.addEventListener("click", (event) => {
+        if (
+          event.defaultPrevented
+          || event.metaKey
+          || event.ctrlKey
+          || event.shiftKey
+          || event.altKey
+        ) return;
+        const interactive = event.target instanceof Element
+          ? event.target.closest("a, button, input, select, textarea")
+          : null;
+        if (interactive) return;
+        openRow();
+      });
+      row.addEventListener("keydown", (event) => {
+        if (event.target !== row || (event.key !== "Enter" && event.key !== " ")) return;
+        event.preventDefault();
+        openRow();
+      });
       row.append(
-        element("td", {text: stringValue(message.sender, "Unknown sender")}),
+        element("td", {text: sender}),
       );
       const subjectCell = element("td");
       const subjectLink = element("a", {
-        text: stringValue(message.subject, "(No subject)"),
+        text: subject,
       });
       subjectLink.href = `${url.pathname}${url.search}`;
       subjectLink.dataset.route = "";
       subjectCell.append(subjectLink);
+      const actionCell = element("td", {className: "message-actions-cell"});
+      const actionGroup = element("div", {className: "message-row-actions"});
+      actionGroup.setAttribute("role", "group");
+      actionGroup.setAttribute("aria-label", `Actions for ${subject}`);
+      const deleteButton = messageActionButton("Delete", context, (button) => (
+        deleteMessageFromRow(context, row, button)
+      ));
+      if (currentIsTrash || !trashAvailable) {
+        deleteButton.dataset.unavailable = "true";
+        deleteButton.disabled = true;
+        deleteButton.title = currentIsTrash
+          ? "This message is already in Trash."
+          : "This account does not have an available Trash mailbox.";
+      }
+      const archiveButton = messageActionButton("Archive", context, (button) => (
+        archiveMessageFromRow(context, row, button)
+      ));
+      if (currentIsArchive || !archiveAvailable) {
+        archiveButton.dataset.unavailable = "true";
+        archiveButton.disabled = true;
+        archiveButton.title = currentIsArchive
+          ? "This message is already archived."
+          : "This account does not have an available Archive mailbox.";
+      }
+      actionGroup.append(
+        messageActionButton("Forward", context, () => {
+          state.pendingForwardSubject = null;
+          navigate(buildForwardUrl({...context, mode: "inline"}));
+        }),
+        messageActionButton("Forward as attachment", context, () => {
+          state.pendingForwardSubject = {
+            account,
+            mailbox,
+            uid,
+            mode: "attachment",
+            subject: boundedForwardedSubject(subject),
+          };
+          navigate(buildForwardUrl({...context, mode: "attachment"}));
+        }),
+        deleteButton,
+        archiveButton,
+      );
+      actionCell.append(actionGroup);
       row.append(
         subjectCell,
         element("td", {text: stringValue(message.date, "Unknown date")}),
+        actionCell,
       );
       fragment.append(row);
     }
@@ -1281,8 +1515,259 @@
     updateFormattingButtons();
   };
 
+  const forwardContextFromLocation = () => {
+    const query = new URLSearchParams(window.location.search);
+    const mode = query.get("forward");
+    if (mode === null) return null;
+    const allowedNames = new Set(["forward", "account", "mailbox", "uid"]);
+    if (
+      Array.from(query.keys()).some((name) => !allowedNames.has(name))
+      || Array.from(allowedNames).some((name) => query.getAll(name).length !== 1)
+    ) {
+      throw new ApiError("The forward request contains an unsupported parameter.");
+    }
+    const account = query.get("account") || "";
+    const mailbox = query.get("mailbox") || "";
+    const uid = query.get("uid") || "";
+    if (
+      (mode !== "inline" && mode !== "attachment")
+      || !account
+      || !mailbox
+      || !/^[1-9][0-9]{0,9}$/.test(uid)
+    ) {
+      throw new ApiError("The forward request is incomplete or invalid.");
+    }
+    return {mode, account, mailbox, uid};
+  };
+
+  const forwardedSubject = (subject) => {
+    const value = stringValue(subject, "(No subject)").trim() || "(No subject)";
+    return /^fwd:/i.test(value) ? value : `Fwd: ${value}`;
+  };
+
+  const boundedForwardedSubject = (subject) => {
+    const normalized = forwardedSubject(subject)
+      .replace(/[\u0000-\u001f\u007f]/g, " ")
+      .trim();
+    if (normalized.length <= 4000) return normalized;
+    let truncated = normalized.slice(0, 3997);
+    if (/[\ud800-\udbff]$/i.test(truncated)) truncated = truncated.slice(0, -1);
+    return `${truncated}...`;
+  };
+
+  const takePendingForwardSubject = (context) => {
+    const pending = objectValue(state.pendingForwardSubject);
+    state.pendingForwardSubject = null;
+    if (
+      stringValue(pending.mode) !== context.mode
+      || stringValue(pending.account) !== context.account
+      || stringValue(pending.mailbox) !== context.mailbox
+      || stringValue(pending.uid) !== context.uid
+    ) return "";
+    const subject = stringValue(pending.subject);
+    return subject.length <= 4000 ? subject : "";
+  };
+
+  const forwardedBodySource = (detail) => {
+    const recipients = arrayValue(detail.to)
+      .map((value) => stringValue(value))
+      .filter(Boolean)
+      .join(", ");
+    const copied = arrayValue(detail.cc)
+      .map((value) => stringValue(value))
+      .filter(Boolean)
+      .join(", ");
+    const headerLines = [
+      ["From", stringValue(detail.sender, "Unknown sender")],
+      ["Date", stringValue(detail.date, "Unknown date")],
+      ["Subject", stringValue(detail.subject, "(No subject)")],
+      ["To", recipients],
+      ["Cc", copied],
+    ].filter((entry) => entry[1]);
+    const headers = headerLines
+      .map(([label, value]) => `<strong>${label}:</strong> ${escapeText(value)}`)
+      .join("<br>");
+    return [
+      "<p><br></p>",
+      "<blockquote>",
+      "<p>---------- Forwarded message ----------</p>",
+      `<p>${headers}</p>`,
+      `<pre>${escapeText(stringValue(detail.text))}</pre>`,
+      "</blockquote>",
+    ].join("");
+  };
+
+  const safeForwardFilename = (value) => {
+    const filename = stringValue(value);
+    if (
+      !filename
+      || filename.includes("/")
+      || filename.includes("\\")
+      || /[\u0000-\u001f\u007f]/.test(filename)
+    ) {
+      throw new ApiError("The server returned an unsafe attachment name.");
+    }
+    return filename;
+  };
+
+  const safeForwardContentType = (value) => {
+    const contentType = stringValue(value).toLowerCase();
+    return /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/.test(contentType)
+      ? contentType
+      : "application/octet-stream";
+  };
+
+  const forwardDownloadUrl = (value, context, expectedPath) => {
+    const url = sameOriginUrl(stringValue(value), expectedPath);
+    if (
+      !url
+      || url.pathname !== expectedPath
+      || url.searchParams.get("account") !== context.account
+      || url.searchParams.get("mailbox") !== context.mailbox
+    ) {
+      throw new ApiError("The server returned an invalid message download URL.");
+    }
+    return `${url.pathname}${url.search}`;
+  };
+
+  const downloadForwardFile = async ({
+    url,
+    filename,
+    contentType,
+    maximum,
+    signal,
+  }) => {
+    const response = await fetch(url, {
+      method: "GET",
+      credentials: "same-origin",
+      headers: {"Accept": "application/octet-stream"},
+      redirect: "error",
+      signal,
+    });
+    if (!response.ok) {
+      throw new ApiError(`Attachment download failed with status ${response.status}.`, {
+        status: response.status,
+      });
+    }
+    const lengthHeader = response.headers.get("Content-Length") || "";
+    if (/^[0-9]+$/.test(lengthHeader) && Number(lengthHeader) > maximum) {
+      if (response.body) void response.body.cancel();
+      throw new ApiError("The forwarded content exceeds the configured upload limit.");
+    }
+    const blob = await response.blob();
+    if (blob.size > maximum) {
+      throw new ApiError("The forwarded content exceeds the configured upload limit.");
+    }
+    return new File([blob], filename, {type: contentType});
+  };
+
+  const applyForwardDraft = async (context, senders, maximumUpload, signal) => {
+    const query = messageApiQuery(context).toString();
+    let detail = null;
+    if (context.mode === "inline") {
+      detail = await apiData(
+        `/mail/${encodeURIComponent(context.uid)}?${query}`,
+        {signal},
+      );
+      if (
+        stringValue(detail.uid) !== context.uid
+        || stringValue(detail.account) !== context.account
+        || stringValue(detail.mailbox) !== context.mailbox
+      ) {
+        throw new ApiError("The server returned a mismatched forward source.");
+      }
+      if (detail.preview_too_large === true) {
+        throw new ApiError(
+          "This message is too large to forward inline. Use Forward as attachment.",
+        );
+      }
+    }
+
+    const subject = detail
+      ? boundedForwardedSubject(detail.subject)
+      : takePendingForwardSubject(context) || "Fwd: Forwarded message";
+    const bodySource = detail
+      ? forwardedBodySource(detail)
+      : "<p>Forwarded message attached.</p>";
+    const bodyBytes = new TextEncoder().encode(bodySource).byteLength;
+    const uploadBudget = Math.max(
+      0,
+      maximumUpload - bodyBytes - FORWARD_FORM_RESERVE_BYTES,
+    );
+    const maximumFile = Math.min(uploadBudget, 20 * 1024 * 1024);
+    if (maximumFile <= 0) {
+      throw new ApiError("The forwarded content exceeds the configured upload limit.");
+    }
+
+    const files = [];
+    let used = 0;
+    if (context.mode === "attachment") {
+      const rawPath = `${API_ROOT}/mail/${encodeURIComponent(context.uid)}/raw`;
+      const url = forwardDownloadUrl(`${rawPath}?${query}`, context, rawPath);
+      files.push(await downloadForwardFile({
+        url,
+        filename: `forwarded-message-${context.uid}.eml`,
+        contentType: "message/rfc822",
+        maximum: maximumFile,
+        signal,
+      }));
+    } else {
+      const attachments = arrayValue(objectValue(detail).attachments).map(objectValue);
+      for (const attachment of attachments) {
+        const size = attachment.size;
+        if (!Number.isSafeInteger(size) || size < 0 || size > maximumFile - used) {
+          throw new ApiError("The original attachments exceed the configured upload limit.");
+        }
+        const attachmentId = stringValue(attachment.id);
+        const prefix = (
+          `${API_ROOT}/mail/${encodeURIComponent(context.uid)}/attachments/`
+          + encodeURIComponent(attachmentId)
+        );
+        const url = forwardDownloadUrl(attachment.url, context, prefix);
+        const file = await downloadForwardFile({
+          url,
+          filename: safeForwardFilename(attachment.filename),
+          contentType: safeForwardContentType(attachment.content_type),
+          maximum: Math.min(maximumFile - used, size),
+          signal,
+        });
+        if (file.size !== size) {
+          throw new ApiError("An original attachment changed while preparing the forward.");
+        }
+        used += file.size;
+        files.push(file);
+      }
+    }
+
+    const sender = byId("compose-sender");
+    if (sender instanceof HTMLSelectElement && senders.includes(context.account)) {
+      sender.value = context.account;
+    }
+    byId("compose-subject").value = subject;
+    const source = byId("html-source");
+    if (!(source instanceof HTMLTextAreaElement)) {
+      throw new ApiError("The message editor is unavailable.");
+    }
+    source.value = bodySource;
+    renderSourceInWrite();
+    setBodyMode("write");
+    const attachmentInput = byId("attachments-input");
+    if (!(attachmentInput instanceof HTMLInputElement)) {
+      throw new ApiError("The attachment control is unavailable.");
+    }
+    replaceFileInput(attachmentInput, files);
+    renderAttachmentTray();
+    showToast(
+      context.mode === "attachment"
+        ? "Forward draft prepared with the original message attached."
+        : "Forward draft prepared.",
+    );
+  };
+
   const loadCompose = async (signal) => {
     setLoading("Loading sending accounts.");
+    const forwardContext = forwardContextFromLocation();
+    if (forwardContext) resetCompose();
     const data = await apiData("/compose", {signal});
     const senders = arrayValue(data.senders)
       .map((value) => stringValue(value))
@@ -1294,6 +1779,14 @@
     select.replaceChildren(fragment);
     select.disabled = senders.length === 0;
     byId("send-button").disabled = senders.length === 0 || state.sendLocked;
+    if (forwardContext) {
+      const configuredMaximum = data.max_upload_bytes;
+      const maximumUpload = Number.isSafeInteger(configuredMaximum) && configuredMaximum > 0
+        ? configuredMaximum
+        : 20 * 1024 * 1024;
+      setLoading("Preparing forward draft.");
+      await applyForwardDraft(forwardContext, senders, maximumUpload, signal);
+    }
   };
 
   const statusPill = (positive, positiveText, negativeText) => element("span", {
@@ -1506,6 +1999,11 @@
     showView(route.name, shouldFocus);
     clearAlert();
     if (state.routeController) state.routeController.abort();
+    if (confirmDialog instanceof HTMLDialogElement && confirmDialog.open) {
+      state.confirmAction = null;
+      state.confirmOpener = null;
+      confirmDialog.close();
+    }
     state.routeController = new AbortController();
     const signal = state.routeController.signal;
     try {
@@ -1559,10 +2057,9 @@
     navigate(buildMailUrl({account: value}));
   });
 
-  byId("mail-selector").addEventListener("submit", (event) => {
-    event.preventDefault();
+  byId("mail-mailbox").addEventListener("change", (event) => {
+    const mailbox = event.target instanceof HTMLSelectElement ? event.target.value : "";
     const account = byId("mail-account").value;
-    const mailbox = byId("mail-mailbox").value;
     navigate(buildMailUrl({account, mailbox}));
   });
 

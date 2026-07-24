@@ -544,6 +544,32 @@ async def test_message_page_preserves_authoritative_continuation() -> None:
 
 
 @pytest.mark.asyncio
+async def test_archive_move_uses_the_existing_special_mailbox_operation() -> None:
+    client = FakeClient(
+        {
+            "messages.move": Response.success(
+                "template",
+                {"moved": True, "target": "Stored Mail"},
+            )
+        }
+    )
+    gateway = gateway_with(client)
+    target = await gateway.move_message_to_archive(
+        "user@example.test",
+        "INBOX",
+        "42",
+    )
+    assert target == "Stored Mail"
+    assert client.requests[0].operation == "messages.move"
+    assert client.requests[0].params == {
+        "username": "user@example.test",
+        "source": "INBOX",
+        "uid": "42",
+        "target_special": "archive",
+    }
+
+
+@pytest.mark.asyncio
 @pytest.mark.skipif(os.name == "nt", reason="POSIX private-file mode and ownership contract")
 async def test_raw_message_is_streamed_into_private_existing_file(tmp_path: Path) -> None:
     raw = b"From: sender@example.test\r\n\r\nbody\r\n"

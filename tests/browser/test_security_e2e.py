@@ -7,6 +7,7 @@ import base64
 import json
 import secrets
 from email import policy
+from email.message import EmailMessage
 from email.parser import BytesParser
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -16,6 +17,7 @@ import pytest
 from aiohttp import web
 from conftest import (
     ACCOUNT,
+    ARCHIVE_MAILBOX,
     CERTIFICATE_FINGERPRINT,
     CERTIFICATE_NAME,
     COOKIE_NAME,
@@ -77,15 +79,31 @@ def _message_path() -> str:
     return f"/mail/{MESSAGE_ID}?{query}"
 
 
-async def _open_message(page: Page, live_application: LiveApplication) -> None:
+async def _load_inbox(page: Page, live_application: LiveApplication) -> None:
     await page.goto(live_application.base_url + "/mail")
     await page.locator("#mail-account").select_option(ACCOUNT)
-    await page.locator("#mail-mailbox").select_option(MAILBOX)
-    await page.get_by_role("button", name="Open", exact=True).click()
     message_link = page.locator("#message-list-body a")
     await message_link.wait_for()
+    assert await page.locator("#mail-mailbox").input_value() == MAILBOX
+    await page.wait_for_url("**/mail?account=admin%40example.test&mailbox=INBOX")
     assert await page.locator("#message-list-body img").count() == 0
     assert await page.locator("body").get_attribute("data-list-xss") is None
+
+
+async def _load_mailbox(
+    page: Page,
+    live_application: LiveApplication,
+    mailbox: str,
+) -> None:
+    query = urlencode({"account": ACCOUNT, "mailbox": mailbox})
+    await page.goto(f"{live_application.base_url}/mail?{query}")
+    await page.locator("#message-list-body tr").wait_for()
+    assert await page.locator("#mail-mailbox").input_value() == mailbox
+
+
+async def _open_message(page: Page, live_application: LiveApplication) -> None:
+    await _load_inbox(page, live_application)
+    message_link = page.locator("#message-list-body a")
     await message_link.click()
     await page.get_by_role(
         "heading",
@@ -411,6 +429,268 @@ async def test_rejects_missing_and_replayed_header_csrf(
     assert replayed["status"] == 403
     assert replayed["payload"]["error"]["code"] in {"csrf_failed", "csrf_reused"}
     assert live_application.gateway.permanent_deletions == []
+
+
+async def test_mailbox_auto_opens_inbox_and_rows_support_pointer_and_keyboard_navigation(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    await _load_inbox(page, live_application)
+    assert await page.get_by_role("button", name="Open", exact=True).count() == 0
+    row = page.locator("#message-list-body tr")
+    assert await row.get_attribute("tabindex") == "0"
+
+    await row.locator("td").first.click()
+    await page.wait_for_url(f"**{_message_path()}")
+    await page.go_back()
+    await page.locator("#message-list-body tr").wait_for()
+
+    row = page.locator("#message-list-body tr")
+    await row.focus()
+    await row.press(" ")
+    await page.wait_for_url(f"**{_message_path()}")
+
+    await page.set_viewport_size({"width": 320, "height": 844})
+    await _load_inbox(page, live_application)
+    actions = page.locator(".message-row-action")
+    assert await actions.count() == 4
+    assert await page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+    for index in range(await actions.count()):
+        bounds = await actions.nth(index).bounding_box()
+        assert bounds is not None
+        assert bounds["height"] >= 44
+
+
+async def test_mailbox_forward_actions_prepare_safe_compose_drafts(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    requested_urls: list[str] = []
+    page.on("request", lambda request: requested_urls.append(request.url))
+    await _load_inbox(page, live_application)
+    row = page.locator("#message-list-body tr")
+    await row.get_by_role("button", name="Forward", exact=True).click()
+    await page.wait_for_url("**/compose?forward=inline*")
+    await page.wait_for_function(
+        "() => document.querySelector('#compose-subject').value.startsWith('Fwd:')"
+    )
+
+    assert await page.locator("#compose-sender").input_value() == ACCOUNT
+    assert await page.locator("#compose-to").input_value() == ""
+    assert await page.locator("#compose-password").input_value() == ""
+    assert "plain fallback" in await page.locator("#message-editor").inner_text()
+    assert "Forwarded message" in await page.locator("#message-editor").inner_text()
+    forwarded_files = await page.locator("#attachments-input").evaluate(
+        "input => Array.from(input.files, file => [file.name, file.type])"
+    )
+    assert forwarded_files == [
+        ["logo.png", "image/png"],
+        ["evil.html", "text/html"],
+    ]
+    assert not any("tracker.invalid" in url for url in requested_urls)
+
+    await _load_inbox(page, live_application)
+    row = page.locator("#message-list-body tr")
+    await row.get_by_role("button", name="Forward as attachment", exact=True).click()
+    await page.wait_for_url("**/compose?forward=attachment*")
+    await page.wait_for_function(
+        "() => document.querySelector('#attachments-input').files.length === 1"
+    )
+    attached_files = await page.locator("#attachments-input").evaluate(
+        "input => Array.from(input.files, file => [file.name, file.type])"
+    )
+    assert attached_files == [["forwarded-message-42.eml", "message/rfc822"]]
+    assert await page.locator("#compose-subject").input_value() == (
+        'Fwd: <img src=x onerror="document.body.dataset.listXss=1">Security fixture'
+    )
+    assert await page.locator("body").get_attribute("data-list-xss") is None
+    assert "Forwarded message attached." in await page.locator("#message-editor").inner_text()
+    assert await page.locator("#compose-to").input_value() == ""
+    assert await page.locator("#compose-password").input_value() == ""
+
+    await page.reload()
+    await page.wait_for_function(
+        "() => document.querySelector('#attachments-input').files.length === 1"
+    )
+    assert await page.locator("#compose-subject").input_value() == "Fwd: Forwarded message"
+
+
+async def test_forward_as_attachment_does_not_require_a_parseable_message(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    malformed = EmailMessage()
+    malformed["From"] = "sender@example.test"
+    malformed["To"] = ACCOUNT
+    malformed["Subject"] = "Attachment limit fixture"
+    malformed.set_content("Body")
+    for index in range(65):
+        malformed.add_attachment(
+            b"",
+            maintype="application",
+            subtype="octet-stream",
+            filename=f"part-{index}.bin",
+        )
+    live_application.gateway.raw = malformed.as_bytes(policy=policy.SMTP)
+
+    await _load_inbox(page, live_application)
+    context = urlencode({"account": ACCOUNT, "mailbox": MAILBOX})
+    detail_status = await page.evaluate(
+        """async url => (await fetch(url, {
+          credentials: "same-origin",
+          headers: {"Accept": "application/json"},
+        })).status""",
+        f"/api/v1/mail/{MESSAGE_ID}?{context}",
+    )
+    assert detail_status == 422
+
+    row = page.locator("#message-list-body tr")
+    await row.get_by_role("button", name="Forward as attachment", exact=True).click()
+    await page.wait_for_url("**/compose?forward=attachment*")
+    await page.wait_for_function(
+        "() => document.querySelector('#attachments-input').files.length === 1"
+    )
+    attached = await page.locator("#attachments-input").evaluate(
+        "input => [input.files[0].name, input.files[0].type, input.files[0].size]"
+    )
+    assert attached == [
+        "forwarded-message-42.eml",
+        "message/rfc822",
+        len(live_application.gateway.raw),
+    ]
+
+
+async def test_mailbox_actions_abort_stale_reads_and_close_pending_confirmations(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    await _load_inbox(page, live_application)
+    live_application.gateway.message_read_started.clear()
+    live_application.gateway.message_read_release.clear()
+    row = page.locator("#message-list-body tr")
+    await row.get_by_role("button", name="Archive", exact=True).click()
+    await asyncio.wait_for(live_application.gateway.message_read_started.wait(), timeout=2)
+    await page.go_back()
+    live_application.gateway.message_read_release.set()
+    await page.get_by_role("heading", name="Mailboxes", exact=True).wait_for()
+    await asyncio.sleep(0.1)
+    assert live_application.gateway.archive_moves == []
+
+    await _load_inbox(page, live_application)
+    live_application.gateway.message_read_started.clear()
+    row = page.locator("#message-list-body tr")
+    await row.get_by_role("button", name="Delete", exact=True).click()
+    await page.locator("#confirm-dialog").wait_for(state="visible")
+    assert not live_application.gateway.message_read_started.is_set()
+    await page.go_back()
+    await page.locator("#confirm-dialog").wait_for(state="hidden")
+    assert live_application.gateway.trash_moves == []
+
+
+async def test_special_use_mailboxes_disable_same_target_actions(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    live_application.gateway.message_location = TRASH_MAILBOX
+    await _load_mailbox(page, live_application, TRASH_MAILBOX)
+    trash_row = page.locator("#message-list-body tr")
+    assert await trash_row.get_by_role("button", name="Delete", exact=True).is_disabled()
+    assert await trash_row.get_by_role("button", name="Archive", exact=True).is_enabled()
+
+    live_application.gateway.message_location = ARCHIVE_MAILBOX
+    await _load_mailbox(page, live_application, ARCHIVE_MAILBOX)
+    archive_row = page.locator("#message-list-body tr")
+    assert await archive_row.get_by_role("button", name="Archive", exact=True).is_disabled()
+    assert await archive_row.get_by_role("button", name="Delete", exact=True).is_enabled()
+
+
+async def test_missing_special_use_targets_disable_move_actions(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    async def inbox_only(_account: str) -> list[dict[str, object]]:
+        return [{"name": MAILBOX, "attributes": []}]
+
+    live_application.gateway.list_mailboxes = inbox_only  # type: ignore[method-assign]
+    await _load_inbox(page, live_application)
+    row = page.locator("#message-list-body tr")
+    assert await row.get_by_role("button", name="Delete", exact=True).is_disabled()
+    assert await row.get_by_role("button", name="Archive", exact=True).is_disabled()
+    assert await row.get_by_role("button", name="Forward", exact=True).is_enabled()
+    assert (
+        await row.get_by_role("button", name="Forward as attachment", exact=True).is_enabled()
+    )
+
+
+async def test_completed_move_posts_do_not_hijack_a_newer_route(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    await _load_inbox(page, live_application)
+    live_application.gateway.archive_move_release.clear()
+    row = page.locator("#message-list-body tr")
+    await row.get_by_role("button", name="Archive", exact=True).click()
+    await asyncio.wait_for(live_application.gateway.archive_move_started.wait(), timeout=2)
+    await page.evaluate(
+        """() => {
+          history.pushState(null, "", "/");
+          window.dispatchEvent(new PopStateEvent("popstate"));
+        }"""
+    )
+    await page.get_by_role("heading", name="Administration overview", exact=True).wait_for()
+    live_application.gateway.archive_move_release.set()
+    await asyncio.wait_for(live_application.gateway.archive_move_finished.wait(), timeout=2)
+    await asyncio.sleep(0.1)
+    assert urlsplit(page.url).path == "/"
+    assert await page.locator("#toast").is_hidden()
+    assert live_application.gateway.archive_moves == [(ACCOUNT, MAILBOX, MESSAGE_ID)]
+
+    live_application.gateway.message_location = MAILBOX
+    await _load_inbox(page, live_application)
+    live_application.gateway.trash_move_release.clear()
+    row = page.locator("#message-list-body tr")
+    await row.get_by_role("button", name="Delete", exact=True).click()
+    await page.locator("#confirm-action").click()
+    await asyncio.wait_for(live_application.gateway.trash_move_started.wait(), timeout=2)
+    await page.evaluate(
+        """() => {
+          history.pushState(null, "", "/");
+          window.dispatchEvent(new PopStateEvent("popstate"));
+        }"""
+    )
+    await page.get_by_role("heading", name="Administration overview", exact=True).wait_for()
+    live_application.gateway.trash_move_release.set()
+    await asyncio.wait_for(live_application.gateway.trash_move_finished.wait(), timeout=2)
+    await asyncio.sleep(0.1)
+    assert urlsplit(page.url).path == "/"
+    assert await page.locator("#toast").is_hidden()
+    assert live_application.gateway.trash_moves == [(ACCOUNT, MAILBOX, MESSAGE_ID)]
+
+
+async def test_mailbox_delete_and_archive_actions_do_not_open_the_message(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    await _load_inbox(page, live_application)
+    row = page.locator("#message-list-body tr")
+    await row.get_by_role("button", name="Delete", exact=True).click()
+    await page.locator("#confirm-dialog").wait_for(state="visible")
+    assert urlsplit(page.url).path == "/mail"
+    assert live_application.gateway.trash_moves == []
+    await page.locator("#confirm-action").click()
+    await page.locator("#confirm-dialog").wait_for(state="hidden")
+    await page.locator("#message-empty").wait_for(state="visible")
+    assert live_application.gateway.trash_moves == [(ACCOUNT, MAILBOX, MESSAGE_ID)]
+    assert live_application.gateway.permanent_deletions == []
+
+    live_application.gateway.message_location = MAILBOX
+    await _load_inbox(page, live_application)
+    row = page.locator("#message-list-body tr")
+    await row.get_by_role("button", name="Archive", exact=True).press("Enter")
+    await page.locator("#message-empty").wait_for(state="visible")
+    assert urlsplit(page.url).path == "/mail"
+    assert live_application.gateway.archive_moves == [(ACCOUNT, MAILBOX, MESSAGE_ID)]
+    assert live_application.gateway.message_location == ARCHIVE_MAILBOX
 
 
 async def test_message_html_is_sandboxed_and_attachment_filename_is_safe(

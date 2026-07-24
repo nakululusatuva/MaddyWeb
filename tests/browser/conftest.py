@@ -27,6 +27,7 @@ ACCOUNT = "admin@example.test"
 NEW_ACCOUNT = "new-user@example.test"
 MAILBOX = "INBOX"
 TRASH_MAILBOX = "Custom Trash"
+ARCHIVE_MAILBOX = "Custom Archive"
 MESSAGE_ID = "42"
 CERTIFICATE_NAME = "mx.example.test"
 CERTIFICATE_FINGERPRINT = ":".join(f"{value:02X}" for value in range(32))
@@ -83,7 +84,19 @@ class BrowserSecurityGateway:
         self.deleted_accounts: list[str] = []
         self.message_location: str | None = MAILBOX
         self.trash_moves: list[tuple[str, str, str]] = []
+        self.archive_moves: list[tuple[str, str, str]] = []
         self.permanent_deletions: list[tuple[str, str, str]] = []
+        self.message_read_started = asyncio.Event()
+        self.message_read_release = asyncio.Event()
+        self.message_read_release.set()
+        self.trash_move_started = asyncio.Event()
+        self.trash_move_release = asyncio.Event()
+        self.trash_move_release.set()
+        self.trash_move_finished = asyncio.Event()
+        self.archive_move_started = asyncio.Event()
+        self.archive_move_release = asyncio.Event()
+        self.archive_move_release.set()
+        self.archive_move_finished = asyncio.Event()
         self.delivery_started = asyncio.Event()
         self.delivery_release = asyncio.Event()
         self.delivery_release.set()
@@ -144,6 +157,7 @@ class BrowserSecurityGateway:
         return [
             {"name": MAILBOX, "attributes": []},
             {"name": TRASH_MAILBOX, "attributes": ["\\Trash"]},
+            {"name": ARCHIVE_MAILBOX, "attributes": ["\\Archive"]},
         ]
 
     async def list_messages(self, _account: str, mailbox: str, **_kwargs: object) -> MessagePage:
@@ -174,6 +188,8 @@ class BrowserSecurityGateway:
     ) -> int:
         if len(self.raw) > max_bytes:
             raise ValueError("fixture exceeds limit")
+        self.message_read_started.set()
+        await self.message_read_release.wait()
         await asyncio.to_thread(destination.write_bytes, self.raw)
         await asyncio.to_thread(os.chmod, destination, 0o600)
         return len(self.raw)
@@ -184,9 +200,25 @@ class BrowserSecurityGateway:
         mailbox: str,
         message_id: str,
     ) -> str:
+        self.trash_move_started.set()
+        await self.trash_move_release.wait()
         self.trash_moves.append((account, mailbox, message_id))
         self.message_location = TRASH_MAILBOX
+        self.trash_move_finished.set()
         return TRASH_MAILBOX
+
+    async def move_message_to_archive(
+        self,
+        account: str,
+        mailbox: str,
+        message_id: str,
+    ) -> str:
+        self.archive_move_started.set()
+        await self.archive_move_release.wait()
+        self.archive_moves.append((account, mailbox, message_id))
+        self.message_location = ARCHIVE_MAILBOX
+        self.archive_move_finished.set()
+        return ARCHIVE_MAILBOX
 
     async def delete_message_permanently(
         self,

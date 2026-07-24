@@ -70,6 +70,7 @@ class BrowserGateway:
             {"name": "INBOX", "attributes": []},
             {"name": "Custom Trash", "attributes": ["\\Trash"]},
             {"name": "Custom Sent", "attributes": ["\\Sent"]},
+            {"name": "Custom Archive", "attributes": ["\\Archive"]},
         ]
 
     async def list_messages(self, *_args: object, **_kwargs: object) -> MessagePage:
@@ -95,6 +96,9 @@ class BrowserGateway:
 
     async def move_message_to_trash(self, *_args: object) -> str:
         return "Custom Trash"
+
+    async def move_message_to_archive(self, *_args: object) -> str:
+        return "Custom Archive"
 
     async def delete_message_permanently(self, *_args: object) -> None:
         return None

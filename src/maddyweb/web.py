@@ -122,6 +122,13 @@ class Gateway(MailGateway, Protocol):
         message_id: str,
     ) -> str: ...
 
+    async def move_message_to_archive(
+        self,
+        account_id: str,
+        mailbox: str,
+        message_id: str,
+    ) -> str: ...
+
     async def delete_message_permanently(
         self,
         account_id: str,
@@ -765,17 +772,75 @@ def _account_payload(record: object) -> dict[str, object]:
     }
 
 
-def _mailbox_payload(record: object) -> dict[str, str]:
+def _mailbox_payload(record: object) -> dict[str, object]:
     if isinstance(record, str):
         name = record
+        attributes: Sequence[object] = ()
     else:
         value = _record_value(record, "name", "mailbox", "id", default=None)
         if not isinstance(value, str):
             raise TypeError("mailbox list item must contain a text name")
         name = value
+        attributes = _backend_sequence(
+            _record_value(record, "attributes", default=()),
+            "mailbox attributes",
+        )
     if not _valid_mailbox_name(name):
         raise TypeError("mailbox list contains an invalid name")
-    return {"name": name}
+    if len(attributes) > 64:
+        raise TypeError("mailbox attribute list exceeds the supported limit")
+    normalized_attributes: set[str] = set()
+    for attribute in attributes:
+        if (
+            not isinstance(attribute, str)
+            or not attribute
+            or len(attribute) > 255
+            or any(ord(char) <= 0x20 or ord(char) == 0x7F for char in attribute)
+        ):
+            raise TypeError("mailbox attribute list contains an invalid flag")
+        normalized_attributes.add(attribute.casefold())
+    return {
+        "name": name,
+        "is_trash": r"\trash" in normalized_attributes,
+        "is_archive": r"\archive" in normalized_attributes,
+    }
+
+
+def _resolved_special_mailbox(
+    mailboxes: Sequence[Mapping[str, object]],
+    special: str,
+) -> str | None:
+    field = f"is_{special}"
+    matches = [
+        str(mailbox["name"])
+        for mailbox in mailboxes
+        if mailbox.get(field) is True
+    ]
+    if not matches:
+        fallback = special.capitalize()
+        matches = [
+            str(mailbox["name"])
+            for mailbox in mailboxes
+            if mailbox["name"] == fallback
+        ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _resolved_mailbox_payloads(
+    records: Sequence[object],
+) -> tuple[list[dict[str, object]], bool, bool]:
+    mailboxes = [_mailbox_payload(record) for record in records]
+    trash_target = _resolved_special_mailbox(mailboxes, "trash")
+    archive_target = _resolved_special_mailbox(mailboxes, "archive")
+    normalized = [
+        {
+            "name": mailbox["name"],
+            "is_trash": trash_target is not None and mailbox["name"] == trash_target,
+            "is_archive": archive_target is not None and mailbox["name"] == archive_target,
+        }
+        for mailbox in mailboxes
+    ]
+    return normalized, trash_target is not None, archive_target is not None
 
 
 def _message_summary_payload(record: object) -> dict[str, object]:
@@ -806,7 +871,7 @@ def _account_identifiers(records: Sequence[object]) -> set[str]:
 
 
 def _mailbox_names(records: Sequence[object]) -> set[str]:
-    return {_mailbox_payload(record)["name"] for record in records}
+    return {str(_mailbox_payload(record)["name"]) for record in records}
 
 
 async def _find_account(request: web.Request, account_id: str) -> object:
@@ -1018,7 +1083,9 @@ async def api_mailbox(request: web.Request) -> web.Response:
         return await _gateway_error(request, "Could not read mailboxes")
     try:
         mailbox_values = _backend_sequence(raw_mailbox_values, "mailbox list")
-        mailbox_payloads = [_mailbox_payload(value) for value in mailbox_values]
+        mailbox_payloads, trash_available, archive_available = _resolved_mailbox_payloads(
+            mailbox_values
+        )
     except TypeError, ValueError:
         LOGGER.error("mailbox backend returned an invalid payload", exc_info=True)
         return _api_error(
@@ -1026,8 +1093,18 @@ async def api_mailbox(request: web.Request) -> web.Response:
             "Backend returned an invalid mailbox list.",
             status=502,
         )
-    if mailbox_name and mailbox_name not in _mailbox_names(mailbox_values):
+    mailbox_names = _mailbox_names(mailbox_values)
+    if mailbox_name and mailbox_name not in mailbox_names:
         raise web.HTTPBadRequest(text="Mailbox is not in the allowed list.")
+    if account and not mailbox_name:
+        mailbox_name = next(
+            (
+                mailbox["name"]
+                for mailbox in mailbox_payloads
+                if mailbox["name"].casefold() == "inbox"
+            ),
+            "",
+        )
 
     cursor_state: _MailboxCursorState | None = None
     page = 1
@@ -1089,6 +1166,8 @@ async def api_mailbox(request: web.Request) -> web.Response:
         payload = {
             "accounts": account_payloads,
             "mailboxes": mailbox_payloads,
+            "trash_available": trash_available,
+            "archive_available": archive_available,
             "messages": [_message_summary_payload(value) for value in message_page.items],
             "selected_account": account,
             "selected_mailbox": mailbox_name,
@@ -1255,6 +1334,37 @@ def _message_download_url(
 ) -> str:
     query = urlencode({"account": account, "mailbox": mailbox_name})
     return f"/api/v1/mail/{quote(message_id, safe='')}/{suffix}?{query}"
+
+
+async def api_message_action_snapshot(request: web.Request) -> web.Response:
+    query = _read_query(
+        request,
+        allowed_fields=frozenset({"account", "mailbox"}),
+    )
+    account, mailbox_name = _mail_context(query)
+    message_id = _message_uid(request.match_info["message_id"])
+    async with _mail_work_slot(request):
+        spool = await _spool_raw_message(request, account, mailbox_name)
+        try:
+            digest = await asyncio.to_thread(_file_sha256, spool.path)
+            size = spool.size
+        finally:
+            await asyncio.to_thread(spool.cleanup)
+        freshness = _freshness_store(request).issue(
+            account,
+            mailbox_name,
+            message_id,
+            digest,
+        )
+    return _api_response(
+        data={
+            "uid": message_id,
+            "account": account,
+            "mailbox": mailbox_name,
+            "size": size,
+            "freshness_token": freshness,
+        }
+    )
 
 
 async def api_message_detail(request: web.Request) -> web.Response:
@@ -1460,6 +1570,41 @@ async def move_message_to_trash(request: web.Request) -> web.Response:
     )
 
 
+async def move_message_to_archive(request: web.Request) -> web.Response:
+    message_id = _message_uid(request.match_info["message_id"])
+    values = await _read_json_object(
+        request,
+        allowed_fields=frozenset({"account", "mailbox", "freshness"}),
+    )
+    account, mailbox_name = _mail_context(values)
+    await _verify_message_freshness(
+        request,
+        account=account,
+        mailbox=mailbox_name,
+        uid=message_id,
+        token=_json_text(values, "freshness"),
+    )
+    try:
+        target = await _gateway(request).move_message_to_archive(
+            account,
+            mailbox_name,
+            message_id,
+        )
+    except Exception:
+        return await _gateway_error(request, "Failed to archive message")
+    if not isinstance(target, str) or not _valid_mailbox_name(target):
+        LOGGER.error("mail backend returned an invalid Archive mailbox")
+        return _api_error(
+            "invalid_backend_response",
+            "Backend returned an invalid Archive mailbox.",
+            status=502,
+        )
+    return _api_response(
+        data={"account": account, "mailbox": target},
+        message="Message archived.",
+    )
+
+
 async def delete_message_permanently(request: web.Request) -> web.Response:
     message_id = _message_uid(request.match_info["message_id"])
     values = await _read_json_object(
@@ -1499,7 +1644,12 @@ async def api_compose(request: web.Request) -> web.Response:
             "Backend returned an invalid sending account list.",
             status=502,
         )
-    return _api_response(data={"senders": list(senders)})
+    return _api_response(
+        data={
+            "senders": list(senders),
+            "max_upload_bytes": _settings(request).max_upload_bytes,
+        },
+    )
 
 
 def _enabled_senders(accounts_found: Sequence[object]) -> tuple[str, ...]:
@@ -2123,7 +2273,12 @@ def create_app(config: object, gateway: Gateway) -> web.Application:
                 download_attachment,
             ),
             web.get("/api/v1/mail/{message_id}/raw", raw_message),
+            web.get(
+                "/api/v1/mail/{message_id}/action-snapshot",
+                api_message_action_snapshot,
+            ),
             web.post("/api/v1/mail/{message_id}/trash", move_message_to_trash),
+            web.post("/api/v1/mail/{message_id}/archive", move_message_to_archive),
             web.post("/api/v1/mail/{message_id}/delete", delete_message_permanently),
             web.get("/api/v1/mail/{message_id}", api_message_detail),
             web.get("/api/v1/compose", api_compose),

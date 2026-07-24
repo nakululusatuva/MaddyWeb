@@ -525,6 +525,29 @@ class HelperGateway:
             raise HelperCallError("invalid_response", "messages.move returned no target mailbox")
         return target
 
+    async def move_message_to_archive(
+        self,
+        account_id: str,
+        mailbox: str,
+        message_id: str,
+    ) -> str:
+        result = _mapping(
+            await self._call(
+                "messages.move",
+                {
+                    "username": account_id,
+                    "source": mailbox,
+                    "uid": _single_uid(message_id),
+                    "target_special": "archive",
+                },
+            ),
+            "messages.move",
+        )
+        target = result.get("target")
+        if not isinstance(target, str) or not target:
+            raise HelperCallError("invalid_response", "messages.move returned no target mailbox")
+        return target
+
     async def delete_message_permanently(
         self,
         account_id: str,

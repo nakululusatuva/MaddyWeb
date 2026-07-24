@@ -15,7 +15,7 @@ import pytest_asyncio
 from aiohttp import CookieJar, FormData
 from aiohttp.test_utils import TestClient, TestServer
 
-from maddyweb.mail import DeliveryRejected, PreparedMessage
+from maddyweb.mail import DeliveryRejected, MailError, PreparedMessage
 from maddyweb.web import MessagePage, create_app
 
 FIXTURE_CREDENTIAL = "-".join(("account", "credential"))
@@ -171,6 +171,15 @@ class FakeGateway:
         self.operations.append(("trash", account_id, mailbox, message_id))
         return "Trash"
 
+    async def move_message_to_archive(
+        self,
+        account_id: str,
+        mailbox: str,
+        message_id: str,
+    ) -> str:
+        self.operations.append(("archive", account_id, mailbox, message_id))
+        return "Archive"
+
     async def delete_message_permanently(
         self,
         account_id: str,
@@ -268,6 +277,10 @@ def _origin(client: TestClient) -> str:
     return str(client.make_url("/").origin())
 
 
+def _raw_spool_paths(temp_dir: Path) -> list[Path]:
+    return list(temp_dir.glob("raw-message-*.eml"))
+
+
 async def _api_data(client: TestClient, path: str) -> tuple[object, dict[str, object]]:
     response = await client.get(path)
     payload = await response.json()
@@ -299,8 +312,8 @@ async def test_home_static_assets_and_strict_headers(
     page = await response.text()
     assert response.status == 200
     assert "Administration overview" in page
-    assert 'href="/static/app.css?v=8"' in page
-    assert 'src="/static/app.js?v=9"' in page
+    assert 'href="/static/app.css?v=9"' in page
+    assert 'src="/static/app.js?v=10"' in page
     assert 'id="compose-sender-name"' in page
     assert 'name="sender_name"' in page
     assert 'maxlength="256"' in page
@@ -673,6 +686,260 @@ async def test_mail_requires_account_and_mailbox_context_and_has_two_delete_leve
 
 
 @pytest.mark.asyncio
+async def test_account_only_mail_context_selects_authoritative_inbox(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+
+    async def case_variant_mailboxes(account_id: str) -> list[dict[str, str]]:
+        gateway.operations.append(("list_mailboxes", account_id))
+        return [{"name": "Inbox"}, {"name": "Sent"}, {"name": "Trash"}]
+
+    gateway.list_mailboxes = case_variant_mailboxes  # type: ignore[method-assign]
+    response, data = await _api_data(
+        client,
+        "/api/v1/mail?account=admin%40example.test",
+    )
+    assert response.status == 200
+    assert data["selected_account"] == "admin@example.test"
+    assert data["selected_mailbox"] == "Inbox"
+    assert data["messages"][0]["uid"] == "42"
+    assert ("list_messages", "admin@example.test", "Inbox", 20, 0) in gateway.operations
+
+
+@pytest.mark.asyncio
+async def test_account_only_mail_context_does_not_guess_missing_inbox(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+
+    async def mailboxes_without_inbox(account_id: str) -> list[dict[str, str]]:
+        gateway.operations.append(("list_mailboxes", account_id))
+        return [{"name": "Sent"}, {"name": "Archive"}]
+
+    gateway.list_mailboxes = mailboxes_without_inbox  # type: ignore[method-assign]
+    response, data = await _api_data(
+        client,
+        "/api/v1/mail?account=admin%40example.test",
+    )
+    assert response.status == 200
+    assert data["selected_mailbox"] == ""
+    assert data["messages"] == []
+    assert not any(operation[0] == "list_messages" for operation in gateway.operations)
+
+
+@pytest.mark.asyncio
+async def test_mailbox_payload_exposes_validated_special_use_flags(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+
+    async def special_use_mailboxes(account_id: str) -> list[object]:
+        gateway.operations.append(("list_mailboxes", account_id))
+        return [
+            "Inbox",
+            {"name": "Deleted Items", "attributes": [r"\Trash", r"\HasNoChildren"]},
+            {"name": "Stored Mail", "attributes": [r"\ARCHIVE"]},
+        ]
+
+    gateway.list_mailboxes = special_use_mailboxes  # type: ignore[method-assign]
+    response, data = await _api_data(
+        client,
+        "/api/v1/mail?account=admin%40example.test",
+    )
+
+    assert response.status == 200
+    assert data["mailboxes"] == [
+        {"name": "Inbox", "is_trash": False, "is_archive": False},
+        {"name": "Deleted Items", "is_trash": True, "is_archive": False},
+        {"name": "Stored Mail", "is_trash": False, "is_archive": True},
+    ]
+    assert data["trash_available"] is True
+    assert data["archive_available"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mailboxes", "expected_mailboxes", "trash_available", "archive_available"),
+    [
+        (
+            [
+                {"name": "Deleted Items", "attributes": [r"\Trash"]},
+                {"name": "Stored Mail", "attributes": [r"\Archive"]},
+                {"name": "Trash", "attributes": []},
+                {"name": "Archive", "attributes": []},
+            ],
+            [
+                {"name": "Deleted Items", "is_trash": True, "is_archive": False},
+                {"name": "Stored Mail", "is_trash": False, "is_archive": True},
+                {"name": "Trash", "is_trash": False, "is_archive": False},
+                {"name": "Archive", "is_trash": False, "is_archive": False},
+            ],
+            True,
+            True,
+        ),
+        (
+            ["INBOX", "Saved"],
+            [
+                {"name": "INBOX", "is_trash": False, "is_archive": False},
+                {"name": "Saved", "is_trash": False, "is_archive": False},
+            ],
+            False,
+            False,
+        ),
+        (
+            [
+                {"name": "Trash One", "attributes": [r"\Trash"]},
+                {"name": "Trash Two", "attributes": [r"\Trash"]},
+                {"name": "Archive One", "attributes": [r"\Archive"]},
+                {"name": "Archive Two", "attributes": [r"\Archive"]},
+            ],
+            [
+                {"name": "Trash One", "is_trash": False, "is_archive": False},
+                {"name": "Trash Two", "is_trash": False, "is_archive": False},
+                {"name": "Archive One", "is_trash": False, "is_archive": False},
+                {"name": "Archive Two", "is_trash": False, "is_archive": False},
+            ],
+            False,
+            False,
+        ),
+        (
+            ["INBOX", "Trash", {"name": "Archive", "attributes": []}],
+            [
+                {"name": "INBOX", "is_trash": False, "is_archive": False},
+                {"name": "Trash", "is_trash": True, "is_archive": False},
+                {"name": "Archive", "is_trash": False, "is_archive": True},
+            ],
+            True,
+            True,
+        ),
+    ],
+    ids=("unique-flags", "missing", "ambiguous-flags", "exact-name-fallback"),
+)
+async def test_mailbox_special_targets_match_helper_resolution_semantics(
+    web_client: tuple[TestClient, FakeGateway],
+    mailboxes: list[object],
+    expected_mailboxes: list[dict[str, object]],
+    trash_available: bool,
+    archive_available: bool,
+) -> None:
+    client, gateway = web_client
+
+    async def listed_mailboxes(account_id: str) -> list[object]:
+        gateway.operations.append(("list_mailboxes", account_id))
+        return mailboxes
+
+    gateway.list_mailboxes = listed_mailboxes  # type: ignore[method-assign]
+    _response, data = await _api_data(
+        client,
+        "/api/v1/mail?account=admin%40example.test",
+    )
+
+    assert data["mailboxes"] == expected_mailboxes
+    assert data["trash_available"] is trash_available
+    assert data["archive_available"] is archive_available
+
+
+@pytest.mark.asyncio
+async def test_mailbox_payload_rejects_invalid_special_use_attributes(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+
+    async def invalid_mailboxes(account_id: str) -> list[dict[str, object]]:
+        gateway.operations.append(("list_mailboxes", account_id))
+        return [{"name": "Trash", "attributes": r"\Trash"}]
+
+    gateway.list_mailboxes = invalid_mailboxes  # type: ignore[method-assign]
+    response = await client.get("/api/v1/mail?account=admin%40example.test")
+    payload = await response.json()
+
+    assert response.status == 502
+    assert payload["error"]["code"] == "invalid_backend_response"
+
+
+@pytest.mark.asyncio
+async def test_archive_requires_and_consumes_a_fresh_message_snapshot(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+    context = urlencode({"account": "admin@example.test", "mailbox": "INBOX"})
+    _response, detail = await _api_data(client, f"/api/v1/mail/42?{context}")
+    body = {
+        "account": "admin@example.test",
+        "mailbox": "INBOX",
+        "freshness": detail["freshness_token"],
+    }
+
+    token = await _get_token(client)
+    archived = await _post_json(client, "/api/v1/mail/42/archive", token, body)
+    assert archived.status == 200
+    payload = await archived.json()
+    assert payload["data"] == {
+        "account": "admin@example.test",
+        "mailbox": "Archive",
+    }
+    assert ("archive", "admin@example.test", "INBOX", "42") in gateway.operations
+
+    token = await _get_token(client)
+    replayed = await _post_json(client, "/api/v1/mail/42/archive", token, body)
+    assert replayed.status == 409
+    assert sum(operation[0] == "archive" for operation in gateway.operations) == 1
+
+
+@pytest.mark.asyncio
+async def test_action_snapshot_does_not_require_mime_preview(
+    web_client: tuple[TestClient, FakeGateway],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    client, gateway = web_client
+
+    def reject_preview(_raw: bytes) -> object:
+        raise MailError("fixture parser rejection")
+
+    monkeypatch.setattr("maddyweb.web.parse_message", reject_preview)
+    context = urlencode({"account": "admin@example.test", "mailbox": "INBOX"})
+
+    detail = await client.get(f"/api/v1/mail/42?{context}")
+    assert detail.status == 422
+
+    snapshot_response, snapshot = await _api_data(
+        client,
+        f"/api/v1/mail/42/action-snapshot?{context}",
+    )
+    assert snapshot_response.status == 200
+    assert set(snapshot) == {
+        "uid",
+        "account",
+        "mailbox",
+        "size",
+        "freshness_token",
+    }
+    assert snapshot["uid"] == "42"
+    assert snapshot["account"] == "admin@example.test"
+    assert snapshot["mailbox"] == "INBOX"
+    assert snapshot["size"] == len(gateway.raw_message)
+    assert snapshot["freshness_token"]
+    assert not await asyncio.to_thread(_raw_spool_paths, tmp_path)
+
+    token = await _get_token(client)
+    archived = await _post_json(
+        client,
+        "/api/v1/mail/42/archive",
+        token,
+        {
+            "account": "admin@example.test",
+            "mailbox": "INBOX",
+            "freshness": snapshot["freshness_token"],
+        },
+    )
+    assert archived.status == 200
+    assert ("archive", "admin@example.test", "INBOX", "42") in gateway.operations
+    assert not await asyncio.to_thread(_raw_spool_paths, tmp_path)
+
+
+@pytest.mark.asyncio
 async def test_single_uid_and_freshness_are_required_for_destructive_mail_actions(
     web_client: tuple[TestClient, FakeGateway],
 ) -> None:
@@ -908,6 +1175,7 @@ async def test_compose_uses_enabled_sender_and_streams_cid_mime(
     response, data = await _api_data(client, "/api/v1/compose")
     assert response.status == 200
     assert data["senders"] == ["admin@example.test"]
+    assert data["max_upload_bytes"] == 4 * 1024 * 1024
     token = await _get_token(client)
 
     form = FormData()

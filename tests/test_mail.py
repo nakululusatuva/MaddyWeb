@@ -270,6 +270,26 @@ def test_parse_received_message_sanitizes_html_and_attachment_name() -> None:
     assert parsed.attachments[0].filename == "payload.html"
 
 
+def test_parse_html_only_message_provides_sanitized_plain_text_fallback() -> None:
+    source = EmailMessage()
+    source["From"] = "sender@example.test"
+    source["To"] = "recipient@example.test"
+    source["Subject"] = "HTML only"
+    source.set_content(
+        '<script>hidden()</script><img src="https://tracker.test/pixel">'
+        "<p>Visible <strong>message</strong></p>",
+        subtype="html",
+    )
+
+    parsed = parse_message(source.as_bytes(policy=policy.SMTP))
+
+    assert parsed.html is not None
+    assert "script" not in parsed.html
+    assert "tracker.test" not in parsed.html
+    assert parsed.text.strip()
+    assert "Visible message" in parsed.text
+
+
 class _MailGateway:
     def __init__(self, delivery_error: Exception | None = None, *, fail_sent: bool = False):
         self.delivery_error = delivery_error
