@@ -21,6 +21,12 @@ MAX_CONFIG_BYTES = 4 * 1024 * 1024
 BEGIN_MARKER = "# BEGIN MADDYWEB MANAGED SUBMISSION v1"
 END_MARKER = "# END MADDYWEB MANAGED SUBMISSION v1"
 MANAGED_HEADER = "submission tcp://127.0.0.1:1587 {"
+SUPPORTED_SOURCE_HEADERS = frozenset(
+    {
+        "submission tls://0.0.0.0:465 tcp://0.0.0.0:587 {",
+        "submission tls://[::]:465 tcp://[::]:587 {",
+    }
+)
 REQUIRED_TOKENS = ("authorize_sender", "local_routing", "dkim", "remote_queue")
 REQUIRED_SOURCE_PATTERNS = (
     r"\bsource\s+\$\(local_domains\)\s*\{",
@@ -149,7 +155,7 @@ def source_submission(lines: list[str]) -> Block:
         )
     candidate = candidates[0]
     header = strip_comments_and_strings(lines[candidate.start]).strip()
-    if "tls://0.0.0.0:465" not in header or "tcp://0.0.0.0:587" not in header:
+    if header not in SUPPORTED_SOURCE_HEADERS:
         fail("default submission listener does not match the supported 465/587 layout")
     normalized = code_for(lines, candidate).lower()
     for pattern in REQUIRED_SOURCE_PATTERNS:

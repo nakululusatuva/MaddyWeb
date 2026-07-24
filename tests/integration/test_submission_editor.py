@@ -52,6 +52,34 @@ def test_add_remove_is_byte_for_byte_roundtrip_and_bounded() -> None:
     assert EDITOR.remove_managed(managed) == original
 
 
+def test_dual_stack_add_remove_is_byte_for_byte_roundtrip() -> None:
+    original = default_config().replace(
+        "submission tls://0.0.0.0:465 tcp://0.0.0.0:587 {",
+        "submission tls://[::]:465 tcp://[::]:587 {",
+    )
+    managed = EDITOR.build_managed(original)
+    assert managed.count("submission tcp://127.0.0.1:1587 {") == 1
+    assert EDITOR.remove_managed(managed) == original
+
+
+@pytest.mark.parametrize(
+    "header",
+    (
+        "submission tls://[::]:465 tcp://0.0.0.0:587 {",
+        "submission tls://0.0.0.0:465 tcp://[::]:587 {",
+        "submission tls://[::]:465 tcp://[::]:587 tcp://127.0.0.1:1587 {",
+        "submission tls://[::]:466 tcp://[::]:587 {",
+    ),
+)
+def test_add_rejects_unreviewed_submission_listener_layout(header: str) -> None:
+    mutated = default_config().replace(
+        "submission tls://0.0.0.0:465 tcp://0.0.0.0:587 {",
+        header,
+    )
+    with pytest.raises(EDITOR.EditError):
+        EDITOR.build_managed(mutated)
+
+
 def test_crlf_is_preserved_and_roundtrips() -> None:
     original = default_config().replace("\n", "\r\n")
     managed = EDITOR.build_managed(original)
