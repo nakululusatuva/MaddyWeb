@@ -34,6 +34,7 @@ def test_safe_defaults_are_loopback_and_small_after_explicit_mode() -> None:
     assert config.server.request_body_timeout_seconds == 15
     assert config.server.max_upload_bytes == 20 * 1024 * 1024
     assert config.maddy.mode == "docker"
+    assert config.maddy.docker_submission_scope == "container"
     assert config.certificates.webroot_roots == ()
 
 
@@ -81,6 +82,45 @@ def test_maddy_mode_must_be_explicit() -> None:
         AppConfig.from_dict({})
     with pytest.raises(ConfigError, match="explicitly configured"):
         AppConfig.from_dict({"maddy": {}})
+
+
+def test_docker_submission_scope_accepts_explicit_host_loopback() -> None:
+    config = _config({"maddy": {"docker_submission_scope": "host-loopback"}})
+    assert config.maddy.docker_submission_scope == "host-loopback"
+
+
+@pytest.mark.parametrize("scope", ("host", "loopback", "HOST-LOOPBACK", 1))
+def test_docker_submission_scope_rejects_unknown_values(scope: object) -> None:
+    with pytest.raises(ConfigError, match="docker_submission_scope"):
+        _config({"maddy": {"docker_submission_scope": scope}})
+
+
+def test_native_mode_rejects_host_loopback_docker_submission_scope() -> None:
+    with pytest.raises(ConfigError, match=r"host-loopback.*maddy\.mode is native"):
+        AppConfig.from_dict(
+            {
+                "maddy": {
+                    "mode": "native",
+                    "docker_submission_scope": "host-loopback",
+                }
+            }
+        )
+    config = AppConfig.from_dict({"maddy": {"mode": "native"}})
+    assert config.maddy.docker_submission_scope == "container"
+
+
+@pytest.mark.parametrize(
+    "override",
+    (
+        {"submission_host": "::1"},
+        {"submission_host": "127.0.0.2"},
+        {"submission_port": 587},
+        {"submission_port": 11587},
+    ),
+)
+def test_submission_endpoint_is_fixed(override: dict[str, object]) -> None:
+    with pytest.raises(ConfigError, match=r"submission_(host|port)"):
+        _config({"maddy": override})
 
 
 def test_load_toml(tmp_path: Path) -> None:

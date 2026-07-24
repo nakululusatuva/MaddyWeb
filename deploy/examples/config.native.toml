@@ -11,6 +11,7 @@ temp_dir = "/var/tmp/maddyweb"
 
 [maddy]
 mode = "native"
+docker_submission_scope = "container"
 container = "maddy"
 binary = "/usr/bin/maddy"
 config_path = "/etc/maddy/maddy.conf"

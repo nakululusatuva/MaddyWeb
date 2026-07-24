@@ -217,6 +217,7 @@ class ServerConfig:
 @dataclass(frozen=True, slots=True)
 class MaddyConfig:
     mode: Literal["docker", "native"] = "docker"
+    docker_submission_scope: Literal["container", "host-loopback"] = "container"
     container: str = "maddy"
     binary: PurePosixPath = _DEFAULT_MADDY_BINARY
     config_path: PurePosixPath = _DEFAULT_MADDY_CONFIG
@@ -232,6 +233,7 @@ class MaddyConfig:
         defaults = cls()
         allowed = {
             "mode",
+            "docker_submission_scope",
             "container",
             "binary",
             "config_path",
@@ -248,6 +250,18 @@ class MaddyConfig:
         mode = _string(raw, "mode", defaults.mode, "maddy.mode")
         if mode not in {"docker", "native"}:
             raise ConfigError("maddy.mode must be docker or native")
+        docker_submission_scope = _string(
+            raw,
+            "docker_submission_scope",
+            defaults.docker_submission_scope,
+            "maddy.docker_submission_scope",
+        )
+        if docker_submission_scope not in {"container", "host-loopback"}:
+            raise ConfigError("maddy.docker_submission_scope must be container or host-loopback")
+        if mode == "native" and docker_submission_scope == "host-loopback":
+            raise ConfigError(
+                "maddy.docker_submission_scope cannot be host-loopback when maddy.mode is native"
+            )
         default_config_path = _DEFAULT_MADDY_CONFIG if mode == "docker" else _NATIVE_MADDY_CONFIG
         default_data_dir = _DEFAULT_MADDY_DATA if mode == "docker" else _NATIVE_MADDY_DATA
         container = _string(raw, "container", defaults.container, "maddy.container")
@@ -281,12 +295,13 @@ class MaddyConfig:
             defaults.command_timeout_seconds,
             "maddy.command_timeout_seconds",
         )
-        if not 1 <= port <= 65535:
-            raise ConfigError("maddy.submission_port is out of range")
+        if port != 1587:
+            raise ConfigError("maddy.submission_port must use exactly 1587")
         if not 1.0 <= timeout <= 120.0:
             raise ConfigError("maddy.command_timeout_seconds must be between 1 and 120")
         return cls(
             mode=mode,  # type: ignore[arg-type]
+            docker_submission_scope=docker_submission_scope,  # type: ignore[arg-type]
             container=container,
             binary=_absolute(
                 _string(raw, "binary", str(defaults.binary), "maddy.binary"),

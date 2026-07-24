@@ -165,22 +165,37 @@ if [[ -z "$config_template" ]]; then
 fi
 require_regular_file "$config_template" "config template"
 
+run_preflight() {
+    local app_config=${1:?application config is required}
+    if [[ "$maddy_mode" == native ]]; then
+        "$SCRIPT_DIR/preflight.sh" \
+            --mode native --app-config "$app_config" \
+            --maddy-binary "$maddy_binary" --maddy-config "$maddy_config" \
+            --maddy-state "$maddy_state" --python "$python_binary"
+    else
+        "$SCRIPT_DIR/preflight.sh" \
+            --mode container --app-config "$app_config" \
+            --container "$container" --docker-binary "$docker_binary" \
+            --maddy-config "$maddy_config" --python "$python_binary"
+    fi
+}
+
 if [[ "$maddy_mode" == native ]]; then
     [[ -n "$maddy_binary" && -n "$maddy_state" ]] || die "native mode requires --maddy-binary and --maddy-state"
     [[ -z "$container" ]] || die "--container is invalid in native mode"
-    "$SCRIPT_DIR/preflight.sh" \
-        --mode native --app-config "$config_template" \
-        --maddy-binary "$maddy_binary" --maddy-config "$maddy_config" \
-        --maddy-state "$maddy_state" --python "$python_binary"
 else
     [[ -z "$maddy_binary" && -z "$maddy_state" ]] || die "Docker mode does not accept native binary/state paths"
     [[ "$container" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || die "Docker mode requires a safe --container"
     [[ -n "$docker_binary" ]] || die "Docker mode requires --docker-binary"
-    "$SCRIPT_DIR/preflight.sh" \
-        --mode container --app-config "$config_template" \
-        --container "$container" --docker-binary "$docker_binary" \
-        --maddy-config "$maddy_config" --python "$python_binary"
 fi
+
+preflight_config="$config_template"
+if [[ -e "$CONFIG_ROOT/config.toml" || -L "$CONFIG_ROOT/config.toml" ]]; then
+    assert_config_root_metadata
+    assert_managed_config_file "$CONFIG_ROOT/config.toml"
+    preflight_config="$CONFIG_ROOT/config.toml"
+fi
+run_preflight "$preflight_config"
 
 artifact_name=$(basename -- "$artifact")
 release_name=$release_commit
@@ -238,6 +253,7 @@ else
     )
 fi
 "$python_binary" "$SCRIPT_DIR/validate-config.py" "${config_validation[@]}"
+run_preflight "$CONFIG_ROOT/config.toml"
 if [[ "$maddy_mode" == native ]]; then
     [[ "$(realpath -e -- "$maddy_config")" == "$maddy_config" ]] \
         || die "native Maddy config path must not traverse a symbolic link"

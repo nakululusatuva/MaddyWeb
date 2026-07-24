@@ -18,18 +18,23 @@ Native options:
 
 Docker options:
   --docker-binary /absolute/docker --container maddy
+  --docker-submission-scope container|host-loopback
   For a bind mount, --maddy-config is the host maddy.conf. For a named volume,
   it must be exactly /data/maddy.conf; the volume name is never caller-supplied.
 
 Common options:
   --python /absolute/python3.14
+  --app-config /etc/maddyweb/config.toml
   --backup-dir /var/backups/maddyweb/submission
   --approval-file /run/maddyweb-approval/approval-...
   --allow-downtime       Required to mutate Maddy 0.8.2 (short restart)
 
 The default is a read-only plan. The editor only appends/removes its exact
 marker block, preserves metadata atomically, and creates a private backup.
-Docker mode never publishes port 1587. No Nginx file or unit is touched.
+Docker never publishes port 1587. The default scope requires an isolated
+container network namespace. The explicit host-loopback scope requires Docker
+host networking and permits only the exact host listener 127.0.0.1:1587.
+No Nginx file or unit is touched.
 EOF
 }
 
@@ -41,7 +46,9 @@ maddy_config=""
 maddy_binary=""
 docker_binary="$(command -v docker || true)"
 container=""
+docker_submission_scope="container"
 python_binary="/opt/maddyweb/current/bin/python"
+app_config="/etc/maddyweb/config.toml"
 backup_dir="/var/backups/maddyweb/submission"
 approval_file=""
 allow_downtime=false
@@ -57,7 +64,9 @@ while (($#)); do
         --maddy-binary) (($# >= 2)) || die "--maddy-binary requires a value"; maddy_binary=$2; shift 2 ;;
         --docker-binary) (($# >= 2)) || die "--docker-binary requires a value"; docker_binary=$2; shift 2 ;;
         --container) (($# >= 2)) || die "--container requires a value"; container=$2; shift 2 ;;
+        --docker-submission-scope) (($# >= 2)) || die "--docker-submission-scope requires a value"; docker_submission_scope=$2; shift 2 ;;
         --python) (($# >= 2)) || die "--python requires a value"; python_binary=$2; shift 2 ;;
+        --app-config) (($# >= 2)) || die "--app-config requires a value"; app_config=$2; shift 2 ;;
         --backup-dir) (($# >= 2)) || die "--backup-dir requires a value"; backup_dir=$2; shift 2 ;;
         --approval-file) (($# >= 2)) || die "--approval-file requires a value"; approval_file=$2; shift 2 ;;
         --allow-downtime) allow_downtime=true; shift ;;
@@ -70,15 +79,32 @@ done
 case "$action" in add|remove) ;; *) die "--action must be add or remove" ;; esac
 case "$environment" in development|production) ;; *) die "--environment must be development or production" ;; esac
 case "$mode" in native|docker) ;; *) die "--mode must be native or docker" ;; esac
+case "$docker_submission_scope" in
+    container|host-loopback) ;;
+    *) die "--docker-submission-scope must be container or host-loopback" ;;
+esac
 [[ -n "$target_host" && "$target_host" == "$(hostname)" ]] || die "--host must exactly match $(hostname)"
 require_absolute_path "$python_binary" "Python binary"
 [[ -x "$python_binary" ]] || die "Python is not executable"
 "$python_binary" -c 'import sys; raise SystemExit(sys.implementation.name != "cpython" or sys.version_info[:2] != (3, 14))' \
     || die "CPython 3.14 is required"
+require_regular_file "$app_config" "MaddyWeb config"
+assert_private_file_mode "$app_config"
+require_command realpath
+[[ "$(realpath -e -- "$app_config")" == "$app_config" ]] \
+    || die "MaddyWeb config path must be canonical and traverse no symbolic link"
+if [[ "$environment" == production ]]; then
+    [[ "$app_config" == /etc/maddyweb/config.toml ]] \
+        || die "production requires --app-config exactly /etc/maddyweb/config.toml"
+    [[ "$(stat -c '%u:%a:%h' -- "$app_config")" == "0:640:1" ]] \
+        || die "production MaddyWeb config must be single-link root-owned mode 0640"
+fi
 require_absolute_path "$backup_dir" "backup directory"
 require_command ss
 
 if [[ "$mode" == "native" ]]; then
+    [[ "$docker_submission_scope" == container ]] \
+        || die "--docker-submission-scope is valid only in docker mode"
     require_regular_file "$maddy_config" "Maddy config"
     assert_private_file_mode "$maddy_config"
     [[ -n "$maddy_binary" ]] || die "native mode requires --maddy-binary"
@@ -90,6 +116,10 @@ if [[ "$mode" == "native" ]]; then
         "$maddy_binary" -config "$maddy_config" verify-config >/dev/null 2>&1 || die "current Maddy config does not verify"
         help_fingerprint=not-applicable
     fi
+    "$python_binary" "$SCRIPT_DIR/validate-config.py" \
+        --config "$app_config" --expected-host 127.0.0.1 --expected-port 8787 \
+        --expected-maddy-mode native --expected-maddy-binary "$maddy_binary" \
+        --expected-maddy-config "$maddy_config" >/dev/null
 else
     [[ "$container" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || die "docker container name is unsafe"
     [[ -n "$docker_binary" ]] || die "docker mode requires --docker-binary"
@@ -101,10 +131,19 @@ else
         'import json,sys; print(json.loads(sys.argv[1])["config_kind"])' "$container_before")
     container_id=$("$python_binary" -c \
         'import json,sys; print(json.loads(sys.argv[1])["id"])' "$container_before")
+    network_mode=$("$python_binary" -c \
+        'import json,sys; print(json.loads(sys.argv[1])["network_mode"])' "$container_before")
     [[ "$config_kind" == bind || "$config_kind" == volume ]] \
         || die "container inspection returned an invalid configuration kind"
     [[ "$container_id" =~ ^[0-9a-f]{64}$ ]] \
         || die "container inspection returned an invalid container ID"
+    if [[ "$docker_submission_scope" == host-loopback ]]; then
+        [[ "$network_mode" == host ]] \
+            || die "host-loopback scope requires Docker host networking"
+    else
+        [[ "$network_mode" != host && "$network_mode" != container:* ]] \
+            || die "container scope requires an isolated Docker network namespace"
+    fi
     if [[ "$config_kind" == bind ]]; then
         require_regular_file "$maddy_config" "Maddy config"
         assert_private_file_mode "$maddy_config"
@@ -119,6 +158,22 @@ else
             || die "current container Maddy config does not verify"
         help_fingerprint=not-applicable
     fi
+    "$python_binary" "$SCRIPT_DIR/validate-config.py" \
+        --config "$app_config" --expected-host 127.0.0.1 --expected-port 8787 \
+        --expected-maddy-mode docker --expected-container "$container" \
+        --expected-maddy-config /data/maddy.conf --expected-maddy-data /data \
+        >/dev/null
+    configured_submission_scope=$("$python_binary" - "$app_config" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as handle:
+    config = tomllib.load(handle)
+print(config["maddy"].get("docker_submission_scope", "container"))
+PY
+) || die "cannot read Docker Submission scope from validated config"
+    [[ "$configured_submission_scope" == "$docker_submission_scope" ]] \
+        || die "--docker-submission-scope must match maddy.docker_submission_scope"
 fi
 
 if [[ "$maddy_version" == "0.8.2" && "$apply" == true && "$allow_downtime" != true ]]; then
@@ -153,12 +208,21 @@ fi
     --action "check-$action" --config "$planned_config" >/dev/null
 
 host_listener_count=$(ss -H -ltn 'sport = :1587' 2>/dev/null | wc -l)
+host_listener_addresses=$(ss -H -ltn 'sport = :1587' 2>/dev/null | awk '{print $4}')
 if [[ "$mode" == "native" ]]; then
     if [[ "$action" == "add" && "$host_listener_count" -ne 0 ]]; then
         die "host port 1587 is already occupied"
     fi
-    if [[ "$action" == "remove" ]] && ! ss -H -ltn 'sport = :1587' 2>/dev/null | awk '{print $4}' | grep -qx '127.0.0.1:1587'; then
+    if [[ "$action" == "remove" && "$host_listener_addresses" != 127.0.0.1:1587 ]]; then
         die "managed native listener is not active on exactly 127.0.0.1:1587"
+    fi
+elif [[ "$docker_submission_scope" == host-loopback ]]; then
+    if [[ "$action" == "add" && "$host_listener_count" -ne 0 ]]; then
+        die "host port 1587 is already occupied"
+    fi
+    if [[ "$action" == "remove" \
+        && "$host_listener_addresses" != 127.0.0.1:1587 ]]; then
+        die "managed host-network listener is not exactly 127.0.0.1:1587"
     fi
 else
     # Host publication is prohibited in Docker mode; the inspection above also
@@ -166,8 +230,10 @@ else
     [[ "$host_listener_count" -eq 0 ]] || die "Docker mode must not publish host port 1587"
 fi
 
-printf 'environment=%s\nhost=%s\nmode=%s\nconfig_kind=%s\naction=%s\nmaddy=%s\nconfig=%s\nbackup_dir=%s\nlegacy_help_fingerprint=%s\ndowntime_required=%s\n' \
-    "$environment" "$target_host" "$mode" "${config_kind:-native}" "$action" "$maddy_version" "$maddy_config" "$backup_dir" "$help_fingerprint" \
+printf 'environment=%s\nhost=%s\nmode=%s\nconfig_kind=%s\ndocker_submission_scope=%s\nnetwork_mode=%s\naction=%s\nmaddy=%s\nconfig=%s\nbackup_dir=%s\nlegacy_help_fingerprint=%s\ndowntime_required=%s\n' \
+    "$environment" "$target_host" "$mode" "${config_kind:-native}" \
+    "$docker_submission_scope" "${network_mode:-native}" "$action" \
+    "$maddy_version" "$maddy_config" "$backup_dir" "$help_fingerprint" \
     "$([[ "$maddy_version" == "0.8.2" ]] && printf true || printf false)"
 
 if [[ "$apply" != true ]]; then
@@ -224,7 +290,8 @@ container_snapshot_matches() {
     "$python_binary" -c 'import json, sys
 before, after = map(json.loads, sys.argv[1:])
 keys = ("id", "mounts_sha256", "ports_sha256", "restart_policy_sha256",
-        "config_kind", "config_source", "volume_name", "volume_sha256")
+        "network_mode", "config_kind", "config_source", "volume_name",
+        "volume_sha256")
 raise SystemExit(any(before.get(key) != after.get(key) for key in keys))' \
         "$container_before" "$after"
 }
@@ -345,26 +412,38 @@ config_verify() {
 
 managed_listener_gate() {
     local expected=$1
-    if [[ "$mode" == "native" ]]; then
-        local listeners
-        listeners=$(ss -H -ltn 'sport = :1587' 2>/dev/null | awk '{print $4}')
+    local listeners
+    listeners=$(ss -H -ltn 'sport = :1587' 2>/dev/null | awk '{print $4}')
+    if [[ "$mode" == "native" \
+        || "$docker_submission_scope" == host-loopback ]]; then
         if [[ "$expected" == present ]]; then
             [[ "$listeners" == "127.0.0.1:1587" ]]
         else
             [[ -z "$listeners" ]]
         fi
     else
-        local table found=false
-        table=$("$docker_binary" exec "$container_id" /bin/cat /proc/net/tcp 2>/dev/null) || return 1
-        if printf '%s\n' "$table" | awk '$2 == "0100007F:0633" && $4 == "0A" {found=1} END {exit !found}'; then
-            found=true
-        fi
+        [[ -z "$listeners" ]]
+    fi
+    if [[ "$mode" == docker ]]; then
+        local table listener_summary
+        table=$(
+            "$docker_binary" exec "$container_id" \
+                /bin/cat /proc/net/tcp /proc/net/tcp6 2>/dev/null
+        ) || return 1
+        listener_summary=$(
+            printf '%s\n' "$table" \
+                | awk '$2 ~ /:0633$/ && $4 == "0A" {
+                    count += 1
+                    if ($2 == "0100007F:0633") exact += 1
+                }
+                END {print count + 0 ":" exact + 0}'
+        )
         if [[ "$expected" == present ]]; then
-            [[ "$found" == true ]] || return 1
+            [[ "$listener_summary" == 1:1 ]] || return 1
             "$docker_binary" exec "$container_id" /usr/bin/nc -z -w 2 127.0.0.1 1587 \
                 >/dev/null 2>&1
         else
-            [[ "$found" == false ]]
+            [[ "$listener_summary" == 0:0 ]]
         fi
     fi
 }

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import socket
 import threading
@@ -10,6 +11,7 @@ from typing import Any
 
 import pytest
 
+import maddyweb.helper as helper_module
 from maddyweb.helper import (
     ALLOWED_OPERATIONS,
     PrivilegedDispatcher,
@@ -31,6 +33,31 @@ from maddyweb.protocol import (
     send_frame,
     send_stream_frame,
 )
+
+_PROC_HEADER = b"  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt\n"
+_PROC6_HEADER = (
+    b"  sl  local_address                         remote_address"
+    b"                        st tx_queue rx_queue tr tm->when retrnsmt\n"
+)
+_CONTAINER_ID = "a" * 64
+
+
+def _proc_table(*rows: str, ipv6: bool = False) -> bytes:
+    header = _PROC6_HEADER if ipv6 else _PROC_HEADER
+    return header + "".join(f"{row}\n" for row in rows).encode("ascii")
+
+
+def _runtime_metadata(**changes: Any) -> bytes:
+    values: dict[str, Any] = {
+        "id": _CONTAINER_ID,
+        "running": True,
+        "paused": False,
+        "network_mode": "bridge",
+        "port_bindings": {"25/tcp": [{"HostIp": "127.0.0.1", "HostPort": "25"}]},
+        "runtime_ports": {"25/tcp": [{"HostIp": "127.0.0.1", "HostPort": "25"}]},
+    }
+    values.update(changes)
+    return json.dumps(values, separators=(",", ":")).encode("ascii")
 
 
 class FakeMaddy:
@@ -393,6 +420,301 @@ def test_submission_cannot_bypass_the_maddy_write_safety_gate(tmp_path: Path) ->
         assert smtp.calls == []
     finally:
         spool.close()
+
+
+def test_submission_endpoint_and_scope_are_fixed() -> None:
+    target = MaddyTarget(mode="docker", container="maddy", service_user=None)
+    for values in (
+        {"host": "127.0.0.2"},
+        {"port": 587},
+        {"docker_submission_scope": "automatic"},
+    ):
+        with pytest.raises(ValueError):
+            SMTPSubmissionClient(target, **values)
+
+    configured = SMTPSubmissionClient.from_config(
+        SimpleNamespace(
+            mode="docker",
+            container="maddy",
+            submission_host="127.0.0.1",
+            submission_port=1587,
+            docker_submission_scope="host-loopback",
+            command_timeout_seconds=7.0,
+        )
+    )
+    assert configured.docker_submission_scope == "host-loopback"
+    assert (configured.host, configured.port) == ("127.0.0.1", 1587)
+
+
+def test_proc_net_parser_requires_one_exact_ipv4_loopback_listener() -> None:
+    exact = _proc_table(
+        "0: 0100007F:0633 00000000:0000 0A",
+        "1: 0100007F:0633 0100007F:1234 01",
+        "2: 00000000:0019 00000000:0000 0A",
+    )
+    empty_ipv6 = _proc_table()
+    assert helper_module._submission_listeners(exact, empty_ipv6) == (("ipv4", "0100007F"),)
+    helper_module._require_submission_listener(exact, empty_ipv6, present=True)
+    helper_module._require_submission_listener(_proc_table(), empty_ipv6, present=False)
+
+
+def test_combined_proc_tables_require_exact_ipv4_and_ipv6_headers() -> None:
+    ipv4 = _proc_table("0: 0100007F:0633 00000000:0000 0A")
+    ipv6 = _proc_table(ipv6=True)
+    assert helper_module._split_proc_net_tables(ipv4 + ipv6) == (ipv4, ipv6)
+    assert helper_module._parse_proc_net_table(ipv6, ipv6=True) == ()
+    for payload in (ipv4, ipv4 + ipv6 + _proc_table(), b"not-procfs\n"):
+        with pytest.raises(SMTPTransportError):
+            helper_module._split_proc_net_tables(payload)
+
+
+@pytest.mark.parametrize(
+    ("ipv4", "ipv6"),
+    (
+        (_proc_table(), _proc_table()),
+        (_proc_table("0: 00000000:0633 00000000:0000 0A"), _proc_table()),
+        (
+            _proc_table(
+                "0: 0100007F:0633 00000000:0000 0A",
+                "1: 0100007F:0633 00000000:0000 0A",
+            ),
+            _proc_table(),
+        ),
+        (
+            _proc_table(),
+            _proc_table(
+                "0: 00000000000000000000000001000000:0633 00000000000000000000000000000000:0000 0A"
+            ),
+        ),
+        (
+            _proc_table("malformed"),
+            _proc_table(),
+        ),
+    ),
+)
+def test_proc_net_parser_rejects_missing_wildcard_duplicate_ipv6_and_malformed(
+    ipv4: bytes,
+    ipv6: bytes,
+) -> None:
+    with pytest.raises(SMTPTransportError):
+        helper_module._require_submission_listener(ipv4, ipv6, present=True)
+
+
+@pytest.mark.parametrize(
+    ("changes", "scope"),
+    (
+        ({"running": False}, "container"),
+        ({"paused": True}, "container"),
+        ({"network_mode": "host"}, "container"),
+        ({"network_mode": "bridge"}, "host-loopback"),
+        ({"network_mode": "none"}, "container"),
+        ({"port_bindings": {"1587/tcp": None}}, "container"),
+        (
+            {"runtime_ports": {"25/tcp": [{"HostIp": "127.0.0.1", "HostPort": "1587"}]}},
+            "container",
+        ),
+    ),
+)
+def test_docker_runtime_parser_fails_closed_on_scope_or_publication_drift(
+    changes: dict[str, Any],
+    scope: str,
+) -> None:
+    with pytest.raises(SMTPTransportError):
+        helper_module._parse_docker_submission_runtime(
+            _runtime_metadata(**changes),
+            scope=scope,
+        )
+
+
+def test_docker_runtime_parser_accepts_only_matching_scopes() -> None:
+    isolated = helper_module._parse_docker_submission_runtime(
+        _runtime_metadata(),
+        scope="container",
+    )
+    assert (isolated.container_id, isolated.network_mode) == (_CONTAINER_ID, "bridge")
+
+    host = helper_module._parse_docker_submission_runtime(
+        _runtime_metadata(network_mode="host"),
+        scope="host-loopback",
+    )
+    assert (host.container_id, host.network_mode) == (_CONTAINER_ID, "host")
+
+
+class _CompletedGuardProcess:
+    def __init__(self, stdout: bytes, *, stderr: bytes = b"", return_code: int = 0) -> None:
+        self.stdout = io.BytesIO(stdout)
+        self.stderr = io.BytesIO(stderr)
+        self.return_code = return_code
+        self.killed = False
+
+    def wait(self, timeout: float) -> int:
+        assert timeout > 0
+        return self.return_code
+
+    def kill(self) -> None:
+        self.killed = True
+
+
+def test_docker_runtime_guard_uses_fixed_bounded_commands_and_validated_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exact = _proc_table("0: 0100007F:0633 00000000:0000 0A")
+    outputs = [_runtime_metadata(), exact + _proc_table()]
+    calls: list[tuple[tuple[str, ...], dict[str, Any]]] = []
+
+    def popen(argv: tuple[str, ...], **kwargs: Any) -> _CompletedGuardProcess:
+        calls.append((argv, kwargs))
+        return _CompletedGuardProcess(outputs.pop(0))
+
+    monkeypatch.setattr(helper_module.subprocess, "Popen", popen)
+
+    class Client(SMTPSubmissionClient):
+        @staticmethod
+        def _host_socket_tables() -> tuple[bytes, bytes]:
+            return _proc_table(), _proc_table()
+
+    client = Client(MaddyTarget(mode="docker", container="maddy", service_user=None))
+    assert client._validate_docker_runtime() == _CONTAINER_ID
+    assert [call[0] for call in calls] == [
+        (
+            "/usr/bin/docker",
+            helper_module._DOCKER_LOCAL_HOST_ARG,
+            "container",
+            "inspect",
+            "--format",
+            helper_module._DOCKER_INSPECT_TEMPLATE,
+            "maddy",
+        ),
+        (
+            "/usr/bin/docker",
+            helper_module._DOCKER_LOCAL_HOST_ARG,
+            "exec",
+            _CONTAINER_ID,
+            "/bin/cat",
+            "/proc/net/tcp",
+            "/proc/net/tcp6",
+        ),
+    ]
+    for _argv, kwargs in calls:
+        assert kwargs["shell"] is False
+        assert kwargs["stdin"] is helper_module.subprocess.DEVNULL
+        assert kwargs["env"] == helper_module._FIXED_SUBPROCESS_ENV
+        assert "DOCKER_HOST" not in kwargs["env"]
+        assert "DOCKER_CONTEXT" not in kwargs["env"]
+
+
+def test_docker_smtp_channel_pins_local_daemon_and_validated_container_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    class Channel:
+        def __init__(self, argv: tuple[str, ...]) -> None:
+            calls.append(argv)
+
+    monkeypatch.setattr(helper_module, "_ProcessChannel", Channel)
+    client = SMTPSubmissionClient(MaddyTarget(mode="docker", container="maddy", service_user=None))
+    channel = client._channel(docker_container=_CONTAINER_ID)
+    assert isinstance(channel, Channel)
+    assert calls == [
+        (
+            "/usr/bin/docker",
+            helper_module._DOCKER_LOCAL_HOST_ARG,
+            "exec",
+            "-i",
+            _CONTAINER_ID,
+            "/usr/bin/nc",
+            "127.0.0.1",
+            "1587",
+        )
+    ]
+
+
+def test_host_loopback_scope_requires_the_same_exact_host_listener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exact = _proc_table("0: 0100007F:0633 00000000:0000 0A")
+    outputs = [_runtime_metadata(network_mode="host"), exact + _proc_table()]
+
+    def popen(_argv: tuple[str, ...], **_kwargs: Any) -> _CompletedGuardProcess:
+        return _CompletedGuardProcess(outputs.pop(0))
+
+    monkeypatch.setattr(helper_module.subprocess, "Popen", popen)
+
+    class Client(SMTPSubmissionClient):
+        @staticmethod
+        def _host_socket_tables() -> tuple[bytes, bytes]:
+            return exact, _proc_table()
+
+    client = Client(
+        MaddyTarget(mode="docker", container="maddy", service_user=None),
+        docker_submission_scope="host-loopback",
+    )
+    assert client._validate_docker_runtime() == _CONTAINER_ID
+
+
+def test_docker_runtime_guard_rejects_oversized_subprocess_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _CompletedGuardProcess(b"x" * 33)
+    monkeypatch.setattr(
+        helper_module.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: process,
+    )
+    with pytest.raises(SMTPTransportError):
+        helper_module._bounded_command_output(
+            ("/usr/bin/docker", "context", "show"),
+            timeout=1,
+            maximum=32,
+        )
+    assert process.killed is True
+
+
+def test_docker_listener_drift_fails_before_channel_or_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+    outputs = [
+        _runtime_metadata(),
+        _proc_table("0: 0100007F:0633 00000000:0000 0A") + _proc_table(),
+    ]
+
+    def popen(argv: tuple[str, ...], **_kwargs: Any) -> _CompletedGuardProcess:
+        calls.append(argv)
+        return _CompletedGuardProcess(outputs.pop(0))
+
+    monkeypatch.setattr(helper_module.subprocess, "Popen", popen)
+
+    class Client(SMTPSubmissionClient):
+        channel_opened = False
+
+        @staticmethod
+        def _host_socket_tables() -> tuple[bytes, bytes]:
+            return (
+                _proc_table("0: 0100007F:0633 00000000:0000 0A"),
+                _proc_table(),
+            )
+
+        def _channel(self, *, docker_container: str | None = None) -> ScriptedChannel:
+            del docker_container
+            self.channel_opened = True
+            raise AssertionError("SMTP channel must not open after guard failure")
+
+    client = Client(MaddyTarget(mode="docker", container="maddy", service_user=None))
+    password = "-".join(("must", "not", "leave", "the", "helper"))
+    with pytest.raises(SMTPTransportError, match="listener"):
+        client.send(
+            username="sender@example.test",
+            password=password,
+            mail_from="sender@example.test",
+            recipients=["recipient@example.test"],
+            message=io.BytesIO(b"body"),
+            message_length=4,
+        )
+    assert client.channel_opened is False
+    assert len(calls) == 2
+    assert password not in repr(calls)
 
 
 class ScriptedChannel:

@@ -41,3 +41,20 @@ jobs:
             $Arguments.AllowImagePull = $true
           }
           ./tests/integration/maddy-wsl-matrix.ps1 @Arguments
+      - name: Run host-network Submission integration
+        shell: pwsh
+        env:
+          WSL_DISTRO: ${{ inputs.distro }}
+        run: |
+          $Repository = (Resolve-Path -LiteralPath '.').Path
+          $WslPathOutput = & wsl.exe -d $env:WSL_DISTRO --exec wslpath -a -- $Repository 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            throw "wslpath failed: $WslPathOutput"
+          }
+          $WslRepository = ($WslPathOutput | Select-Object -Last 1).Trim()
+          & wsl.exe -d $env:WSL_DISTRO --user root --exec bash `
+            "$WslRepository/tests/integration/test-host-network-submission.sh" `
+            $WslRepository python3.14
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Host-network Submission integration failed.'
+          }

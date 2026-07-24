@@ -28,6 +28,7 @@ nonce=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
 container="maddyweb-named-volume-$nonce"
 second="maddyweb-named-volume-second-$nonce"
 volume="maddyweb-named-volume-$nonce"
+network="maddyweb-named-volume-$nonce"
 label="io.maddyweb.named-volume-test=$nonce"
 work=$(mktemp -d /tmp/maddyweb-named-volume.XXXXXXXX)
 release="$work/release"
@@ -40,8 +41,13 @@ export PATH
 cp -a -- "$repository/scripts/." "$release/"
 chmod -R go-w -- "$release"
 chmod 0755 -- "$release"/*.sh "$release"/*.py
+app_config="$work/config.toml"
+cp -- "$repository/docker/config.toml" "$app_config"
+sed -i "s/^container = .*/container = \"$container\"/" "$app_config"
+chmod 0600 -- "$app_config"
 fixture="$repository/tests/integration/fixtures/maddy-default-submission.conf"
 volume_created=false
+network_created=false
 
 cleanup() {
     local status=$?
@@ -53,6 +59,9 @@ cleanup() {
             | xargs -r docker rm --force >/dev/null 2>&1
         docker volume rm --force "$volume" >/dev/null 2>&1
     fi
+    if [[ "$network_created" == true ]]; then
+        docker network rm "$network" >/dev/null 2>&1
+    fi
     if [[ "$work" == /tmp/maddyweb-named-volume.* && -d "$work" && ! -L "$work" ]]; then
         rm -rf -- "$work"
     fi
@@ -62,13 +71,15 @@ trap cleanup EXIT
 
 docker volume create --label "$label" "$volume" >/dev/null
 volume_created=true
+docker network create --internal --label "$label" "$network" >/dev/null
+network_created=true
 docker run --rm --network none --read-only \
     --mount "type=volume,source=$volume,target=/data" \
     --mount "type=bind,source=$fixture,target=/input/maddy.conf,readonly" \
     --entrypoint /bin/sh "$image" -c \
     'cp /input/maddy.conf /data/maddy.conf && chown 1234:1234 /data/maddy.conf && chmod 0600 /data/maddy.conf && sync /data' \
     >/dev/null
-docker run --detach --name "$container" --label "$label" --network none \
+docker run --detach --name "$container" --label "$label" --network "$network" \
     --mount "type=volume,source=$volume,target=/data" \
     --entrypoint /bin/sleep "$image" 600 >/dev/null
 container_id=$(docker inspect --format '{{.Id}}' "$container")
@@ -159,7 +170,7 @@ stopped_copy="$work/stopped.conf"
     || die "stopped-state export changed content"
 docker start "$container_id" >/dev/null
 
-docker run --detach --name "$second" --label "$label" --network none \
+docker run --detach --name "$second" --label "$label" --network "$network" \
     --mount "type=volume,source=$volume,target=/data" \
     --entrypoint /bin/sleep "$image" 600 >/dev/null
 if "$python_binary" "$release/check-maddy-container.py" \
@@ -195,7 +206,8 @@ docker unpause "$container_id" >/dev/null
 common_args=(
     --action add --environment development --host "$(hostname)" --mode docker
     --maddy-config /data/maddy.conf --docker-binary "$docker_binary"
-    --container "$container" --python "$python_binary" --backup-dir "$work/backups"
+    --container "$container" --python "$python_binary" --app-config "$app_config"
+    --backup-dir "$work/backups"
 )
 if "$release/configure-submission.sh" "${common_args[@]}" --apply >/dev/null 2>&1; then
     die "Maddy 0.8.2 mutation did not require --allow-downtime"
@@ -230,5 +242,55 @@ final_copy="$work/final.conf"
     --action export --output "$final_copy" >/dev/null
 [[ "$(sha256sum "$final_copy" | awk '{print $1}')" == "$original_hash" ]] \
     || die "failed transaction did not restore exact original content"
+
+# Recreate the same disposable fixture in exact Docker host-network mode. The
+# explicit host-loopback scope must plan successfully, while the default
+# container scope must reject the shared host namespace. The sleep fixture
+# cannot create the expected listener, so apply must roll the edited named
+# volume back and leave no host port behind.
+docker rm --force "$container_id" >/dev/null
+docker run --detach --name "$container" --label "$label" --network host \
+    --mount "type=volume,source=$volume,target=/data" \
+    --entrypoint /bin/sleep "$image" 600 >/dev/null
+container_id=$(docker inspect --format '{{.Id}}' "$container")
+[[ "$(docker inspect --format '{{.HostConfig.NetworkMode}}' "$container_id")" == host ]] \
+    || die "host-network fixture has the wrong network mode"
+[[ -z "$(ss -H -ltn 'sport = :1587')" ]] \
+    || die "host-network fixture found an occupied port 1587"
+sed -i 's/^docker_submission_scope = "container"$/docker_submission_scope = "host-loopback"/' \
+    "$app_config"
+host_args=(
+    --action add --environment development --host "$(hostname)" --mode docker
+    --maddy-config /data/maddy.conf --docker-binary "$docker_binary"
+    --container "$container" --python "$python_binary" --backup-dir "$work/host-backups"
+    --docker-submission-scope host-loopback --app-config "$app_config"
+)
+host_plan=$("$release/configure-submission.sh" "${host_args[@]}")
+printf '%s\n' "$host_plan" | grep -qx 'docker_submission_scope=host-loopback' \
+    || die "host-network dry run did not report its explicit scope"
+printf '%s\n' "$host_plan" | grep -qx 'network_mode=host' \
+    || die "host-network dry run did not report exact network mode"
+sed -i 's/^docker_submission_scope = "host-loopback"$/docker_submission_scope = "container"/' \
+    "$app_config"
+if "$release/configure-submission.sh" "${common_args[@]}" >/dev/null 2>&1; then
+    die "default container scope accepted Docker host networking"
+fi
+sed -i 's/^docker_submission_scope = "container"$/docker_submission_scope = "host-loopback"/' \
+    "$app_config"
+if "$release/configure-submission.sh" "${host_args[@]}" \
+    --allow-downtime --apply >/dev/null 2>&1; then
+    die "host-network sleep fixture unexpectedly passed the listener gate"
+fi
+[[ "$(docker inspect --format '{{.State.Running}} {{.State.Paused}}' "$container_id")" == "true false" ]] \
+    || die "host-network rollback did not restore running and unpaused state"
+[[ -z "$(ss -H -ltn 'sport = :1587')" ]] \
+    || die "host-network rollback left port 1587 occupied"
+host_final="$work/host-final.conf"
+"$python_binary" "$release/docker-volume-config.py" \
+    --docker "$docker_binary" --container "$container_id" \
+    --expected-container-id "$container_id" --state running \
+    --action export --output "$host_final" >/dev/null
+[[ "$(sha256sum "$host_final" | awk '{print $1}')" == "$original_hash" ]] \
+    || die "host-network rollback did not restore exact original content"
 
 printf 'named-volume Submission integration passed\n'

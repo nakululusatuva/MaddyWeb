@@ -39,14 +39,22 @@ Only Maddy runs in the existing container; the MaddyWeb Web process and helper r
 - `/data/maddy.conf` is valid configuration;
 - an executable `/usr/bin/nc` always exists inside the container;
 - port `1587` is not exposed with `-p` or `--publish`;
+- `maddy.docker_submission_scope = "container"` is used for an isolated
+  container network namespace, or the explicit `"host-loopback"` value is used
+  only with exact Docker network mode `host`;
 - when the operations script must edit Submission, `/data` is either a host bind directory or a local named volume
   referenced only by this Maddy container and without driver options. In named-volume mode,
   the configuration location is fixed at `/data/maddy.conf`; a volume name or internal Docker daemon
   path is not accepted as input.
 
-The management Submission endpoint listens only on `127.0.0.1:1587` inside the container. The helper uses the fixed
-`docker exec -i <container> /usr/bin/nc 127.0.0.1 1587` command to transport SMTP inside the container network
-namespace. It does not depend on the container network mode and never maps the host port.
+The management Submission endpoint always listens on IPv4
+`127.0.0.1:1587`, and the helper uses the fixed
+`docker exec -i <container> /usr/bin/nc 127.0.0.1 1587` command. No Docker
+publish rule is allowed. The default `container` scope rejects host networking
+and keeps the listener in the container namespace. The explicit
+`host-loopback` scope requires exact Docker network mode `host`; in that mode
+the shared namespace creates one host-loopback listener. The validator rejects
+wildcard, IPv6, duplicate, and non-loopback alternatives.
 
 The Docker-mode example is `docker/config.toml`. It is not a Compose file and does not create,
 replace, or upgrade the Maddy container.
@@ -75,8 +83,17 @@ request_body_timeout_seconds = 15
 helper_socket = "/run/maddyweb/helper.sock"
 submission_host = "127.0.0.1"
 submission_port = 1587
+docker_submission_scope = "container"
 command_timeout_seconds = 15
 ```
+
+Use `docker_submission_scope = "host-loopback"` only for an existing
+host-network Maddy container after confirming the host is single-tenant and
+local shell users are trusted. Maddy SMTP AUTH remains mandatory in both
+scopes.
+Submission configuration and rollback commands validate this value against
+the effective `/etc/maddyweb/config.toml`; a command-line override cannot
+weaken the configured network boundary.
 
 `server.request_body_timeout_seconds` limits the time to read the complete HTTP request body, preventing slow or
 stalled uploads from occupying scarce workers indefinitely; the production validator accepts 1..120 seconds, fixed at 15 in the template.

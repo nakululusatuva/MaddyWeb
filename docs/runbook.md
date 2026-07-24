@@ -88,6 +88,7 @@ bash scripts/configure-submission.sh \
   --action add --environment production --host "$HOST" --mode native \
   --maddy-config /etc/maddy/maddy.conf \
   --maddy-binary /usr/bin/maddy \
+  --app-config /etc/maddyweb/config.toml \
   --python /opt/maddyweb/current/bin/python
 ```
 
@@ -116,6 +117,8 @@ bash scripts/configure-submission.sh \
   --action add --environment production --host "$HOST" --mode docker \
   --maddy-config /srv/maddy/data/maddy.conf \
   --docker-binary /usr/bin/docker --container maddy \
+  --docker-submission-scope container \
+  --app-config /etc/maddyweb/config.toml \
   --python /opt/maddyweb/current/bin/python
 ```
 
@@ -136,8 +139,37 @@ bash scripts/configure-submission.sh \
   --action add --environment production --host "$(hostname)" --mode docker \
   --maddy-config /data/maddy.conf \
   --docker-binary /usr/bin/docker --container maddy \
+  --docker-submission-scope container \
+  --app-config /etc/maddyweb/config.toml \
   --python /opt/maddyweb/current/bin/python
 ```
+
+The matching application configuration uses
+`maddy.docker_submission_scope = "container"`. This default scope rejects
+Docker network mode `host`, `none`, and shared `container:` namespaces.
+
+For an existing Maddy container that intentionally uses exact Docker network
+mode `host`, set the application value to `"host-loopback"` and pass the
+matching explicit option:
+
+```console
+bash scripts/configure-submission.sh \
+  --action add --environment production --host "$(hostname)" --mode docker \
+  --maddy-config /data/maddy.conf \
+  --docker-binary /usr/bin/docker --container maddy \
+  --docker-submission-scope host-loopback \
+  --app-config /etc/maddyweb/config.toml \
+  --python /opt/maddyweb/current/bin/python
+```
+
+This opt-in does not create a Docker publication and does not alter public
+mail ports. Because host networking shares the network namespace, it permits
+one host listener at exact IPv4 `127.0.0.1:1587`. The transaction rejects
+wildcard, IPv6, duplicate, and non-loopback listeners, includes network mode
+in every identity snapshot, and continues to require real mailbox SMTP AUTH.
+Use it only on a single-tenant host whose local shell users are trusted.
+The transaction validates the effective application configuration and rejects
+any command-line scope or container that does not match it.
 
 The dry run executes only fixed, read-only commands against the verified full container ID:
 `stat/readlink/sha256sum/cat`. Metadata and hashes must match before and after; it does not pause, invoke `docker run`,
@@ -155,16 +187,18 @@ while reporting `CRITICAL`; it never continues with unknown configuration. On `0
 it runs `verify-config` and sends SIGUSR2 only after success. `0.8.2` requires `--allow-downtime` and a short restart.
 Even if a bad candidate makes the container exit, it restores through that ID's stopped volume, starts it, and reads it back.
 
-Again, `0.8.2` requires `--allow-downtime`. The tool prohibits every Docker publish rule for port 1587,
-verifies unchanged container ID, mounts, ports, and restart policy, and after reload or restart
-checks `/proc/net/tcp` inside the container before running the fixed
-`docker exec maddy /usr/bin/nc -z -w 2 127.0.0.1 1587` reachability probe. Mail
-data also enters container loopback through `docker exec -i ... /usr/bin/nc`; it never passes through a host
-TCP listener.
+Again, `0.8.2` requires `--allow-downtime`. The tool prohibits every Docker
+publish rule for port 1587, verifies unchanged container ID, network mode,
+mounts, ports, and restart policy, and after reload or restart checks both
+IPv4 and IPv6 listener tables before running the fixed
+`docker exec maddy /usr/bin/nc -z -w 2 127.0.0.1 1587` reachability probe.
+In `container` scope no host listener may exist. In `host-loopback` scope the
+only permitted host listener is `127.0.0.1:1587`.
 
-To remove the block, change `--action add` and the approval action to `remove` and
-`submission-remove`, respectively. Removal accepts only exact, unmodified managed-marker content; it does not delete
-similar manual configuration.
+To remove the block, change `--action add` and the approval action to `remove`
+and `submission-remove`, respectively, while preserving the same
+`--docker-submission-scope` value. Removal accepts only exact, unmodified
+managed-marker content; it does not delete similar manual configuration.
 
 ### Enable Web for the first time
 
@@ -278,12 +312,19 @@ sudo bash scripts/rollback.sh <same reviewed arguments> \
 The tool atomically switches the symlink, restarts Web and helper, and runs smoke; a failure restores the original release.
 To also remove managed Submission under the same approval, explicitly add
 `--remove-managed-submission` and the mode, configuration, and container options. `0.8.2` again requires
-`--allow-downtime`.
+`--allow-downtime`. A Docker rollback must preserve the deployed
+`--docker-submission-scope`; host-network containers therefore require
+`--docker-submission-scope host-loopback`.
 
 The combined release-rollback-and-remove entry point accepts only native or Docker bind-mounted configuration.
 For a Docker named volume, first use the separate `configure-submission.sh --action remove` transaction above
 with `submission-remove` approval and verify it, then run release rollback separately.
 Never pass an internal daemon volume path to the rollback command as though it were a host configuration path.
+Every release rollback first loads the effective `/etc/maddyweb/config.toml`
+with the target release. A target whose closed configuration schema cannot
+represent the active settings is rejected before approval is consumed or any
+service, symlink, or Maddy configuration is changed. Configuration downgrade
+is never automatic.
 
 After a candidate release or smoke failure, the tool reports successful restoration only if the previous symlink, unit states, and release
 smoke result all read back successfully, along with optional Submission configuration, reload, port 1587 listener, and Docker identity.
