@@ -342,7 +342,12 @@ def test_public_edge_checker_probes_login_health_and_direct_origin_denial() -> N
     assert "X-Forwarded-Proto" not in health_probe
     assert "X-Real-IP" not in health_probe
     assert '--resolve "$domain:443:127.0.0.1"' in checker
-    assert '[[ "$direct_origin_exit" == "52" ]]' in checker
+    direct_origin_probe = checker.split("direct_origin_exit=0", maxsplit=1)[1].split(
+        "getent ahosts", maxsplit=1
+    )[0]
+    assert "--write-out '%{http_code}'" in direct_origin_probe
+    assert '[[ "$direct_origin_status" == "000" ]]' in direct_origin_probe
+    assert "52|56)" in direct_origin_probe
     assert '"https://$domain/healthz"' in checker
     assert '[[ "$public_health_status" == "404" ]]' in checker
     assert "strict-transport-security:" in checker

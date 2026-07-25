@@ -400,15 +400,24 @@ loopback_health_status=$(
     || die "loopback MaddyWeb health returned HTTP $loopback_health_status"
 
 direct_origin_exit=0
-curl --noproxy '*' --silent --output /dev/null \
-    --connect-timeout 3 --max-time 5 \
-    --resolve "$domain:443:127.0.0.1" "https://$domain/" \
-    || direct_origin_exit=$?
+direct_origin_status=$(
+    curl --noproxy '*' --silent --output /dev/null \
+        --write-out '%{http_code}' \
+        --connect-timeout 3 --max-time 5 \
+        --resolve "$domain:443:127.0.0.1" "https://$domain/"
+) || direct_origin_exit=$?
 if (( direct_origin_exit == 0 )); then
     die "direct-origin HTTPS unexpectedly returned an HTTP response"
 fi
-[[ "$direct_origin_exit" == "52" ]] \
-    || die "direct-origin HTTPS denial probe failed unexpectedly (curl $direct_origin_exit)"
+[[ "$direct_origin_status" == "000" ]] \
+    || die "direct-origin HTTPS unexpectedly returned HTTP $direct_origin_status"
+case "$direct_origin_exit" in
+    52|56)
+        ;;
+    *)
+        die "direct-origin HTTPS denial probe failed unexpectedly (curl $direct_origin_exit)"
+        ;;
+esac
 
 getent ahosts "$domain" >/dev/null 2>&1 \
     || die "public hostname does not resolve: $domain"

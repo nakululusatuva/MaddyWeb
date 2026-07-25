@@ -326,6 +326,12 @@ response must be 404 and carry the reviewed HSTS header. Therefore the host
 running the checker needs outbound DNS and HTTPS access. After it passes,
 verify:
 
+Nginx `return 444` deliberately closes the connection without an HTTP
+response. Depending on the curl TLS backend and close behavior, curl reports
+this as either exit 52 (empty reply) or exit 56 (receive failure). The checker
+accepts only those two results and separately requires HTTP status `000`; any
+received HTTP response still fails the direct-origin denial check.
+
 - the Cloudflare public URL redirects HTTP to HTTPS;
 - the HTTPS response includes exactly
   `Strict-Transport-Security: max-age=31536000`;
