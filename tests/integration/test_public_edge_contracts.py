@@ -270,7 +270,9 @@ def test_public_edge_checker_is_read_only_and_profile_bound() -> None:
     assert 'certbot_binary="/opt/certbot/bin/certbot"' in checker
     assert 'nginx_service="custom-acme-webroot.service"' in checker
     assert "system nginx.service must remain disabled" in checker
-    assert "pre_hook|post_hook|renew_hook|deploy_hook" in checker
+    assert 'RENEWAL_POLICY_CHECKER="$SCRIPT_DIR/validate-renewal-profile.py"' in checker
+    assert '"$installed_python" -I "$RENEWAL_POLICY_CHECKER" "$renewal_file"' in checker
+    assert "webroot-only plugin policy" in checker
     assert 'certificate_root="/var/lib/maddyweb-web-cert"' in checker
     assert "require_root_private_directory" in checker
     assert "require_root_secret_file" in checker
@@ -387,6 +389,12 @@ def test_public_edge_documentation_preserves_mail_automation() -> None:
     )
     assert "Use a separate Certbot state tree" in compact_guide
     assert (
+        "Certbot 5.5 writes a `certonly --webroot` lineage without an `installer` option"
+        in compact_guide
+    )
+    assert "exact legacy value `installer = None`" in compact_guide
+    assert "only accepted no-installer forms" in compact_guide
+    assert (
         "Never use `/etc/letsencrypt`, `/var/lib/letsencrypt`, or "
         "`/var/log/letsencrypt` for the Web lineage"
     ) in compact_guide
@@ -416,6 +424,7 @@ def test_installer_retains_public_edge_assets_in_immutable_release() -> None:
     assert '"$staging/public-edge/nginx"' in install
     assert '"$staging/public-edge/systemd"' in install
     assert '"$staging/public-edge/check-public-edge.sh"' in install
+    assert '"$staging/public-edge/validate-renewal-profile.py"' in install
     assert '"$staging/public-edge/public-edge.md"' in install
     for name in (
         "cloudflare-http.conf",

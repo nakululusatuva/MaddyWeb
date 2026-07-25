@@ -6,6 +6,7 @@ umask 077
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 ASSET_DIR="$SCRIPT_DIR/nginx"
 UNIT_ASSET_DIR="$SCRIPT_DIR/systemd"
+RENEWAL_POLICY_CHECKER="$SCRIPT_DIR/validate-renewal-profile.py"
 
 log() {
     printf '[maddyweb-public-edge] %s\n' "$*" >&2
@@ -164,6 +165,7 @@ require_root_private_file "/etc/maddyweb/config.toml"
 require_root_private_file "$ASSET_DIR/cloudflare-http.conf"
 require_root_private_file "$ASSET_DIR/cloudflare-realip.conf"
 require_root_private_file "$source_vhost"
+require_root_private_file "$RENEWAL_POLICY_CHECKER"
 require_root_private_file "$UNIT_ASSET_DIR/$service_unit"
 require_root_private_file "$UNIT_ASSET_DIR/$timer_unit"
 require_root_executable "$nginx_binary"
@@ -329,14 +331,8 @@ require_root_private_directory "$certificate_live"
 require_root_private_directory "$certificate_archive"
 require_root_private_file "$certificate_root/config/renewal/$domain.conf"
 renewal_file="$certificate_root/config/renewal/$domain.conf"
-grep -Eq '^[[:space:]]*authenticator[[:space:]]*=[[:space:]]*webroot[[:space:]]*$' \
-    "$renewal_file" || die "Web certificate lineage is not webroot-only"
-grep -Eq '^[[:space:]]*installer[[:space:]]*=[[:space:]]*(None|none)[[:space:]]*$' \
-    "$renewal_file" || die "Web certificate lineage has an installer"
-if grep -Eq '^[[:space:]]*(pre_hook|post_hook|renew_hook|deploy_hook)[[:space:]]*=' \
-    "$renewal_file"; then
-    die "Web certificate lineage contains a hook"
-fi
+"$installed_python" -I "$RENEWAL_POLICY_CHECKER" "$renewal_file" >/dev/null \
+    || die "Web certificate lineage violates the webroot-only plugin policy"
 grep -Fq "archive_dir = $certificate_root/config/archive/$domain" "$renewal_file" \
     || die "Web certificate archive path drifted"
 grep -Fq "cert = $certificate_root/config/live/$domain/cert.pem" "$renewal_file" \

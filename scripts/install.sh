@@ -23,6 +23,7 @@ readonly CERTBOT_DEPLOY_HOOK="$CERTBOT_DEPLOY_HOOKS/maddyweb"
 readonly CERTBOT_HOOK_MARKER="# Managed by MaddyWeb install.sh; do not edit."
 readonly PUBLIC_EDGE_ROOT="$REPO_ROOT/deploy/public-edge"
 readonly PUBLIC_EDGE_CHECKER="$PUBLIC_EDGE_ROOT/check-public-edge.sh"
+readonly PUBLIC_EDGE_RENEWAL_CHECKER="$PUBLIC_EDGE_ROOT/validate-renewal-profile.py"
 readonly PUBLIC_EDGE_DOCUMENTATION="$REPO_ROOT/docs/public-edge.md"
 readonly -a PUBLIC_EDGE_NGINX_ASSETS=(
     cloudflare-http.conf
@@ -202,6 +203,7 @@ require_path_below "$artifact" "$wheelhouse"
 require_absolute_path "$python_binary" "Python binary"
 [[ -x "$python_binary" ]] || die "Python binary is not executable"
 require_regular_file "$PUBLIC_EDGE_CHECKER" "public-edge checker"
+require_regular_file "$PUBLIC_EDGE_RENEWAL_CHECKER" "public-edge renewal checker"
 require_regular_file "$PUBLIC_EDGE_DOCUMENTATION" "public-edge documentation"
 for public_edge_asset in "${PUBLIC_EDGE_NGINX_ASSETS[@]}"; do
     require_regular_file "$PUBLIC_EDGE_ROOT/nginx/$public_edge_asset" "public-edge Nginx asset"
@@ -436,6 +438,8 @@ install -d -o root -g root -m 0755 -- \
     "$staging/public-edge/systemd"
 install -o root -g root -m 0555 -- \
     "$PUBLIC_EDGE_CHECKER" "$staging/public-edge/check-public-edge.sh"
+install -o root -g root -m 0444 -- \
+    "$PUBLIC_EDGE_RENEWAL_CHECKER" "$staging/public-edge/validate-renewal-profile.py"
 install -o root -g root -m 0444 -- \
     "$PUBLIC_EDGE_DOCUMENTATION" "$staging/public-edge/public-edge.md"
 for public_edge_asset in "${PUBLIC_EDGE_NGINX_ASSETS[@]}"; do

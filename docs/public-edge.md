@@ -104,6 +104,13 @@ dedicated Web services use an exact `--cert-name` and
 installer, and contain no `pre_hook`, `post_hook`, `renew_hook`, or
 `deploy_hook`.
 
+Certbot 5.5 writes a `certonly --webroot` lineage without an `installer`
+option when no installer was selected. Older renewal files can instead contain
+the exact legacy value `installer = None`. These two forms are equivalent and
+are the only accepted no-installer forms. Do not edit a newly generated file
+just to add the legacy option. Any other value, spelling, or duplicate
+`installer` option fails the public-edge check.
+
 Use a separate Certbot state tree at `/var/lib/maddyweb-web-cert`, including
 independent `config`, `work`, and `logs` directories. Never use
 `/etc/letsencrypt`, `/var/lib/letsencrypt`, or `/var/log/letsencrypt` for the
