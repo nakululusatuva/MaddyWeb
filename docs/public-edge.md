@@ -78,6 +78,12 @@ public hostname. It also requires the cookie names and authentication state
 directory shown above. Validate and restart MaddyWeb before enabling the final
 TLS virtual host, then confirm that port 8787 remains loopback-only.
 
+The complete reviewed host profiles are
+`deploy/examples/config.standalone.toml` and
+`deploy/examples/config.custom.toml`. Use the matching file as the explicit
+replacement configuration; do not reconstruct a production profile by
+editing a development example during deployment.
+
 ## Preserve existing certificate automation
 
 Before any edge change, record existing mail certificate state:

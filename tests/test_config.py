@@ -59,6 +59,46 @@ def test_example_cookie_names_are_distinct_across_local_instances() -> None:
 
 
 @pytest.mark.parametrize(
+    ("filename", "domain", "issuer", "submission_scope", "certificate_name"),
+    (
+        (
+            "config.standalone.toml",
+            "maddy.standalone.example.test",
+            "MaddyWeb Standalone",
+            "container",
+            "mail.standalone.example.test",
+        ),
+        (
+            "config.custom.toml",
+            "maddy.custom.example.test",
+            "MaddyWeb Custom",
+            "host-loopback",
+            "mail.custom.example.test",
+        ),
+    ),
+)
+def test_public_edge_production_profiles_match_the_checker_contract(
+    filename: str,
+    domain: str,
+    issuer: str,
+    submission_scope: str,
+    certificate_name: str,
+) -> None:
+    repository = Path(__file__).resolve().parents[1]
+    config = load_config(repository / "deploy" / "examples" / filename)
+
+    assert config.server.allowed_hosts == ("127.0.0.1", "localhost", domain)
+    assert config.maddy.mode == "docker"
+    assert config.maddy.docker_submission_scope == submission_scope
+    assert config.certificates.names == (certificate_name,)
+    assert config.security.auth_state_dir.as_posix() == "/var/lib/maddyweb-auth"
+    assert config.security.session_cookie_name == "__Host-maddyweb-session"
+    assert config.security.csrf_cookie_name == "__Host-maddyweb-csrf"
+    assert config.security.public_origin == f"https://{domain}"
+    assert config.security.totp_issuer == issuer
+
+
+@pytest.mark.parametrize(
     "listen", ["0.0.0.0:8787", "127.0.0.2:8787", "localhost:8787", "[::1]:8787"]
 )
 def test_non_exact_loopback_is_rejected(listen: str) -> None:

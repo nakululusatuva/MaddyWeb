@@ -1,0 +1,49 @@
+[server]
+listen = "127.0.0.1:8787"
+allowed_hosts = ["127.0.0.1", "localhost", "maddy.custom.example.test"]
+concurrency = 8
+backlog = 16
+keepalive_seconds = 5
+request_body_timeout_seconds = 15
+max_upload_bytes = 20971520
+page_size = 50
+temp_dir = "/var/tmp/maddyweb"
+
+[maddy]
+mode = "docker"
+docker_submission_scope = "host-loopback"
+container = "maddy"
+binary = "/usr/bin/maddy"
+config_path = "/data/maddy.conf"
+data_dir = "/data"
+service_user = "maddy"
+helper_socket = "/run/maddyweb/helper.sock"
+submission_host = "127.0.0.1"
+submission_port = 1587
+command_timeout_seconds = 15
+
+[certificates]
+enabled = true
+names = ["mail.custom.example.test"]
+certbot_binary = "/opt/certbot/bin/certbot"
+openssl_binary = "/usr/bin/openssl"
+nginx_binary = "/usr/local/libexec/custom-nginx-test"
+renewal_dir = "/etc/letsencrypt/renewal"
+webroot_roots = ["/var/www/letsencrypt"]
+live_dir = "/etc/letsencrypt/live"
+timer_unit = "custom-certbot-renew.timer"
+command_timeout_seconds = 300
+deployed_cert_path = "/data/tls/fullchain.pem"
+deployed_key_path = "/data/tls/privkey.pem"
+
+[security]
+session_key_file = "/var/lib/maddyweb/session.key"
+auth_state_dir = "/var/lib/maddyweb-auth"
+csrf_ttl_seconds = 900
+session_cookie_name = "__Host-maddyweb-session"
+csrf_cookie_name = "__Host-maddyweb-csrf"
+public_origin = "https://maddy.custom.example.test"
+totp_issuer = "MaddyWeb Custom"
+
+[logging]
+level = "INFO"
