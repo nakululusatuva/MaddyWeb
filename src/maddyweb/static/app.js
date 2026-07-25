@@ -66,6 +66,26 @@
   const objectValue = (value) => (
     value && typeof value === "object" && !Array.isArray(value) ? value : {}
   );
+  const compactMessageDate = (value) => {
+    const source = stringValue(value);
+    if (!source) return "Unknown date";
+    const parsed = new Date(source);
+    if (Number.isNaN(parsed.getTime())) return source;
+    const now = new Date();
+    const sameDay = (
+      parsed.getFullYear() === now.getFullYear()
+      && parsed.getMonth() === now.getMonth()
+      && parsed.getDate() === now.getDate()
+    );
+    return new Intl.DateTimeFormat(
+      undefined,
+      sameDay
+        ? {hour: "2-digit", minute: "2-digit"}
+        : parsed.getFullYear() === now.getFullYear()
+          ? {month: "short", day: "numeric"}
+          : {year: "numeric", month: "short", day: "numeric"},
+    ).format(parsed);
+  };
 
   const state = {
     csrfToken: "",
@@ -907,10 +927,10 @@
     }), {replace: true, focus: false});
   };
 
-  const messageActionButton = (label, context, handler) => {
+  const messageActionButton = (label, context, handler, visibleLabel = label) => {
     const button = element("button", {
       className: "message-row-action",
-      text: label,
+      text: visibleLabel,
       title: `${label}: ${context.subject}`,
       type: "button",
     });
@@ -1028,7 +1048,33 @@
     if (!workspaceIndicator.hidden) {
       byId("admin-workspace-address").textContent = accountLabel;
     }
-    const mailboxes = arrayValue(mail.mailboxes || mail.folders).map(objectValue);
+    const mailboxOrder = new Map([
+      ["inbox", 0],
+      ["drafts", 1],
+      ["sent", 2],
+      ["archive", 3],
+      ["all mail", 4],
+      ["junk", 5],
+      ["spam", 5],
+      ["trash", 6],
+    ]);
+    const mailboxes = arrayValue(mail.mailboxes || mail.folders)
+      .map(objectValue)
+      .sort((left, right) => {
+        const leftName = stringValue(left.name);
+        const rightName = stringValue(right.name);
+        const leftPriority = left.is_archive === true
+          ? 3
+          : left.is_trash === true
+            ? 6
+            : mailboxOrder.get(leftName.toLowerCase()) ?? 20;
+        const rightPriority = right.is_archive === true
+          ? 3
+          : right.is_trash === true
+            ? 6
+            : mailboxOrder.get(rightName.toLowerCase()) ?? 20;
+        return leftPriority - rightPriority || leftName.localeCompare(rightName);
+      });
     const messages = arrayValue(mail.messages || mail.items).map(objectValue);
     const selectedMailbox = mailboxes.find(
       (item) => stringValue(item.name) === mailbox,
@@ -1046,6 +1092,7 @@
       })),
       account,
       "Select an account",
+      Boolean(accounts.length),
     );
     populateSelect(
       byId("mail-mailbox"),
@@ -1059,6 +1106,7 @@
     );
     byId("mail-mailbox").disabled = !account;
     byId("mail-mailbox").required = Boolean(account && mailboxes.length);
+    byId("mail-identity-card").hidden = state.role === "admin";
     byId("current-mailbox-identity").textContent = accountLabel;
     byId("mail-title").textContent = mailbox || "Mail";
     byId("mail-list-summary").textContent = mailbox
@@ -1074,15 +1122,29 @@
       link.dataset.route = "";
       if (name === mailbox) link.setAttribute("aria-current", "page");
       const normalized = name.toLowerCase();
-      const symbol = normalized === "inbox"
-        ? "I"
-        : normalized === "sent"
-          ? "S"
-          : normalized === "trash"
-            ? "T"
-            : normalized === "archive" || normalized === "all mail"
-              ? "A"
+      const kind = item.is_trash === true
+        ? "trash"
+        : item.is_archive === true
+          ? "archive"
+          : normalized === "inbox"
+            ? "inbox"
+            : normalized === "sent"
+              ? "sent"
               : normalized === "drafts"
+                ? "drafts"
+                : normalized === "junk" || normalized === "spam"
+                  ? "junk"
+                  : "folder";
+      link.dataset.kind = kind;
+      const symbol = kind === "inbox"
+        ? "I"
+        : kind === "sent"
+          ? "S"
+          : kind === "trash"
+            ? "T"
+            : kind === "archive"
+              ? "A"
+              : kind === "drafts"
                 ? "D"
                 : "F";
       link.append(
@@ -1107,6 +1169,8 @@
     }
 
     const fragment = document.createDocumentFragment();
+    const activeRoute = parseRoute();
+    const activeMessageUid = activeRoute.name === "message" ? activeRoute.uid : "";
     for (const message of messages) {
       const uid = stringValue(message.uid);
       const url = new URL(`/mail/${encodeURIComponent(uid)}`, window.location.origin);
@@ -1120,6 +1184,10 @@
       const row = element("tr", {
         className: message.unread === true ? "message-unread" : "",
       });
+      if (uid === activeMessageUid) {
+        row.classList.add("is-selected");
+        row.setAttribute("aria-current", "true");
+      }
       row.tabIndex = 0;
       row.setAttribute("aria-label", `Open message from ${sender}: ${subject}`);
       row.title = `Open message: ${subject}`;
@@ -1143,9 +1211,23 @@
         event.preventDefault();
         openRow();
       });
-      row.append(
-        element("td", {text: sender}),
+      const senderCell = element("td", {className: "message-sender-cell"});
+      senderCell.append(
+        element("span", {
+          className: "message-sender-avatar",
+          text: sender.trim().slice(0, 1).toUpperCase() || "?",
+        }),
+        element("span", {className: "message-sender-label", text: sender}),
       );
+      if (message.unread === true) {
+        senderCell.append(
+          element("span", {
+            className: "message-unread-dot",
+            title: "Unread",
+          }),
+        );
+      }
+      row.append(senderCell);
       const subjectCell = element("td");
       const subjectLink = element("a", {
         text: subject,
@@ -1191,14 +1273,17 @@
             subject: boundedForwardedSubject(subject),
           };
           navigate(buildForwardUrl({...context, mode: "attachment"}));
-        }),
+        }, "Attach"),
         deleteButton,
         archiveButton,
       );
       actionCell.append(actionGroup);
+      const date = stringValue(message.date, "Unknown date");
+      const dateCell = element("td", {text: compactMessageDate(date)});
+      dateCell.title = date;
       row.append(
         subjectCell,
-        element("td", {text: stringValue(message.date, "Unknown date")}),
+        dateCell,
         actionCell,
       );
       fragment.append(row);
@@ -1207,7 +1292,12 @@
     const empty = byId("message-empty");
     empty.hidden = messages.length !== 0;
     empty.textContent = account && mailbox
-      ? "This mailbox has no messages."
+      ? mailbox.trim().toLowerCase() === "sent"
+        ? (
+          "No sent copies are stored here. MaddyWeb saves a copy after it sends; "
+          + "other mail clients must save their own Sent copy."
+        )
+        : "This mailbox has no messages."
       : "Select an account and mailbox.";
 
     const previous = byId("mail-previous");
@@ -1239,31 +1329,21 @@
         )
       ) query.set(name, value);
     }
-    if (!query.get("mailbox")) {
-      query.set("phase", "context");
-      const contextData = await apiData(`/mail?${query.toString()}`, {signal});
-      state.mail = contextData;
-      renderMail(contextData);
-      const selectedAccount = stringValue(contextData.selected_account);
-      const selectedMailbox = stringValue(contextData.selected_mailbox);
-      if (!selectedMailbox) return;
-      query.delete("phase");
-      if (state.role === "admin" && selectedAccount) {
-        query.set("account", selectedAccount);
-      } else {
-        query.delete("account");
-      }
-      query.set("mailbox", selectedMailbox);
-      window.history.replaceState(
-        null,
-        "",
-        buildMailUrl({account: selectedAccount, mailbox: selectedMailbox}),
-      );
-    }
     const suffix = query.size ? `?${query.toString()}` : "";
     const data = await apiData(`/mail${suffix}`, {signal});
     state.mail = data;
     renderMail(data);
+    const selectedMailbox = stringValue(data.selected_mailbox);
+    if (!query.get("mailbox") && selectedMailbox) {
+      window.history.replaceState(
+        null,
+        "",
+        buildMailUrl({
+          account: stringValue(data.selected_account),
+          mailbox: selectedMailbox,
+        }),
+      );
+    }
   };
 
   const renderMessageBody = (message) => {

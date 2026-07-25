@@ -173,7 +173,6 @@ async def test_normal_user_mail_defaults_to_own_inbox_with_minimal_requests(
     assert _api_request_paths(requests) == [
         "/api/v1/auth/session",
         "/api/v1/me/mail",
-        "/api/v1/me/mail",
     ]
 
 
@@ -222,7 +221,6 @@ async def test_admin_mail_defaults_to_the_admins_own_inbox(
     assert _api_request_paths(requests) == [
         "/api/v1/auth/session",
         "/api/v1/admin/mail",
-        "/api/v1/admin/mail",
     ]
 
 
@@ -237,8 +235,18 @@ async def test_mailbox_placeholder_cannot_be_selected(
     placeholder = mailbox.locator('option[value=""]')
     assert await mailbox.input_value() == MAILBOX
     assert await mailbox.is_enabled()
+    assert await mailbox.is_hidden()
     assert await placeholder.get_attribute("disabled") is not None
     assert await placeholder.get_attribute("hidden") is not None
+
+    folder_pane = await page.locator("#mail-folder-pane").bounding_box()
+    account_select = await page.locator("#mail-account").bounding_box()
+    assert folder_pane is not None
+    assert account_select is not None
+    assert account_select["x"] >= folder_pane["x"]
+    assert account_select["x"] + account_select["width"] <= (
+        folder_pane["x"] + folder_pane["width"] + 1
+    )
 
 
 def _message_path() -> str:
@@ -743,6 +751,43 @@ async def test_mailbox_auto_opens_inbox_and_rows_support_pointer_and_keyboard_na
         bounds = await actions.nth(index).bounding_box()
         assert bounds is not None
         assert bounds["height"] >= 44
+
+
+async def test_mailbox_rows_fit_the_desktop_message_pane(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    for width in (1440, 1024):
+        await page.set_viewport_size({"width": width, "height": 900})
+        await _load_inbox(page, live_application)
+
+        pane = page.locator("#mail-view")
+        pane_bounds = await pane.bounding_box()
+        assert pane_bounds is not None
+        assert await page.locator(".mail-list-table").evaluate(
+            "node => node.scrollWidth <= node.clientWidth"
+        )
+        for action in await page.locator(".message-row-action").all():
+            bounds = await action.bounding_box()
+            assert bounds is not None
+            assert bounds["x"] >= pane_bounds["x"]
+            assert bounds["x"] + bounds["width"] <= pane_bounds["x"] + pane_bounds["width"] + 1
+
+
+async def test_empty_sent_mailbox_explains_when_copies_are_created(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    query = urlencode({"account": ACCOUNT, "mailbox": "Sent"})
+    await page.goto(f"{live_application.base_url}/mail?{query}")
+
+    empty = page.locator("#message-empty")
+    await page.wait_for_function(
+        "() => document.querySelector('#message-empty').textContent.includes("
+        "'MaddyWeb saves a copy after it sends')"
+    )
+    assert "MaddyWeb saves a copy after it sends" in await empty.inner_text()
+    assert await page.locator("#mail-mailbox").input_value() == "Sent"
 
 
 async def test_mailbox_forward_actions_prepare_safe_compose_drafts(

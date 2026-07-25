@@ -30,6 +30,7 @@ NORMAL_ACCOUNT_ADDRESS = "tornado@custom.example.test"
 NEW_ACCOUNT = "new-user@example.test"
 NEW_ACCOUNT_ID = "b" * 32
 MAILBOX = "INBOX"
+SENT_MAILBOX = "Sent"
 TRASH_MAILBOX = "Custom Trash"
 ARCHIVE_MAILBOX = "Custom Archive"
 MESSAGE_ID = "42"
@@ -249,6 +250,7 @@ class BrowserSecurityGateway:
     async def list_mailboxes(self, _account: str) -> list[dict[str, object]]:
         return [
             {"name": MAILBOX, "attributes": []},
+            {"name": SENT_MAILBOX, "attributes": ["\\Sent"]},
             {"name": TRASH_MAILBOX, "attributes": ["\\Trash"]},
             {"name": ARCHIVE_MAILBOX, "attributes": ["\\Archive"]},
         ]

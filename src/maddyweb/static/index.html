@@ -7,8 +7,8 @@
   <meta name="theme-color" content="#f4f6f9">
   <meta name="description" content="MaddyWeb mail workspace and server administration console">
   <title>MaddyWeb</title>
-  <link rel="stylesheet" href="/static/app.css?v=10">
-  <script src="/static/app.js?v=12" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=11">
+  <script src="/static/app.js?v=13" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to main content</a>
@@ -101,22 +101,31 @@
         <aside id="mail-folder-pane" class="mail-folder-pane" data-mail-pane="folders" aria-label="Mailbox folders">
           <div class="mail-pane-heading">
             <div>
-              <p class="eyebrow">Mailbox</p>
+              <p class="eyebrow">Mail</p>
               <h2 id="folder-pane-title">Folders</h2>
             </div>
-            <a class="mail-pane-compose" href="/compose" data-route aria-label="Compose a new message">+</a>
           </div>
+          <a class="mail-pane-compose" href="/compose" data-route>
+            <span aria-hidden="true">+</span>
+            New message
+          </a>
           <div id="mail-selector" class="mail-selector">
             <label id="mail-account-field">
-              <span>Account</span>
-              <select id="mail-account" name="account" required><option value="">Select an account</option></select>
-            </label>
-            <label class="mailbox-jump">
-              <span>Jump to folder</span>
-              <select id="mail-mailbox" name="mailbox"><option value="">Select a mailbox</option></select>
+              <span>Viewing mailbox</span>
+              <span class="mail-select-shell">
+                <span class="mail-account-mark" aria-hidden="true">A</span>
+                <select id="mail-account" name="account" required><option value="">Select an account</option></select>
+              </span>
             </label>
           </div>
-          <p id="current-mailbox-identity" class="current-mailbox-identity"></p>
+          <div id="mail-identity-card" class="mail-identity-card">
+            <span class="mail-account-mark" aria-hidden="true">M</span>
+            <span>
+              <small>Signed in as</small>
+              <strong id="current-mailbox-identity"></strong>
+            </span>
+          </div>
+          <select id="mail-mailbox" name="mailbox" hidden aria-hidden="true" tabindex="-1"><option value="">Select a mailbox</option></select>
           <nav id="mail-folder-list" class="mail-folder-list" aria-labelledby="folder-pane-title"></nav>
           <div class="folder-pane-footer">
             <a href="/security" data-route>
@@ -141,7 +150,7 @@
               <tbody id="message-list-body"></tbody>
             </table>
           </div>
-          <div id="message-empty" class="empty-state">Select an account and mailbox.</div>
+          <div id="message-empty" class="empty-state" hidden>Select an account and mailbox.</div>
           <nav class="mail-list-footer pagination" aria-label="Message pagination">
             <a id="mail-previous" class="button button-secondary" href="/mail" data-route hidden>Previous</a>
             <span id="mail-page">Page 1</span>
