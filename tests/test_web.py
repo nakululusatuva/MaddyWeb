@@ -449,8 +449,8 @@ async def test_home_static_assets_and_strict_headers(
     page = await response.text()
     assert response.status == 200
     assert "Administration overview" in page
-    assert 'href="/static/app.css?v=9"' in page
-    assert 'src="/static/app.js?v=10"' in page
+    assert 'href="/static/app.css?v=10"' in page
+    assert 'src="/static/app.js?v=12"' in page
     assert 'id="compose-sender-name"' in page
     assert 'name="sender_name"' in page
     assert 'maxlength="256"' in page
@@ -757,15 +757,24 @@ async def test_mail_summary_boundary_removes_directional_controls(
 
 
 @pytest.mark.asyncio
-async def test_mail_requires_account_and_mailbox_context_and_has_two_delete_levels(
+async def test_mail_defaults_to_admin_inbox_and_has_two_delete_levels(
     web_client: tuple[TestClient, FakeGateway],
 ) -> None:
     client, gateway = web_client
     response, data = await _api_data(client, "/api/v1/mail")
     assert response.status == 200
-    assert data["selected_account"] == ""
-    assert data["mailboxes"] == []
+    assert data["selected_account"] == ADMIN_ACCOUNT_ID
+    assert data["selected_mailbox"] == "INBOX"
+    assert data["messages"][0]["uid"] == "42"
+    assert ("list_messages", ADMIN_ACCOUNT_ID, "INBOX", 20, 0) in gateway.operations
+
+    gateway.operations.clear()
+    response, data = await _api_data(client, "/api/v1/mail?phase=context")
+    assert response.status == 200
+    assert data["selected_account"] == ADMIN_ACCOUNT_ID
+    assert data["selected_mailbox"] == "INBOX"
     assert data["messages"] == []
+    assert ("list_mailboxes", ADMIN_ACCOUNT_ID) in gateway.operations
     assert not any(operation[0] == "list_messages" for operation in gateway.operations)
 
     context = urlencode({"account": ADMIN_ACCOUNT_ID, "mailbox": "INBOX"})
@@ -781,6 +790,12 @@ async def test_mail_requires_account_and_mailbox_context_and_has_two_delete_leve
     assert detail_data["subject"] == "Received message"
     assert detail_data["has_html"] is True
     assert detail_data["html_url"].startswith("/api/v1/admin/mail/42/html?")
+    embedded = detail_data["html_document"]
+    assert "tracker.test" not in embedded
+    assert "<script" not in embedded
+    assert "data:image/png;base64," in embedded
+    assert "cid:missing" not in embedded
+    assert "cid:logo" not in embedded
     assert detail_data["raw_url"].startswith("/api/v1/admin/mail/42/raw?")
     assert detail_data["freshness_token"]
 

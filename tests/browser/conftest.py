@@ -25,6 +25,8 @@ if TYPE_CHECKING:
 
 ACCOUNT = "a" * 32
 ACCOUNT_ADDRESS = "admin@example.test"
+NORMAL_ACCOUNT = "c" * 32
+NORMAL_ACCOUNT_ADDRESS = "tornado@custom.example.test"
 NEW_ACCOUNT = "new-user@example.test"
 NEW_ACCOUNT_ID = "b" * 32
 MAILBOX = "INBOX"
@@ -60,7 +62,7 @@ class BrowserSecurityGateway:
             '<meta http-equiv="refresh" content="0;url=https://meta.invalid/">'
             '<style>@import "https://style.invalid/x";</style>'
             '<form action="https://form.invalid/"><input autofocus name="token"></form>'
-            '<svg><foreignObject><script>window.top.svgXss=true</script></foreignObject></svg>'
+            "<svg><foreignObject><script>window.top.svgXss=true</script></foreignObject></svg>"
             '<math><annotation-xml encoding="text/html"><script>window.top.mathXss=true'
             "</script></annotation-xml></math>"
             '<iframe src="https://frame.invalid/"></iframe>'
@@ -134,9 +136,7 @@ class BrowserSecurityGateway:
         self.password_login_attempts: list[tuple[str, str, str]] = []
         self.totp_login_attempts: list[tuple[str, str, str]] = []
 
-    @staticmethod
-    def _principal() -> dict[str, object]:
-        return {
+        self.principal: dict[str, object] = {
             "account_id": ACCOUNT,
             "email": ACCOUNT_ADDRESS,
             "role": "admin",
@@ -146,6 +146,9 @@ class BrowserSecurityGateway:
             "absolute_expires_at": 2_000_010_000,
             "recovery_codes_remaining": 10,
         }
+
+    def _principal(self) -> dict[str, object]:
+        return dict(self.principal)
 
     def _account(self, account_id: str) -> dict[str, object]:
         return next(item for item in self.accounts if item["id"] == account_id)

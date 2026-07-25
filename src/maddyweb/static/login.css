@@ -248,6 +248,10 @@ button {
   letter-spacing: -0.045em;
   line-height: 1.12;
 }
+.auth-view h2[tabindex="-1"]:focus {
+  outline: none;
+}
+
 
 .view-copy {
   margin: 14px 0 26px;
@@ -567,8 +571,8 @@ input:focus {
   .auth-card,
   .auth-card:has(.auth-view-wide:not([hidden])) {
     width: 100%;
-    min-height: calc(100vh - 42px);
-    padding: 30px 22px;
+    min-height: 0;
+    padding: 26px 18px 30px;
     border: 0;
     border-radius: 0;
     box-shadow: none;
@@ -576,22 +580,75 @@ input:focus {
 
   .enrollment-layout {
     grid-template-columns: 1fr;
+    gap: 20px;
+    margin: 22px 0;
   }
 
   .qr-frame {
     justify-self: center;
+    width: min(240px, 100%);
+    height: auto;
+    aspect-ratio: 1;
+    padding: 8px;
+  }
+
+  .qr-frame canvas,
+  .qr-frame img {
+    width: 100%;
+    height: auto;
+    aspect-ratio: 1;
+  }
+
+  .setup-details dl div {
+    grid-template-columns: 1fr;
+    gap: 2px;
+  }
+
+  .secret-block > div {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .secret-block .secondary-action {
+    width: 100%;
   }
 
   .enrollment-form {
     grid-template-columns: 1fr;
   }
 
+  .recovery-toolbar {
+    flex-wrap: wrap;
+    margin-bottom: 14px;
+  }
+
+  .recovery-toolbar .secondary-action {
+    flex: 1 1 140px;
+  }
+
   .recovery-code-list {
     grid-template-columns: 1fr;
+    gap: 8px;
+    padding: 14px 14px 14px 34px;
+  }
+
+  .acknowledgement {
+    margin: 16px 0;
   }
 
   .auth-footer {
     padding: 0 18px 15px;
+  }
+}
+
+@media (max-width: 380px) {
+  .auth-card,
+  .auth-card:has(.auth-view-wide:not([hidden])) {
+    padding-inline: 16px;
+  }
+
+  .recovery-toolbar .secondary-action {
+    flex-basis: 100%;
   }
 }
 

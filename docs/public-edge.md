@@ -78,10 +78,12 @@ session_cookie_name = "__Host-maddyweb-session"
 csrf_cookie_name = "__Host-maddyweb-csrf"
 public_origin = "https://maddy.standalone.example.test"
 totp_issuer = "MaddyWeb Standalone"
+login_domain = "standalone.example.test"
 ```
 
-Use `maddy.custom.example.test` in both fields on `mail_custom`. Do not configure both
-production hostnames on one server. The production checker requires the
+On `mail_custom`, use `maddy.custom.example.test` for the allowed host and public origin,
+`MaddyWeb Custom` for the issuer, and `custom.example.test` for the login domain. Do not
+configure both production hostnames on one server. The production checker requires the
 allowed host set to be exactly `127.0.0.1`, `localhost`, and the selected
 public hostname. It also requires the cookie names and authentication state
 directory shown above. Validate and restart MaddyWeb before enabling the final
@@ -215,7 +217,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now maddyweb-web-cert-standalone.timer
 ```
 
-## Custom custom Nginx service
+## Custom Nginx service
 
 `mail_custom` owns Nginx through its existing custom service and
 `/etc/custom-acme/nginx.conf`. Do not enable, start, reload, or edit the system
@@ -265,7 +267,7 @@ sudo /usr/bin/nginx -t -c /etc/custom-acme/nginx.conf
 sudo systemctl reload custom-acme-webroot.service
 ```
 
-Use Custom's existing `/opt/certbot/bin/certbot`; `/usr/bin/certbot` is not the
+Use the custom profile's existing `/opt/certbot/bin/certbot`; `/usr/bin/certbot` is not the
 selected runtime on this host. Issue the dedicated lineage:
 
 ```console
@@ -285,12 +287,12 @@ Inspect
 replace the bootstrap include with `maddy.custom.example.test.conf`, test with the custom
 `-c` argument, and reload only `custom-acme-webroot.service`. The existing
 `mail.custom.example.test` server remains the port 80 `default_server`; MaddyWeb must not
-claim that HTTP default. The final Custom fragment owns only the port 443
+claim that HTTP default. The final custom fragment owns only the port 443
 default-deny server. Stop if the existing custom configuration begins to claim
 an HTTPS `default_server`; resolve that collision explicitly instead of
 deleting an unrelated server.
 
-Install only the Custom Web certificate unit and timer:
+Install only the custom Web certificate unit and timer:
 
 ```console
 sudo install -o root -g root -m 0644 \
@@ -416,7 +418,7 @@ managed MaddyWeb include or remove its single Custom include line, validate the
 correct Nginx configuration, and reload its established owner. On Standalone,
 remove the exact bounded `conf.d` include only after its managed files are no
 longer needed, run `/usr/bin/nginx -t -c /etc/nginx/nginx.conf`, and signal
-the root-owned master with `/usr/bin/nginx -s reload`. On Custom, test the
+the root-owned master with `/usr/bin/nginx -s reload`. On the custom profile, test the
 custom configuration and reload `custom-acme-webroot.service`. Do not restore
 an entire Nginx configuration tree, enable the Standalone `nginx.service`,
 disable a mail timer, remove a mail hook, or delete a certificate lineage

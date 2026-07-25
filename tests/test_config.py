@@ -59,11 +59,12 @@ def test_example_cookie_names_are_distinct_across_local_instances() -> None:
 
 
 @pytest.mark.parametrize(
-    ("filename", "domain", "issuer", "submission_scope", "certificate_name"),
+    ("filename", "domain", "login_domain", "issuer", "submission_scope", "certificate_name"),
     (
         (
             "config.standalone.toml",
             "maddy.standalone.example.test",
+            "standalone.example.test",
             "MaddyWeb Standalone",
             "container",
             "mail.standalone.example.test",
@@ -71,6 +72,7 @@ def test_example_cookie_names_are_distinct_across_local_instances() -> None:
         (
             "config.custom.toml",
             "maddy.custom.example.test",
+            "custom.example.test",
             "MaddyWeb Custom",
             "host-loopback",
             "mail.custom.example.test",
@@ -80,6 +82,7 @@ def test_example_cookie_names_are_distinct_across_local_instances() -> None:
 def test_public_edge_production_profiles_match_the_checker_contract(
     filename: str,
     domain: str,
+    login_domain: str,
     issuer: str,
     submission_scope: str,
     certificate_name: str,
@@ -95,8 +98,21 @@ def test_public_edge_production_profiles_match_the_checker_contract(
     assert config.security.session_cookie_name == "__Host-maddyweb-session"
     assert config.security.csrf_cookie_name == "__Host-maddyweb-csrf"
     assert config.security.public_origin == f"https://{domain}"
+    assert config.security.login_domain == login_domain
     assert config.security.totp_issuer == issuer
 
+
+@pytest.mark.parametrize(
+    "filename",
+    (
+        "deploy/examples/config.native.toml",
+        "deploy/examples/config.wsl.toml",
+        "docker/config.toml",
+    ),
+)
+def test_generic_deployment_profiles_disable_short_login_identifiers(filename: str) -> None:
+    repository = Path(__file__).resolve().parents[1]
+    assert load_config(repository / filename).security.login_domain == ""
 
 @pytest.mark.parametrize(
     "listen", ["0.0.0.0:8787", "127.0.0.2:8787", "localhost:8787", "[::1]:8787"]
@@ -344,3 +360,17 @@ def test_session_and_csrf_cookie_names_must_be_distinct() -> None:
                 }
             }
         )
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    (("example.test", "example.test"), ("MAIL.Example.test", "mail.example.test"), ("", "")),
+)
+def test_login_domain_is_optional_and_canonical(value: str, expected: str) -> None:
+    assert _config({"security": {"login_domain": value}}).security.login_domain == expected
+
+
+@pytest.mark.parametrize("value", ("example..test", "example.test.", "127.0.0.1"))
+def test_login_domain_rejects_invalid_or_non_dns_values(value: str) -> None:
+    with pytest.raises(ConfigError, match="login_domain"):
+        _config({"security": {"login_domain": value}})

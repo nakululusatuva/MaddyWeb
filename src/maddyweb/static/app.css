@@ -626,6 +626,10 @@ dialog:focus-visible {
   outline: none;
 }
 
+h1[tabindex="-1"]:focus {
+  outline: none;
+}
+
 .app-main:focus-visible {
   outline: 3px solid color-mix(in srgb, var(--focus) 35%, transparent);
   outline-offset: -4px;
@@ -1586,7 +1590,8 @@ td:last-child .button,
 .compose-editor-toolbar {
   display: flex;
   min-height: 56px;
-  align-items: center;
+  flex-wrap: wrap;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
   padding: 8px 12px;
@@ -1596,24 +1601,12 @@ td:last-child .button,
 
 .format-toolbar {
   display: flex;
+  flex: 1 1 280px;
+  flex-wrap: wrap;
   min-width: 0;
   align-items: center;
   gap: 4px;
-  overflow-x: auto;
-  scrollbar-width: thin;
-}
-
-.format-toolbar::-webkit-scrollbar {
-  height: 4px;
-}
-
-.format-toolbar::-webkit-scrollbar-track {
-  background: transparent;
-}
-
-.format-toolbar::-webkit-scrollbar-thumb {
-  border-radius: 999px;
-  background: var(--border-strong);
+  overflow: visible;
 }
 
 .format-button {
@@ -1663,6 +1656,7 @@ td:last-child .button,
   width: max-content;
   max-width: 100%;
   flex: 0 0 auto;
+  margin-left: auto;
   gap: 3px;
   padding: 3px;
   border: 1px solid var(--border);
@@ -2790,9 +2784,8 @@ html[data-view="message"] .app-footer {
 
 .mail-workspace {
   display: grid;
-  height: calc(100vh - 112px);
-  min-height: 590px;
-  grid-template-columns: 220px minmax(560px, 0.95fr) minmax(440px, 1.05fr);
+  min-height: min(590px, calc(100dvh - 112px));
+  grid-template-columns: minmax(180px, 220px) minmax(0, 0.95fr) minmax(0, 1.05fr);
   border: 1px solid var(--border);
   border-radius: 16px;
   background: var(--surface);
@@ -2805,7 +2798,7 @@ html[data-view="message"] .app-footer {
 .reading-pane,
 .message-placeholder {
   min-width: 0;
-  min-height: 0;
+  min-height: min(520px, calc(100dvh - 144px));
 }
 
 .mail-folder-pane {
@@ -3114,7 +3107,6 @@ html[data-view="message"] .app-footer {
 }
 
 .reading-pane {
-  height: 100%;
   background: var(--surface);
   overflow-y: auto;
 }
@@ -3164,13 +3156,25 @@ html[data-view="message"] .app-footer {
   align-content: start;
 }
 
-.security-grid .stack-form {
-  margin-top: 18px;
+.security-card-body {
+  display: grid;
+  gap: 20px;
+  padding: 20px;
+}
+
+.security-card-body > p,
+.security-card-body .security-details,
+.security-card-body .security-recovery-count {
+  margin: 0;
+}
+
+.security-card-body .stack-form {
+  margin: 0;
   padding-top: 18px;
   border-top: 1px solid var(--border);
 }
 
-.security-grid .stack-form h3 {
+.security-card-body .stack-form h3 {
   margin: 0;
   font-size: 15px;
 }
@@ -3178,7 +3182,6 @@ html[data-view="message"] .app-footer {
 .security-details {
   display: grid;
   gap: 0;
-  margin: 8px 0 22px;
 }
 
 .security-details > div {
@@ -3202,7 +3205,6 @@ html[data-view="message"] .app-footer {
   display: flex;
   align-items: baseline;
   gap: 9px;
-  margin: 24px 0 6px;
 }
 
 .security-recovery-count strong {
@@ -3331,7 +3333,7 @@ html[data-view="message"] .app-footer {
 
 @media (max-width: 1450px) {
   .mail-workspace {
-    grid-template-columns: 205px minmax(470px, 0.95fr) minmax(390px, 1.05fr);
+    grid-template-columns: minmax(170px, 205px) minmax(0, 0.95fr) minmax(0, 1.05fr);
   }
 
   .mail-list-table .message-table {
@@ -3351,7 +3353,7 @@ html[data-view="message"] .app-footer {
   }
 
   .mail-workspace {
-    grid-template-columns: 190px minmax(430px, 1fr) minmax(360px, 1fr);
+    grid-template-columns: minmax(160px, 190px) minmax(0, 1fr) minmax(0, 1fr);
   }
 
   .nav-section-label {
@@ -3382,8 +3384,7 @@ html[data-view="message"] .app-footer {
 
   .mail-workspace {
     display: block;
-    height: calc(100vh - 66px - 68px - env(safe-area-inset-bottom));
-    min-height: 480px;
+    min-height: calc(100dvh - 66px - 68px - env(safe-area-inset-bottom));
     border: 0;
     border-radius: 0;
     box-shadow: none;
@@ -3394,7 +3395,7 @@ html[data-view="message"] .app-footer {
   .reading-pane,
   .message-placeholder {
     width: 100%;
-    height: 100%;
+    min-height: calc(100dvh - 66px - 68px - env(safe-area-inset-bottom));
     border: 0;
   }
 
@@ -3447,6 +3448,11 @@ html[data-view="message"] .app-footer {
 
   .security-grid {
     grid-template-columns: 1fr;
+  }
+
+  .security-card-body {
+    gap: 16px;
+    padding: 16px;
   }
 
   .admin-workspace-indicator {

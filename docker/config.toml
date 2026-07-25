@@ -45,6 +45,7 @@ session_cookie_name = "__Host-maddyweb-docker-session"
 csrf_cookie_name = "__Host-maddyweb-docker-csrf"
 public_origin = ""
 totp_issuer = "MaddyWeb Docker"
+login_domain = ""
 
 [logging]
 level = "INFO"

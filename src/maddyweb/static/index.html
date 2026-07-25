@@ -7,8 +7,8 @@
   <meta name="theme-color" content="#f4f6f9">
   <meta name="description" content="MaddyWeb mail workspace and server administration console">
   <title>MaddyWeb</title>
-  <link rel="stylesheet" href="/static/app.css?v=9">
-  <script src="/static/app.js?v=10" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=10">
+  <script src="/static/app.js?v=12" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to main content</a>
@@ -50,16 +50,16 @@
           <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 5 6v5c0 4.6 2.9 8.5 7 10 4.1-1.5 7-5.4 7-10V6z"></path><path d="m9 12 2 2 4-5"></path></svg>
           <span>Security</span>
         </a>
-        <p class="nav-section-label" data-role="admin">Administration</p>
-        <a class="nav-link" href="/" data-route data-section="overview" data-role="admin">
+        <p class="nav-section-label" data-role="admin" hidden>Administration</p>
+        <a class="nav-link" href="/" data-route data-section="overview" data-role="admin" hidden>
           <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z"></path></svg>
           <span>Overview</span>
         </a>
-        <a class="nav-link" href="/accounts" data-route data-section="accounts" data-role="admin">
+        <a class="nav-link" href="/accounts" data-route data-section="accounts" data-role="admin" hidden>
           <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"></circle><path d="M4 21c0-4 3.6-7 8-7s8 3 8 7"></path></svg>
           <span>Accounts</span>
         </a>
-        <a class="nav-link" href="/certificates" data-route data-section="certificates" data-role="admin">
+        <a class="nav-link" href="/certificates" data-route data-section="certificates" data-role="admin" hidden>
           <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 5 6v5c0 4.6 2.9 8.5 7 10 4.1-1.5 7-5.4 7-10V6z"></path></svg>
           <span>Certificates</span>
         </a>
@@ -79,7 +79,7 @@
         <a class="button button-secondary" href="/accounts" data-route>Return to administration</a>
       </aside>
 
-      <section id="overview-view" class="view" data-view="overview" aria-labelledby="overview-title">
+      <section id="overview-view" class="view" data-view="overview" aria-labelledby="overview-title" hidden>
         <div class="page-heading">
           <div><p class="eyebrow">Private mail control plane</p><h1 id="overview-title">Administration overview</h1><p>Inspect the runtime and open the tools used to operate this Maddy server.</p></div>
         </div>
@@ -306,31 +306,35 @@
         <div class="security-grid">
           <section class="data-card security-summary-card">
             <div class="card-heading"><div><p class="eyebrow">Signed in as</p><h2 id="security-address">Mail account</h2></div><span id="security-role" class="status-pill status-neutral">Mailbox user</span></div>
-            <div id="password-change-required" class="notice notice-warning" role="status" hidden>Your password must be changed before mailbox access is restored.</div>
-            <dl class="security-details">
-              <div><dt>Session status</dt><dd id="security-session-state">Active</dd></div>
-              <div><dt>Absolute expiration</dt><dd id="security-session-expiration">Not provided</dd></div>
-              <div><dt>Idle expiration</dt><dd id="security-idle-expiration">Not provided</dd></div>
-            </dl>
-            <form id="own-password-form" class="stack-form" autocomplete="off">
-              <h3>Change password</h3>
-              <label><span>Current password</span><input name="current_password" type="password" required maxlength="1024" autocomplete="current-password"></label>
-              <label><span>New password</span><input name="new_password" type="password" required minlength="12" maxlength="1024" autocomplete="new-password"></label>
-              <label><span>Confirm new password</span><input name="confirm_password" type="password" required minlength="12" maxlength="1024" autocomplete="new-password"></label>
-              <button class="button button-primary" type="submit">Change password and sign out</button>
-            </form>
-            <button id="security-logout-button" class="button button-secondary" type="button">Sign out of this session</button>
+            <div class="security-card-body">
+              <div id="password-change-required" class="notice notice-warning" role="status" hidden>Your password must be changed before mailbox access is restored.</div>
+              <dl class="security-details">
+                <div><dt>Session status</dt><dd id="security-session-state">Active</dd></div>
+                <div><dt>Absolute expiration</dt><dd id="security-session-expiration">Not provided</dd></div>
+                <div><dt>Idle expiration</dt><dd id="security-idle-expiration">Not provided</dd></div>
+              </dl>
+              <form id="own-password-form" class="stack-form" autocomplete="off">
+                <h3>Change password</h3>
+                <label><span>Current password</span><input name="current_password" type="password" required maxlength="1024" autocomplete="current-password"></label>
+                <label><span>New password</span><input name="new_password" type="password" required minlength="12" maxlength="1024" autocomplete="new-password"></label>
+                <label><span>Confirm new password</span><input name="confirm_password" type="password" required minlength="12" maxlength="1024" autocomplete="new-password"></label>
+                <button class="button button-primary" type="submit">Change password and sign out</button>
+              </form>
+              <button id="security-logout-button" class="button button-secondary" type="button">Sign out of this session</button>
+            </div>
           </section>
           <section class="data-card">
             <div class="card-heading"><div><p class="eyebrow">Two-step verification</p><h2>Authenticator and recovery</h2></div><span id="security-totp-state" class="status-pill status-positive">Enabled</span></div>
-            <p>Your authenticator is required whenever a new browser session is created.</p>
-            <div class="security-recovery-count"><strong id="security-recovery-count">Unknown</strong><span>unused recovery codes</span></div>
-            <p class="field-help">Recovery-code regeneration requires fresh password and second-factor verification. Existing codes become invalid.</p>
-            <form id="regenerate-recovery-form" class="stack-form" autocomplete="off">
-              <label><span>Current password</span><input name="password" type="password" required maxlength="1024" autocomplete="current-password"></label>
-              <label><span>Authenticator code</span><input name="code" type="text" required pattern="[0-9]{6}" maxlength="6" inputmode="numeric" autocomplete="one-time-code" placeholder="000000"></label>
-              <button id="regenerate-recovery-button" class="button button-secondary" type="submit">Regenerate recovery codes and sign out</button>
-            </form>
+            <div class="security-card-body">
+              <p>Your authenticator is required whenever a new browser session is created.</p>
+              <div class="security-recovery-count"><strong id="security-recovery-count">Unknown</strong><span>unused recovery codes</span></div>
+              <p class="field-help">Recovery-code regeneration requires fresh password and second-factor verification. Existing codes become invalid.</p>
+              <form id="regenerate-recovery-form" class="stack-form" autocomplete="off">
+                <label><span>Current password</span><input name="password" type="password" required maxlength="1024" autocomplete="current-password"></label>
+                <label><span>Authenticator code</span><input name="code" type="text" required pattern="[0-9]{6}" maxlength="6" inputmode="numeric" autocomplete="one-time-code" placeholder="000000"></label>
+                <button id="regenerate-recovery-button" class="button button-secondary" type="submit">Regenerate recovery codes and sign out</button>
+              </form>
+            </div>
           </section>
         </div>
       </section>

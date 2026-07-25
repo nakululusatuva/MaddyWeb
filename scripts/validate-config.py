@@ -58,6 +58,7 @@ SCHEMA: dict[str, set[str]] = {
         "session_cookie_name",
         "csrf_cookie_name",
         "public_origin",
+        "login_domain",
         "totp_issuer",
     },
     "logging": {"level"},
@@ -358,6 +359,19 @@ def validate(
     public_origin = https_origin(security["public_origin"], "security.public_origin")
     if public_origin and urlsplit(public_origin).hostname not in hosts:
         fail("security.public_origin hostname must be listed in server.allowed_hosts")
+    login_domain = string(
+        security["login_domain"],
+        "security.login_domain",
+        allow_empty=True,
+    )
+    if login_domain:
+        login_domain = host(login_domain, "security.login_domain")
+        try:
+            ipaddress.ip_address(login_domain)
+        except ValueError:
+            pass
+        else:
+            fail("security.login_domain must be a DNS hostname")
     issuer = string(security["totp_issuer"], "security.totp_issuer")
     if (
         not 1 <= len(issuer) <= 64

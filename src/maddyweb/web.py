@@ -96,7 +96,9 @@ _SESSION_COOKIE_KEY = web.AppKey("session_cookie_name", str)
 _PUBLIC_ORIGIN_KEY = web.AppKey("public_origin", str)
 _SECURE_COOKIE_KEY = web.AppKey("secure_session_cookie", bool)
 _TOTP_ISSUER_KEY = web.AppKey("totp_issuer", str)
+_LOGIN_DOMAIN_KEY = web.AppKey("login_domain", str)
 _ACCOUNT_RE = re.compile(r"\A[^\s@/\\\x00-\x1f\x7f]+@[^\s@/\\\x00-\x1f\x7f]+\Z")
+_LOGIN_LOCAL_RE = re.compile(r"\A[A-Za-z0-9!#$%&'*+/=?^_\x60{|}~.-]+\Z")
 _ACCOUNT_ID_RE = re.compile(r"\A[0-9a-f]{32}\Z")
 _IMAGE_TYPES = {
     "image/gif",
@@ -970,10 +972,7 @@ def _authentication_middleware() -> web.middleware:
                 raise web.HTTPNotFound()
             return await handler(request)
 
-        if (
-            request.method in {"GET", "HEAD"}
-            and request.path in _TOKENLESS_PUBLIC_STATIC_PATHS
-        ):
+        if request.method in {"GET", "HEAD"} and request.path in _TOKENLESS_PUBLIC_STATIC_PATHS:
             return await handler(request)
 
         token = request.cookies.get(_session_cookie_name(request))
@@ -1013,9 +1012,12 @@ def _authentication_middleware() -> web.middleware:
 
         if request.path in _ANONYMOUS_PATHS:
             if request.path == "/login" and principal is not None:
-                destination = (
-                    "/security" if principal.get("password_change_required") is True else "/"
-                )
+                if principal.get("password_change_required") is True:
+                    destination = "/security"
+                elif principal.get("role") == "admin":
+                    destination = "/"
+                else:
+                    destination = "/mail"
                 raise web.HTTPFound(destination)
             if principal is not None and token is not None:
                 request[_AUTH_PRINCIPAL_KEY] = principal
@@ -1277,16 +1279,10 @@ def _message_summary_payload(record: object) -> dict[str, object]:
         raise TypeError("message summary unread flag must be a boolean")
     return {
         "uid": identifier,
-        "sender": safe_display_header(
-            _record_value(record, "sender", "from_", "from", default="")
-        ),
-        "subject": safe_display_header(
-            _record_value(record, "subject", default="(No subject)")
-        )
+        "sender": safe_display_header(_record_value(record, "sender", "from_", "from", default="")),
+        "subject": safe_display_header(_record_value(record, "subject", default="(No subject)"))
         or "(No subject)",
-        "date": safe_display_header(
-            _record_value(record, "date", "received_at", default="")
-        ),
+        "date": safe_display_header(_record_value(record, "date", "received_at", default="")),
         "unread": unread,
     }
 
@@ -1459,15 +1455,45 @@ async def api_auth_csrf(request: web.Request) -> web.Response:
     return _api_response(data={"csrf_token": csrf_token_for_request(request)})
 
 
+def _valid_login_local_part(value: str) -> bool:
+    return (
+        1 <= len(value) <= 64
+        and not value.startswith(".")
+        and not value.endswith(".")
+        and ".." not in value
+        and _LOGIN_LOCAL_RE.fullmatch(value) is not None
+    )
+
+
+def _normalize_login_identifier(value: str, login_domain: str) -> str:
+    candidate = value.strip()
+    if not candidate.isascii():
+        return ""
+    candidate = candidate.casefold()
+    if "@" in candidate:
+        if _ACCOUNT_RE.fullmatch(candidate) is None:
+            return ""
+        local, domain = candidate.rsplit("@", 1)
+        if not _valid_login_local_part(local) or (login_domain and domain != login_domain):
+            return ""
+        return candidate
+    if not login_domain or not _valid_login_local_part(candidate):
+        return ""
+    if len(candidate) + 1 + len(login_domain) > 254:
+        return ""
+    return f"{candidate}@{login_domain}"
+
+
 async def api_auth_password(request: web.Request) -> web.Response:
     values = await _read_json_object(
         request,
         allowed_fields=frozenset({"email", "password"}),
     )
-    email = _bounded_auth_text(values, "email", minimum=3, maximum=254).strip().casefold()
+    identifier = _bounded_auth_text(values, "email", minimum=1, maximum=254)
+    email = _normalize_login_identifier(identifier, request.app[_LOGIN_DOMAIN_KEY])
     password = _bounded_auth_text(values, "password", minimum=1, maximum=1024)
     values["password"] = ""
-    if _ACCOUNT_RE.fullmatch(email) is None:
+    if not email:
         return _api_error("invalid_credentials", "Authentication failed.", status=401)
     try:
         result = await _gateway(request).begin_password_login(
@@ -1908,11 +1934,18 @@ async def api_mailbox(request: web.Request) -> web.Response:
         _require_admin(request)
     query = _read_query(
         request,
-        allowed_fields=frozenset({"account", "mailbox", "cursor", "page"}),
+        allowed_fields=frozenset({"account", "mailbox", "cursor", "page", "phase"}),
     )
     if personal_scope and "account" in query:
         raise web.HTTPBadRequest(text="Personal mailbox APIs do not accept an account field.")
-    account = _principal_account_id(request) if personal_scope else query.get("account", "")
+    context_only = query.get("phase", "") == "context"
+    if "phase" in query and not context_only:
+        raise web.HTTPBadRequest(text="Invalid mailbox loading phase.")
+    account = (
+        _principal_account_id(request)
+        if personal_scope
+        else (query.get("account", "") or _principal_account_id(request))
+    )
     mailbox_name = query.get("mailbox", "")
     if account:
         account = _account_id(account)
@@ -1921,6 +1954,8 @@ async def api_mailbox(request: web.Request) -> web.Response:
     if "page" in query:
         raise web.HTTPBadRequest(text="Page link expired; restart from the mailbox list.")
     cursor_token = query.get("cursor")
+    if context_only and cursor_token is not None:
+        raise web.HTTPBadRequest(text="Mailbox context does not accept a pagination cursor.")
     if cursor_token is not None and (not account or not mailbox_name):
         raise web.HTTPBadRequest(text="Pagination cursor lacks account or mailbox context.")
     page_size = _settings(request).page_size
@@ -2006,7 +2041,7 @@ async def api_mailbox(request: web.Request) -> web.Response:
                     offset=offset,
                 )
             )
-            if account and mailbox_name
+            if account and mailbox_name and not context_only
             else MessagePage((), False)
         )
     except Exception as exc:
@@ -2325,6 +2360,11 @@ async def api_message_detail(request: web.Request) -> web.Response:
             }
             for attachment in message.attachments
         ]
+        html_document = (
+            await asyncio.to_thread(_message_iframe_document, message)
+            if message.html is not None
+            else None
+        )
         return _api_response(
             data={
                 "uid": message_id,
@@ -2342,6 +2382,7 @@ async def api_message_detail(request: web.Request) -> web.Response:
                 "references": list(message.references),
                 "text": message.text,
                 "has_html": message.html is not None,
+                "html_document": html_document,
                 "html_url": (
                     _message_download_url(
                         request,
@@ -2376,18 +2417,24 @@ async def message_html(request: web.Request) -> web.Response:
         message = await _parsed_message(request, account, mailbox_name)
         if message.html is None:
             raise web.HTTPNotFound(text="This message has no HTML body.")
-        cid_urls = {
-            attachment.content_id: _inline_attachment_data_url(attachment)
-            for attachment in _eligible_inline_attachments(message)
-            if attachment.content_id is not None
-        }
-        document = await asyncio.to_thread(_iframe_document, message.html, cid_urls)
+        document = await asyncio.to_thread(_message_iframe_document, message)
         return web.Response(
             text=document,
             content_type="text/html",
             charset="utf-8",
             headers=email_document_headers(),
         )
+
+
+def _message_iframe_document(message: ParsedMessage) -> str:
+    if message.html is None:
+        raise ValueError("message has no HTML body")
+    cid_urls = {
+        attachment.content_id: _inline_attachment_data_url(attachment)
+        for attachment in _eligible_inline_attachments(message)
+        if attachment.content_id is not None
+    }
+    return _iframe_document(message.html, cid_urls)
 
 
 def _iframe_document(message_html: str, cid_urls: Mapping[str, str]) -> str:
@@ -3462,6 +3509,7 @@ def create_app(config: object, gateway: Gateway) -> web.Application:
     secure_cookies = bool(_config_value(config, "security.secure_cookies", True))
     public_origin = str(_config_value(config, "security.public_origin", ""))
     totp_issuer = str(_config_value(config, "security.totp_issuer", "MaddyWeb"))
+    login_domain = str(_config_value(config, "security.login_domain", "")).casefold()
     configured_origins = tuple(
         str(value) for value in _config_value(config, "security.public_origins", ())
     )
@@ -3509,6 +3557,7 @@ def create_app(config: object, gateway: Gateway) -> web.Application:
     app[_PUBLIC_ORIGIN_KEY] = public_origin
     app[_SECURE_COOKIE_KEY] = secure_cookies
     app[_TOTP_ISSUER_KEY] = totp_issuer
+    app[_LOGIN_DOMAIN_KEY] = login_domain
     app.add_routes(
         [
             web.get("/", app_shell),

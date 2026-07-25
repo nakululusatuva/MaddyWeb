@@ -29,7 +29,10 @@ from conftest import (
     MESSAGE_ID,
     NEW_ACCOUNT,
     NEW_ACCOUNT_ID,
+    NORMAL_ACCOUNT,
+    NORMAL_ACCOUNT_ADDRESS,
     SESSION_COOKIE_NAME,
+    SESSION_TOKEN,
     TRASH_MAILBOX,
     BrowserSecurityGateway,
     LiveApplication,
@@ -78,6 +81,164 @@ async def page() -> AsyncIterator[Page]:
         finally:
             await context.close()
             await browser.close()
+
+
+@pytest.fixture
+async def normal_user_application(tmp_path: Path) -> AsyncIterator[LiveApplication]:
+    gateway = BrowserSecurityGateway()
+    gateway.principal = {
+        "account_id": NORMAL_ACCOUNT,
+        "email": NORMAL_ACCOUNT_ADDRESS,
+        "role": "user",
+        "password_change_required": False,
+        "enrollment_state": "active",
+        "idle_expires_at": 2_000_000_000,
+        "absolute_expires_at": 2_000_010_000,
+        "recovery_codes_remaining": 10,
+    }
+    gateway.accounts = [
+        {
+            "id": NORMAL_ACCOUNT,
+            "address": NORMAL_ACCOUNT_ADDRESS,
+            "has_credentials": True,
+            "has_mailbox": True,
+            "append_limit": None,
+        }
+    ]
+    app = create_app(  # type: ignore[arg-type]
+        {
+            "server": {
+                "allowed_hosts": ("127.0.0.1",),
+                "concurrency": 4,
+                "max_upload_bytes": 4 * 1024 * 1024,
+                "request_body_timeout_seconds": 5,
+                "page_size": 20,
+                "temp_dir": tmp_path,
+            },
+            "security": {
+                "session_signing_key": secrets.token_bytes(32),
+                "csrf_ttl_seconds": 300,
+                "csrf_cookie_name": COOKIE_NAME,
+                "session_cookie_name": SESSION_COOKIE_NAME,
+                "secure_cookies": True,
+            },
+        },
+        gateway,
+    )
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    listener, port = _listening_socket()
+    site = web.SockSite(runner, listener)
+    await site.start()
+    try:
+        yield LiveApplication(f"http://127.0.0.1:{port}", port, gateway)
+    finally:
+        await runner.cleanup()
+
+
+async def _install_session(page: Page, application: LiveApplication) -> None:
+    await page.context.add_cookies(
+        [
+            {
+                "name": SESSION_COOKIE_NAME,
+                "value": SESSION_TOKEN,
+                "url": application.base_url,
+                "httpOnly": True,
+                "secure": False,
+                "sameSite": "Strict",
+            }
+        ]
+    )
+
+
+def _api_request_paths(requests: list[str]) -> list[str]:
+    return [urlsplit(url).path for url in requests if urlsplit(url).path.startswith("/api/v1/")]
+
+
+async def test_normal_user_mail_defaults_to_own_inbox_with_minimal_requests(
+    page: Page,
+    normal_user_application: LiveApplication,
+) -> None:
+    await _install_session(page, normal_user_application)
+    requests: list[str] = []
+    page.on("request", lambda request: requests.append(request.url))
+
+    await page.goto(normal_user_application.base_url + "/mail")
+    await page.locator("#message-list-body tr").wait_for()
+
+    assert await page.locator("#mail-account-field").is_hidden()
+    assert await page.locator("#mail-account").input_value() == NORMAL_ACCOUNT
+    assert await page.locator("#mail-mailbox").input_value() == MAILBOX
+    assert await page.locator("#current-mailbox-identity").inner_text() == NORMAL_ACCOUNT_ADDRESS
+    assert _api_request_paths(requests) == [
+        "/api/v1/auth/session",
+        "/api/v1/me/mail",
+        "/api/v1/me/mail",
+    ]
+
+
+async def test_normal_user_hides_administrator_ui_before_session_resolution(
+    page: Page,
+    normal_user_application: LiveApplication,
+) -> None:
+    await _install_session(page, normal_user_application)
+    session_requested = asyncio.Event()
+    release_session = asyncio.Event()
+
+    async def pause_session(route: Route) -> None:
+        session_requested.set()
+        await release_session.wait()
+        await route.continue_()
+
+    await page.route("**/api/v1/auth/session", pause_session)
+    navigation = asyncio.create_task(
+        page.goto(normal_user_application.base_url + "/mail", wait_until="domcontentloaded")
+    )
+    try:
+        await asyncio.wait_for(session_requested.wait(), timeout=2)
+        assert await page.locator("#mail-account-field").is_hidden()
+        assert await page.locator("#admin-workspace-indicator").is_hidden()
+        assert await page.locator('[data-role="admin"]').evaluate_all(
+            "nodes => nodes.every(node => node.hidden)"
+        )
+    finally:
+        release_session.set()
+        await navigation
+
+
+async def test_admin_mail_defaults_to_the_admins_own_inbox(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    requests: list[str] = []
+    page.on("request", lambda request: requests.append(request.url))
+
+    await page.goto(live_application.base_url + "/mail")
+    await page.locator("#message-list-body tr").wait_for()
+
+    assert await page.locator("#mail-account").input_value() == ACCOUNT
+    assert await page.locator("#mail-mailbox").input_value() == MAILBOX
+    assert await page.locator("#admin-workspace-indicator").is_visible()
+    assert _api_request_paths(requests) == [
+        "/api/v1/auth/session",
+        "/api/v1/admin/mail",
+        "/api/v1/admin/mail",
+    ]
+
+
+async def test_mailbox_placeholder_cannot_be_selected(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    await page.goto(live_application.base_url + "/mail")
+    await page.locator("#message-list-body tr").wait_for()
+
+    mailbox = page.locator("#mail-mailbox")
+    placeholder = mailbox.locator('option[value=""]')
+    assert await mailbox.input_value() == MAILBOX
+    assert await mailbox.is_enabled()
+    assert await placeholder.get_attribute("disabled") is not None
+    assert await placeholder.get_attribute("hidden") is not None
 
 
 def _message_path() -> str:
@@ -156,7 +317,8 @@ async def test_spa_navigation_loads_each_operational_view_without_document_reloa
 
     await page.locator('a[data-section="mail"]').click()
     await page.wait_for_url("**/mail")
-    await page.get_by_role("heading", name="Mail", exact=True).wait_for()
+    await page.get_by_role("heading", name=MAILBOX, exact=True).wait_for()
+    await page.locator("#message-list-body tr").wait_for()
 
     await page.locator(".compose-action").click()
     await page.wait_for_url("**/compose")
@@ -273,7 +435,7 @@ async def test_account_workflows_use_json_mutations_and_typed_deletion(
 ) -> None:
     await page.goto(live_application.base_url + "/accounts")
     await page.locator("#accounts-body").get_by_text(ACCOUNT_ADDRESS, exact=True).wait_for()
-    assert await page.locator("#runtime-badge").inner_text() == "MADDY 0.9.5"
+    assert await page.locator("#runtime-badge").inner_text() == "CONNECTED"
 
     create_form = page.locator("#create-account-form")
     await create_form.locator('input[name="username"]').fill(NEW_ACCOUNT)
@@ -818,15 +980,7 @@ async def test_message_html_is_sandboxed_and_attachment_filename_is_safe(
     live_application: LiveApplication,
 ) -> None:
     requested_urls: list[str] = []
-    html_headers: list[dict[str, str]] = []
     page.on("request", lambda request: requested_urls.append(request.url))
-
-    async def capture_html_response(response: object) -> None:
-        url = getattr(response, "url", "")
-        if "/api/v1/admin/mail/" in url and "/html?" in url:
-            html_headers.append(await response.all_headers())
-
-    page.on("response", capture_html_response)
     await _open_message(page, live_application)
 
     frame_element = page.locator("iframe.message-frame")
@@ -846,9 +1000,7 @@ async def test_message_html_is_sandboxed_and_attachment_filename_is_safe(
     ):
         assert await frame.locator(f"body {active_tag}").count() == 0
     assert await frame.locator('head meta[charset="utf-8"]').count() == 1
-    assert await frame.locator(
-        'head meta[http-equiv="Content-Security-Policy"]'
-    ).count() == 1
+    assert await frame.locator('head meta[http-equiv="Content-Security-Policy"]').count() == 1
     assert await frame.locator("head style").count() == 1
     assert await frame.locator("body").get_attribute("data-xss") is None
     assert await frame.locator("[onerror], [srcset], [style]").count() == 0
@@ -865,12 +1017,11 @@ async def test_message_html_is_sandboxed_and_attachment_filename_is_safe(
     assert len(image_sources) == 1
     assert image_sources[0].startswith("data:image/png;base64,")
     assert await frame_element.get_attribute("sandbox") == ""
+    frame_source = await frame_element.get_attribute("src")
+    assert frame_source is not None and frame_source.startswith("blob:")
+    assert not any("/html?" in url for url in requested_urls)
     assert await frame_element.get_attribute("referrerpolicy") == "no-referrer"
     assert not any(".invalid" in url or url.startswith("data:") for url in requested_urls)
-    assert html_headers
-    assert "sandbox" in html_headers[0]["content-security-policy"]
-    assert "img-src data:" in html_headers[0]["content-security-policy"]
-    assert html_headers[0]["referrer-policy"] == "no-referrer"
 
     attachment = page.locator("#attachment-list li").filter(has_text="evil.html")
     assert await attachment.count() == 1

@@ -27,6 +27,7 @@ from .web import create_app
 LOGGER = logging.getLogger(__name__)
 _SYSTEMD_FD_START = 3
 _MAX_REQUESTS_PER_ACTIVATION = 64
+_HELPER_IDLE_SECONDS = 5.0
 _HELPER_SPOOL_DIRECTORY = Path("/run/maddyweb/helper-tmp")
 _AUTH_DATABASE_NAME = "auth.sqlite3"
 _AUTH_MASTER_KEY_NAME = "master.key"
@@ -306,7 +307,10 @@ def _run_helper(config: AppConfig) -> None:
     try:
         while served < _MAX_REQUESTS_PER_ACTIVATION:
             if served:
-                listener.settimeout(0.25)
+                # Keep one initialized helper warm for a short interactive burst.
+                # It still exits after the bounded idle window while mailbox requests
+                # avoid repeated capability probes and authentication database setup.
+                listener.settimeout(_HELPER_IDLE_SECONDS)
             try:
                 connection, _address = listener.accept()
             except TimeoutError:

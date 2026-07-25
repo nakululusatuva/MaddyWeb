@@ -246,6 +246,7 @@ def _config(
     *,
     public: bool = False,
     secure_cookies: bool = False,
+    login_domain: str = "",
 ) -> dict[str, object]:
     security: dict[str, object] = {
         "session_signing_key": b"k" * 32,
@@ -255,6 +256,7 @@ def _config(
             "__Host-maddyweb-session" if secure_cookies else "maddyweb-session"
         ),
         "secure_cookies": secure_cookies,
+        "login_domain": login_domain,
     }
     allowed_hosts: tuple[str, ...] = ("127.0.0.1", "localhost")
     if public:
@@ -373,6 +375,89 @@ async def _login_totp(
 
 
 @pytest.mark.asyncio
+async def test_short_login_identifier_uses_the_configured_local_domain(tmp_path: Path) -> None:
+    gateway = AuthGateway()
+    client = TestClient(
+        TestServer(create_app(_config(tmp_path, login_domain="example.test"), gateway)),
+        cookie_jar=CookieJar(unsafe=True),
+    )
+    await client.start_server()
+    try:
+        challenge, _csrf_token = await _password_challenge(client, email="User.Name")
+        assert challenge == CHALLENGE
+        assert gateway.operations == [
+            ("password", "user.name@example.test", "mailbox-password", "127.0.0.1")
+        ]
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_configured_login_domain_restricts_and_canonicalizes_identifiers(
+    tmp_path: Path,
+) -> None:
+    gateway = AuthGateway()
+    client = TestClient(
+        TestServer(create_app(_config(tmp_path, login_domain="example.test"), gateway)),
+        cookie_jar=CookieJar(unsafe=True),
+    )
+    await client.start_server()
+    try:
+        await _password_challenge(client, email="User.Name")
+        await _password_challenge(client, email="USER.NAME@EXAMPLE.TEST")
+        assert gateway.operations == [
+            ("password", "user.name@example.test", "mailbox-password", "127.0.0.1"),
+            ("password", "user.name@example.test", "mailbox-password", "127.0.0.1"),
+        ]
+
+        csrf = await _csrf(client)
+        response = await _post_json(
+            client,
+            "/api/v1/auth/password",
+            csrf,
+            {"email": "user@outside.test", "password": "mailbox-password"},
+        )
+        assert response.status == 401
+        assert (await response.json())["error"] == {
+            "code": "invalid_credentials",
+            "message": "Authentication failed.",
+        }
+        assert gateway.operations == [
+            ("password", "user.name@example.test", "mailbox-password", "127.0.0.1"),
+            ("password", "user.name@example.test", "mailbox-password", "127.0.0.1"),
+        ]
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_short_login_identifier_is_disabled_without_a_configured_domain(
+    auth_client: tuple[TestClient, AuthGateway],
+) -> None:
+    client, gateway = auth_client
+    csrf = await _csrf(client)
+    response = await _post_json(
+        client,
+        "/api/v1/auth/password",
+        csrf,
+        {"email": "user", "password": "mailbox-password"},
+    )
+    assert response.status == 401
+    assert not gateway.operations
+
+
+@pytest.mark.asyncio
+async def test_active_normal_user_login_redirects_to_mail(
+    auth_client: tuple[TestClient, AuthGateway],
+) -> None:
+    client, gateway = auth_client
+    await _login_totp(client, gateway)
+    response = await client.get("/login", allow_redirects=False)
+    assert response.status == 302
+    assert response.headers["Location"] == "/mail"
+
+
+@pytest.mark.asyncio
 async def test_unauthenticated_browser_is_confined_to_login_surface(
     auth_client: tuple[TestClient, AuthGateway],
 ) -> None:
@@ -390,9 +475,7 @@ async def test_unauthenticated_browser_is_confined_to_login_surface(
         public_asset = await client.get(path)
         assert public_asset.status == 200
         assert "Set-Cookie" not in public_asset.headers
-        assert public_asset.headers["Cache-Control"] == (
-            "public, max-age=31536000, immutable"
-        )
+        assert public_asset.headers["Cache-Control"] == ("public, max-age=31536000, immutable")
     assert (await client.get("/static/login.css")).status == 404
     assert (await client.get("/static/login.js?v=incorrect")).status == 404
     assert (await client.get("/api/v1/auth/csrf")).status == 200
@@ -437,9 +520,7 @@ async def test_versioned_login_assets_ignore_session_cookies_and_helper_outage(
             asset = await client.get(path, headers={"Cookie": cookie})
             assert asset.status == 200
             assert "Set-Cookie" not in asset.headers
-            assert asset.headers["Cache-Control"] == (
-                "public, max-age=31536000, immutable"
-            )
+            assert asset.headers["Cache-Control"] == ("public, max-age=31536000, immutable")
 
     assert not any(operation[0] == "session" for operation in gateway.operations)
 
@@ -741,8 +822,22 @@ async def test_normal_user_cannot_select_or_reach_another_account(
     assert folder_injection.status == 400
     assert not any(operation[0] == "create_mailbox" for operation in gateway.operations)
 
-    own = await client.get("/api/v1/me/mail?mailbox=INBOX")
+    gateway.operations.clear()
+    context = await client.get("/api/v1/me/mail?phase=context")
+    assert context.status == 200
+    context_data = (await context.json())["data"]
+    assert context_data["selected_account"] == USER_ID
+    assert context_data["selected_mailbox"] == "INBOX"
+    assert context_data["messages"] == []
+    assert ("list_mailboxes", USER_ID) in gateway.operations
+    assert not any(operation[0] == "list_messages" for operation in gateway.operations)
+
+    gateway.operations.clear()
+    own = await client.get("/api/v1/me/mail")
     assert own.status == 200
+    own_data = (await own.json())["data"]
+    assert own_data["selected_account"] == USER_ID
+    assert own_data["selected_mailbox"] == "INBOX"
     assert ("list_messages", USER_ID, "INBOX", 20, 0) in gateway.operations
 
 

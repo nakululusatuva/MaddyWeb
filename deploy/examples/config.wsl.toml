@@ -47,6 +47,7 @@ session_cookie_name = "__Host-maddyweb-wsl-session"
 csrf_cookie_name = "__Host-maddyweb-wsl-csrf"
 public_origin = ""
 totp_issuer = "MaddyWeb WSL"
+login_domain = ""
 
 [logging]
 level = "INFO"

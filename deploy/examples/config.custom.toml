@@ -44,6 +44,7 @@ session_cookie_name = "__Host-maddyweb-session"
 csrf_cookie_name = "__Host-maddyweb-csrf"
 public_origin = "https://maddy.custom.example.test"
 totp_issuer = "MaddyWeb Custom"
+login_domain = "custom.example.test"
 
 [logging]
 level = "INFO"

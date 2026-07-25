@@ -37,6 +37,8 @@ LOGGER = logging.getLogger(__name__)
 
 _HEALTH_CACHE_SECONDS = 10.0
 _ACCOUNT_CACHE_SECONDS = 2.0
+_MAILBOX_CACHE_SECONDS = 15.0
+_MAILBOX_CACHE_CAPACITY = 128
 _SMTP_AUTH_PUBLIC_MESSAGE = (
     "Authentication for the selected sending account was rejected. Check its mailbox "
     "password and confirm that credentials are enabled, then try again. The message was "
@@ -126,6 +128,13 @@ class _AccountCache:
 
 
 @dataclass(slots=True)
+class _MailboxCacheEntry:
+    expires_at: float
+    generation: int
+    value: tuple[Any, ...]
+
+
+@dataclass(slots=True)
 class _TaskOutcome:
     value: Any = None
     error: Exception | None = None
@@ -161,6 +170,9 @@ class HelperGateway:
         self._account_mutations_inflight = 0
         self._account_mutation_tasks: set[asyncio.Task[Any]] = set()
         self._account_cache_quarantined = False
+
+        self._mailbox_cache: dict[tuple[bytes, str], _MailboxCacheEntry] = {}
+        self._mailbox_generation: dict[str, int] = {}
 
     async def _call(
         self,
@@ -594,6 +606,32 @@ class HelperGateway:
             raise outcome.error
         return outcome.value
 
+    def _invalidate_mailboxes(self, account_id: str) -> None:
+        self._mailbox_generation[account_id] = self._mailbox_generation.get(account_id, 0) + 1
+        for key in tuple(self._mailbox_cache):
+            if key[1] == account_id:
+                del self._mailbox_cache[key]
+
+    def _prune_mailbox_cache(self, now: float) -> None:
+        for key, entry in tuple(self._mailbox_cache.items()):
+            if entry.expires_at <= now:
+                del self._mailbox_cache[key]
+        while len(self._mailbox_cache) >= _MAILBOX_CACHE_CAPACITY:
+            del self._mailbox_cache[next(iter(self._mailbox_cache))]
+
+    @staticmethod
+    def _copy_mailboxes(values: Sequence[Any]) -> list[Any]:
+        return copy.deepcopy(list(values))
+
+    async def _mailbox_mutation(
+        self, account_id: str, operation: str, params: Mapping[str, Any]
+    ) -> Any:
+        self._invalidate_mailboxes(account_id)
+        try:
+            return await self._call(operation, params)
+        finally:
+            self._invalidate_mailboxes(account_id)
+
     async def create_account(self, username: str, password: str) -> object:
         return await self._account_mutation(
             "accounts.create",
@@ -619,19 +657,40 @@ class HelperGateway:
         )
 
     async def delete_mailbox(self, account_id: str) -> None:
-        await self._account_mutation(
-            "accounts.delete_imap_account",
-            {"target_account_id": account_id, "confirm": True},
-        )
+        self._invalidate_mailboxes(account_id)
+        try:
+            await self._account_mutation(
+                "accounts.delete_imap_account",
+                {"target_account_id": account_id, "confirm": True},
+            )
+        finally:
+            self._invalidate_mailboxes(account_id)
 
     async def list_mailboxes(self, account_id: str) -> Sequence[object]:
-        return _sequence(
+        auth_key = _authorization_cache_key(_AUTH_TOKEN.get())
+        cache_key = (auth_key, account_id)
+        now = time.monotonic()
+        cached = self._mailbox_cache.get(cache_key)
+        generation = self._mailbox_generation.get(account_id, 0)
+        if cached is not None and cached.expires_at > now and cached.generation == generation:
+            return self._copy_mailboxes(cached.value)
+        values = _sequence(
             await self._call("mailboxes.list", {"target_account_id": account_id}),
             "mailboxes.list",
         )
+        snapshot = tuple(self._copy_mailboxes(values))
+        if generation == self._mailbox_generation.get(account_id, 0):
+            self._prune_mailbox_cache(time.monotonic())
+            self._mailbox_cache[cache_key] = _MailboxCacheEntry(
+                expires_at=time.monotonic() + _MAILBOX_CACHE_SECONDS,
+                generation=generation,
+                value=snapshot,
+            )
+        return self._copy_mailboxes(snapshot)
 
     async def create_mailbox(self, account_id: str, mailbox: str) -> None:
-        await self._call(
+        await self._mailbox_mutation(
+            account_id,
             "mailboxes.create",
             {"target_account_id": account_id, "mailbox": mailbox},
         )
@@ -642,7 +701,8 @@ class HelperGateway:
         old_name: str,
         new_name: str,
     ) -> None:
-        await self._call(
+        await self._mailbox_mutation(
+            account_id,
             "mailboxes.rename",
             {
                 "target_account_id": account_id,
@@ -652,7 +712,8 @@ class HelperGateway:
         )
 
     async def delete_named_mailbox(self, account_id: str, mailbox: str) -> None:
-        await self._call(
+        await self._mailbox_mutation(
+            account_id,
             "mailboxes.delete",
             {
                 "target_account_id": account_id,

@@ -217,7 +217,8 @@ def test_host_specific_nginx_ownership_is_not_interchangeable() -> None:
     assert "Do not enable, start, reload, or edit the system" in compact_guide
     assert "`nginx.service`" in compact_guide
     assert (
-        "The existing `mail.custom.example.test` server remains the port 80 `default_server`" in compact_guide
+        "The existing `mail.custom.example.test` server remains the port 80 "
+        "`default_server`" in compact_guide
     )
     assert "owns only the port 443 default-deny server" in compact_guide
 
@@ -279,6 +280,8 @@ def test_public_edge_checker_is_read_only_and_profile_bound() -> None:
     assert "--profile standalone|custom" in checker
     assert 'totp_issuer="MaddyWeb Standalone"' in checker
     assert 'totp_issuer="MaddyWeb Custom"' in checker
+    assert 'login_domain="standalone.example.test"' in checker
+    assert 'login_domain="custom.example.test"' in checker
     assert "/etc/nginx/nginx.conf" in checker
     assert "/etc/custom-acme/nginx.conf" in checker
     assert "nginx_test=(/usr/bin/nginx -t -c /etc/custom-acme/nginx.conf)" in checker
@@ -322,6 +325,8 @@ def test_public_edge_checker_validates_exact_application_profile() -> None:
     assert '"csrf_cookie_name": "__Host-maddyweb-csrf"' in checker
     assert '"public_origin": f"https://{domain}"' in checker
     assert '"totp_issuer": issuer' in checker
+    assert '"login_domain": login_domain' in checker
+    assert "config_path, domain, other_domain, issuer, login_domain = sys.argv[1:]" in checker
     assert "other production hostname is present" in checker
 
 
@@ -376,7 +381,7 @@ def test_standalone_checker_validates_standalone_nginx_master() -> None:
 
     assert 'nginx_pid_file="/run/nginx.pid"' in checker
     assert "/usr/bin/nginx -t -c /etc/nginx/nginx.conf" in checker
-    assert "nginx.service must remain inactive for the standalone Standalone master" in checker
+    assert "nginx.service must remain inactive for the standalone Nginx master" in checker
     assert "standalone nginx pid file is invalid" in checker
     assert "stat -c '%u' -- \"/proc/$nginx_master_pid\"" in checker
     assert 'realpath -e -- "/proc/$nginx_master_pid/exe"' in checker

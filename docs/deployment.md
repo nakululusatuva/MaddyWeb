@@ -95,6 +95,7 @@ session_cookie_name = "__Host-maddyweb-session"
 csrf_cookie_name = "__Host-maddyweb-csrf"
 public_origin = ""
 totp_issuer = "MaddyWeb Example"
+login_domain = ""
 
 [maddy]
 helper_socket = "/run/maddyweb/helper.sock"
@@ -117,6 +118,9 @@ names must be distinct, use the `__Host-` prefix, and remain unique when the
 same browser reaches multiple MaddyWeb deployments. `totp_issuer` is the
 printable Google Authenticator issuer shown to users and must be stable for
 the lifetime of the factors.
+
+Set security.login_domain to the single local mailbox domain to allow users
+to sign in with only their mailbox name. Leave it empty to require full email addresses.
 
 For an SSH-only deployment, leave `security.public_origin` empty and keep
 `server.allowed_hosts` loopback-only. For the reviewed public edge, add

@@ -71,7 +71,7 @@
     csrfToken: "",
     authState: "checking",
     principal: {},
-    role: "admin",
+    role: "mailbox",
     capabilities: new Set(),
     sessionExpiresAt: 0,
     idleExpiresAt: 0,
@@ -285,6 +285,11 @@
     const role = state.role === "admin" ? "admin" : "mailbox";
     document.documentElement.dataset.authState = state.authState;
     document.documentElement.dataset.role = role;
+    if (!state.health) {
+      const badge = byId("runtime-badge");
+      badge.textContent = "Connected";
+      badge.className = "status-pill status-positive";
+    }
 
     document.querySelectorAll("[data-role]").forEach((node) => {
       node.hidden = node.getAttribute("data-role") !== role;
@@ -801,15 +806,19 @@
     renderAccounts(state.accounts);
   };
 
-  const optionNode = (value, label) => {
+  const optionNode = (value, label, disabled = false) => {
     const option = element("option", {text: label});
     option.value = value;
+    option.disabled = disabled;
+    option.hidden = disabled;
     return option;
   };
 
-  const populateSelect = (select, values, selected, placeholder) => {
+  const populateSelect = (select, values, selected, placeholder, disablePlaceholder = false) => {
     const fragment = document.createDocumentFragment();
-    fragment.append(optionNode("", placeholder));
+    const placeholderOption = optionNode("", placeholder, disablePlaceholder);
+    placeholderOption.selected = !selected;
+    fragment.append(placeholderOption);
     for (const value of values) {
       const option = optionNode(value.value, value.label);
       option.selected = value.value === selected;
@@ -1046,8 +1055,10 @@
       }),
       mailbox,
       account ? "Select a mailbox" : "Select an account first",
+      Boolean(account && mailboxes.length),
     );
     byId("mail-mailbox").disabled = !account;
+    byId("mail-mailbox").required = Boolean(account && mailboxes.length);
     byId("current-mailbox-identity").textContent = accountLabel;
     byId("mail-title").textContent = mailbox || "Mail";
     byId("mail-list-summary").textContent = mailbox
@@ -1228,6 +1239,27 @@
         )
       ) query.set(name, value);
     }
+    if (!query.get("mailbox")) {
+      query.set("phase", "context");
+      const contextData = await apiData(`/mail?${query.toString()}`, {signal});
+      state.mail = contextData;
+      renderMail(contextData);
+      const selectedAccount = stringValue(contextData.selected_account);
+      const selectedMailbox = stringValue(contextData.selected_mailbox);
+      if (!selectedMailbox) return;
+      query.delete("phase");
+      if (state.role === "admin" && selectedAccount) {
+        query.set("account", selectedAccount);
+      } else {
+        query.delete("account");
+      }
+      query.set("mailbox", selectedMailbox);
+      window.history.replaceState(
+        null,
+        "",
+        buildMailUrl({account: selectedAccount, mailbox: selectedMailbox}),
+      );
+    }
     const suffix = query.size ? `?${query.toString()}` : "";
     const data = await apiData(`/mail${suffix}`, {signal});
     state.mail = data;
@@ -1257,8 +1289,9 @@
       fragment.append(section);
     }
     if (message.has_html === true) {
+      const documentSource = stringValue(message.html_document);
       const source = mailResourceUrl(stringValue(message.html_url));
-      if (source) {
+      if (documentSource || source) {
         const section = element("section", {className: "message-part"});
         section.append(element("h2", {text: "Sanitized HTML body"}));
         const frame = document.createElement("iframe");
@@ -1267,7 +1300,17 @@
         frame.loading = "lazy";
         frame.referrerPolicy = "no-referrer";
         frame.setAttribute("sandbox", "");
-        frame.src = `${source.pathname}${source.search}`;
+        if (documentSource) {
+          const objectUrl = URL.createObjectURL(new Blob([documentSource], {
+            type: "text/html;charset=utf-8",
+          }));
+          const releaseObjectUrl = () => URL.revokeObjectURL(objectUrl);
+          frame.addEventListener("load", releaseObjectUrl, {once: true});
+          frame.addEventListener("error", releaseObjectUrl, {once: true});
+          frame.src = objectUrl;
+        } else if (source) {
+          frame.src = `${source.pathname}${source.search}`;
+        }
         section.append(frame);
         fragment.append(section);
       }
@@ -2637,8 +2680,12 @@
       if (route.name === "overview") await loadOverview(signal);
       else if (route.name === "mail") await loadMail(signal);
       else if (route.name === "message") {
-        await loadMail(signal);
-        await loadMessage(route, signal);
+        const query = new URLSearchParams(window.location.search);
+        const currentMail = objectValue(state.mail);
+        const matchesLoadedMail = stringValue(currentMail.selected_account) === (query.get("account") || scopedAccount())
+          && stringValue(currentMail.selected_mailbox) === query.get("mailbox");
+        if (matchesLoadedMail) await loadMessage(route, signal);
+        else await Promise.all([loadMail(signal), loadMessage(route, signal)]);
       }
       else if (route.name === "compose") await loadCompose(signal);
       else if (route.name === "accounts") await loadAccounts(signal);
@@ -3563,13 +3610,6 @@
     } catch (error) {
       handleError(error, "The secure session could not be initialized.");
       if (state.authState !== "active") return;
-    }
-    if (parseRoute().name !== "overview") {
-      try {
-        await fetchHealth();
-      } catch {
-        markHealthUnavailable();
-      }
     }
     await renderRoute(false);
   };

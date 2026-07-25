@@ -615,6 +615,61 @@ async def test_health_preserves_version_when_storage_is_unavailable() -> None:
 
 
 @pytest.mark.asyncio
+async def test_mailbox_list_cache_is_session_scoped_and_returns_copies() -> None:
+    account_id = "a" * 32
+    client = FakeClient(
+        {
+            "mailboxes.list": Response.success(
+                "template",
+                [{"name": "INBOX"}],
+            ),
+        }
+    )
+    gateway = gateway_with(client)
+
+    with bind_helper_identity("A" * 43):
+        first = await gateway.list_mailboxes(account_id)
+        second = await gateway.list_mailboxes(account_id)
+        assert isinstance(first, list)
+        first.clear()
+        third = await gateway.list_mailboxes(account_id)
+
+    with bind_helper_identity("B" * 43):
+        other_session = await gateway.list_mailboxes(account_id)
+
+    assert second == [{"name": "INBOX"}]
+    assert third == [{"name": "INBOX"}]
+    assert other_session == [{"name": "INBOX"}]
+    assert [request.operation for request in client.requests] == [
+        "mailboxes.list",
+        "mailboxes.list",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_mailbox_mutation_invalidates_the_scoped_cache() -> None:
+    account_id = "a" * 32
+    client = FakeClient(
+        {
+            "mailboxes.list": Response.success("template", [{"name": "INBOX"}]),
+            "mailboxes.create": Response.success("template", None),
+        }
+    )
+    gateway = gateway_with(client)
+
+    with bind_helper_identity("A" * 43):
+        await gateway.list_mailboxes(account_id)
+        await gateway.create_mailbox(account_id, "Archive")
+        await gateway.list_mailboxes(account_id)
+
+    assert [request.operation for request in client.requests] == [
+        "mailboxes.list",
+        "mailboxes.create",
+        "mailboxes.list",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_message_page_preserves_authoritative_continuation() -> None:
     account_id = "a" * 32
     payload = {

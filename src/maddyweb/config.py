@@ -136,6 +136,15 @@ def _host(value: str, name: str) -> str:
     return candidate
 
 
+def _dns_name(value: str, name: str) -> str:
+    candidate = _host(value, name)
+    try:
+        ipaddress.ip_address(candidate)
+    except ValueError:
+        return candidate
+    raise ConfigError(f"{name} must be a DNS hostname")
+
+
 def _https_origin(value: str, name: str) -> str:
     try:
         parsed = urlsplit(value)
@@ -559,6 +568,7 @@ class SecurityConfig:
     session_cookie_name: str = "__Host-maddyweb-session"
     csrf_cookie_name: str = "__Host-maddyweb-csrf"
     public_origin: str = ""
+    login_domain: str = ""
     totp_issuer: str = "MaddyWeb"
 
     @classmethod
@@ -571,6 +581,7 @@ class SecurityConfig:
             "session_cookie_name",
             "csrf_cookie_name",
             "public_origin",
+            "login_domain",
             "totp_issuer",
         }
         _closed("security", raw, allowed)
@@ -615,6 +626,15 @@ class SecurityConfig:
             if public_origin_value
             else ""
         )
+        login_domain_value = _string(
+            raw,
+            "login_domain",
+            defaults.login_domain,
+            "security.login_domain",
+        )
+        login_domain = (
+            _dns_name(login_domain_value, "security.login_domain") if login_domain_value else ""
+        )
         issuer = _string(raw, "totp_issuer", defaults.totp_issuer, "security.totp_issuer")
         if (
             not 1 <= len(issuer) <= 64
@@ -649,6 +669,7 @@ class SecurityConfig:
             session_cookie_name=session_cookie,
             csrf_cookie_name=csrf_cookie,
             public_origin=public_origin,
+            login_domain=login_domain,
             totp_issuer=issuer,
         )
 

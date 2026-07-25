@@ -49,6 +49,7 @@ case "$profile" in
     standalone)
         domain="maddy.standalone.example.test"
         other_domain="maddy.custom.example.test"
+        login_domain="standalone.example.test"
         totp_issuer="MaddyWeb Standalone"
         nginx_config="/etc/nginx/nginx.conf"
         nginx_http_include="/etc/nginx/conf.d/00-maddyweb-cloudflare-http.conf"
@@ -66,6 +67,7 @@ case "$profile" in
     custom)
         domain="maddy.custom.example.test"
         other_domain="maddy.standalone.example.test"
+        login_domain="custom.example.test"
         totp_issuer="MaddyWeb Custom"
         nginx_config="/etc/custom-acme/nginx.conf"
         nginx_http_include="/etc/custom-acme/maddyweb/cloudflare-http.conf"
@@ -187,7 +189,7 @@ installed_python="$current_release/bin/python"
     --config /etc/maddyweb/config.toml >/dev/null \
     || die "installed MaddyWeb rejected the production configuration"
 "$installed_python" -I - \
-    /etc/maddyweb/config.toml "$domain" "$other_domain" "$totp_issuer" <<'PY' \
+    /etc/maddyweb/config.toml "$domain" "$other_domain" "$totp_issuer" "$login_domain" <<'PY' \
     || die "production configuration does not match the selected public-edge profile"
 from __future__ import annotations
 
@@ -195,7 +197,7 @@ import sys
 import tomllib
 from pathlib import Path
 
-config_path, domain, other_domain, issuer = sys.argv[1:]
+config_path, domain, other_domain, issuer, login_domain = sys.argv[1:]
 config = tomllib.loads(Path(config_path).read_text(encoding="utf-8"))
 server = config.get("server", {})
 security = config.get("security", {})
@@ -213,6 +215,7 @@ expected_security = {
     "csrf_cookie_name": "__Host-maddyweb-csrf",
     "public_origin": f"https://{domain}",
     "totp_issuer": issuer,
+    "login_domain": login_domain,
 }
 for name, expected in expected_security.items():
     if security.get(name) != expected:
@@ -253,7 +256,7 @@ if [[ "$profile" == "standalone" ]]; then
     ' "$nginx_config" \
         || die "standalone nginx managed include is not one exact contiguous block"
     if systemctl is-active --quiet "$nginx_service"; then
-        die "nginx.service must remain inactive for the standalone Standalone master"
+        die "nginx.service must remain inactive for the standalone Nginx master"
     fi
     require_root_private_file "$nginx_pid_file"
     nginx_master_pid=$(<"$nginx_pid_file")
@@ -292,7 +295,7 @@ else
         "/etc/custom-acme/maddyweb/maddyweb-http.inc" \
         || die "installed custom MaddyWeb include wrapper drifted from the reviewed asset"
     grep -Fq 'include /etc/custom-acme/maddyweb/maddyweb-http.inc;' "$nginx_config" \
-        || die "custom custom nginx does not include the managed MaddyWeb fragment"
+        || die "custom Nginx does not include the managed MaddyWeb fragment"
     if systemctl is-enabled --quiet nginx.service 2>/dev/null; then
         die "system nginx.service must remain disabled on the custom profile"
     fi

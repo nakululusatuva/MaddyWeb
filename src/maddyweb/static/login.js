@@ -103,12 +103,19 @@
       view.hidden = view.getAttribute("data-auth-view") !== selected;
     });
     setNotice(options.notice || "", options.kind || "neutral");
+    if (selected === "totp_enrollment_required" || selected === "recovery_ack_required") {
+      const activeView = document.querySelector(`[data-auth-view="${selected}"]`);
+      const heading = activeView?.querySelector("h2");
+      if (heading instanceof HTMLElement) {
+        heading.tabIndex = -1;
+        window.setTimeout(() => heading.focus({preventScroll: true}), 0);
+      }
+      return;
+    }
     const focusTarget = {
       anonymous: "login-address",
       totp_required: "totp-code",
       recovery_required: "recovery-login-code",
-      totp_enrollment_required: "enrollment-code",
-      recovery_ack_required: "recovery-acknowledged",
       unavailable: "retry-session",
     }[selected];
     if (focusTarget) window.setTimeout(() => byId(focusTarget)?.focus(), 0);
