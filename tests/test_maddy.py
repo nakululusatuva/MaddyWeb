@@ -765,6 +765,19 @@ def test_message_list_removes_controls_decoded_from_encoded_words() -> None:
     assert record["subject"] == "Visible Bcc: hidden@example.test"
 
 
+def test_message_list_removes_directional_and_invisible_formatting() -> None:
+    unsafe = "Visible\u202ecod.exe\u2066\u200b"
+    encoded = base64.b64encode(unsafe.encode("utf-8")).decode("ascii")
+
+    raw_record = parse_message_list(full_message_record(1, 1, unsafe))[0]
+    encoded_record = parse_message_list(
+        full_message_record(2, 2, f"=?UTF-8?B?{encoded}?=")
+    )[0]
+
+    assert raw_record["subject"] == "Visiblecod.exe"
+    assert encoded_record["subject"] == "Visiblecod.exe"
+
+
 def test_message_list_bounds_encoded_word_count_and_decoded_length() -> None:
     word = "=?UTF-8?B?QQ==?="
     excessive_words = " ".join([word] * 65)

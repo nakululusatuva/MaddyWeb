@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import socket
 import struct
+import sys
 import threading
 
 import pytest
@@ -57,6 +58,23 @@ def test_decode_converts_excessive_json_nesting_to_protocol_error() -> None:
     payload = b'{"nested":' + (b"[" * 2000) + b"0" + (b"]" * 2000) + b"}"
     with pytest.raises(ProtocolError):
         decode_payload(payload)
+
+
+def test_decode_converts_excessive_integer_digits_to_protocol_error() -> None:
+    payload = b'{"value":' + (b"9" * 5000) + b"}"
+    original_limit = sys.get_int_max_str_digits()
+    try:
+        sys.set_int_max_str_digits(0)
+        with pytest.raises(ProtocolError):
+            decode_payload(payload)
+    finally:
+        sys.set_int_max_str_digits(original_limit)
+
+    assert decode_payload(b'{"value":18446744073709551615}')["value"] == (1 << 64) - 1
+    with pytest.raises(ProtocolError):
+        decode_payload(b'{"value":18446744073709551616}')
+    with pytest.raises(ProtocolError):
+        encode_frame({"value": 1 << 64})
 
 
 def test_request_and_response_are_versioned_and_closed() -> None:

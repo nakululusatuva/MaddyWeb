@@ -555,9 +555,13 @@ def security_middleware(
     scope_resolver: Callable[[web.Request], CsrfScope] | None = None,
     state_capacity: int = 4096,
     flows_per_identity: int = 8,
+    tokenless_safe_paths: Iterable[str] = (),
 ) -> web.middleware:
     """Build middleware enforcing Host, Origin, CSRF and response policies."""
 
+    tokenless_paths = frozenset(tokenless_safe_paths)
+    if any(not isinstance(path, str) or not path.startswith("/") for path in tokenless_paths):
+        raise ValueError("tokenless safe paths must be absolute request paths")
     states = CurrentCsrfStore(
         capacity=state_capacity,
         flows_per_identity=flows_per_identity,
@@ -659,6 +663,14 @@ def security_middleware(
                 code="invalid_host",
                 message="Invalid Host header.",
             )
+            _apply_security_headers(response)
+            return response
+
+        if request.method in SAFE_METHODS and request.path in tokenless_paths:
+            try:
+                response = await handler(request)
+            except web.HTTPException as exc:
+                response = _http_exception_response(request, exc)
             _apply_security_headers(response)
             return response
 
@@ -888,7 +900,7 @@ def email_document_headers() -> dict[str, str]:
         "Cache-Control": "no-store",
         "Content-Security-Policy": (
             "sandbox; default-src 'none'; base-uri 'none'; form-action 'none'; "
-            "frame-ancestors 'self'; img-src 'self'; object-src 'none'; "
+            "frame-ancestors 'self'; img-src data:; object-src 'none'; "
             "style-src 'unsafe-inline'"
         ),
         "Cross-Origin-Resource-Policy": "same-origin",

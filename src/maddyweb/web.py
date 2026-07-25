@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import hashlib
 import ipaddress
@@ -28,12 +29,16 @@ from .gateway import HelperCallError, bind_helper_identity
 from .mail import (
     MAX_ATTACHMENT_BYTES,
     MAX_RAW_MESSAGE_BYTES,
+    MAX_RENDERED_CID_BYTES,
+    MAX_RENDERED_CID_IMAGES,
+    MAX_RENDERED_CID_PIXELS,
     Attachment,
     DeliveryResult,
     MailError,
     MailGateway,
     MailValidationError,
     OutgoingMessage,
+    ParsedAttachment,
     ParsedMessage,
     PreparedMessage,
     attachment_download_headers,
@@ -44,7 +49,9 @@ from .mail import (
     reply_subject,
     reply_thread_headers,
     rewrite_cid_images,
+    safe_display_header,
     safe_filename,
+    safe_inline_image_metadata,
     sandboxed_html_document,
 )
 from .protocol import DEFAULT_MAX_STREAM_BYTES
@@ -846,6 +853,12 @@ _PASSWORD_CHANGE_PATHS = frozenset(
         "/static/preview.css",
     }
 )
+_TOKENLESS_PUBLIC_STATIC_PATHS = frozenset(
+    {
+        "/static/login.css",
+        "/static/login.js",
+    }
+)
 
 
 def _session_cookie_name(request: web.Request) -> str:
@@ -955,6 +968,12 @@ def _authentication_middleware() -> web.middleware:
         if request.path == "/healthz":
             if request.remote != "127.0.0.1" or request.host.split(":", 1)[0] != "127.0.0.1":
                 raise web.HTTPNotFound()
+            return await handler(request)
+
+        if (
+            request.method in {"GET", "HEAD"}
+            and request.path in _TOKENLESS_PUBLIC_STATIC_PATHS
+        ):
             return await handler(request)
 
         token = request.cookies.get(_session_cookie_name(request))
@@ -1258,9 +1277,16 @@ def _message_summary_payload(record: object) -> dict[str, object]:
         raise TypeError("message summary unread flag must be a boolean")
     return {
         "uid": identifier,
-        "sender": str(_record_value(record, "sender", "from_", "from", default="")),
-        "subject": str(_record_value(record, "subject", default="(No subject)")) or "(No subject)",
-        "date": str(_record_value(record, "date", "received_at", default="")),
+        "sender": safe_display_header(
+            _record_value(record, "sender", "from_", "from", default="")
+        ),
+        "subject": safe_display_header(
+            _record_value(record, "subject", default="(No subject)")
+        )
+        or "(No subject)",
+        "date": safe_display_header(
+            _record_value(record, "date", "received_at", default="")
+        ),
         "unread": unread,
     }
 
@@ -2350,27 +2376,10 @@ async def message_html(request: web.Request) -> web.Response:
         message = await _parsed_message(request, account, mailbox_name)
         if message.html is None:
             raise web.HTTPNotFound(text="This message has no HTML body.")
-        cid_counts: dict[str, int] = {}
-        for attachment in message.attachments:
-            if attachment.content_id:
-                cid_counts[attachment.content_id] = cid_counts.get(attachment.content_id, 0) + 1
-        personal_scope = request.path.startswith("/api/v1/me/")
-        context_query = urlencode(
-            {"mailbox": mailbox_name}
-            if personal_scope
-            else {"account": account, "mailbox": mailbox_name}
-        )
-        route_prefix = "/api/v1/me/mail" if personal_scope else "/api/v1/admin/mail"
         cid_urls = {
-            attachment.content_id: (
-                f"{route_prefix}/{quote(request.match_info['message_id'], safe='')}/inline/"
-                f"{quote(attachment.attachment_id, safe='')}?{context_query}"
-            )
-            for attachment in message.attachments
-            if attachment.inline
-            and attachment.content_id is not None
-            and cid_counts.get(attachment.content_id) == 1
-            and detect_safe_image_type(attachment.data) is not None
+            attachment.content_id: _inline_attachment_data_url(attachment)
+            for attachment in _eligible_inline_attachments(message)
+            if attachment.content_id is not None
         }
         document = await asyncio.to_thread(_iframe_document, message.html, cid_urls)
         return web.Response(
@@ -2386,6 +2395,45 @@ def _iframe_document(message_html: str, cid_urls: Mapping[str, str]) -> str:
     return sandboxed_html_document(rewritten, already_sanitized=True)
 
 
+def _inline_attachment_data_url(attachment: ParsedAttachment) -> str:
+    metadata = safe_inline_image_metadata(attachment.data)
+    if metadata is None:
+        raise RuntimeError("inline attachment was not validated")
+    encoded = base64.b64encode(attachment.data).decode("ascii")
+    return f"data:{metadata[0]};base64,{encoded}"
+
+
+def _eligible_inline_attachments(
+    message: ParsedMessage,
+) -> tuple[ParsedAttachment, ...]:
+    cid_counts: dict[str, int] = {}
+    for attachment in message.attachments:
+        if attachment.content_id:
+            cid_counts[attachment.content_id] = cid_counts.get(attachment.content_id, 0) + 1
+    selected: list[ParsedAttachment] = []
+    selected_bytes = 0
+    selected_pixels = 0
+    for attachment in message.attachments:
+        if (
+            len(selected) >= MAX_RENDERED_CID_IMAGES
+            or not attachment.inline
+            or attachment.content_id is None
+            or cid_counts.get(attachment.content_id) != 1
+            or selected_bytes + attachment.size > MAX_RENDERED_CID_BYTES
+        ):
+            continue
+        metadata = safe_inline_image_metadata(attachment.data)
+        if metadata is None:
+            continue
+        pixels = metadata[1] * metadata[2]
+        if selected_pixels + pixels > MAX_RENDERED_CID_PIXELS:
+            continue
+        selected.append(attachment)
+        selected_bytes += attachment.size
+        selected_pixels += pixels
+    return tuple(selected)
+
+
 async def inline_image(request: web.Request) -> web.Response:
     query = _read_query(
         request,
@@ -2396,16 +2444,18 @@ async def inline_image(request: web.Request) -> web.Response:
         message = await _parsed_message(request, account, mailbox_name)
         attachment_id = _identifier(request.match_info["attachment_id"], "inline image identifier")
         attachment = next(
-            (item for item in message.attachments if item.attachment_id == attachment_id),
+            (
+                item
+                for item in _eligible_inline_attachments(message)
+                if item.attachment_id == attachment_id
+            ),
             None,
         )
-        if attachment is None or not attachment.inline or attachment.content_id is None:
+        if attachment is None:
             raise web.HTTPNotFound(text="Inline image does not exist.")
-        if sum(item.content_id == attachment.content_id for item in message.attachments) != 1:
-            raise web.HTTPNotFound(text="Inline image identifier is not unique.")
         content_type = detect_safe_image_type(attachment.data)
-        if content_type is None:
-            raise web.HTTPUnsupportedMediaType(text="Inline image format is not supported.")
+        if content_type is None:  # pragma: no cover - eligibility already checked
+            raise web.HTTPNotFound(text="Inline image does not exist.")
         return web.Response(
             body=attachment.data,
             content_type=content_type,
@@ -3285,6 +3335,25 @@ def _static_body(name: str) -> bytes:
         raise web.HTTPNotFound() from exc
 
 
+@cache
+def _login_asset_version() -> str:
+    digest = hashlib.sha256()
+    for name in ("login.css", "login.js"):
+        digest.update(name.encode("ascii"))
+        digest.update(b"\0")
+        digest.update(_static_body(name))
+    return digest.hexdigest()[:16]
+
+
+@cache
+def _login_shell_body() -> bytes:
+    placeholder = b"__MADDYWEB_LOGIN_ASSET_VERSION__"
+    body = _static_body("login.html")
+    if body.count(placeholder) != 2:
+        raise RuntimeError("login shell asset version placeholders are invalid")
+    return body.replace(placeholder, _login_asset_version().encode("ascii"))
+
+
 async def app_shell(_request: web.Request) -> web.Response:
     return web.Response(
         body=_static_body("index.html"),
@@ -3296,7 +3365,7 @@ async def app_shell(_request: web.Request) -> web.Response:
 
 async def login_shell(_request: web.Request) -> web.Response:
     return web.Response(
-        body=_static_body("login.html"),
+        body=_login_shell_body(),
         content_type="text/html",
         charset="utf-8",
         headers={"Cache-Control": "no-store"},
@@ -3315,9 +3384,12 @@ async def static_asset(request: web.Request) -> web.Response:
     content_type = content_types.get(name)
     if content_type is None:
         raise web.HTTPNotFound()
-    cache_control = (
-        "public, max-age=3600" if name in {"login.css", "login.js"} else "private, no-store"
-    )
+    cache_control = "private, no-store"
+    if name in {"login.css", "login.js"}:
+        versions = request.query.getall("v", [])
+        if len(request.query) != 1 or versions != [_login_asset_version()]:
+            raise web.HTTPNotFound()
+        cache_control = "public, max-age=31536000, immutable"
     return web.Response(
         body=_static_body(name),
         content_type=content_type,
@@ -3419,6 +3491,7 @@ def create_app(config: object, gateway: Gateway) -> web.Application:
             security_middleware(
                 browser_security,
                 scope_resolver=_csrf_scope,
+                tokenless_safe_paths=_TOKENLESS_PUBLIC_STATIC_PATHS,
             ),
         ],
         client_max_size=max_upload,

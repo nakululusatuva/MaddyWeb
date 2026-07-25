@@ -1150,10 +1150,10 @@ class PrivilegedDispatcher:
         touch: bool,
         audit_fields: dict[str, Any] | None = None,
     ) -> tuple[Request, Any | None]:
-        # Unit tests can construct a dispatcher without an authentication store.
-        # The production CLI always supplies the root-owned store.
         if self.auth_store is None:
-            return request, None
+            if operation.permission == "public":
+                return request, None
+            raise AuthorizationDenied("authentication service is unavailable")
         if operation.permission == "public":
             return request, None
         if request.auth_token is None:
@@ -1222,28 +1222,56 @@ class PrivilegedDispatcher:
             principal,
         )
 
-    def preflight(self, request: Request) -> Response | None:
+    def preflight(
+        self,
+        request: Request,
+    ) -> tuple[Response | None, dict[str, Any]]:
         """Authorize a control frame before receiving any declared upload body."""
 
+        fields = {
+            "request_id": request.request_id,
+            "operation": request.operation,
+            "actor": None,
+            "params": redact_for_audit(request.params),
+            "stream_length": request.stream_length or 0,
+        }
         operation = ALLOWED_OPERATIONS.get(request.operation)
         if operation is None:
-            return Response.failure(
-                request.request_id,
-                "operation_denied",
-                "Operation is not allow-listed",
+            self.audit("helper.operation", outcome="operation_denied", fields=fields)
+            return (
+                Response.failure(
+                    request.request_id,
+                    "operation_denied",
+                    "Operation is not allow-listed",
+                ),
+                fields,
             )
         if operation.stream_in is not (request.stream_length is not None):
-            return Response.failure(
-                request.request_id,
-                "invalid_stream",
-                "Operation stream shape does not match",
+            self.audit("helper.operation", outcome="invalid_stream", fields=fields)
+            return (
+                Response.failure(
+                    request.request_id,
+                    "invalid_stream",
+                    "Operation stream shape does not match",
+                ),
+                fields,
             )
         try:
-            self._authorize_request(request, operation, touch=False)
+            self._authorize_request(
+                request,
+                operation,
+                touch=False,
+                audit_fields=fields,
+            )
         except Exception as exc:
             code, message = self._safe_error(exc)
-            return Response.failure(request.request_id, code, message)
-        return None
+            self.audit(
+                "helper.operation",
+                outcome=code,
+                fields={**fields, "error_type": type(exc).__name__},
+            )
+            return Response.failure(request.request_id, code, message), fields
+        return None, fields
 
     def dispatch(self, request: Request, input_spool: TrustedSpool | None = None) -> DispatchResult:
         fields = {
@@ -2061,12 +2089,14 @@ class UnixHelperServer:
         connection.settimeout(self.socket_timeout)
         input_spool: TrustedSpool | None = None
         output_spool: TrustedSpool | None = None
+        stream_audit_fields: dict[str, Any] | None = None
+        receiving_stream = False
         try:
             self._verify_peer(connection)
             request = Request.from_payload(
                 receive_frame(connection, max_bytes=self.max_frame_bytes)
             )
-            preflight_failure = self.dispatcher.preflight(request)
+            preflight_failure, preflight_fields = self.dispatcher.preflight(request)
             if preflight_failure is not None:
                 send_frame(
                     connection,
@@ -2075,6 +2105,8 @@ class UnixHelperServer:
                 )
                 return
             if request.stream_length is not None:
+                stream_audit_fields = preflight_fields
+                receiving_stream = True
                 if request.stream_length > self.max_stream_bytes:
                     raise StreamError("request stream exceeds configured limit")
                 input_spool = TrustedSpool.create(self.dispatcher.spool_dir)
@@ -2087,6 +2119,7 @@ class UnixHelperServer:
                 )
                 input_spool.length = request.stream_length
                 input_spool.rewind()
+                receiving_stream = False
             result = self.dispatcher.dispatch(request, input_spool)
             output_spool = result.output_spool
             if output_spool is None:
@@ -2100,6 +2133,15 @@ class UnixHelperServer:
                     max_stream_bytes=self.max_stream_bytes,
                 )
         except (ConnectionClosed, ProtocolError, StreamError, OSError) as exc:
+            if receiving_stream and stream_audit_fields is not None:
+                self.dispatcher.audit(
+                    "helper.operation",
+                    outcome="stream_receive_failed",
+                    fields={
+                        **stream_audit_fields,
+                        "error_type": type(exc).__name__,
+                    },
+                )
             self.audit(
                 "helper.protocol",
                 outcome="rejected",

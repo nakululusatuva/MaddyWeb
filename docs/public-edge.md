@@ -26,7 +26,15 @@ The reviewed layout has these invariants:
 - `/healthz` is unavailable through the public edge.
 - Password, TOTP, recovery, and both enrollment steps share a small
   visitor-address rate-limit zone. CSRF bootstrap and message submission have
-  separate visitor-address limits.
+  separate visitor-address limits. The login shell and its two public static
+  assets have a separate moderate visitor-address limit. All other proxied
+  paths have a generous visitor-address ceiling so alternate paths cannot
+  create unbounded session lookups.
+- Public login CSS and JavaScript responses do not issue CSRF cookies, so
+  Cloudflare can cache their content-derived immutable URLs. Missing, stale,
+  or malformed asset versions return 404 instead of serving mutable content
+  under a long-lived cache key. The login shell and explicit CSRF bootstrap
+  endpoint remain the only anonymous CSRF-cookie issuers.
 - The default request body limit is 128 KiB. Only the three exact message-send
   endpoints accept 32 MiB, and those locations stream to the authenticated
   application without Nginx request buffering.
@@ -36,8 +44,9 @@ The reviewed layout has these invariants:
 - The Web certificate has its own lineage, service, and timer. Existing mail
   certificate lineages, hooks, and timers are not replaced or disabled.
 
-Keep Cloudflare proxying enabled for the two `maddy` records and select
-Full (strict) origin TLS. Do not proxy SMTP, IMAP, Submission, MX, or mail
+Keep Cloudflare proxying enabled for the two `maddy` records, select
+Full (strict) origin TLS, and set the zone Minimum TLS Version to TLS 1.2.
+Do not proxy SMTP, IMAP, Submission, MX, or mail
 autoconfiguration records. A host firewall may restrict only origin TCP ports
 80 and 443 to the pinned Cloudflare ranges; it must not block public mail
 ports.
@@ -321,7 +330,11 @@ hostname or which expires within 24 hours.
 
 The checker also probes the loopback login and health routes through the exact
 trusted proxy headers, requires a direct-origin HTTPS request to be closed by
-Nginx, and requests the public `/healthz` path through normal DNS. The public
+Nginx, verifies that the Cloudflare visitor edge rejects TLS 1.0 and TLS 1.1
+with a protocol-version alert from a legacy-capable OpenSSL probe while
+accepting TLS 1.2 and TLS 1.3, and requests the public `/healthz` path through
+normal DNS. A local client that cannot initiate a legacy handshake is an
+inconclusive failure, not evidence that the edge rejected it. The public
 response must be 404 and carry the reviewed HSTS header. Therefore the host
 running the checker needs outbound DNS and HTTPS access. After it passes,
 verify:
@@ -343,10 +356,13 @@ received HTTP response still fails the direct-origin denial check.
   hooks match the pre-change snapshot.
 
 Confirm in the Cloudflare dashboard that SSL/TLS mode is Full (strict).
+Confirm that Edge Certificates sets Minimum TLS Version to TLS 1.2; the
+origin `ssl_protocols` directive cannot disable deprecated protocols at the
+Cloudflare visitor edge.
 Confirm that no Transform Rule or edge header rule removes or replaces the
-origin HSTS header. These two zone settings cannot be proven by the origin
-checker; a successful HTTPS probe does not distinguish Full (strict) from
-weaker Cloudflare modes. They remain explicit deployment gates.
+origin HSTS header. Full (strict) and edge header-rule state cannot be proven
+by the origin checker; a successful HTTPS probe does not distinguish Full
+(strict) from weaker Cloudflare modes. They remain explicit deployment gates.
 
 Do not send an unbounded login burst. A local direct-origin probe is expected
 to fail because loopback is not a Cloudflare proxy range:

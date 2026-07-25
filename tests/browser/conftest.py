@@ -39,6 +39,11 @@ SESSION_TOKEN = "S" * 43
 LOGIN_CHALLENGE = "C" * 43
 LOGIN_PASSWORD = "fixture-mail-password"  # noqa: S105 - synthetic browser fixture
 LOGIN_TOTP = "123456"
+VALID_PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d4948445200000001000000010804000000"
+    "b51c0c020000000b4944415478da6364f80f00010501012718e3660000"
+    "000049454e44ae426082"
+)
 
 
 class BrowserSecurityGateway:
@@ -52,16 +57,27 @@ class BrowserSecurityGateway:
         message.set_content("plain fallback")
         message.add_alternative(
             '<script>document.body.dataset.xss="executed"</script>'
-            '<img id="remote-image" src="https://tracker.invalid/pixel">'
+            '<meta http-equiv="refresh" content="0;url=https://meta.invalid/">'
+            '<style>@import "https://style.invalid/x";</style>'
+            '<form action="https://form.invalid/"><input autofocus name="token"></form>'
+            '<svg><foreignObject><script>window.top.svgXss=true</script></foreignObject></svg>'
+            '<math><annotation-xml encoding="text/html"><script>window.top.mathXss=true'
+            "</script></annotation-xml></math>"
+            '<iframe src="https://frame.invalid/"></iframe>'
+            '<object data="https://object.invalid/x"></object>'
+            '<embed src="https://embed.invalid/x">'
+            '<img id="remote-image" src="https://tracker.invalid/pixel" '
+            'srcset="https://srcset.invalid/pixel 1x" onerror="window.top.imageXss=true">'
             '<img id="data-image" src="data:image/png;base64,iVBORw0KGgo=">'
             '<img id="inline-image" src="cid:logo">'
+            '<a id="unsafe-link" href="javascript:window.top.linkXss=true">Unsafe link</a>'
             '<b id="safe-content">Safe body</b>',
             subtype="html",
         )
         html_part = message.get_payload()[-1]
         assert isinstance(html_part, EmailMessage)
         html_part.add_related(
-            b"\x89PNG\r\n\x1a\nfixture",
+            VALID_PNG,
             maintype="image",
             subtype="png",
             cid="<logo>",

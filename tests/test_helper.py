@@ -184,7 +184,21 @@ def make_dispatcher(
     auth_store: Any = None,
     audit: Any = None,
 ) -> PrivilegedDispatcher:
-    return PrivilegedDispatcher(
+    dispatcher_type = PrivilegedDispatcher
+    if auth_store is None:
+        class LegacyOperationDispatcher(PrivilegedDispatcher):
+            def _authorize_request(
+                self,
+                request: Request,
+                operation: Any,
+                *,
+                touch: bool,
+                audit_fields: dict[str, Any] | None = None,
+            ) -> tuple[Request, Any | None]:
+                return request, None
+
+        dispatcher_type = LegacyOperationDispatcher
+    return dispatcher_type(
         maddy,
         SimpleNamespace(),
         spool_dir=tmp_path,
@@ -270,6 +284,18 @@ def test_dispatcher_allowlist_and_sensitive_audit(tmp_path: Path) -> None:
     assert "accounts.delete" not in ALLOWED_OPERATIONS
     assert "certificates.install" not in ALLOWED_OPERATIONS
     assert "certificates.upload" not in ALLOWED_OPERATIONS
+
+
+def test_dispatcher_without_authentication_store_fails_closed(tmp_path: Path) -> None:
+    dispatcher = PrivilegedDispatcher(
+        FakeMaddy(),
+        SimpleNamespace(),
+        spool_dir=tmp_path,
+        audit=lambda *_args, **_kwargs: None,
+    )
+    denied = dispatcher.dispatch(Request.create("accounts.list"))
+    assert denied.response.error is not None
+    assert denied.response.error.code == "forbidden"
 
 
 def test_production_auth_store_denies_missing_and_invalid_sessions(tmp_path: Path) -> None:
@@ -1703,12 +1729,18 @@ def _serve_once(server: UnixHelperServer, connection: socket.socket) -> None:
 def test_stream_preflight_rejects_unauthorized_request_before_spooling(
     tmp_path: Path,
 ) -> None:
+    audit_records: list[tuple[str, str, dict[str, Any]]] = []
+
+    def audit(action: str, *, outcome: str, fields: dict[str, Any]) -> None:
+        audit_records.append((action, outcome, fields))
+
     with make_auth_store(tmp_path) as store:
         server = _TestUnixHelperServer(
             make_dispatcher(
                 tmp_path,
                 FakeMaddy(),
                 auth_store=store,
+                audit=audit,
             ),
             allowed_peer_uid=0,
         )
@@ -1730,6 +1762,68 @@ def test_stream_preflight_rejects_unauthorized_request_before_spooling(
     assert response.error is not None
     assert response.error.code == "forbidden"
     assert not thread.is_alive()
+    assert list(tmp_path.glob("maddyweb-*.spool")) == []
+    assert audit_records[-1][0] == "helper.operation"
+    assert audit_records[-1][1] == "forbidden"
+    assert audit_records[-1][2]["operation"] == "messages.append"
+
+
+def test_authorized_truncated_stream_has_attributed_operation_audit(
+    tmp_path: Path,
+) -> None:
+    audit_records: list[tuple[str, str, dict[str, Any]]] = []
+
+    def audit(action: str, *, outcome: str, fields: dict[str, Any]) -> None:
+        audit_records.append((action, outcome, fields))
+
+    with make_auth_store(tmp_path) as store:
+        _account, token = provision_session(store, "sender@example.test")
+        server = _TestUnixHelperServer(
+            make_dispatcher(
+                tmp_path,
+                FakeMaddy(),
+                auth_store=store,
+                audit=audit,
+            ),
+            allowed_peer_uid=0,
+            audit=audit,
+        )
+        client_socket, server_socket = socket.socketpair()
+        request = Request.create(
+            "messages.append",
+            {"mailbox_special": "sent"},
+            auth_token=token,
+            stream_length=1024,
+        )
+
+        def send_truncated_stream() -> None:
+            with client_socket:
+                send_frame(client_socket, request.to_payload())
+                client_socket.shutdown(socket.SHUT_WR)
+
+        thread = threading.Thread(target=send_truncated_stream)
+        thread.start()
+        try:
+            with server_socket:
+                server.serve_connection(server_socket)
+        finally:
+            thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    operation_records = [
+        record
+        for record in audit_records
+        if record[0] == "helper.operation"
+        and record[1] == "stream_receive_failed"
+    ]
+    assert len(operation_records) == 1
+    fields = operation_records[0][2]
+    assert fields["request_id"] == request.request_id
+    assert fields["operation"] == "messages.append"
+    assert fields["actor"] == "sender@example.test"
+    assert fields["target"] == "sender@example.test"
+    assert fields["params"] == {"mailbox_special": "sent"}
+    assert fields["error_type"] == "StreamTruncated"
     assert list(tmp_path.glob("maddyweb-*.spool")) == []
 
 

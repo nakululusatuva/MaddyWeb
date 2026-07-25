@@ -67,6 +67,14 @@ def test_cloudflare_peer_and_login_limit_use_independent_addresses() -> None:
     assert "geo $realip_remote_addr $maddyweb_cloudflare_peer" in http
     assert "limit_req_zone $binary_remote_addr zone=maddyweb_auth_login:1m rate=5r/m;" in http
     assert "limit_req_zone $binary_remote_addr zone=maddyweb_auth_csrf:1m rate=30r/m;" in http
+    assert (
+        "limit_req_zone $binary_remote_addr zone=maddyweb_login_surface:1m rate=60r/m;"
+        in http
+    )
+    assert (
+        "limit_req_zone $binary_remote_addr zone=maddyweb_general:1m rate=300r/m;"
+        in http
+    )
     assert "limit_req_zone $binary_remote_addr zone=maddyweb_send:1m rate=10r/m;" in http
     assert "real_ip_header CF-Connecting-IP;" in realip
     assert "real_ip_recursive off;" in realip
@@ -91,6 +99,15 @@ def test_public_vhosts_pin_host_headers_health_rate_limit_and_tls() -> None:
         assert "return 444;" in source
         assert "location = /healthz {" in source
         assert re.search(r"location = /healthz \{\s*return 404;\s*\}", source)
+        for path in ("/login", "/static/login.css", "/static/login.js"):
+            assert f"location = {path} {{" in source
+        assert source.count(
+            "limit_req zone=maddyweb_login_surface burst=20 nodelay;"
+        ) == 3
+        assert re.search(
+            r"location / \{\s*limit_req zone=maddyweb_general burst=100 nodelay;",
+            source,
+        )
         assert "location = /api/v1/auth/password {" in source
         assert "location = /api/v1/auth/totp {" in source
         assert "location = /api/v1/auth/recovery {" in source
@@ -448,3 +465,12 @@ def test_installer_retains_public_edge_assets_in_immutable_release() -> None:
     ):
         assert name in install
     assert "immutable commit-named release" in guide
+
+
+def test_public_edge_checker_rejects_deprecated_visitor_tls() -> None:
+    checker = _read(ROOT / "deploy/public-edge/check-public-edge.sh")
+    assert "for modern_tls in 1.2 1.3; do" in checker
+    assert "for legacy_tls in tls1 tls1_1; do" in checker
+    assert "-cipher 'DEFAULT:@SECLEVEL=0'" in checker
+    assert "alert protocol version|SSL alert number 70" in checker
+    assert 'die "deprecated $legacy_tls verification was inconclusive"' in checker

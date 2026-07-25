@@ -186,6 +186,88 @@ async def test_account_list_coalesces_and_returns_independent_snapshots() -> Non
 
 
 @pytest.mark.asyncio
+async def test_account_list_cache_is_partitioned_by_authenticated_session() -> None:
+    client = FakeClient(
+        {
+            "accounts.list": Response.success(
+                "template",
+                [{"username": "user@example.test"}],
+            ),
+        }
+    )
+    gateway = gateway_with(client)
+    first_token = "A" * 43
+    second_token = "B" * 43
+
+    with bind_helper_identity(first_token):
+        assert await gateway.list_accounts()
+        assert await gateway.list_accounts()
+    with bind_helper_identity(second_token):
+        assert await gateway.list_accounts()
+    assert await gateway.list_accounts()
+
+    assert [request.auth_token for request in client.requests] == [
+        first_token,
+        second_token,
+        None,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_overlapping_account_reads_do_not_cross_session_boundaries() -> None:
+    first_token = "A" * 43
+    second_token = "B" * 43
+
+    class TokenClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__({})
+            self.started = {
+                first_token: threading.Event(),
+                second_token: threading.Event(),
+            }
+            self.release = {
+                first_token: threading.Event(),
+                second_token: threading.Event(),
+            }
+
+        def call(self, request: Request) -> Response:
+            token = request.auth_token
+            assert token in self.started
+            self.requests.append(request)
+            self.started[token].set()
+            assert self.release[token].wait(timeout=2)
+            return Response.success(
+                request.request_id,
+                [{"username": f"{token[0].lower()}@example.test"}],
+            )
+
+    client = TokenClient()
+    gateway = gateway_with(client)
+
+    async def read(token: str) -> Any:
+        with bind_helper_identity(token):
+            return await gateway.list_accounts()
+
+    first = asyncio.create_task(read(first_token))
+    assert await asyncio.to_thread(client.started[first_token].wait, 2)
+    second = asyncio.create_task(read(second_token))
+    assert await asyncio.to_thread(client.started[second_token].wait, 2)
+    client.release[second_token].set()
+    assert await second == ({"username": "b@example.test"},)
+    client.release[first_token].set()
+    assert await first == ({"username": "a@example.test"},)
+
+    assert await read(second_token) == ({"username": "b@example.test"},)
+    assert await read(first_token) == ({"username": "a@example.test"},)
+    assert [request.auth_token for request in client.requests] == [
+        first_token,
+        second_token,
+        second_token,
+        first_token,
+    ]
+
+
+@pytest.mark.asyncio
 async def test_account_list_failure_is_single_flight() -> None:
     client = FakeClient(
         {

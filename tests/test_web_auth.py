@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -377,9 +378,23 @@ async def test_unauthenticated_browser_is_confined_to_login_surface(
 ) -> None:
     client, gateway = auth_client
 
-    assert (await client.get("/login")).status == 200
-    assert (await client.get("/static/login.css")).status == 200
-    assert (await client.get("/static/login.js")).status == 200
+    login = await client.get("/login")
+    assert login.status == 200
+    login_html = await login.text()
+    asset_paths = re.findall(
+        r'(?:href|src)="(/static/login\.(?:css|js)\?v=[0-9a-f]{16})"',
+        login_html,
+    )
+    assert len(asset_paths) == 2
+    for path in asset_paths:
+        public_asset = await client.get(path)
+        assert public_asset.status == 200
+        assert "Set-Cookie" not in public_asset.headers
+        assert public_asset.headers["Cache-Control"] == (
+            "public, max-age=31536000, immutable"
+        )
+    assert (await client.get("/static/login.css")).status == 404
+    assert (await client.get("/static/login.js?v=incorrect")).status == 404
     assert (await client.get("/api/v1/auth/csrf")).status == 200
 
     for path in ("/", "/mail", "/compose", "/accounts", "/certificates", "/security"):
@@ -402,6 +417,31 @@ async def test_unauthenticated_browser_is_confined_to_login_surface(
     assert health.status == 200
     assert "accounts" not in await health.json()
     assert ("list_accounts",) not in gateway.operations
+
+
+@pytest.mark.asyncio
+async def test_versioned_login_assets_ignore_session_cookies_and_helper_outage(
+    auth_client: tuple[TestClient, AuthGateway],
+) -> None:
+    client, gateway = auth_client
+    login_html = await (await client.get("/login")).text()
+    asset_paths = re.findall(
+        r'(?:href|src)="(/static/login\.(?:css|js)\?v=[0-9a-f]{16})"',
+        login_html,
+    )
+    assert len(asset_paths) == 2
+    gateway.session_error = HelperCallError("backend_failure")
+
+    for cookie in ("maddyweb-session=malformed", f"maddyweb-session={'Z' * 43}"):
+        for path in asset_paths:
+            asset = await client.get(path, headers={"Cookie": cookie})
+            assert asset.status == 200
+            assert "Set-Cookie" not in asset.headers
+            assert asset.headers["Cache-Control"] == (
+                "public, max-age=31536000, immutable"
+            )
+
+    assert not any(operation[0] == "session" for operation in gateway.operations)
 
 
 @pytest.mark.asyncio

@@ -11,6 +11,12 @@ to the loopback application. SSH local forwarding remains an optional
 alternative for a deployment without the public edge. A public application
 listener, Docker port publication, or arbitrary reverse proxy is unsupported.
 
+The Cloudflare zone must use Full (strict) and a Minimum TLS Version of TLS
+1.2. Origin Nginx also permits only TLS 1.2 and TLS 1.3. Because each mail MX
+host exposes a co-located origin address, source-IP secrecy is not a security
+boundary; provider firewall rules should allow only Cloudflare ranges to
+origin ports 80 and 443 while preserving the required public mail ports.
+
 Public Nginx overwrites `Host`, `X-Real-IP`, and `X-Forwarded-Proto`, clears
 all other forwarding headers, and never exposes `/healthz`. The application
 trusts public-host proxy headers only from a loopback peer, requires the exact
@@ -107,6 +113,22 @@ whose role can be assigned only by the root `maddyweb auth-role` command.
 The Web interface cannot self-elevate. Every send, including administrator
 impersonation of another mailbox, re-verifies the selected sender mailbox's
 current password.
+
+Incoming mail is always untrusted. HTML is sanitized before storage in the
+preview model, active elements and remote resources are removed, and the
+result is served in a scriptless sandboxed iframe with an independent CSP.
+Only unique CID references backed by structurally valid, bounded,
+non-animated PNG, JPEG, GIF, or WebP data can render. Eligible CID images are
+embedded into the isolated document so viewing a message does not trigger
+separate message fetches. One message preview is limited by CID count,
+compressed bytes, decoded pixels, sanitized HTML size, element count and
+depth, MIME part count and depth, and header count and size. Content below an
+attached MIME container is never selected as the outer message body or as an
+inline resource. Attachments and raw messages are always download-only with
+`application/octet-stream`, `nosniff`, a safe filename, and a deny-all CSP.
+Display headers remove control, directional, and zero-width formatting
+characters; the original bytes remain available only through the explicit
+raw-message download.
 
 An address deleted with an external Maddy CLI must remain absent until root
 runs `maddyweb auth-purge` for that exact address. Recreating it first is

@@ -11,13 +11,14 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import copy
+import hashlib
 import logging
 import os
 import stat
 import time
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -50,6 +51,12 @@ _TARGET_ACCOUNT_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     default=None,
 )
 _USE_CONTEXT_TOKEN = object()
+
+
+def _authorization_cache_key(auth_token: str | None) -> bytes:
+    if auth_token is None:
+        return b""
+    return hashlib.sha256(auth_token.encode("ascii", "strict")).digest()
 
 
 @contextmanager
@@ -115,6 +122,7 @@ class _HealthCache:
 class _AccountCache:
     expires_at: float = 0.0
     value: tuple[dict[str, Any], ...] | None = None
+    auth_key: bytes = field(default=b"", repr=False)
 
 
 @dataclass(slots=True)
@@ -126,6 +134,8 @@ class _TaskOutcome:
 @dataclass(slots=True)
 class _AccountFlight:
     generation: int
+    auth_key: bytes = field(repr=False)
+    auth_token: str | None = field(repr=False)
     task: asyncio.Task[_TaskOutcome]
 
 
@@ -393,13 +403,14 @@ class HelperGateway:
             )
             return frozen
 
-    async def _fetch_accounts(self) -> tuple[dict[str, Any], ...]:
+    async def _fetch_accounts(self, auth_token: str | None) -> tuple[dict[str, Any], ...]:
         return tuple(
             dict(_mapping(account, "accounts.list item"))
             for account in _sequence(
                 await self._call(
                     "accounts.list",
                     {"include_append_limits": False},
+                    auth_token=auth_token,
                 ),
                 "accounts.list",
             )
@@ -425,11 +436,13 @@ class HelperGateway:
     async def _run_account_read(
         self,
         generation: int,
+        auth_key: bytes,
+        auth_token: str | None,
     ) -> _TaskOutcome:
         task = asyncio.current_task()
         try:
             try:
-                accounts = await self._fetch_accounts()
+                accounts = await self._fetch_accounts(auth_token)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -444,6 +457,7 @@ class HelperGateway:
                 self._account_cache = _AccountCache(
                     time.monotonic() + _ACCOUNT_CACHE_SECONDS,
                     accounts,
+                    auth_key,
                 )
             return _TaskOutcome(value=accounts)
         finally:
@@ -454,10 +468,14 @@ class HelperGateway:
             if flight is not None and flight.task is task:
                 self._account_flight = None
 
-    def _start_account_read(self) -> _AccountFlight:
+    def _start_account_read(
+        self,
+        auth_key: bytes,
+        auth_token: str | None,
+    ) -> _AccountFlight:
         generation = self._account_generation
-        task = asyncio.create_task(self._run_account_read(generation))
-        flight = _AccountFlight(generation, task)
+        task = asyncio.create_task(self._run_account_read(generation, auth_key, auth_token))
+        flight = _AccountFlight(generation, auth_key, auth_token, task)
         self._account_flight = flight
         self._account_read_tasks.add(task)
         task.add_done_callback(self._release_account_read_task)
@@ -483,6 +501,8 @@ class HelperGateway:
         # APPENDLIMIT has no bulk CLI in supported Maddy releases.  Avoid an
         # N+1 command storm on every account/mail/compose page; setting a limit
         # remains an explicit verified write operation.
+        auth_token = _AUTH_TOKEN.get()
+        auth_key = _authorization_cache_key(auth_token)
         while True:
             if self._account_mutations_inflight:
                 await self._wait_for_account_mutations()
@@ -493,12 +513,17 @@ class HelperGateway:
                 self._account_mutations_inflight == 0
                 and not self._account_cache_quarantined
                 and cached is not None
+                and self._account_cache.auth_key == auth_key
                 and self._account_cache.expires_at > now
             ):
                 return self._copy_accounts(cached)
             flight = self._account_flight
-            if flight is None or flight.generation != self._account_generation:
-                flight = self._start_account_read()
+            if (
+                flight is None
+                or flight.generation != self._account_generation
+                or flight.auth_key != auth_key
+            ):
+                flight = self._start_account_read(auth_key, auth_token)
             outcome = await asyncio.shield(flight.task)
             if outcome.error is not None:
                 raise outcome.error

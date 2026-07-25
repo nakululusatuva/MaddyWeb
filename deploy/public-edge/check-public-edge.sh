@@ -85,7 +85,7 @@ case "$profile" in
         ;;
 esac
 
-for command in awk basename cmp curl dirname getent grep openssl readlink realpath sed sha256sum stat systemctl ss tr; do
+for command in awk basename cmp curl dirname getent grep openssl readlink realpath sed sha256sum stat systemctl ss timeout tr; do
     command -v "$command" >/dev/null 2>&1 || die "required command not found: $command"
 done
 
@@ -421,6 +421,34 @@ esac
 
 getent ahosts "$domain" >/dev/null 2>&1 \
     || die "public hostname does not resolve: $domain"
+for modern_tls in 1.2 1.3; do
+    modern_status=$(
+        curl --noproxy '*' --silent --show-error --output /dev/null \
+            --write-out '%{http_code}' \
+            "--tlsv$modern_tls" --tls-max "$modern_tls" \
+            --connect-timeout 5 --max-time 15 "https://$domain/login"
+    ) || die "public edge does not complete TLS $modern_tls"
+    [[ "$modern_status" == "200" ]] \
+        || die "public edge TLS $modern_tls login returned HTTP $modern_status"
+done
+for legacy_tls in tls1 tls1_1; do
+    legacy_output=""
+    legacy_exit=0
+    legacy_output=$(
+        timeout 15 openssl s_client \
+            -connect "$domain:443" \
+            -servername "$domain" \
+            "-$legacy_tls" \
+            -cipher 'DEFAULT:@SECLEVEL=0' \
+            </dev/null 2>&1
+    ) || legacy_exit=$?
+    (( legacy_exit != 0 )) \
+        || die "public edge still accepts deprecated $legacy_tls"
+    (( legacy_exit != 124 )) \
+        || die "deprecated $legacy_tls verification timed out"
+    grep -Eiq 'alert protocol version|SSL alert number 70' <<<"$legacy_output" \
+        || die "deprecated $legacy_tls verification was inconclusive"
+done
 public_health_headers=$(
     curl --noproxy '*' --silent --show-error --dump-header - --output /dev/null \
         --connect-timeout 5 --max-time 15 "https://$domain/healthz"

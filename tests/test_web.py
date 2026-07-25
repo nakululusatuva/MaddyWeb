@@ -15,13 +15,32 @@ import pytest_asyncio
 from aiohttp import CookieJar, FormData
 from aiohttp.test_utils import TestClient, TestServer
 
-from maddyweb.mail import DeliveryRejected, MailError, PreparedMessage
-from maddyweb.web import MessagePage, _FreshnessStore, create_app
+from maddyweb.mail import (
+    MAX_RENDERED_CID_BYTES,
+    MAX_RENDERED_CID_IMAGES,
+    MAX_RENDERED_CID_PIXELS,
+    DeliveryRejected,
+    MailError,
+    ParsedAttachment,
+    ParsedMessage,
+    PreparedMessage,
+)
+from maddyweb.web import (
+    MessagePage,
+    _eligible_inline_attachments,
+    _FreshnessStore,
+    create_app,
+)
 
 FIXTURE_CREDENTIAL = "-".join(("account", "credential"))
 ADMIN_ACCOUNT_ID = "a" * 32
 DISABLED_ACCOUNT_ID = "d" * 32
 ADMIN_SESSION_TOKEN = "S" * 43
+VALID_PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d4948445200000001000000010804000000"
+    "b51c0c020000000b4944415478da6364f80f00010501012718e3660000"
+    "000049454e44ae426082"
+)
 
 
 def test_freshness_tokens_are_owner_bound_and_evict_without_global_failure() -> None:
@@ -47,6 +66,78 @@ def test_freshness_tokens_are_owner_bound_and_evict_without_global_failure() -> 
     assert store.consume(third_a, owner_a) is None
     assert store.consume(first_b, owner_b) is not None
     assert store.consume(newest, owner_c) is not None
+
+
+def _message_with_attachments(
+    attachments: tuple[ParsedAttachment, ...],
+) -> ParsedMessage:
+    return ParsedMessage(
+        subject="fixture",
+        sender="sender@example.test",
+        to=("recipient@example.test",),
+        cc=(),
+        date="",
+        message_id="<fixture@example.test>",
+        text="body",
+        html="<p>body</p>",
+        attachments=attachments,
+    )
+
+
+def test_inline_cid_rendering_bounds_count_bytes_pixels_and_duplicates() -> None:
+    count_limited = tuple(
+        ParsedAttachment(
+            str(index),
+            f"image-{index}.png",
+            "image/png",
+            VALID_PNG,
+            content_id=f"image-{index}",
+            inline=True,
+        )
+        for index in range(MAX_RENDERED_CID_IMAGES + 2)
+    )
+    selected = _eligible_inline_attachments(_message_with_attachments(count_limited))
+    assert len(selected) == MAX_RENDERED_CID_IMAGES
+
+    one_megabyte = VALID_PNG + b"\0" * (1024 * 1024)
+    byte_limited = tuple(
+        ParsedAttachment(
+            str(index),
+            f"large-{index}.png",
+            "image/png",
+            one_megabyte,
+            content_id=f"large-{index}",
+            inline=True,
+        )
+        for index in range(5)
+    )
+    selected = _eligible_inline_attachments(_message_with_attachments(byte_limited))
+    assert sum(item.size for item in selected) <= MAX_RENDERED_CID_BYTES
+    assert len(selected) == 3
+
+    large_pixels = bytearray(VALID_PNG)
+    large_pixels[16:20] = (2000).to_bytes(4, "big")
+    large_pixels[20:24] = (2000).to_bytes(4, "big")
+    pixel_limited = tuple(
+        ParsedAttachment(
+            str(index),
+            f"pixels-{index}.png",
+            "image/png",
+            bytes(large_pixels),
+            content_id=f"pixels-{index}",
+            inline=True,
+        )
+        for index in range(3)
+    )
+    selected = _eligible_inline_attachments(_message_with_attachments(pixel_limited))
+    assert len(selected) == 2
+    assert len(selected) * 2000 * 2000 == MAX_RENDERED_CID_PIXELS
+
+    duplicates = (
+        ParsedAttachment("0", "a.png", "image/png", VALID_PNG, "same", True),
+        ParsedAttachment("1", "b.png", "image/png", VALID_PNG, "same", True),
+    )
+    assert _eligible_inline_attachments(_message_with_attachments(duplicates)) == ()
 
 
 class FakeGateway:
@@ -111,7 +202,7 @@ class FakeGateway:
         html_part = incoming.get_payload()[-1]
         assert isinstance(html_part, EmailMessage)
         html_part.add_related(
-            b"\x89PNG\r\n\x1a\ninline-image",
+            VALID_PNG,
             maintype="image",
             subtype="png",
             cid="<logo>",
@@ -646,6 +737,26 @@ async def test_invalid_backend_account_payload_fails_closed(
 
 
 @pytest.mark.asyncio
+async def test_mail_summary_boundary_removes_directional_controls(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+    unsafe = "Invoice\u202ecod.exe\u2066\u200b"
+    gateway.message_rows[0]["from"] = unsafe
+    gateway.message_rows[0]["subject"] = unsafe
+    gateway.message_rows[0]["date"] = unsafe
+    context = urlencode({"account": ADMIN_ACCOUNT_ID, "mailbox": "INBOX"})
+
+    response, data = await _api_data(client, f"/api/v1/mail?{context}")
+
+    assert response.status == 200
+    message = data["messages"][0]
+    assert message["sender"] == "Invoicecod.exe"
+    assert message["subject"] == "Invoicecod.exe"
+    assert message["date"] == "Invoicecod.exe"
+
+
+@pytest.mark.asyncio
 async def test_mail_requires_account_and_mailbox_context_and_has_two_delete_levels(
     web_client: tuple[TestClient, FakeGateway],
 ) -> None:
@@ -679,23 +790,20 @@ async def test_mail_requires_account_and_mailbox_context_and_has_two_delete_leve
     assert html_body.headers["Referrer-Policy"] == "no-referrer"
     iframe_csp = html_body.headers["Content-Security-Policy"]
     assert "sandbox" in iframe_csp
-    assert "img-src 'self'" in iframe_csp
-    assert "data:" not in iframe_csp
+    assert "img-src data:" in iframe_csp
     assert "cid:" not in iframe_csp
     assert "tracker.test" not in rendered
     assert "script" not in rendered
-    assert "data:image" not in rendered
+    assert "data:image/png;base64," in rendered
     assert "cid:missing" not in rendered
     assert "cid:logo" not in rendered
-    assert (
-        f"/api/v1/admin/mail/42/inline/0?account={ADMIN_ACCOUNT_ID}&amp;mailbox=INBOX" in rendered
-    )
+    assert "/inline/" not in rendered
 
     inline = await client.get(f"/api/v1/mail/42/inline/0?{context}")
     assert inline.status == 200
     assert inline.content_type == "image/png"
     assert inline.headers["X-Content-Type-Options"] == "nosniff"
-    assert await inline.read() == b"\x89PNG\r\n\x1a\ninline-image"
+    assert await inline.read() == VALID_PNG
 
     attachment = await client.get(f"/api/v1/mail/42/attachments/1?{context}")
     assert attachment.content_type == "application/octet-stream"

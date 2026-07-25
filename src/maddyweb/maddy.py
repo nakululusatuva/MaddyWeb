@@ -26,6 +26,8 @@ from functools import total_ordering
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Protocol, Self
 
+from .mail import safe_display_header
+
 _SEMVER_RE = re.compile(
     r"\A(?:v)?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
     r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
@@ -1029,7 +1031,10 @@ def _strict_output_integer(
 
 
 def _clean_envelope_header(value: str) -> str:
-    return _HEADER_CONTROL_RE.sub(" ", value).strip()[:MAX_ENVELOPE_HEADER_OUTPUT_CHARS]
+    return safe_display_header(
+        _HEADER_CONTROL_RE.sub(" ", value).strip(),
+        maximum=MAX_ENVELOPE_HEADER_OUTPUT_CHARS,
+    )
 
 
 def _decode_q_word(value: str) -> bytes | None:

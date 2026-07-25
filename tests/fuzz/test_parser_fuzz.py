@@ -18,7 +18,7 @@ from maddyweb.maddy import (
     _config_tokens_and_text,
     parse_message_list,
 )
-from maddyweb.mail import MailError, parse_message
+from maddyweb.mail import MailError, parse_message, safe_inline_image_metadata
 from maddyweb.protocol import ProtocolError, decode_payload
 
 _SEED = 0x4D41444459574542
@@ -86,3 +86,5 @@ def test_untrusted_parsers_fail_closed_under_deterministic_mutation() -> None:
 
         with suppress(MailError):
             parse_message(payload)
+
+        safe_inline_image_metadata(payload)

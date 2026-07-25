@@ -36,6 +36,22 @@ MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
 MAX_TOTAL_ATTACHMENT_BYTES = 25 * 1024 * 1024
 MAX_ATTACHMENTS = 64
 MAX_MIME_PARTS = 128
+MAX_MIME_DEPTH = 32
+MAX_RENDERED_CID_IMAGES = 8
+MAX_RENDERED_CID_BYTES = 4 * 1024 * 1024
+MAX_RENDERED_CID_PIXELS = 8_000_000
+MAX_INLINE_IMAGE_DIMENSION = 4096
+MAX_INLINE_IMAGE_PIXELS = 4_000_000
+MAX_SANITIZED_HTML_CHARACTERS = 3 * 1024 * 1024
+MAX_SANITIZED_HTML_ELEMENTS = 4096
+MAX_SANITIZED_HTML_DEPTH = 64
+MAX_TOP_LEVEL_HEADER_BYTES = 64 * 1024
+MAX_HEADERS_PER_PART = 256
+MAX_HEADER_CHARACTERS_PER_PART = 64 * 1024
+MAX_MESSAGE_HEADERS = 512
+MAX_MESSAGE_HEADER_CHARACTERS = 128 * 1024
+MAX_ADDRESS_HEADER_VALUES = 32
+MAX_ADDRESS_HEADER_CHARACTERS = 16 * 1024
 MAX_SENDER_NAME_CHARACTERS = 256
 MAX_THREAD_MESSAGE_IDS = 32
 
@@ -44,7 +60,12 @@ _TOKEN_RE = re.compile(r"^[A-Za-z0-9!#$&^_.+-]+$")
 _CID_RE = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~@-]{1,200}$")
 _MESSAGE_ID_RE = re.compile(r"<[^<>\s@]+@[^<>\s@]+>", re.ASCII)
 _REPLY_PREFIX_RE = re.compile(r"\A\s*re(?:\[\d{1,4}\])?\s*:\s*", re.IGNORECASE)
+_CID_DATA_URL_RE = re.compile(
+    r"\Adata:image/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/]*={0,2}\Z",
+    re.ASCII,
+)
 _UNSAFE_FILENAME_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
+_UNSAFE_HEADER_CATEGORIES = _UNSAFE_FILENAME_CATEGORIES
 
 
 @cache
@@ -233,7 +254,9 @@ class _CidImageRewriter(HTMLParser):
             if source is None or not source.lower().startswith("cid:"):
                 return
             mapped = self.cid_urls.get(source[4:].strip("<>"))
-            if mapped is None or not mapped.startswith("/"):
+            if mapped is None or (
+                not mapped.startswith("/") and _CID_DATA_URL_RE.fullmatch(mapped) is None
+            ):
                 return
             rendered.append(f' src="{html.escape(mapped, quote=True)}"')
             seen.add("src")
@@ -269,6 +292,43 @@ class _CidImageRewriter(HTMLParser):
             self.parts.append(f"&#{name};")
 
 
+class _SanitizedHtmlBudget(HTMLParser):
+    _VOID_TAGS: ClassVar[frozenset[str]] = frozenset({"br", "col", "hr", "img"})
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.elements = 0
+        self.depth = 0
+
+    def _element(self, tag: str, *, nested: bool) -> None:
+        self.elements += 1
+        if self.elements > MAX_SANITIZED_HTML_ELEMENTS:
+            raise MailLimitError("HTML body has too many elements")
+        if nested and tag.lower() not in self._VOID_TAGS:
+            self.depth += 1
+            if self.depth > MAX_SANITIZED_HTML_DEPTH:
+                raise MailLimitError("HTML body nesting is too deep")
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._element(tag, nested=True)
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._element(tag, nested=False)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() not in self._VOID_TAGS and self.depth:
+            self.depth -= 1
+
+
+def _validate_sanitized_html(value: str) -> str:
+    if len(value) > MAX_SANITIZED_HTML_CHARACTERS:
+        raise MailLimitError("sanitized HTML body is too large")
+    parser = _SanitizedHtmlBudget()
+    parser.feed(value)
+    parser.close()
+    return value
+
+
 def html_to_text(value: str) -> str:
     """Create a conservative plain-text alternative without extra packages."""
 
@@ -295,18 +355,203 @@ def rewrite_cid_images(value: str, cid_urls: Mapping[str, str]) -> str:
     return "".join(parser.parts)
 
 
-def detect_safe_image_type(data: bytes) -> str | None:
-    """Recognize the four passive raster formats allowed in the mail iframe."""
+def _safe_image_dimensions(width: int, height: int) -> bool:
+    return (
+        0 < width <= MAX_INLINE_IMAGE_DIMENSION
+        and 0 < height <= MAX_INLINE_IMAGE_DIMENSION
+        and width * height <= MAX_INLINE_IMAGE_PIXELS
+    )
 
-    if data.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "image/png"
-    if data.startswith(b"\xff\xd8\xff"):
-        return "image/jpeg"
-    if data.startswith((b"GIF87a", b"GIF89a")):
-        return "image/gif"
-    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
-        return "image/webp"
+
+def _png_dimensions(data: bytes) -> tuple[int, int] | None:
+    if (
+        len(data) < 45
+        or not data.startswith(b"\x89PNG\r\n\x1a\n")
+        or data[8:12] != b"\x00\x00\x00\r"
+        or data[12:16] != b"IHDR"
+    ):
+        return None
+    dimensions = (
+        int.from_bytes(data[16:20], "big"),
+        int.from_bytes(data[20:24], "big"),
+    )
+    offset = 8
+    while offset + 12 <= len(data):
+        chunk_length = int.from_bytes(data[offset : offset + 4], "big")
+        chunk_end = offset + 12 + chunk_length
+        if chunk_end > len(data):
+            return None
+        chunk_type = data[offset + 4 : offset + 8]
+        if chunk_type == b"acTL":
+            return None
+        if chunk_type == b"IEND":
+            return dimensions if chunk_length == 0 else None
+        offset = chunk_end
     return None
+
+
+def _gif_dimensions(data: bytes) -> tuple[int, int] | None:
+    if len(data) < 14 or not data.startswith((b"GIF87a", b"GIF89a")):
+        return None
+    dimensions = (
+        int.from_bytes(data[6:8], "little"),
+        int.from_bytes(data[8:10], "little"),
+    )
+    packed = data[10]
+    offset = 13
+    if packed & 0x80:
+        offset += 3 * (1 << ((packed & 0x07) + 1))
+    image_count = 0
+    while offset < len(data):
+        marker = data[offset]
+        if marker == 0x3B:
+            return dimensions if image_count == 1 else None
+        if marker == 0x21:
+            if offset + 2 > len(data):
+                return None
+            offset += 2
+        elif marker == 0x2C:
+            if offset + 10 > len(data):
+                return None
+            image_count += 1
+            if image_count > 1:
+                return None
+            left = int.from_bytes(data[offset + 1 : offset + 3], "little")
+            top = int.from_bytes(data[offset + 3 : offset + 5], "little")
+            frame_width = int.from_bytes(data[offset + 5 : offset + 7], "little")
+            frame_height = int.from_bytes(data[offset + 7 : offset + 9], "little")
+            dimensions = (
+                max(dimensions[0], left + frame_width),
+                max(dimensions[1], top + frame_height),
+            )
+            if not _safe_image_dimensions(*dimensions):
+                return None
+            descriptor_packed = data[offset + 9]
+            offset += 10
+            if descriptor_packed & 0x80:
+                offset += 3 * (1 << ((descriptor_packed & 0x07) + 1))
+            if offset >= len(data):
+                return None
+            offset += 1
+        else:
+            return None
+        while offset < len(data):
+            block_size = data[offset]
+            offset += 1
+            if block_size == 0:
+                break
+            offset += block_size
+            if offset > len(data):
+                return None
+        else:
+            return None
+    return None
+
+
+def _jpeg_dimensions(data: bytes) -> tuple[int, int] | None:
+    if not data.startswith(b"\xff\xd8"):
+        return None
+    offset = 2
+    start_of_frame = {
+        0xC0,
+        0xC1,
+        0xC2,
+        0xC3,
+        0xC5,
+        0xC6,
+        0xC7,
+        0xC9,
+        0xCA,
+        0xCB,
+        0xCD,
+        0xCE,
+        0xCF,
+    }
+    standalone = {0x01, 0xD8, 0xD9, *range(0xD0, 0xD8)}
+    while offset < len(data):
+        if data[offset] != 0xFF:
+            return None
+        while offset < len(data) and data[offset] == 0xFF:
+            offset += 1
+        if offset >= len(data):
+            return None
+        marker = data[offset]
+        offset += 1
+        if marker in standalone:
+            if marker == 0xD9:
+                return None
+            continue
+        if marker == 0xDA or offset + 2 > len(data):
+            return None
+        segment_length = int.from_bytes(data[offset : offset + 2], "big")
+        if segment_length < 2 or offset + segment_length > len(data):
+            return None
+        if marker in start_of_frame:
+            if segment_length < 7:
+                return None
+            height = int.from_bytes(data[offset + 3 : offset + 5], "big")
+            width = int.from_bytes(data[offset + 5 : offset + 7], "big")
+            return width, height
+        offset += segment_length
+    return None
+
+
+def _webp_dimensions(data: bytes) -> tuple[int, int] | None:
+    if (
+        len(data) < 30
+        or not data.startswith(b"RIFF")
+        or data[8:12] != b"WEBP"
+        or int.from_bytes(data[4:8], "little") + 8 > len(data)
+    ):
+        return None
+    chunk = data[12:16]
+    if chunk == b"VP8X":
+        if data[20] & 0x02:
+            return None
+        width = int.from_bytes(data[24:27], "little") + 1
+        height = int.from_bytes(data[27:30], "little") + 1
+        return width, height
+    if chunk == b"VP8 " and data[23:26] == b"\x9d\x01\x2a":
+        width = int.from_bytes(data[26:28], "little") & 0x3FFF
+        height = int.from_bytes(data[28:30], "little") & 0x3FFF
+        return width, height
+    if chunk == b"VP8L" and data[20] == 0x2F:
+        dimensions = int.from_bytes(data[21:25], "little")
+        width = (dimensions & 0x3FFF) + 1
+        height = ((dimensions >> 14) & 0x3FFF) + 1
+        return width, height
+    return None
+
+
+def safe_inline_image_metadata(data: bytes) -> tuple[str, int, int] | None:
+    """Recognize one bounded, non-animated raster image for mail rendering."""
+
+    dimensions: tuple[int, int] | None = None
+    content_type: str | None = None
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        dimensions = _png_dimensions(data)
+        content_type = "image/png"
+    elif data.startswith((b"GIF87a", b"GIF89a")):
+        dimensions = _gif_dimensions(data)
+        content_type = "image/gif"
+    elif data.startswith(b"\xff\xd8"):
+        dimensions = _jpeg_dimensions(data)
+        content_type = "image/jpeg"
+    elif data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        dimensions = _webp_dimensions(data)
+        content_type = "image/webp"
+    if dimensions is None or not _safe_image_dimensions(*dimensions):
+        return None
+    if content_type is None:  # pragma: no cover - every recognized branch sets it
+        return None
+    return content_type, dimensions[0], dimensions[1]
+
+
+def detect_safe_image_type(data: bytes) -> str | None:
+    """Return the content type of a bounded passive raster image."""
+
+    metadata = safe_inline_image_metadata(data)
+    return metadata[0] if metadata is not None else None
 
 
 def sanitize_html_email(value: str) -> str:
@@ -322,16 +567,18 @@ def sanitize_html_email(value: str) -> str:
         raise MailLimitError("HTML body is too large")
     sanitizer = _load_nh3()
     if sanitizer is None:
-        return f"<pre>{html.escape(value)}</pre>"
-    return sanitizer.clean(
-        value,
-        tags=_HTML_TAGS,
-        attributes=_HTML_ATTRIBUTES,
-        clean_content_tags=_REMOVE_CONTENT_TAGS,
-        link_rel="noopener noreferrer nofollow",
-        strip_comments=True,
-        url_schemes={"cid", "http", "https", "mailto"},
-        attribute_filter=_mail_attribute_filter,
+        return _validate_sanitized_html(f"<pre>{html.escape(value)}</pre>")
+    return _validate_sanitized_html(
+        sanitizer.clean(
+            value,
+            tags=_HTML_TAGS,
+            attributes=_HTML_ATTRIBUTES,
+            clean_content_tags=_REMOVE_CONTENT_TAGS,
+            link_rel="noopener noreferrer nofollow",
+            strip_comments=True,
+            url_schemes={"cid", "http", "https", "mailto"},
+            attribute_filter=_mail_attribute_filter,
+        )
     )
 
 
@@ -361,7 +608,7 @@ def sandboxed_html_document(value: str, *, already_sanitized: bool = False) -> s
         '<!doctype html><html lang="und"><head><meta charset="utf-8">'
         '<meta name="referrer" content="no-referrer">'
         '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; '
-        "base-uri 'none'; form-action 'none'; img-src 'self'; object-src 'none'; "
+        "base-uri 'none'; form-action 'none'; img-src data:; object-src 'none'; "
         "style-src 'unsafe-inline'\">"
         "<style>body{box-sizing:border-box;margin:0;padding:1rem;color:#172033;"
         "font:15px/1.55 system-ui,sans-serif;overflow-wrap:anywhere}"
@@ -1174,10 +1421,101 @@ def _decode_text_part(part: Message) -> str:
     return value
 
 
-def _header_text(message: Message, name: str) -> str:
-    value = message.get(name, "")
+def safe_display_header(value: object, *, maximum: int = 998) -> str:
+    """Remove control and directional formatting characters from a display header."""
+
+    if maximum <= 0:
+        raise ValueError("display header maximum must be positive")
     rendered = str(value)
-    return _CONTROL_RE.sub("", rendered)[:998]
+    return "".join(
+        character
+        for character in rendered
+        if unicodedata.category(character) not in _UNSAFE_HEADER_CATEGORIES
+    )[:maximum]
+
+
+def _header_text(message: Message, name: str) -> str:
+    return safe_display_header(message.get(name, ""))
+
+
+def _header_values(message: Message, name: str) -> tuple[str, ...]:
+    return tuple(safe_display_header(value) for value in message.get_all(name, []))
+
+
+def _validate_top_level_headers(raw: bytes) -> None:
+    stream = io.BytesIO(raw)
+    header_bytes = 0
+    header_count = 0
+    while True:
+        line = stream.readline(MAX_TOP_LEVEL_HEADER_BYTES + 2)
+        if not line:
+            return
+        header_bytes += len(line)
+        if header_bytes > MAX_TOP_LEVEL_HEADER_BYTES:
+            raise MailLimitError("top-level message headers are too large")
+        content = line.rstrip(b"\r\n")
+        if not content:
+            return
+        if content[:1] in {b" ", b"\t"}:
+            continue
+        if b":" not in content:
+            return
+        header_count += 1
+        if header_count > MAX_HEADERS_PER_PART:
+            raise MailLimitError("too many top-level message headers")
+
+
+def _validate_part_headers(part: Message) -> tuple[int, int]:
+    header_count = 0
+    header_characters = 0
+    address_values = 0
+    address_characters = 0
+    for name, value in part.raw_items():
+        header_count += 1
+        header_characters += len(name) + len(value)
+        if (
+            header_count > MAX_HEADERS_PER_PART
+            or header_characters > MAX_HEADER_CHARACTERS_PER_PART
+        ):
+            raise MailLimitError("message headers are too large")
+        if name.casefold() in {"to", "cc", "reply-to"}:
+            address_values += 1
+            address_characters += len(value)
+            if (
+                address_values > MAX_ADDRESS_HEADER_VALUES
+                or address_characters > MAX_ADDRESS_HEADER_CHARACTERS
+            ):
+                raise MailLimitError("message address headers are too large")
+    return header_count, header_characters
+
+
+def _bounded_message_parts(message: Message) -> Iterator[tuple[Message, bool]]:
+    stack: list[tuple[Message, int, bool]] = [(message, 0, False)]
+    part_count = 0
+    while stack:
+        part, depth, under_attachment = stack.pop()
+        if depth > MAX_MIME_DEPTH:
+            raise MailLimitError("MIME nesting is too deep")
+        part_count += 1
+        if part_count > MAX_MIME_PARTS:
+            raise MailLimitError("too many MIME parts")
+        yield part, under_attachment
+        if not part.is_multipart():
+            continue
+        payload = part.get_payload()
+        if not isinstance(payload, list) or any(
+            not isinstance(child, Message) for child in payload
+        ):
+            raise MailError("invalid multipart message")
+        child_under_attachment = (
+            under_attachment
+            or part.get_content_disposition() == "attachment"
+            or part.get_filename() is not None
+            or part.get_content_type().lower() == "message/rfc822"
+        )
+        stack.extend(
+            (child, depth + 1, child_under_attachment) for child in reversed(payload)
+        )
 
 
 def parse_message(raw: bytes) -> ParsedMessage:
@@ -1185,8 +1523,25 @@ def parse_message(raw: bytes) -> ParsedMessage:
 
     if len(raw) > MAX_RAW_MESSAGE_BYTES:
         raise MailLimitError("raw message is too large")
+    _validate_top_level_headers(raw)
+    parsed_part_count = 0
+
+    def bounded_message_factory(*args: Any, **kwargs: Any) -> EmailMessage:
+        nonlocal parsed_part_count
+        parsed_part_count += 1
+        if parsed_part_count > MAX_MIME_PARTS:
+            raise MailLimitError("too many MIME parts")
+        return EmailMessage(*args, **kwargs)
+
     try:
-        message = BytesParser(policy=policy.default).parsebytes(raw)
+        message = BytesParser(
+            _class=bounded_message_factory,
+            policy=policy.default,
+        ).parsebytes(raw)
+    except MailLimitError:
+        raise
+    except RecursionError as exc:
+        raise MailLimitError("MIME nesting is too deep") from exc
     except (TypeError, ValueError) as exc:
         raise MailError("invalid message") from exc
 
@@ -1194,11 +1549,17 @@ def parse_message(raw: bytes) -> ParsedMessage:
     html_body: str | None = None
     attachments: list[ParsedAttachment] = []
     total_attachment_bytes = 0
-    part_count = 0
-    for part in message.walk():
-        part_count += 1
-        if part_count > MAX_MIME_PARTS:
-            raise MailLimitError("too many MIME parts")
+    total_headers = 0
+    total_header_characters = 0
+    for part, under_attachment in _bounded_message_parts(message):
+        part_headers, part_header_characters = _validate_part_headers(part)
+        total_headers += part_headers
+        total_header_characters += part_header_characters
+        if (
+            total_headers > MAX_MESSAGE_HEADERS
+            or total_header_characters > MAX_MESSAGE_HEADER_CHARACTERS
+        ):
+            raise MailLimitError("message headers are too large")
         if part.is_multipart():
             continue
         content_type = part.get_content_type().lower()
@@ -1206,6 +1567,8 @@ def parse_message(raw: bytes) -> ParsedMessage:
         filename = part.get_filename()
         content_id = _header_text(part, "Content-ID").strip("<>") or None
         is_body = (
+            not under_attachment
+            and
             disposition != "attachment"
             and filename is None
             and content_type
@@ -1237,7 +1600,8 @@ def parse_message(raw: bytes) -> ParsedMessage:
                 content_type=content_type,
                 data=payload,
                 content_id=content_id,
-                inline=disposition == "inline" or content_id is not None,
+                inline=not under_attachment
+                and (disposition == "inline" or content_id is not None),
             )
         )
 
@@ -1248,14 +1612,14 @@ def parse_message(raw: bytes) -> ParsedMessage:
     return ParsedMessage(
         subject=_header_text(message, "Subject") or "(No subject)",
         sender=_header_text(message, "From"),
-        to=tuple(str(value) for value in message.get_all("To", [])),
-        cc=tuple(str(value) for value in message.get_all("Cc", [])),
+        to=_header_values(message, "To"),
+        cc=_header_values(message, "Cc"),
         date=_header_text(message, "Date"),
         message_id=_header_text(message, "Message-ID"),
         text=text_body,
         html=html_body,
         attachments=tuple(attachments),
-        reply_to=tuple(str(value) for value in message.get_all("Reply-To", [])),
+        reply_to=_header_values(message, "Reply-To"),
         in_reply_to=in_reply_to[0] if in_reply_to else "",
         references=references,
     )
@@ -1288,7 +1652,9 @@ __all__ = [
     "reply_subject",
     "reply_thread_headers",
     "rewrite_cid_images",
+    "safe_display_header",
     "safe_filename",
+    "safe_inline_image_metadata",
     "sandboxed_html_document",
     "sanitize_html_email",
 ]

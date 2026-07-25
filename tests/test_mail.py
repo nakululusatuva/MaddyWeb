@@ -10,6 +10,13 @@ from urllib.parse import unquote
 import pytest
 
 from maddyweb.mail import (
+    MAX_ADDRESS_HEADER_CHARACTERS,
+    MAX_HEADERS_PER_PART,
+    MAX_INLINE_IMAGE_DIMENSION,
+    MAX_MIME_DEPTH,
+    MAX_MIME_PARTS,
+    MAX_SANITIZED_HTML_DEPTH,
+    MAX_SANITIZED_HTML_ELEMENTS,
     Attachment,
     DeliveryRejected,
     DeliveryUncertain,
@@ -28,12 +35,27 @@ from maddyweb.mail import (
     reply_subject,
     reply_thread_headers,
     rewrite_cid_images,
+    safe_display_header,
     safe_filename,
+    safe_inline_image_metadata,
     sandboxed_html_document,
     sanitize_html_email,
 )
 
 FIXTURE_CREDENTIAL = "-".join(("account", "credential"))
+VALID_PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d4948445200000001000000010804000000"
+    "b51c0c020000000b4944415478da6364f80f00010501012718e3660000"
+    "000049454e44ae426082"
+)
+VALID_GIF = bytes.fromhex(
+    "47494638396101000100800000000000ffffff2c00000000010001000002014c003b"
+)
+VALID_WEBP = bytes.fromhex(
+    "52494646220000005745425056503820160000003001009d012a0100010001402625"
+    "a400037000feff3d58000000"
+)
+VALID_JPEG_HEADER = bytes.fromhex("ffd8ffc0000b080001000103011100")
 
 
 def _message(**changes: object) -> OutgoingMessage:
@@ -51,12 +73,29 @@ def test_html_sanitizer_blocks_active_content_and_remote_images() -> None:
     cleaned = sanitize_html_email(
         "<style>body{background:url(https://tracker.test/x)}</style>"
         '<script>alert(1)</script><iframe src="https://evil.test"></iframe>'
+        '<meta http-equiv="refresh" content="0;url=https://meta.test/">'
+        '<base href="https://base.test/"><link rel="stylesheet" href="https://css.test/x">'
+        '<form action="https://form.test/"><input autofocus name="token"></form>'
+        '<svg><foreignObject><script>alert(2)</script></foreignObject></svg>'
+        "<math><annotation-xml encoding=\"text/html\"><script>alert(3)</script>"
+        "</annotation-xml></math>"
+        '<object data="https://object.test/x"></object>'
+        '<embed src="https://embed.test/x"><video poster="https://video.test/x"></video>'
         '<img src="https://tracker.test/pixel"><img src="//tracker.test/pixel">'
-        '<img src="data:image/svg+xml,x"><img src="cid:logo.1">'
+        '<img src="data:image/svg+xml,x" srcset="https://srcset.test/x 1x">'
+        '<img src="cid:logo.1" onerror="alert(4)" style="background:url(https://style.test/x)">'
+        '<a href="javascript:alert(5)" ping="https://ping.test/x">Unsafe link</a>'
         '<a href="https://example.test/path">Link</a>'
     )
     assert "script" not in cleaned
     assert "iframe" not in cleaned
+    assert "foreignObject" not in cleaned
+    assert "http-equiv" not in cleaned
+    assert "srcset" not in cleaned
+    assert "onerror" not in cleaned
+    assert "style=" not in cleaned
+    assert "javascript:" not in cleaned
+    assert "ping=" not in cleaned
     assert "tracker.test" not in cleaned
     assert "data:image" not in cleaned
     assert 'src="cid:logo.1"' in cleaned
@@ -68,9 +107,8 @@ def test_sandbox_document_has_no_network_capability() -> None:
     assert "tracker.test" not in document
     assert "default-src 'none'" in document
     assert "form-action 'none'" in document
-    assert "img-src 'self'" in document
+    assert "img-src data:" in document
     assert "img-src cid:" not in document
-    assert "img-src data:" not in document
 
 
 def test_cid_rewriter_only_maps_exact_known_safe_url() -> None:
@@ -87,8 +125,67 @@ def test_cid_rewriter_only_maps_exact_known_safe_url() -> None:
     assert "data:" not in rewritten
     assert "tracker.test" not in rewritten
     assert rewritten.count("<img") == 1
-    assert detect_safe_image_type(b"\x89PNG\r\n\x1a\nrest") == "image/png"
+    assert detect_safe_image_type(VALID_PNG) == "image/png"
     assert detect_safe_image_type(b"<svg></svg>") is None
+
+
+def test_cid_rewriter_accepts_only_validated_raster_data_urls() -> None:
+    sanitized = sanitize_html_email('<img src="cid:known"><img src="cid:missing">')
+    encoded = "data:image/png;base64," + "A" * 12
+    assert encoded in rewrite_cid_images(sanitized, {"known": encoded})
+    for unsafe in (
+        "data:image/svg+xml;base64,AAAA",
+        "data:text/html;base64,AAAA",
+        "data:image/png;base64,AAAA<script>",
+        "javascript:alert(1)",
+    ):
+        assert "<img" not in rewrite_cid_images(sanitized, {"known": unsafe})
+
+
+def test_sanitized_html_bounds_elements_and_depth() -> None:
+    with pytest.raises(MailLimitError, match="too many elements"):
+        sanitize_html_email("<span></span>" * (MAX_SANITIZED_HTML_ELEMENTS + 1))
+    with pytest.raises(MailLimitError, match="nesting"):
+        sanitize_html_email(
+            "<div>" * (MAX_SANITIZED_HTML_DEPTH + 1)
+            + "body"
+            + "</div>" * (MAX_SANITIZED_HTML_DEPTH + 1)
+        )
+
+
+def test_inline_image_detector_rejects_animation_and_decode_bombs() -> None:
+    assert safe_inline_image_metadata(VALID_PNG) == ("image/png", 1, 1)
+    assert safe_inline_image_metadata(VALID_GIF) == ("image/gif", 1, 1)
+    assert safe_inline_image_metadata(VALID_JPEG_HEADER) == ("image/jpeg", 1, 1)
+    assert safe_inline_image_metadata(VALID_WEBP) == ("image/webp", 1, 1)
+
+    oversized_png = bytearray(VALID_PNG)
+    oversized_png[16:20] = (MAX_INLINE_IMAGE_DIMENSION + 1).to_bytes(4, "big")
+    assert safe_inline_image_metadata(bytes(oversized_png)) is None
+
+    pixel_bomb = bytearray(VALID_PNG)
+    pixel_bomb[16:20] = (8000).to_bytes(4, "big")
+    pixel_bomb[20:24] = (8000).to_bytes(4, "big")
+    assert safe_inline_image_metadata(bytes(pixel_bomb)) is None
+
+    comment_with_comma = b"\x21\xfe\x01\x2c\x00"
+    static_gif_with_comma = VALID_GIF[:19] + comment_with_comma + VALID_GIF[19:]
+    assert safe_inline_image_metadata(static_gif_with_comma) == ("image/gif", 1, 1)
+
+    second_frame = VALID_GIF[19:-1]
+    animated_gif = VALID_GIF[:-1] + second_frame + b"\x3b"
+    assert safe_inline_image_metadata(animated_gif) is None
+
+    animated_png_control = bytes.fromhex(
+        "000000086163544c000000010000000000000000"
+    )
+    animated_png = VALID_PNG[:-12] + animated_png_control + VALID_PNG[-12:]
+    assert safe_inline_image_metadata(animated_png) is None
+
+    animated_webp = bytearray(VALID_WEBP)
+    animated_webp[12:16] = b"VP8X"
+    animated_webp[20] = 0x02
+    assert safe_inline_image_metadata(bytes(animated_webp)) is None
 
 
 def test_attachment_filename_and_headers_are_download_only() -> None:
@@ -279,6 +376,128 @@ def test_parse_received_message_sanitizes_html_and_attachment_name() -> None:
     assert "script" not in parsed.html
     assert "tracker.test" not in parsed.html
     assert parsed.attachments[0].filename == "payload.html"
+
+
+def _nested_multipart(depth: int) -> bytes:
+    chunks: list[str] = []
+    for index in range(depth):
+        boundary = f"b{index}"
+        chunks.append(
+            f"Content-Type: multipart/mixed; boundary={boundary}\r\n\r\n"
+            f"--{boundary}\r\n"
+        )
+    chunks.append("Content-Type: text/plain\r\n\r\nbody\r\n")
+    for index in reversed(range(depth)):
+        chunks.append(f"--b{index}--\r\n")
+    return "".join(chunks).encode("ascii")
+
+
+def test_parse_message_bounds_mime_depth_and_part_construction() -> None:
+    assert parse_message(_nested_multipart(MAX_MIME_DEPTH)).text == "body"
+    with pytest.raises(MailLimitError, match="nesting"):
+        parse_message(_nested_multipart(MAX_MIME_DEPTH + 1))
+    with pytest.raises(MailLimitError):
+        parse_message(_nested_multipart(1100))
+
+    boundary = "siblings"
+    parts = "".join(
+        f"--{boundary}\r\nContent-Type: application/octet-stream\r\n\r\n\r\n"
+        for _ in range(MAX_MIME_PARTS)
+    )
+    siblings = (
+        f"From: sender@example.test\r\n"
+        f"Content-Type: multipart/mixed; boundary={boundary}\r\n\r\n"
+        f"{parts}--{boundary}--\r\n"
+    ).encode("ascii")
+    with pytest.raises(MailLimitError, match="too many MIME parts"):
+        parse_message(siblings)
+
+
+def test_attached_message_body_and_cid_are_never_rendered_as_outer_content() -> None:
+    attached = EmailMessage()
+    attached["From"] = "nested@example.test"
+    attached["To"] = "recipient@example.test"
+    attached["Subject"] = "Nested"
+    attached.set_content("nested plain text")
+    attached.add_alternative(
+        '<b>nested HTML</b><img src="cid:nested-logo">',
+        subtype="html",
+    )
+    nested_html = attached.get_payload()[-1]
+    assert isinstance(nested_html, EmailMessage)
+    nested_html.add_related(
+        VALID_PNG,
+        maintype="image",
+        subtype="png",
+        cid="<nested-logo>",
+        filename="nested.png",
+        disposition="inline",
+    )
+
+    outer = EmailMessage()
+    outer["From"] = "sender@example.test"
+    outer["To"] = "recipient@example.test"
+    outer["Subject"] = "Outer"
+    outer.set_content("outer plain text")
+    outer.add_attachment(attached, filename="attached-message.eml")
+
+    parsed = parse_message(outer.as_bytes(policy=policy.SMTP))
+
+    assert parsed.text.strip() == "outer plain text"
+    assert parsed.html is None
+    assert parsed.attachments
+    assert all(not attachment.inline for attachment in parsed.attachments)
+
+
+def test_parse_message_rejects_header_count_and_address_bombs() -> None:
+    too_many_headers = "".join(
+        f"X-Test-{index}: value\r\n" for index in range(MAX_HEADERS_PER_PART + 1)
+    )
+    with pytest.raises(MailLimitError, match="headers"):
+        parse_message((too_many_headers + "\r\nbody").encode("ascii"))
+
+    repeated_recipients = "".join(
+        f"To: User{index} <user{index}@example.test>\r\n" for index in range(20_000)
+    )
+    with pytest.raises(MailLimitError, match="headers"):
+        parse_message(
+            (
+                "From: sender@example.test\r\n"
+                "Subject: recipient bomb\r\n"
+                f"{repeated_recipients}\r\nbody"
+            ).encode("ascii")
+        )
+
+    recipients = ", ".join(
+        f"user{index}@example.test"
+        for index in range(MAX_ADDRESS_HEADER_CHARACTERS // 20 + 200)
+    )
+    with pytest.raises(MailLimitError, match="address headers"):
+        parse_message(
+            (
+                "From: sender@example.test\r\n"
+                f"To: {recipients}\r\n"
+                "Subject: one large address header\r\n\r\nbody"
+            ).encode("ascii")
+        )
+
+
+def test_display_headers_remove_directional_and_invisible_controls() -> None:
+    unsafe = "Invoice\u202ecod.exe\u2066\u200b"
+    assert safe_display_header(unsafe) == "Invoicecod.exe"
+
+    source = EmailMessage()
+    source["From"] = f"{unsafe} <sender@example.test>"
+    source["To"] = "recipient@example.test"
+    source["Subject"] = unsafe
+    source.set_content("body")
+    parsed = parse_message(source.as_bytes(policy=policy.SMTP))
+    assert parsed.subject == "Invoicecod.exe"
+    assert parsed.sender == '"Invoicecod.exe" <sender@example.test>'
+    assert all(
+        character not in parsed.subject + parsed.sender
+        for character in "\u202e\u2066\u200b"
+    )
 
 
 def test_parse_html_only_message_provides_sanitized_plain_text_fallback() -> None:

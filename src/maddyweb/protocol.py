@@ -28,6 +28,8 @@ _ID_RE = re.compile(r"\A[A-Za-z0-9_.-]{1,64}\Z")
 _OPERATION_RE = re.compile(r"\A[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*){1,5}\Z")
 _ERROR_CODE_RE = re.compile(r"\A[a-z][a-z0-9_]{0,63}\Z")
 _AUTH_TOKEN_RE = re.compile(r"\A[A-Za-z0-9_-]{43}\Z")
+_MAX_JSON_INTEGER_DIGITS = 20
+_MAX_JSON_FLOAT_CHARACTERS = 128
 
 
 class ProtocolError(ValueError):
@@ -58,10 +60,31 @@ def _reject_constant(value: str) -> None:
     raise ProtocolError(f"non-standard JSON constant is not allowed: {value}")
 
 
+def _bounded_int(value: str) -> int:
+    digits = value[1:] if value.startswith("-") else value
+    if len(digits) > _MAX_JSON_INTEGER_DIGITS:
+        raise ProtocolError("JSON integer is too large")
+    parsed = int(value)
+    if parsed.bit_length() > 64:
+        raise ProtocolError("JSON integer is outside the supported range")
+    return parsed
+
+
+def _bounded_float(value: str) -> float:
+    if len(value) > _MAX_JSON_FLOAT_CHARACTERS:
+        raise ProtocolError("JSON floating-point number is too large")
+    parsed = float(value)
+    if parsed != parsed or parsed in {float("inf"), float("-inf")}:
+        raise ProtocolError("non-finite JSON number")
+    return parsed
+
+
 def _validate_json_value(value: Any, *, depth: int = 0) -> None:
     if depth > 32:
         raise ProtocolError("JSON nesting is too deep")
     if value is None or isinstance(value, bool | int | float | str):
+        if isinstance(value, int) and not isinstance(value, bool) and value.bit_length() > 64:
+            raise ProtocolError("JSON integer is outside the supported range")
         if isinstance(value, float) and (value != value or value in {float("inf"), float("-inf")}):
             raise ProtocolError("non-finite JSON number")
         return
@@ -109,10 +132,15 @@ def decode_payload(payload: bytes, *, max_bytes: int = DEFAULT_MAX_FRAME_BYTES) 
     if len(payload) > max_bytes:
         raise FrameTooLarge(f"frame exceeds {max_bytes} bytes")
     try:
-        decoded = json.loads(payload.decode("utf-8"), parse_constant=_reject_constant)
+        decoded = json.loads(
+            payload.decode("utf-8"),
+            parse_constant=_reject_constant,
+            parse_float=_bounded_float,
+            parse_int=_bounded_int,
+        )
     except UnicodeDecodeError as exc:
         raise ProtocolError("frame body is not valid UTF-8") from exc
-    except (json.JSONDecodeError, RecursionError) as exc:
+    except (RecursionError, ValueError) as exc:
         raise ProtocolError("frame body is not valid JSON") from exc
     if not isinstance(decoded, dict):
         raise ProtocolError("a protocol message must be a JSON object")

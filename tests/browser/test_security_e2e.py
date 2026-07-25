@@ -833,19 +833,43 @@ async def test_message_html_is_sandboxed_and_attachment_filename_is_safe(
     frame = page.frame_locator("iframe.message-frame")
     assert "Safe body" in await frame.locator("body").inner_text()
     assert await frame.locator("script").count() == 0
+    for active_tag in (
+        "meta",
+        "style",
+        "form",
+        "input",
+        "svg",
+        "math",
+        "iframe",
+        "object",
+        "embed",
+    ):
+        assert await frame.locator(f"body {active_tag}").count() == 0
+    assert await frame.locator('head meta[charset="utf-8"]').count() == 1
+    assert await frame.locator(
+        'head meta[http-equiv="Content-Security-Policy"]'
+    ).count() == 1
+    assert await frame.locator("head style").count() == 1
     assert await frame.locator("body").get_attribute("data-xss") is None
+    assert await frame.locator("[onerror], [srcset], [style]").count() == 0
+    assert await frame.locator("#unsafe-link").count() == 0
+    assert await page.evaluate(
+        "typeof window.svgXss === 'undefined' "
+        "&& typeof window.mathXss === 'undefined' "
+        "&& typeof window.imageXss === 'undefined' "
+        "&& typeof window.linkXss === 'undefined'"
+    )
     image_sources = await frame.locator("img").evaluate_all(
         "images => images.map(image => image.getAttribute('src'))"
     )
-    assert all(
-        source is None or (source.startswith("/api/v1/admin/mail/") and "/inline/" in source)
-        for source in image_sources
-    )
+    assert len(image_sources) == 1
+    assert image_sources[0].startswith("data:image/png;base64,")
     assert await frame_element.get_attribute("sandbox") == ""
     assert await frame_element.get_attribute("referrerpolicy") == "no-referrer"
-    assert not any("tracker.invalid" in url or url.startswith("data:") for url in requested_urls)
+    assert not any(".invalid" in url or url.startswith("data:") for url in requested_urls)
     assert html_headers
     assert "sandbox" in html_headers[0]["content-security-policy"]
+    assert "img-src data:" in html_headers[0]["content-security-policy"]
     assert html_headers[0]["referrer-policy"] == "no-referrer"
 
     attachment = page.locator("#attachment-list li").filter(has_text="evil.html")
