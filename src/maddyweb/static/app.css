@@ -4041,7 +4041,7 @@ html[data-view="message"] .app-footer {
 
   .mail-list-table .message-row-action {
     width: 100%;
-    min-height: 44px;
+    min-height: 45px;
     font-size: 11px;
   }
 }
