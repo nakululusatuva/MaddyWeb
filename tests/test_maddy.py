@@ -770,9 +770,7 @@ def test_message_list_removes_directional_and_invisible_formatting() -> None:
     encoded = base64.b64encode(unsafe.encode("utf-8")).decode("ascii")
 
     raw_record = parse_message_list(full_message_record(1, 1, unsafe))[0]
-    encoded_record = parse_message_list(
-        full_message_record(2, 2, f"=?UTF-8?B?{encoded}?=")
-    )[0]
+    encoded_record = parse_message_list(full_message_record(2, 2, f"=?UTF-8?B?{encoded}?="))[0]
 
     assert raw_record["subject"] == "Visiblecod.exe"
     assert encoded_record["subject"] == "Visiblecod.exe"
@@ -1220,7 +1218,7 @@ def test_current_native_env_or_import_config_is_read_only(tmp_path: Path) -> Non
             service.require_write_safety(Capability.MESSAGE_ADMIN)
 
 
-def test_every_write_safety_gate_refreshes_version_and_help_profile(tmp_path: Path) -> None:
+def test_write_safety_refreshes_version_and_reuses_matching_help_profile(tmp_path: Path) -> None:
     config = tmp_path / "maddy.conf"
     config.write_text("auth.pass_table local_authdb {}\n", encoding="utf-8")
     runner = HelpRunner(verify_config=True)
@@ -1231,12 +1229,8 @@ def test_every_write_safety_gate_refreshes_version_and_help_profile(tmp_path: Pa
     service.require_write_safety(Capability.MESSAGE_ADMIN)
     service.require_write_safety(Capability.MESSAGE_ADMIN)
     assert sum(call[-1] == "version" for call in runner.calls) == 2
-    top_level_help = [
-        call
-        for call in runner.calls
-        if call[-1] == "--help" and "-config" in call and call[-2] != "version"
-    ]
-    assert len(top_level_help) >= 2
+    top_level_help = [call for call in runner.calls if call[-1] == "--help" and len(call) == 4]
+    assert len(top_level_help) == 1
 
 
 def test_write_gate_blocks_a_version_changed_after_startup(tmp_path: Path) -> None:

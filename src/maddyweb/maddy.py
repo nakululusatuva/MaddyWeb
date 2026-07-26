@@ -1292,6 +1292,7 @@ class MaddyService:
             with suppress(UnsupportedVersion):
                 self._version = require_supported_version(version)
         self._cli_fingerprint = cli_fingerprint
+        self._cli_fingerprint_version = self._version if cli_fingerprint is not None else None
         self._legacy_config_checked = False
         self._legacy_config_has_ldap = False
         self._legacy_config_has_import = False
@@ -1524,9 +1525,13 @@ class MaddyService:
         """Validate the actual help contract before permitting any CLI write."""
 
         with self._lock:
-            if self._cli_fingerprint is not None and not refresh:
-                return self._cli_fingerprint
             version = self.probe_version()
+            if (
+                self._cli_fingerprint is not None
+                and self._cli_fingerprint_version == version
+                and not refresh
+            ):
+                return self._cli_fingerprint
             if str(version) not in self._PROFILED_RELEASES:
                 raise CapabilityFingerprintError("Maddy release has no locked CLI profile")
             normalized_profile: list[str] = []
@@ -1577,6 +1582,7 @@ class MaddyService:
                 signatures.append(f"{' '.join(suffix)} --help")
             digest = hashlib.sha256("\n".join(normalized_profile).encode("utf-8")).hexdigest()
             self._cli_fingerprint = CliFingerprint(digest, tuple(signatures))
+            self._cli_fingerprint_version = version
             return self._cli_fingerprint
 
     def _read_effective_config(self) -> str:
@@ -1677,7 +1683,7 @@ class MaddyService:
         }
 
     def require_write_safety(self, capability: Capability) -> SemVer:
-        """Re-probe every mutable-operation gate immediately before use."""
+        """Revalidate runtime identity and the attested CLI contract before a write."""
 
         with self._lock:
             version = self.probe_version(refresh=True)
@@ -1693,7 +1699,11 @@ class MaddyService:
                 # never remain allowed because of a stale startup cache.
                 self._legacy_config_checked = False
             self._ensure_legacy_auth_safe(version)
-            self.probe_cli_fingerprint(refresh=True)
+            # A complete CLI help profile costs dozens of container executions.
+            # Bind the attestation to the freshly observed version and reuse it for
+            # this bounded helper activation. Any version drift forces a complete
+            # profile scan before the write can proceed.
+            self.probe_cli_fingerprint()
             return version
 
     def _require(self, capability: Capability, *, write: bool = False) -> SemVer:

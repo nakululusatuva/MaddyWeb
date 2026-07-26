@@ -177,6 +177,7 @@ class FakeGateway:
         self.delivery_error: Exception | None = None
         self.spool_gate: asyncio.Event | None = None
         self.spool_active = 0
+        self.spool_calls = 0
         self.two_spools_started = asyncio.Event()
         self.health_payload: dict[str, object] = {
             "status": "ok",
@@ -282,6 +283,7 @@ class FakeGateway:
         *,
         max_bytes: int,
     ) -> int:
+        self.spool_calls += 1
         self.operations.append(("spool_message", account_id, mailbox, message_id))
         if self.spool_gate is not None:
             self.spool_active += 1
@@ -479,7 +481,7 @@ async def test_home_static_assets_and_strict_headers(
     assert response.status == 200
     assert "Administration overview" in page
     assert 'href="/static/app.css?v=13"' in page
-    assert 'src="/static/app.js?v=16"' in page
+    assert 'src="/static/app.js?v=17"' in page
     assert 'id="compose-sender-name"' in page
     assert 'name="sender_name"' in page
     assert 'maxlength="256"' in page
@@ -1118,6 +1120,20 @@ async def test_mailbox_payload_rejects_invalid_special_use_attributes(
 
     assert response.status == 502
     assert payload["error"]["code"] == "invalid_backend_response"
+
+
+@pytest.mark.asyncio
+async def test_message_detail_reuses_bounded_parsing_but_issues_fresh_action_tokens(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+    context = urlencode({"account": ADMIN_ACCOUNT_ID, "mailbox": "INBOX"})
+    _first_response, first = await _api_data(client, f"/api/v1/mail/42?{context}")
+    _second_response, second = await _api_data(client, f"/api/v1/mail/42?{context}")
+
+    assert gateway.spool_calls == 1
+    assert second["subject"] == first["subject"]
+    assert second["freshness_token"] != first["freshness_token"]
 
 
 @pytest.mark.asyncio

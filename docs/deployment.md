@@ -433,7 +433,9 @@ and coalesces simultaneous successful or failed page reads with a shared task. E
 a generation and clears the cache before invocation and again when the helper call finishes. Even if the HTTP request is cancelled,
 the background call completes invalidation. A stale read crossing a generation may neither refill nor return; an uncertain transport
 result quarantines the cache until a later serialized account read succeeds. The health storage probe does not use the page cache.
-The helper's pre-send account check and each write's version, configuration, and CLI fingerprint check never use it either.
+The helper's pre-send account check and each write's version and configuration checks never use it either.
+The complete CLI help profile is bound to the freshly observed Maddy version and reused only for the bounded
+helper activation; a version change forces a complete re-attestation before any write.
 
 A cold health check in Docker mode must probe the full Maddy CLI fingerprint, so its duration includes `docker exec` startup
 cost. The smoke test therefore limits listener, helper socket, and health separately to 20, 3, and 10

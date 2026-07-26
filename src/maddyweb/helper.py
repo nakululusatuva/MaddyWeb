@@ -2133,15 +2133,18 @@ class UnixHelperServer:
             request = Request.from_payload(
                 receive_frame(connection, max_bytes=self.max_frame_bytes)
             )
-            preflight_failure, preflight_fields = self.dispatcher.preflight(request)
-            if preflight_failure is not None:
-                send_frame(
-                    connection,
-                    preflight_failure.to_payload(),
-                    max_bytes=self.max_frame_bytes,
-                )
-                return
             if request.stream_length is not None:
+                # Stream requests must be authorized before any attacker-controlled
+                # bytes are accepted. Dispatch authorizes them again after the upload
+                # so a session cannot be revoked midway and still perform a write.
+                preflight_failure, preflight_fields = self.dispatcher.preflight(request)
+                if preflight_failure is not None:
+                    send_frame(
+                        connection,
+                        preflight_failure.to_payload(),
+                        max_bytes=self.max_frame_bytes,
+                    )
+                    return
                 stream_audit_fields = preflight_fields
                 receiving_stream = True
                 if request.stream_length > self.max_stream_bytes:

@@ -569,6 +569,15 @@ async def test_authenticated_application_bundle_is_never_publicly_cacheable(
         assert "no-store" in directives
         assert "public" not in directives
 
+    versioned = await client.get("/static/app.js?v=17")
+    assert versioned.status == 200
+    directives = {
+        directive.strip().casefold() for directive in versioned.headers["Cache-Control"].split(",")
+    }
+    assert "private" in directives
+    assert "immutable" in directives
+    assert "public" not in directives
+
 
 @pytest.mark.asyncio
 async def test_first_login_enrollment_and_recovery_login_flows(

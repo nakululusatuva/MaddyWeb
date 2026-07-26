@@ -335,8 +335,11 @@ class BrowserSecurityGateway:
         mailbox: str,
         message_ids: Sequence[str],
     ) -> str:
+        self.trash_move_started.set()
+        await self.trash_move_release.wait()
         self.bulk_moves.append((account, mailbox, tuple(message_ids), TRASH_MAILBOX))
         self.message_location = TRASH_MAILBOX
+        self.trash_move_finished.set()
         return TRASH_MAILBOX
 
     async def move_messages_to_archive(
@@ -345,8 +348,11 @@ class BrowserSecurityGateway:
         mailbox: str,
         message_ids: Sequence[str],
     ) -> str:
+        self.archive_move_started.set()
+        await self.archive_move_release.wait()
         self.bulk_moves.append((account, mailbox, tuple(message_ids), ARCHIVE_MAILBOX))
         self.message_location = ARCHIVE_MAILBOX
+        self.archive_move_finished.set()
         return ARCHIVE_MAILBOX
 
     async def delete_message_permanently(

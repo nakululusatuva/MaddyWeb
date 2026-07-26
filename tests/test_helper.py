@@ -190,6 +190,7 @@ def make_dispatcher(
 ) -> PrivilegedDispatcher:
     dispatcher_type = PrivilegedDispatcher
     if auth_store is None:
+
         class LegacyOperationDispatcher(PrivilegedDispatcher):
             def _authorize_request(
                 self,
@@ -458,6 +459,7 @@ async def test_gateway_and_helper_accept_ordinary_user_own_opaque_id(
     assert server_errors == []
     assert page["items"][0]["uid"] == 1
     assert maddy.message_list_args == [("sender@example.test", "INBOX")]
+    assert maddy.account_list_modes == [False]
 
 
 def test_admin_can_resolve_an_opaque_target_account_id(tmp_path: Path) -> None:
@@ -1168,9 +1170,7 @@ def test_message_moves_allow_bounded_selection_but_deletion_requires_one_uid(
         )
     )
     assert moved_many.response.result == {"moved": True, "target": "Custom Trash"}
-    assert maddy.moved_many == [
-        ("sender@example.test", "INBOX", "41,42", "Custom Trash")
-    ]
+    assert maddy.moved_many == [("sender@example.test", "INBOX", "41,42", "Custom Trash")]
 
     move_all = dispatcher.dispatch(
         Request.create(
@@ -1847,8 +1847,7 @@ def test_authorized_truncated_stream_has_attributed_operation_audit(
     operation_records = [
         record
         for record in audit_records
-        if record[0] == "helper.operation"
-        and record[1] == "stream_receive_failed"
+        if record[0] == "helper.operation" and record[1] == "stream_receive_failed"
     ]
     assert len(operation_records) == 1
     fields = operation_records[0][2]

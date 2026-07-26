@@ -540,8 +540,9 @@ ssh -vv -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=yes \
 - Browser cookies are scoped to the loopback hostname, not the local port. When two MaddyWeb servers may be
   forwarded at the same time, configure different `security.session_cookie_name` and
   `security.csrf_cookie_name` values with the `__Host-` prefix on each
-  server. The SPA synchronizes its process-bound CSRF token immediately before each write, but unique cookie
-  names also prevent one remote server from replacing another server's cookie.
+  server. Large upload writes synchronize through the token-only endpoint before sending the body. Small JSON
+  writes recover once only from a CSRF rejection that the middleware proves occurred before the operation
+  handler ran. Unique cookie names prevent one remote server from replacing another server's cookie.
 
 ## Incident stop conditions
 

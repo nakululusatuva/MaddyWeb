@@ -80,6 +80,9 @@ MAX_MESSAGE_CURSOR = (1 << 32) - 1
 MAILBOX_CURSOR_CAPACITY = 4096
 MESSAGE_FRESHNESS_CAPACITY = 4096
 MESSAGE_FRESHNESS_PER_SESSION = 64
+PARSED_MESSAGE_CACHE_SECONDS = 60.0
+PARSED_MESSAGE_CACHE_CAPACITY = 32
+PARSED_MESSAGE_CACHE_MAX_BYTES = 32 * 1024 * 1024
 MAX_BULK_MESSAGE_UIDS = 50
 MAX_TOTP_QR_SVG_CHARS = 256 * 1024
 _SPA_PATHS = frozenset({"/", "/accounts", "/certificates", "/compose", "/mail", "/security"})
@@ -90,6 +93,7 @@ _SETTINGS_KEY = web.AppKey("web_settings", object)
 _MAIL_WORK_KEY = web.AppKey("mail_work_semaphore", object)
 _MAIL_CURSOR_KEY = web.AppKey("mail_cursor_store", object)
 _FRESHNESS_KEY = web.AppKey("message_freshness_store", object)
+_PARSED_MESSAGE_CACHE_KEY = web.AppKey("parsed_message_cache", object)
 _AUTH_PRINCIPAL_KEY = web.RequestKey("authenticated_principal", object)
 _AUTH_TOKEN_KEY = web.RequestKey("authenticated_session_token", str)
 _CLIENT_IP_KEY = web.RequestKey("authenticated_client_ip", str)
@@ -490,6 +494,106 @@ class _FreshnessStore:
         return self._remove(token)
 
 
+@dataclass(frozen=True, slots=True)
+class _ParsedMessageCacheEntry:
+    message: ParsedMessage
+    digest: str
+    size: int
+    expires_at: float
+
+
+class _ParsedMessageCache:
+    """Short-lived, bounded cache for immutable IMAP message bodies."""
+
+    def __init__(
+        self,
+        *,
+        ttl_seconds: float = PARSED_MESSAGE_CACHE_SECONDS,
+        capacity: int = PARSED_MESSAGE_CACHE_CAPACITY,
+        max_bytes: int = PARSED_MESSAGE_CACHE_MAX_BYTES,
+    ) -> None:
+        if ttl_seconds <= 0 or capacity <= 0 or max_bytes <= 0:
+            raise ValueError("parsed message cache limits must be positive")
+        self._ttl_seconds = ttl_seconds
+        self._capacity = capacity
+        self._max_bytes = max_bytes
+        self._size = 0
+        self._entries: OrderedDict[
+            tuple[str, str, str],
+            _ParsedMessageCacheEntry,
+        ] = OrderedDict()
+
+    def _remove(self, key: tuple[str, str, str]) -> None:
+        entry = self._entries.pop(key, None)
+        if entry is not None:
+            self._size -= entry.size
+
+    def _prune(self, now: float) -> None:
+        for key, entry in tuple(self._entries.items()):
+            if entry.expires_at <= now:
+                self._remove(key)
+
+    def get(
+        self,
+        account: str,
+        mailbox: str,
+        uid: str,
+    ) -> tuple[ParsedMessage, str] | None:
+        now = time.monotonic()
+        self._prune(now)
+        key = (account, mailbox, uid)
+        entry = self._entries.get(key)
+        if entry is None:
+            return None
+        self._entries.move_to_end(key)
+        return entry.message, entry.digest
+
+    def put(
+        self,
+        account: str,
+        mailbox: str,
+        uid: str,
+        message: ParsedMessage,
+        digest: str,
+        *,
+        size: int,
+    ) -> None:
+        if size <= 0 or size > self._max_bytes // 2:
+            return
+        now = time.monotonic()
+        self._prune(now)
+        key = (account, mailbox, uid)
+        self._remove(key)
+        while self._entries and (
+            len(self._entries) >= self._capacity or self._size + size > self._max_bytes
+        ):
+            self._remove(next(iter(self._entries)))
+        self._entries[key] = _ParsedMessageCacheEntry(
+            message=message,
+            digest=digest,
+            size=size,
+            expires_at=now + self._ttl_seconds,
+        )
+        self._size += size
+
+    def invalidate(
+        self,
+        account: str,
+        mailbox: str | None = None,
+        uids: Sequence[str] | None = None,
+    ) -> None:
+        selected = set(uids) if uids is not None else None
+        for key in tuple(self._entries):
+            key_account, key_mailbox, key_uid = key
+            if key_account != account:
+                continue
+            if mailbox is not None and key_mailbox != mailbox:
+                continue
+            if selected is not None and key_uid not in selected:
+                continue
+            self._remove(key)
+
+
 def _message_page(value: MessagePage | Mapping[str, object]) -> MessagePage:
     """Normalize a gateway page without inferring continuation from item count."""
 
@@ -677,6 +781,13 @@ def _freshness_store(request: web.Request) -> _FreshnessStore:
     if not isinstance(store, _FreshnessStore):
         raise RuntimeError("message freshness store is not configured")
     return store
+
+
+def _parsed_message_cache(request: web.Request) -> _ParsedMessageCache:
+    cache_store = request.app[_PARSED_MESSAGE_CACHE_KEY]
+    if not isinstance(cache_store, _ParsedMessageCache):
+        raise RuntimeError("parsed message cache is not configured")
+    return cache_store
 
 
 def _freshness_owner(request: web.Request) -> str:
@@ -1000,6 +1111,16 @@ def _authentication_middleware() -> web.middleware:
             return await handler(request)
 
         token = request.cookies.get(_session_cookie_name(request))
+        if (
+            request.path == "/api/v1/auth/csrf"
+            and isinstance(token, str)
+            and re.fullmatch(r"[A-Za-z0-9_-]{43}", token) is not None
+        ):
+            # CSRF synchronization needs only the opaque cookie as its scope.
+            # The following POST performs full session authorization, so avoid
+            # an otherwise redundant privileged Maddy account check here.
+            request[_AUTH_TOKEN_KEY] = token
+            return await handler(request)
         principal: Mapping[str, object] | None = None
         invalid_session = bool(token)
         if token and re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
@@ -1922,6 +2043,7 @@ async def delete_mailbox(request: web.Request) -> web.Response:
         await _gateway(request).delete_mailbox(account_id)
     except Exception:
         return await _gateway_error(request, "Permanent mailbox deletion failed")
+    _parsed_message_cache(request).invalidate(account_id)
     return _api_response(message="Mailbox permanently deleted.")
 
 
@@ -2154,13 +2276,32 @@ async def _parsed_message_snapshot(
     account: str,
     mailbox_name: str,
 ) -> tuple[ParsedMessage, str]:
-    spool = await _spool_raw_message(request, account, mailbox_name)
+    message_id = _message_uid(request.match_info["message_id"])
+    await _authorize_mail_context(request, account, mailbox_name)
+    cached = _parsed_message_cache(request).get(account, mailbox_name, message_id)
+    if cached is not None:
+        return cached
+    spool = await _spool_raw_message(
+        request,
+        account,
+        mailbox_name,
+        authorized=True,
+    )
     try:
         digest = await asyncio.to_thread(_file_sha256, spool.path)
         if spool.size > MAX_RAW_MESSAGE_BYTES:
             raise PreviewTooLarge(spool.size, digest)
         raw = await asyncio.to_thread(spool.path.read_bytes)
-        return await asyncio.to_thread(parse_message, raw), digest
+        message = await asyncio.to_thread(parse_message, raw)
+        _parsed_message_cache(request).put(
+            account,
+            mailbox_name,
+            message_id,
+            message,
+            digest,
+            size=spool.size,
+        )
+        return message, digest
     except PreviewTooLarge:
         raise
     except MailError as exc:
@@ -2173,9 +2314,12 @@ async def _spool_raw_message(
     request: web.Request,
     account: str,
     mailbox_name: str,
+    *,
+    authorized: bool = False,
 ) -> RawMessageSpool:
     message_id = _message_uid(request.match_info["message_id"])
-    await _authorize_mail_context(request, account, mailbox_name)
+    if not authorized:
+        await _authorize_mail_context(request, account, mailbox_name)
     settings = _settings(request)
     _ensure_temp_directory(settings)
     descriptor, filename = tempfile.mkstemp(
@@ -2266,12 +2410,14 @@ async def _verify_message_freshness(
     try:
         spool = await _spool_raw_message(request, account, mailbox)
     except web.HTTPException as exc:
+        _parsed_message_cache(request).invalidate(account, mailbox, (uid,))
         raise web.HTTPConflict(text="Message state changed; refresh and try again.") from exc
     try:
         current_digest = await asyncio.to_thread(_file_sha256, spool.path)
     finally:
         await asyncio.to_thread(spool.cleanup)
     if not secrets.compare_digest(entry.digest, current_digest):
+        _parsed_message_cache(request).invalidate(account, mailbox, (uid,))
         raise web.HTTPConflict(text="Message state changed; refresh and try again.")
 
 
@@ -2597,6 +2743,7 @@ async def move_message_to_trash(request: web.Request) -> web.Response:
             "Backend returned an invalid Trash mailbox.",
             status=502,
         )
+    _parsed_message_cache(request).invalidate(account, mailbox_name, (message_id,))
     return _api_response(
         data={"account": account, "mailbox": target},
         message="Message moved to Trash.",
@@ -2632,6 +2779,7 @@ async def move_message_to_archive(request: web.Request) -> web.Response:
             "Backend returned an invalid Archive mailbox.",
             status=502,
         )
+    _parsed_message_cache(request).invalidate(account, mailbox_name, (message_id,))
     return _api_response(
         data={"account": account, "mailbox": target},
         message="Message archived.",
@@ -2658,6 +2806,7 @@ async def delete_message_permanently(request: web.Request) -> web.Response:
         await _gateway(request).delete_message_permanently(account, mailbox_name, message_id)
     except Exception:
         return await _gateway_error(request, "Permanent message deletion failed")
+    _parsed_message_cache(request).invalidate(account, mailbox_name, (message_id,))
     return _api_response(message="Message permanently deleted.")
 
 
@@ -2754,9 +2903,7 @@ async def set_message_read_state(request: web.Request) -> web.Response:
 def _selected_message_uids(values: Mapping[str, Any]) -> tuple[str, ...]:
     raw = values.get("uids")
     if not isinstance(raw, list) or not 1 <= len(raw) <= MAX_BULK_MESSAGE_UIDS:
-        raise web.HTTPBadRequest(
-            text=f"Select between 1 and {MAX_BULK_MESSAGE_UIDS} messages."
-        )
+        raise web.HTTPBadRequest(text=f"Select between 1 and {MAX_BULK_MESSAGE_UIDS} messages.")
     selected: list[str] = []
     seen: set[str] = set()
     for value in raw:
@@ -2831,6 +2978,8 @@ async def bulk_message_action(request: web.Request) -> web.Response:
             message = f"{affected} message{'s' if affected != 1 else ''} moved to Trash."
     except Exception:
         return await _gateway_error(request, "Bulk message action failed")
+    if action in {"archive", "trash"} and selected is not None:
+        _parsed_message_cache(request).invalidate(account, mailbox_name, selected)
     return _api_response(
         data={"account": account, "mailbox": mailbox_name, "affected": affected},
         message=message,
@@ -2869,6 +3018,7 @@ async def move_message_to_folder(request: web.Request) -> web.Response:
         raise
     except Exception:
         return await _gateway_error(request, "Could not move message")
+    _parsed_message_cache(request).invalidate(account, mailbox_name, (message_id,))
     return _api_response(
         data={"account": account, "mailbox": moved_to},
         message="Message moved.",
@@ -2901,6 +3051,7 @@ async def rename_mailbox(request: web.Request) -> web.Response:
         await _gateway(request).rename_mailbox(account, old_name, new_name)
     except Exception:
         return await _gateway_error(request, "Could not rename mailbox")
+    _parsed_message_cache(request).invalidate(account, old_name)
     return _api_response(data={"name": new_name}, message="Folder renamed.")
 
 
@@ -2917,6 +3068,7 @@ async def delete_named_mailbox(request: web.Request) -> web.Response:
         await _gateway(request).delete_named_mailbox(account, name)
     except Exception:
         return await _gateway_error(request, "Could not delete empty mailbox")
+    _parsed_message_cache(request).invalidate(account, name)
     return _api_response(message="Empty folder deleted.")
 
 
@@ -3547,6 +3699,18 @@ async def static_asset(request: web.Request) -> web.Response:
         if len(request.query) != 1 or versions != [_login_asset_version()]:
             raise web.HTTPNotFound()
         cache_control = "public, max-age=31536000, immutable"
+    else:
+        application_versions = {
+            "app.css": "13",
+            "app.js": "17",
+            "preview.css": "1",
+        }
+        versions = request.query.getall("v", [])
+        if len(request.query) == 1 and versions == [application_versions[name]]:
+            # These assets still require an authenticated request on a cold
+            # browser. Once received, their versioned URLs can be reused
+            # without spending bandwidth on every authenticated page load.
+            cache_control = "private, max-age=31536000, immutable"
     return web.Response(
         body=_static_body(name),
         content_type=content_type,
@@ -3663,6 +3827,7 @@ def create_app(config: object, gateway: Gateway) -> web.Application:
     app[_MAIL_WORK_KEY] = asyncio.Semaphore(2)
     app[_MAIL_CURSOR_KEY] = _MailboxCursorStore(ttl_seconds=csrf_ttl)
     app[_FRESHNESS_KEY] = _FreshnessStore(ttl_seconds=csrf_ttl)
+    app[_PARSED_MESSAGE_CACHE_KEY] = _ParsedMessageCache()
     app[_SESSION_COOKIE_KEY] = session_cookie_name
     app[_PUBLIC_ORIGIN_KEY] = public_origin
     app[_SECURE_COOKIE_KEY] = secure_cookies

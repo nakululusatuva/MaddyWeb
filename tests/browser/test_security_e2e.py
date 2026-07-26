@@ -532,18 +532,17 @@ async def test_anonymous_browser_loads_only_login_then_completes_password_and_to
 
         await page.route("**/api/v1/auth/totp", pause_totp)
         totp_submit = page.locator("#totp-submit")
-        initial_color = await totp_submit.evaluate(
-            "node => getComputedStyle(node).backgroundColor"
-        )
+        initial_color = await totp_submit.evaluate("node => getComputedStyle(node).backgroundColor")
         try:
             await totp_submit.click()
             await asyncio.wait_for(totp_started.wait(), timeout=2)
             assert "is-verifying" in (await totp_submit.get_attribute("class") or "")
             assert await totp_submit.inner_text() == "Verifying..."
             assert await totp_submit.get_attribute("aria-busy") == "true"
-            assert await totp_submit.evaluate(
-                "node => getComputedStyle(node).backgroundColor"
-            ) != initial_color
+            assert (
+                await totp_submit.evaluate("node => getComputedStyle(node).backgroundColor")
+                != initial_color
+            )
         finally:
             release_totp.set()
 
@@ -1035,7 +1034,7 @@ async def test_forward_as_attachment_does_not_require_a_parseable_message(
     ]
 
 
-async def test_mailbox_actions_abort_stale_reads_and_close_pending_confirmations(
+async def test_mailbox_actions_avoid_body_reads_and_close_pending_confirmations(
     page: Page,
     live_application: LiveApplication,
 ) -> None:
@@ -1043,14 +1042,19 @@ async def test_mailbox_actions_abort_stale_reads_and_close_pending_confirmations
     live_application.gateway.message_read_started.clear()
     live_application.gateway.message_read_release.clear()
     row = page.locator("#message-list-body tr")
+    live_application.gateway.archive_move_release.clear()
     await row.get_by_role("button", name="Archive", exact=True).click()
-    await asyncio.wait_for(live_application.gateway.message_read_started.wait(), timeout=2)
+    await asyncio.wait_for(live_application.gateway.archive_move_started.wait(), timeout=2)
+    assert not live_application.gateway.message_read_started.is_set()
     await page.go_back()
-    live_application.gateway.message_read_release.set()
+    live_application.gateway.archive_move_release.set()
     await page.get_by_role("heading", name=MAILBOX, exact=True).wait_for()
     await asyncio.sleep(0.1)
-    assert live_application.gateway.archive_moves == []
+    assert live_application.gateway.bulk_moves == [
+        (ACCOUNT, MAILBOX, (MESSAGE_ID,), ARCHIVE_MAILBOX)
+    ]
 
+    live_application.gateway.message_location = MAILBOX
     await _load_inbox(page, live_application)
     live_application.gateway.message_read_started.clear()
     row = page.locator("#message-list-body tr")
@@ -1059,7 +1063,7 @@ async def test_mailbox_actions_abort_stale_reads_and_close_pending_confirmations
     assert not live_application.gateway.message_read_started.is_set()
     await page.go_back()
     await page.locator("#confirm-dialog").wait_for(state="hidden")
-    assert live_application.gateway.trash_moves == []
+    assert not any(move[-1] == TRASH_MAILBOX for move in live_application.gateway.bulk_moves)
 
 
 async def test_special_use_mailboxes_disable_same_target_actions(
@@ -1116,7 +1120,9 @@ async def test_completed_move_posts_do_not_hijack_a_newer_route(
     await asyncio.sleep(0.1)
     assert urlsplit(page.url).path == "/"
     assert await page.locator("#toast").is_hidden()
-    assert live_application.gateway.archive_moves == [(ACCOUNT, MAILBOX, MESSAGE_ID)]
+    assert live_application.gateway.bulk_moves == [
+        (ACCOUNT, MAILBOX, (MESSAGE_ID,), ARCHIVE_MAILBOX)
+    ]
 
     live_application.gateway.message_location = MAILBOX
     await _load_inbox(page, live_application)
@@ -1137,7 +1143,12 @@ async def test_completed_move_posts_do_not_hijack_a_newer_route(
     await asyncio.sleep(0.1)
     assert urlsplit(page.url).path == "/"
     assert await page.locator("#toast").is_hidden()
-    assert live_application.gateway.trash_moves == [(ACCOUNT, MAILBOX, MESSAGE_ID)]
+    assert live_application.gateway.bulk_moves[-1] == (
+        ACCOUNT,
+        MAILBOX,
+        (MESSAGE_ID,),
+        TRASH_MAILBOX,
+    )
 
 
 async def test_mailbox_delete_and_archive_actions_do_not_open_the_message(
@@ -1153,7 +1164,7 @@ async def test_mailbox_delete_and_archive_actions_do_not_open_the_message(
     await page.locator("#confirm-action").click()
     await page.locator("#confirm-dialog").wait_for(state="hidden")
     await page.locator("#message-empty").wait_for(state="visible")
-    assert live_application.gateway.trash_moves == [(ACCOUNT, MAILBOX, MESSAGE_ID)]
+    assert live_application.gateway.bulk_moves == [(ACCOUNT, MAILBOX, (MESSAGE_ID,), TRASH_MAILBOX)]
     assert live_application.gateway.permanent_deletions == []
 
     live_application.gateway.message_location = MAILBOX
@@ -1162,7 +1173,12 @@ async def test_mailbox_delete_and_archive_actions_do_not_open_the_message(
     await row.get_by_role("button", name="Archive", exact=True).press("Enter")
     await page.locator("#message-empty").wait_for(state="visible")
     assert urlsplit(page.url).path == "/mail"
-    assert live_application.gateway.archive_moves == [(ACCOUNT, MAILBOX, MESSAGE_ID)]
+    assert live_application.gateway.bulk_moves[-1] == (
+        ACCOUNT,
+        MAILBOX,
+        (MESSAGE_ID,),
+        ARCHIVE_MAILBOX,
+    )
     assert live_application.gateway.message_location == ARCHIVE_MAILBOX
 
 

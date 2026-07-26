@@ -459,20 +459,31 @@
     return state.csrfToken;
   };
 
+  const refreshCsrfToken = async (signal = undefined) => {
+    const {payload, response} = await requestJson(`${API_ROOT}/auth/csrf`, {
+      allowErrorStatus: true,
+      signal,
+    });
+    if (!response.ok) throw errorFromResponse(response, payload);
+    const token = stringValue(objectValue(objectValue(payload).data).csrf_token);
+    if (!token) throw new ApiError("The server did not provide a CSRF token.");
+    state.csrfToken = token;
+    return token;
+  };
+
   const executeMutation = async (path, options) => {
-    // The process-bound token can expire, become invalid after a service
-    // restart, or be rotated by another tab. Synchronize immediately before
-    // every serialized write so the header and HttpOnly cookie still match.
-    // A rejected write is never retried automatically.
     const guardSignal = options.guardSignal instanceof AbortSignal
       ? options.guardSignal
       : null;
-    await refreshSession(guardSignal || undefined);
+    // Multipart requests may be large, so synchronize their token through the
+    // cheap token-only endpoint before uploading. Small JSON writes use the
+    // current token and may retry once only when CSRF middleware proves that
+    // the request was rejected before its handler ran.
+    if (!state.csrfToken || options.formData instanceof FormData) {
+      await refreshCsrfToken(guardSignal || undefined);
+    }
     if (guardSignal) guardSignal.throwIfAborted();
-    const headers = {
-      "Accept": "application/json",
-      "X-CSRF-Token": state.csrfToken,
-    };
+    const headers = {"Accept": "application/json"};
     let body;
     if (options.formData instanceof FormData) {
       body = options.formData;
@@ -483,29 +494,49 @@
       body = JSON.stringify(values);
     }
 
-    let response;
-    try {
-      response = await fetch(apiPath(path), {
+    const send = async () => {
+      headers["X-CSRF-Token"] = state.csrfToken;
+      return fetch(apiPath(path), {
         method: "POST",
         body,
         credentials: "same-origin",
         headers,
       });
+    };
+    let response;
+    let payload;
+    try {
+      response = await send();
+      let replacementToken = response.headers.get("X-CSRF-Token");
+      if (replacementToken) state.csrfToken = replacementToken;
+      payload = await readJson(response);
+      const errorCode = stringValue(objectValue(objectValue(payload).error).code);
+      if (
+        !(options.formData instanceof FormData)
+        && response.status === 403
+        && new Set(["csrf_failed", "csrf_reused"]).has(errorCode)
+        && replacementToken
+      ) {
+        if (guardSignal) guardSignal.throwIfAborted();
+        response = await send();
+        replacementToken = response.headers.get("X-CSRF-Token");
+        if (replacementToken) state.csrfToken = replacementToken;
+        payload = await readJson(response);
+      }
     } catch (error) {
       state.csrfToken = "";
+      if (error && error.name === "AbortError") throw error;
       throw new ApiError(
         "The server response was not received. Refresh the affected data before another change.",
         {ambiguous: true},
       );
     }
-
-    const replacementToken = response.headers.get("X-CSRF-Token");
-    if (replacementToken) {
-      state.csrfToken = replacementToken;
-    } else if (response.status === 403 || response.status >= 500) {
+    if (
+      !response.headers.get("X-CSRF-Token")
+      && (response.status === 403 || response.status >= 500)
+    ) {
       state.csrfToken = "";
     }
-    const payload = await readJson(response);
     if (payload === null) {
       throw new ApiError(
         "The server response could not be verified.",
@@ -934,29 +965,6 @@
     return allowed ? url : null;
   };
 
-  const loadMessageActionSnapshot = async (context, signal) => {
-    signal.throwIfAborted();
-    const detail = await apiData(
-      `/mail/${encodeURIComponent(context.uid)}/action-snapshot?${
-        messageApiQuery(context).toString()
-      }`,
-      {signal},
-    );
-    signal.throwIfAborted();
-    const detailAccount = stringValue(detail.account);
-    if (
-      stringValue(detail.uid) !== context.uid
-      || (detailAccount && detailAccount !== context.account)
-      || stringValue(detail.mailbox) !== context.mailbox
-      || !Number.isSafeInteger(detail.size)
-      || detail.size <= 0
-      || !stringValue(detail.freshness_token)
-    ) {
-      throw new ApiError("The message changed; refresh the mailbox and try again.");
-    }
-    return detail;
-  };
-
   const setMessageRowBusy = (row, busy) => {
     if (busy) row.setAttribute("aria-busy", "true");
     else row.removeAttribute("aria-busy");
@@ -1037,7 +1045,24 @@
       });
       if (signal.aborted) return;
       finishAction(payload, "Mailbox updated.");
-      refreshMessageList(context);
+      const mail = objectValue(state.mail);
+      const messages = arrayValue(mail.messages || mail.items).map(objectValue);
+      const selectedSet = new Set(selected);
+      if (action === "mark_read" || action === "mark_unread" || action === "mark_all_read") {
+        const unread = action === "mark_unread";
+        for (const message of messages) {
+          if (action === "mark_all_read" || selectedSet.has(stringValue(message.uid))) {
+            message.unread = unread;
+          }
+        }
+      } else {
+        const remaining = messages.filter(
+          (message) => !selectedSet.has(stringValue(message.uid)),
+        );
+        if (Array.isArray(mail.messages)) mail.messages = remaining;
+        else mail.items = remaining;
+      }
+      renderMail(mail);
     } catch (error) {
       if (!signal.aborted) handleError(error);
     } finally {
@@ -1081,71 +1106,27 @@
   );
 
   const archiveMessageFromRow = async (context, row, button) => {
-    const signal = state.routeController?.signal;
-    if (!(signal instanceof AbortSignal)) return;
     setMessageRowBusy(row, true);
-    clearAlert();
     try {
-      const detail = await loadMessageActionSnapshot(context, signal);
-      signal.throwIfAborted();
-      const payload = await mutate(`/mail/${encodeURIComponent(context.uid)}/archive`, {
-        guardSignal: signal,
-        json: {
-          account: context.account,
-          mailbox: context.mailbox,
-          freshness: stringValue(detail.freshness_token),
-        },
-      });
-      if (signal.aborted) return;
-      finishAction(payload, "Message archived.");
-      refreshMessageList(context);
-    } catch (error) {
-      if (!signal.aborted) {
-        handleError(error);
-        if (error instanceof ApiError && error.status === 409) refreshMessageList(context);
-      }
+      await runBulkMessageAction("archive", [context.uid]);
     } finally {
       setMessageRowBusy(row, false);
-      if (!signal.aborted && document.contains(button)) button.focus();
+      if (document.contains(button)) button.focus();
     }
   };
 
   const deleteMessageFromRow = (context, row, button) => {
-    const signal = state.routeController?.signal;
-    if (!(signal instanceof AbortSignal)) return;
     clearAlert();
     openConfirm({
       title: "Move message to Trash?",
-      message: "The message will be rechecked, then moved to Trash.",
+      message: "The selected message will be moved to Trash.",
       label: "Move to Trash",
       danger: true,
       opener: button,
       action: async () => {
-        signal.throwIfAborted();
         setMessageRowBusy(row, true);
         try {
-          const detail = await loadMessageActionSnapshot(context, signal);
-          signal.throwIfAborted();
-          let payload;
-          try {
-            payload = await mutate(
-              `/mail/${encodeURIComponent(context.uid)}/trash`,
-              {
-                guardSignal: signal,
-                json: {
-                  account: context.account,
-                  mailbox: context.mailbox,
-                  freshness: stringValue(detail.freshness_token),
-                },
-              },
-            );
-          } catch (error) {
-            if (signal.aborted) return;
-            throw error;
-          }
-          if (signal.aborted) return;
-          finishAction(payload, "Message moved to Trash.");
-          refreshMessageList(context);
+          await runBulkMessageAction("trash", [context.uid]);
         } finally {
           setMessageRowBusy(row, false);
         }
@@ -1760,7 +1741,12 @@
     );
     state.message = data;
     renderMessage(data);
-    await markOpenedMessageAsRead(data, signal);
+    // Rendering must not wait for the independent read-state write. The list
+    // is updated optimistically and a failure is surfaced without hiding the
+    // already-loaded message.
+    void markOpenedMessageAsRead(data, new AbortController().signal).catch((error) => {
+      handleError(error, "The message opened, but it could not be marked as read.");
+    });
     return data;
   };
 

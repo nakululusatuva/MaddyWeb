@@ -39,6 +39,10 @@ _HEALTH_CACHE_SECONDS = 10.0
 _ACCOUNT_CACHE_SECONDS = 2.0
 _MAILBOX_CACHE_SECONDS = 15.0
 _MAILBOX_CACHE_CAPACITY = 128
+_MESSAGE_LIST_CACHE_SECONDS = 5.0
+_MESSAGE_LIST_CACHE_CAPACITY = 128
+_SESSION_CACHE_SECONDS = 2.0
+_SESSION_CACHE_CAPACITY = 256
 _SMTP_AUTH_PUBLIC_MESSAGE = (
     "Authentication for the selected sending account was rejected. Check its mailbox "
     "password and confirm that credentials are enabled, then try again. The message was "
@@ -151,6 +155,18 @@ class _MailboxCacheEntry:
 
 
 @dataclass(slots=True)
+class _MessageListCacheEntry:
+    expires_at: float
+    value: dict[str, Any]
+
+
+@dataclass(slots=True)
+class _SessionCacheEntry:
+    expires_at: float
+    value: dict[str, Any]
+
+
+@dataclass(slots=True)
 class _TaskOutcome:
     value: Any = None
     error: Exception | None = None
@@ -189,6 +205,12 @@ class HelperGateway:
 
         self._mailbox_cache: dict[tuple[bytes, str], _MailboxCacheEntry] = {}
         self._mailbox_generation: dict[str, int] = {}
+        self._message_list_cache: dict[
+            tuple[bytes, str, str, int, int],
+            _MessageListCacheEntry,
+        ] = {}
+        self._session_cache: dict[bytes, _SessionCacheEntry] = {}
+        self._session_flights: dict[bytes, asyncio.Task[Mapping[str, Any]]] = {}
 
     async def _call(
         self,
@@ -303,13 +325,48 @@ class HelperGateway:
         )
 
     async def session(self, token: str) -> Mapping[str, Any]:
-        return _mapping(
-            await self._call("auth.session", auth_token=token),
-            "auth.session",
+        cache_key = _authorization_cache_key(token)
+        now = time.monotonic()
+        cached = self._session_cache.get(cache_key)
+        if cached is not None and cached.expires_at > now:
+            return copy.deepcopy(cached.value)
+
+        task = self._session_flights.get(cache_key)
+        if task is None:
+
+            async def load() -> Mapping[str, Any]:
+                return _mapping(
+                    await self._call("auth.session", auth_token=token),
+                    "auth.session",
+                )
+
+            task = asyncio.create_task(load())
+            self._session_flights[cache_key] = task
+        try:
+            value = await asyncio.shield(task)
+        finally:
+            if task.done() and self._session_flights.get(cache_key) is task:
+                del self._session_flights[cache_key]
+        snapshot = copy.deepcopy(dict(value))
+        now = time.monotonic()
+        for key, entry in tuple(self._session_cache.items()):
+            if entry.expires_at <= now:
+                del self._session_cache[key]
+        while len(self._session_cache) >= _SESSION_CACHE_CAPACITY:
+            del self._session_cache[next(iter(self._session_cache))]
+        self._session_cache[cache_key] = _SessionCacheEntry(
+            expires_at=time.monotonic() + _SESSION_CACHE_SECONDS,
+            value=snapshot,
         )
+        return copy.deepcopy(snapshot)
 
     async def logout(self, token: str) -> None:
-        await self._call("auth.logout", auth_token=token)
+        cache_key = _authorization_cache_key(token)
+        self._session_cache.pop(cache_key, None)
+        try:
+            await self._call("auth.logout", auth_token=token)
+        finally:
+            self._session_cache.pop(cache_key, None)
 
     async def change_own_password(
         self,
@@ -318,17 +375,20 @@ class HelperGateway:
         *,
         client_ip: str,
     ) -> Mapping[str, Any]:
-        return _mapping(
-            await self._call(
+        try:
+            return _mapping(
+                await self._call(
+                    "auth.change_password",
+                    {
+                        "current_password": current_password,
+                        "new_password": new_password,
+                        "client_ip": client_ip,
+                    },
+                ),
                 "auth.change_password",
-                {
-                    "current_password": current_password,
-                    "new_password": new_password,
-                    "client_ip": client_ip,
-                },
-            ),
-            "auth.change_password",
-        )
+            )
+        finally:
+            self._session_cache.clear()
 
     async def regenerate_recovery_codes(
         self,
@@ -337,13 +397,16 @@ class HelperGateway:
         *,
         client_ip: str,
     ) -> Mapping[str, Any]:
-        return _mapping(
-            await self._call(
+        try:
+            return _mapping(
+                await self._call(
+                    "auth.recovery_regenerate",
+                    {"password": password, "code": code, "client_ip": client_ip},
+                ),
                 "auth.recovery_regenerate",
-                {"password": password, "code": code, "client_ip": client_ip},
-            ),
-            "auth.recovery_regenerate",
-        )
+            )
+        finally:
+            self._session_cache.clear()
 
     async def step_up(
         self,
@@ -361,13 +424,16 @@ class HelperGateway:
         )
 
     async def rotate_account_totp(self, account_id: str) -> Mapping[str, Any]:
-        return _mapping(
-            await self._call(
+        try:
+            return _mapping(
+                await self._call(
+                    "auth.admin_rotate_totp",
+                    {"target_account_id": account_id, "confirm": True},
+                ),
                 "auth.admin_rotate_totp",
-                {"target_account_id": account_id, "confirm": True},
-            ),
-            "auth.admin_rotate_totp",
-        )
+            )
+        finally:
+            self._session_cache.clear()
 
     async def health(self) -> Mapping[str, object]:
         """Return a cached, fixed-schema, non-sensitive readiness snapshot."""
@@ -628,6 +694,23 @@ class HelperGateway:
             if key[1] == account_id:
                 del self._mailbox_cache[key]
 
+    def _invalidate_message_lists(
+        self,
+        account_id: str,
+        mailbox: str | None = None,
+    ) -> None:
+        for key in tuple(self._message_list_cache):
+            _auth_key, key_account, key_mailbox, _limit, _offset = key
+            if key_account == account_id and (mailbox is None or key_mailbox == mailbox):
+                del self._message_list_cache[key]
+
+    def _prune_message_list_cache(self, now: float) -> None:
+        for key, entry in tuple(self._message_list_cache.items()):
+            if entry.expires_at <= now:
+                del self._message_list_cache[key]
+        while len(self._message_list_cache) >= _MESSAGE_LIST_CACHE_CAPACITY:
+            del self._message_list_cache[next(iter(self._message_list_cache))]
+
     def _prune_mailbox_cache(self, now: float) -> None:
         for key, entry in tuple(self._mailbox_cache.items()):
             if entry.expires_at <= now:
@@ -655,10 +738,13 @@ class HelperGateway:
         )
 
     async def change_password(self, account_id: str, password: str) -> None:
-        await self._account_mutation(
-            "accounts.change_password",
-            {"target_account_id": account_id, "password": password},
-        )
+        try:
+            await self._account_mutation(
+                "accounts.change_password",
+                {"target_account_id": account_id, "password": password},
+            )
+        finally:
+            self._session_cache.clear()
 
     async def set_append_limit(self, account_id: str, limit: int) -> None:
         await self._account_mutation(
@@ -667,13 +753,17 @@ class HelperGateway:
         )
 
     async def disable_credentials(self, account_id: str) -> None:
-        await self._account_mutation(
-            "accounts.disable_credentials",
-            {"target_account_id": account_id, "confirm": True},
-        )
+        try:
+            await self._account_mutation(
+                "accounts.disable_credentials",
+                {"target_account_id": account_id, "confirm": True},
+            )
+        finally:
+            self._session_cache.clear()
 
     async def delete_mailbox(self, account_id: str) -> None:
         self._invalidate_mailboxes(account_id)
+        self._invalidate_message_lists(account_id)
         try:
             await self._account_mutation(
                 "accounts.delete_imap_account",
@@ -681,6 +771,8 @@ class HelperGateway:
             )
         finally:
             self._invalidate_mailboxes(account_id)
+            self._invalidate_message_lists(account_id)
+            self._session_cache.clear()
 
     async def list_mailboxes(self, account_id: str) -> Sequence[object]:
         auth_key = _authorization_cache_key(_AUTH_TOKEN.get())
@@ -717,6 +809,8 @@ class HelperGateway:
         old_name: str,
         new_name: str,
     ) -> None:
+        self._invalidate_message_lists(account_id, old_name)
+        self._invalidate_message_lists(account_id, new_name)
         await self._mailbox_mutation(
             account_id,
             "mailboxes.rename",
@@ -728,6 +822,7 @@ class HelperGateway:
         )
 
     async def delete_named_mailbox(self, account_id: str, mailbox: str) -> None:
+        self._invalidate_message_lists(account_id, mailbox)
         await self._mailbox_mutation(
             account_id,
             "mailboxes.delete",
@@ -746,6 +841,17 @@ class HelperGateway:
         limit: int,
         offset: int,
     ) -> Mapping[str, object]:
+        cache_key = (
+            _authorization_cache_key(_AUTH_TOKEN.get()),
+            account_id,
+            mailbox,
+            limit,
+            offset,
+        )
+        now = time.monotonic()
+        cached = self._message_list_cache.get(cache_key)
+        if cached is not None and cached.expires_at > now:
+            return copy.deepcopy(cached.value)
         result = _mapping(
             await self._call(
                 "messages.list",
@@ -759,7 +865,13 @@ class HelperGateway:
             "messages.list",
         )
         _sequence(result.get("items"), "messages.list.items")
-        return result
+        snapshot = copy.deepcopy(dict(result))
+        self._prune_message_list_cache(time.monotonic())
+        self._message_list_cache[cache_key] = _MessageListCacheEntry(
+            expires_at=time.monotonic() + _MESSAGE_LIST_CACHE_SECONDS,
+            value=snapshot,
+        )
+        return copy.deepcopy(snapshot)
 
     @staticmethod
     def _open_destination(path: Path) -> BinaryIO:
@@ -815,21 +927,26 @@ class HelperGateway:
         mailbox: str,
         message_id: str,
     ) -> str:
-        result = _mapping(
-            await self._call(
+        self._invalidate_message_lists(account_id, mailbox)
+        try:
+            result = _mapping(
+                await self._call(
+                    "messages.move",
+                    {
+                        "target_account_id": account_id,
+                        "source": mailbox,
+                        "uid": _single_uid(message_id),
+                        "target_special": "trash",
+                    },
+                ),
                 "messages.move",
-                {
-                    "target_account_id": account_id,
-                    "source": mailbox,
-                    "uid": _single_uid(message_id),
-                    "target_special": "trash",
-                },
-            ),
-            "messages.move",
-        )
+            )
+        finally:
+            self._invalidate_message_lists(account_id, mailbox)
         target = result.get("target")
         if not isinstance(target, str) or not target:
             raise HelperCallError("invalid_response", "messages.move returned no target mailbox")
+        self._invalidate_message_lists(account_id, target)
         return target
 
     async def move_message_to_archive(
@@ -838,21 +955,26 @@ class HelperGateway:
         mailbox: str,
         message_id: str,
     ) -> str:
-        result = _mapping(
-            await self._call(
+        self._invalidate_message_lists(account_id, mailbox)
+        try:
+            result = _mapping(
+                await self._call(
+                    "messages.move",
+                    {
+                        "target_account_id": account_id,
+                        "source": mailbox,
+                        "uid": _single_uid(message_id),
+                        "target_special": "archive",
+                    },
+                ),
                 "messages.move",
-                {
-                    "target_account_id": account_id,
-                    "source": mailbox,
-                    "uid": _single_uid(message_id),
-                    "target_special": "archive",
-                },
-            ),
-            "messages.move",
-        )
+            )
+        finally:
+            self._invalidate_message_lists(account_id, mailbox)
         target = result.get("target")
         if not isinstance(target, str) or not target:
             raise HelperCallError("invalid_response", "messages.move returned no target mailbox")
+        self._invalidate_message_lists(account_id, target)
         return target
 
     async def move_message(
@@ -862,18 +984,24 @@ class HelperGateway:
         message_id: str,
         target: str,
     ) -> str:
-        result = _mapping(
-            await self._call(
+        self._invalidate_message_lists(account_id, mailbox)
+        self._invalidate_message_lists(account_id, target)
+        try:
+            result = _mapping(
+                await self._call(
+                    "messages.move",
+                    {
+                        "target_account_id": account_id,
+                        "source": mailbox,
+                        "uid": _single_uid(message_id),
+                        "target": target,
+                    },
+                ),
                 "messages.move",
-                {
-                    "target_account_id": account_id,
-                    "source": mailbox,
-                    "uid": _single_uid(message_id),
-                    "target": target,
-                },
-            ),
-            "messages.move",
-        )
+            )
+        finally:
+            self._invalidate_message_lists(account_id, mailbox)
+            self._invalidate_message_lists(account_id, target)
         moved_to = result.get("target")
         if not isinstance(moved_to, str) or not moved_to:
             raise HelperCallError("invalid_response", "messages.move returned no target mailbox")
@@ -888,15 +1016,19 @@ class HelperGateway:
         seen: bool,
     ) -> None:
         operation = "messages.add_flags" if seen else "messages.remove_flags"
-        await self._call(
-            operation,
-            {
-                "target_account_id": account_id,
-                "mailbox": mailbox,
-                "uid_set": _single_uid(message_id),
-                "flags": ["\\Seen"],
-            },
-        )
+        self._invalidate_message_lists(account_id, mailbox)
+        try:
+            await self._call(
+                operation,
+                {
+                    "target_account_id": account_id,
+                    "mailbox": mailbox,
+                    "uid_set": _single_uid(message_id),
+                    "flags": ["\\Seen"],
+                },
+            )
+        finally:
+            self._invalidate_message_lists(account_id, mailbox)
 
     async def set_messages_seen(
         self,
@@ -909,15 +1041,19 @@ class HelperGateway:
         if type(seen) is not bool:
             raise ValueError("seen state must be a boolean")
         operation = "messages.add_flags" if seen else "messages.remove_flags"
-        await self._call(
-            operation,
-            {
-                "target_account_id": account_id,
-                "mailbox": mailbox,
-                "uid_set": _uid_set(message_ids),
-                "flags": ["\\Seen"],
-            },
-        )
+        self._invalidate_message_lists(account_id, mailbox)
+        try:
+            await self._call(
+                operation,
+                {
+                    "target_account_id": account_id,
+                    "mailbox": mailbox,
+                    "uid_set": _uid_set(message_ids),
+                    "flags": ["\\Seen"],
+                },
+            )
+        finally:
+            self._invalidate_message_lists(account_id, mailbox)
 
     async def move_messages_to_trash(
         self,
@@ -942,21 +1078,26 @@ class HelperGateway:
         message_ids: Sequence[str],
         target_special: str,
     ) -> str:
-        result = _mapping(
-            await self._call(
+        self._invalidate_message_lists(account_id, mailbox)
+        try:
+            result = _mapping(
+                await self._call(
+                    "messages.move",
+                    {
+                        "target_account_id": account_id,
+                        "source": mailbox,
+                        "uid_set": _uid_set(message_ids),
+                        "target_special": target_special,
+                    },
+                ),
                 "messages.move",
-                {
-                    "target_account_id": account_id,
-                    "source": mailbox,
-                    "uid_set": _uid_set(message_ids),
-                    "target_special": target_special,
-                },
-            ),
-            "messages.move",
-        )
+            )
+        finally:
+            self._invalidate_message_lists(account_id, mailbox)
         target = result.get("target")
         if not isinstance(target, str) or not target:
             raise HelperCallError("invalid_response", "messages.move returned no target mailbox")
+        self._invalidate_message_lists(account_id, target)
         return target
 
     async def delete_message_permanently(
@@ -965,15 +1106,19 @@ class HelperGateway:
         mailbox: str,
         message_id: str,
     ) -> None:
-        await self._call(
-            "messages.delete",
-            {
-                "target_account_id": account_id,
-                "mailbox": mailbox,
-                "uid": _single_uid(message_id),
-                "confirm": True,
-            },
-        )
+        self._invalidate_message_lists(account_id, mailbox)
+        try:
+            await self._call(
+                "messages.delete",
+                {
+                    "target_account_id": account_id,
+                    "mailbox": mailbox,
+                    "uid": _single_uid(message_id),
+                    "confirm": True,
+                },
+            )
+        finally:
+            self._invalidate_message_lists(account_id, mailbox)
 
     async def certificate_status(self) -> object:
         if not self._config.certificates.enabled:
@@ -1075,19 +1220,22 @@ class HelperGateway:
         return message.message_id
 
     async def save_sent(self, message: PreparedMessage) -> None:
-        await self._upload(
-            "messages.append",
-            {
-                "mailbox_special": "sent",
-                "flags": ["\\Seen"],
-                **(
-                    {"target_account_id": _TARGET_ACCOUNT_ID.get()}
-                    if _TARGET_ACCOUNT_ID.get() is not None
-                    else {}
-                ),
-            },
-            message,
-        )
+        target_account = _TARGET_ACCOUNT_ID.get()
+        if target_account is not None:
+            self._invalidate_message_lists(target_account)
+        try:
+            await self._upload(
+                "messages.append",
+                {
+                    "mailbox_special": "sent",
+                    "flags": ["\\Seen"],
+                    **({"target_account_id": target_account} if target_account is not None else {}),
+                },
+                message,
+            )
+        finally:
+            if target_account is not None:
+                self._invalidate_message_lists(target_account)
 
 
 __all__ = ["HelperCallError", "HelperGateway", "bind_helper_identity"]

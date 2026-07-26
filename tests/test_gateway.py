@@ -70,6 +70,32 @@ def gateway_with(client: FakeClient, *, certificates: bool = False) -> HelperGat
 
 
 @pytest.mark.asyncio
+async def test_session_checks_coalesce_and_return_independent_short_lived_snapshots() -> None:
+    client = FakeClient(
+        {
+            "auth.session": Response.success(
+                "template",
+                {
+                    "account_id": "account-id",
+                    "email": "user@example.test",
+                    "role": "mailbox",
+                    "capabilities": ["mail.read"],
+                },
+            ),
+        }
+    )
+    gateway = gateway_with(client)
+    results = await asyncio.gather(*(gateway.session("A" * 43) for _ in range(8)))
+    assert [request.operation for request in client.requests] == ["auth.session"]
+    first = results[0]
+    assert isinstance(first, dict)
+    first["email"] = "mutated@example.test"
+    cached = await gateway.session("A" * 43)
+    assert cached["email"] == "user@example.test"
+    assert [request.operation for request in client.requests] == ["auth.session"]
+
+
+@pytest.mark.asyncio
 async def test_health_has_fixed_schema_discards_accounts_and_is_cached() -> None:
     client = FakeClient(
         {
@@ -165,6 +191,33 @@ async def test_bulk_message_operations_build_only_valid_uid_sets() -> None:
         )
     with pytest.raises(ValueError, match="between 1 and 50"):
         await gateway.move_messages_to_trash("account-id", "INBOX", ())
+
+
+@pytest.mark.asyncio
+async def test_message_pages_are_cached_briefly_and_invalidated_by_flag_changes() -> None:
+    client = FakeClient(
+        {
+            "messages.list": Response.success(
+                "template",
+                {"items": [{"uid": 42, "flags": []}], "has_next": False},
+            ),
+            "messages.add_flags": Response.success("template", {"changed": True}),
+        }
+    )
+    gateway = gateway_with(client)
+    first = await gateway.list_messages("account-id", "INBOX", limit=50, offset=0)
+    first["items"][0]["uid"] = 99  # type: ignore[index]
+    cached = await gateway.list_messages("account-id", "INBOX", limit=50, offset=0)
+    assert cached["items"][0]["uid"] == 42  # type: ignore[index]
+    assert [request.operation for request in client.requests] == ["messages.list"]
+
+    await gateway.set_messages_seen("account-id", "INBOX", ("42",), seen=True)
+    await gateway.list_messages("account-id", "INBOX", limit=50, offset=0)
+    assert [request.operation for request in client.requests] == [
+        "messages.list",
+        "messages.add_flags",
+        "messages.list",
+    ]
 
 
 @pytest.mark.asyncio
