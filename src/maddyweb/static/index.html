@@ -7,8 +7,8 @@
   <meta name="theme-color" content="#f4f6f9">
   <meta name="description" content="MaddyWeb mail workspace and server administration console">
   <title>MaddyWeb</title>
-  <link rel="stylesheet" href="/static/app.css?v=15">
-  <script src="/static/app.js?v=19" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=16">
+  <script src="/static/app.js?v=20" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to main content</a>
@@ -193,12 +193,13 @@
             <button id="mobile-list-button" class="mail-mobile-button" type="button" aria-controls="mail-view">Back to messages</button>
             <div><p class="eyebrow">Message</p><h1 id="message-title">Message</h1><p id="message-summary">Loading message metadata.</p></div>
           </div>
-          <nav class="message-toolbar" aria-label="Message actions">
+          <nav id="message-toolbar" class="message-toolbar" aria-label="Message actions">
             <a id="message-back" class="button button-secondary" href="/mail" data-route>Back to mailbox</a>
             <a id="message-reply" class="button button-secondary" href="/compose" data-route>Reply</a>
             <a id="message-reply-all" class="button button-secondary" href="/compose" data-route>Reply all</a>
             <a id="message-forward" class="button button-secondary" href="/compose" data-route>Forward</a>
             <a id="message-raw" class="button button-secondary" href="#">Download raw .eml</a>
+            <button id="message-body-toggle" class="button button-secondary message-body-toggle" type="button" aria-controls="message-html-body message-source-body" aria-pressed="false" hidden>View source</button>
             <button id="message-trash" class="button button-secondary" type="button">Move to Trash</button>
             <button id="message-delete" class="button button-danger" type="button">Permanently delete</button>
           </nav>

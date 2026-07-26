@@ -950,6 +950,70 @@ async def test_mailbox_rows_fit_the_desktop_message_pane(
             assert bounds["x"] + bounds["width"] <= pane_bounds["x"] + pane_bounds["width"] + 1
 
 
+async def test_mail_workspace_fills_the_tall_desktop_viewport(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    viewport_height = 1400
+    await page.set_viewport_size({"width": 2048, "height": viewport_height})
+    await _load_inbox(page, live_application)
+
+    workspace = await page.locator("#mail-workspace").bounding_box()
+    assert workspace is not None
+    assert workspace["height"] >= 1100
+    assert viewport_height - (workspace["y"] + workspace["height"]) <= 26
+
+
+async def test_message_navigation_hides_stale_content_while_loading(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    await _open_message(page, live_application)
+    old_heading = page.get_by_role(
+        "heading",
+        name="Browser security fixture",
+        exact=True,
+    )
+    assert await old_heading.is_visible()
+
+    await page.locator('a[data-section="security"]').click()
+    await page.get_by_role("heading", name="Security", exact=True).wait_for()
+    await page.locator('a[data-section="mail"]').click()
+    await page.locator("#message-list-body tr").wait_for()
+
+    request_started = asyncio.Event()
+    request_release = asyncio.Event()
+
+    async def delay_message_response(route: Route) -> None:
+        request_started.set()
+        await request_release.wait()
+        await route.continue_()
+
+    message_api = f"**/api/v1/admin/mail/{MESSAGE_ID}?*"
+    await page.route(message_api, delay_message_response)
+    try:
+        await page.locator("#message-list-body a").click()
+        await asyncio.wait_for(
+            request_started.wait(),
+            timeout=2,
+        )
+
+        placeholder = page.locator("#message-placeholder")
+        assert await placeholder.is_visible()
+        assert await placeholder.get_by_role(
+            "heading",
+            name="Loading message",
+            exact=True,
+        ).is_visible()
+        assert await page.locator("#message-view").is_hidden()
+        assert await old_heading.is_hidden()
+    finally:
+        request_release.set()
+
+    await old_heading.wait_for(state="visible")
+    await page.unroute(message_api, delay_message_response)
+
+
 async def test_empty_sent_mailbox_explains_when_copies_are_created(
     page: Page,
     live_application: LiveApplication,
@@ -1265,6 +1329,9 @@ async def test_message_html_is_sandboxed_and_attachment_filename_is_safe(
     assert await page.get_by_text("Sanitized HTML body", exact=True).count() == 0
 
     source_toggle = page.get_by_role("button", name="View source", exact=True)
+    assert await source_toggle.evaluate(
+        "node => node.parentElement?.id"
+    ) == "message-toolbar"
     assert await source_toggle.get_attribute("aria-pressed") == "false"
     assert await frame_element.is_visible()
     assert not await page.locator("#message-source-body").is_visible()

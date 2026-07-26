@@ -654,6 +654,38 @@
     });
   };
 
+  const setMessagePlaceholder = (mode) => {
+    const placeholder = byId("message-placeholder");
+    const messageView = byId("message-view");
+    const title = byId("message-placeholder-title");
+    const copy = placeholder?.querySelector("p");
+    const content = mode === "loading"
+      ? {
+        title: "Loading message",
+        copy: "Retrieving the selected message.",
+      }
+      : mode === "error"
+        ? {
+          title: "Message could not be loaded",
+          copy: "Return to the mailbox and try opening it again.",
+        }
+        : {
+          title: "Select a message to read",
+          copy: "Message content opens here without leaving your mailbox.",
+        };
+    if (title) title.textContent = content.title;
+    if (copy) copy.textContent = content.copy;
+    if (placeholder) placeholder.hidden = false;
+    if (messageView) messageView.hidden = true;
+  };
+
+  const showLoadedMessage = () => {
+    const placeholder = byId("message-placeholder");
+    const messageView = byId("message-view");
+    if (placeholder) placeholder.hidden = true;
+    if (messageView) messageView.hidden = false;
+  };
+
   const showView = (name, shouldFocus) => {
     let active = null;
     const mailWorkspace = byId("mail-workspace");
@@ -674,7 +706,10 @@
       if (viewName === name) active = view;
     });
     const placeholder = byId("message-placeholder");
-    if (placeholder) placeholder.hidden = name === "message";
+    if (placeholder) {
+      placeholder.hidden = name === "message";
+      if (name === "mail") setMessagePlaceholder("select");
+    }
     setActiveNavigation(name === "message" ? "mail" : name);
     if (active instanceof HTMLElement) focusViewHeading(active, shouldFocus);
   };
@@ -1490,7 +1525,12 @@
 
   const renderMessageBody = (message) => {
     const body = byId("message-body");
+    const toggle = byId("message-body-toggle");
     const fragment = document.createDocumentFragment();
+    toggle.hidden = true;
+    toggle.onclick = null;
+    toggle.textContent = "View source";
+    toggle.setAttribute("aria-pressed", "false");
     if (message.preview_too_large === true) {
       fragment.append(
         element("div", {
@@ -1506,14 +1546,6 @@
       const source = mailResourceUrl(stringValue(message.html_url));
       if (source) {
         const section = element("section", {className: "message-part"});
-        const toolbar = element("div", {className: "message-body-toolbar"});
-        const toggle = element("button", {
-          className: "button button-secondary message-body-toggle",
-          text: "View source",
-          type: "button",
-        });
-        toggle.setAttribute("aria-controls", "message-html-body message-source-body");
-        toggle.setAttribute("aria-pressed", "false");
         const frame = document.createElement("iframe");
         frame.id = "message-html-body";
         frame.className = "message-frame";
@@ -1527,15 +1559,15 @@
         });
         plain.id = "message-source-body";
         plain.hidden = true;
-        toggle.addEventListener("click", () => {
+        toggle.hidden = false;
+        toggle.onclick = () => {
           const showSource = plain.hidden;
           plain.hidden = !showSource;
           frame.hidden = showSource;
           toggle.textContent = showSource ? "View HTML" : "View source";
           toggle.setAttribute("aria-pressed", showSource ? "true" : "false");
-        });
-        toolbar.append(toggle);
-        section.append(toolbar, frame, plain);
+        };
+        section.append(frame, plain);
         fragment.append(section);
       } else {
         fragment.append(
@@ -1650,6 +1682,7 @@
     renderAttachments(message);
     byId("message-trash").disabled = !stringValue(message.freshness_token);
     byId("message-delete").disabled = !stringValue(message.freshness_token);
+    showLoadedMessage();
   };
 
   const loadedMessageSummary = (message) => {
@@ -2992,15 +3025,19 @@
     } else if (route.name === "compose" && !capabilityAllowed("mail.send")) {
       route = {name: "access-denied"};
     }
+    if (state.routeController) state.routeController.abort();
     document.title = titleForRoute(route);
-    showView(route.name, shouldFocus);
+    showView(route.name, route.name === "message" ? false : shouldFocus);
+    if (route.name === "message") {
+      state.message = null;
+      setMessagePlaceholder("loading");
+    }
     const requestedMail = requestedMailContext();
     setMailSwitchLoading(
       mailRouteNeedsRefresh(route),
       requestedMail.mailbox,
     );
     clearAlert();
-    if (state.routeController) state.routeController.abort();
     if (confirmDialog instanceof HTMLDialogElement && confirmDialog.open) {
       state.confirmAction = null;
       state.confirmOpener = null;
@@ -3020,11 +3057,15 @@
         if (matchesLoadedMail) message = await loadMessage(route, signal);
         else [, message] = await Promise.all([loadMail(signal), loadMessage(route, signal)]);
         updateLoadedMessageSummaryReadState(message, false);
+        focusViewHeading(byId("message-view"), shouldFocus);
       }
       else if (route.name === "compose") await loadCompose(signal);
       else if (route.name === "accounts") await loadAccounts(signal);
       else if (route.name === "certificates") await loadCertificates(signal);
     } catch (error) {
+      if (route.name === "message" && !signal.aborted) {
+        setMessagePlaceholder("error");
+      }
       handleError(error);
     } finally {
       if (!signal.aborted) {
