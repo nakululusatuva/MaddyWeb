@@ -12,6 +12,8 @@ readonly PREFIX="/opt/maddyweb"
 readonly RELEASE_ROOT="$PREFIX/releases"
 readonly CURRENT_LINK="$PREFIX/current"
 readonly SYSTEMD_ROOT="/etc/systemd/system"
+readonly TMPFILES_ROOT="/etc/tmpfiles.d"
+readonly TMPFILES_CONFIG="$TMPFILES_ROOT/maddyweb.conf"
 readonly CONFIG_ROOT="/etc/maddyweb"
 readonly CONFIG_HISTORY_ROOT="/var/lib/maddyweb-config-history"
 readonly DEPENDENCY_LOCK="$REPO_ROOT/requirements.lock"
@@ -198,6 +200,7 @@ require_regular_file "$artifact" "application artifact"
 require_regular_file "$artifact_manifest" "artifact manifest"
 require_regular_file "$DEPENDENCY_LOCK" "dependency lock"
 require_regular_file "$CLI_WRAPPER" "release-local CLI wrapper"
+require_regular_file "$REPO_ROOT/deploy/systemd/maddyweb.tmpfiles" "tmpfiles policy"
 require_directory "$wheelhouse" "offline wheelhouse"
 require_path_below "$artifact" "$wheelhouse"
 require_absolute_path "$python_binary" "Python binary"
@@ -317,7 +320,18 @@ flock -n "$deployment_lock_fd" || die "another MaddyWeb deployment transaction i
 
 install -d -o root -g root -m 0755 -- "$PREFIX" "$RELEASE_ROOT"
 systemd-sysusers "$REPO_ROOT/deploy/systemd/maddyweb.sysusers"
-systemd-tmpfiles --create "$REPO_ROOT/deploy/systemd/maddyweb.tmpfiles"
+install -d -o root -g root -m 0755 -- "$TMPFILES_ROOT"
+if [[ -e "$TMPFILES_CONFIG" || -L "$TMPFILES_CONFIG" ]]; then
+    [[ -f "$TMPFILES_CONFIG" && ! -L "$TMPFILES_CONFIG" ]] \
+        || die "$TMPFILES_CONFIG must be a regular non-symlink file"
+    [[ "$(stat -c '%u:%g:%a:%h' -- "$TMPFILES_CONFIG")" == "0:0:644:1" ]] \
+        || die "$TMPFILES_CONFIG must be single-link root:root 0644"
+fi
+install -o root -g root -m 0644 -- \
+    "$REPO_ROOT/deploy/systemd/maddyweb.tmpfiles" "$TMPFILES_CONFIG"
+cmp -s -- "$REPO_ROOT/deploy/systemd/maddyweb.tmpfiles" "$TMPFILES_CONFIG" \
+    || die "tmpfiles policy installation failed its readback gate"
+systemd-tmpfiles --create "$TMPFILES_CONFIG"
 if [[ -e "$CONFIG_ROOT" || -L "$CONFIG_ROOT" ]]; then
     assert_config_root_metadata
 else

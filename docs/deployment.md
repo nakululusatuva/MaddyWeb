@@ -358,6 +358,8 @@ dry run before obtaining a new approval.
 Approval lives in the separate `/run/maddyweb-approval` directory (`root:root 0700`). Do not move it
 back under the helper socket parent; `/run/maddyweb` must remain `root:maddyweb 0750`
 so the Web user can connect to the socket.
+The installer persists this ownership policy as `/etc/tmpfiles.d/maddyweb.conf`; that rule is
+required to recreate the directory with the same ownership after every reboot.
 
 The installer:
 

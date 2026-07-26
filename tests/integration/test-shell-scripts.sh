@@ -35,6 +35,9 @@ expected_helper_write_paths='/var/backups/maddyweb /run/maddyweb /var/lib/maddyw
     || fail "base helper write allow-list changed or gained native Maddy paths"
 grep -Fq 'd /run/maddyweb         0750 root     maddyweb -' "$ROOT/deploy/systemd/maddyweb.tmpfiles" || fail "helper socket parent ownership changed"
 grep -Fq 'd /run/maddyweb-approval 0700 root     root     -' "$ROOT/deploy/systemd/maddyweb.tmpfiles" || fail "approval directory is not isolated"
+grep -Fq 'readonly TMPFILES_CONFIG="$TMPFILES_ROOT/maddyweb.conf"' "$ROOT/scripts/install.sh" || fail "persistent tmpfiles target is missing"
+grep -Fq '"$REPO_ROOT/deploy/systemd/maddyweb.tmpfiles" "$TMPFILES_CONFIG"' "$ROOT/scripts/install.sh" || fail "tmpfiles policy is not installed persistently"
+grep -Fq 'systemd-tmpfiles --create "$TMPFILES_CONFIG"' "$ROOT/scripts/install.sh" || fail "installed tmpfiles policy is not applied"
 grep -Fq 'MADDYWEB_APPROVAL_ROOT="/run/maddyweb-approval"' "$ROOT/scripts/lib/common.sh" || fail "approval root is not isolated"
 grep -Fq 'unexpectedly advertises verify-config' "$ROOT/scripts/lib/common.sh" || fail "0.8.2 verify-config guard is missing"
 grep -Fq 'exec "$script_dir/python" -I -m maddyweb "$@"' "$ROOT/deploy/maddyweb-cli" \
