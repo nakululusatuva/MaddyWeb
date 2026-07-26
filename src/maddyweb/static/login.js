@@ -181,7 +181,7 @@
     stringValue(objectValue(principal).role) === "admin" ? "/" : "/mail"
   );
 
-  const finishAuthentication = (response) => {
+  const finishAuthentication = (response, beforeRedirect = null) => {
     const principal = objectValue(response.principal);
     if (!stringValue(principal.email) || !stringValue(principal.account_id)) {
       throw new AuthError("The server did not return an authenticated identity.");
@@ -196,10 +196,17 @@
       revokeQr();
       renderRecoveryCodes(codes);
       showView("recovery_ack_required");
-      return;
+      return false;
     }
+    const destination = activeDestination(principal);
     clearSensitiveState();
-    window.location.replace(activeDestination(principal));
+    if (typeof beforeRedirect === "function") {
+      beforeRedirect();
+      window.requestAnimationFrame(() => window.location.replace(destination));
+    } else {
+      window.location.replace(destination);
+    }
+    return true;
   };
 
   const formatSecret = (value) => (
@@ -405,19 +412,28 @@
     submit.setAttribute("aria-busy", "true");
     submit.textContent = "Verifying...";
     setBusy(true, "Verifying your authenticator code...");
+    let redirecting = false;
     try {
-      finishAuthentication(await authRequest("/totp", {
-        method: "POST",
-        body: {challenge: state.challenge, code},
-      }));
+      redirecting = finishAuthentication(
+        await authRequest("/totp", {
+          method: "POST",
+          body: {challenge: state.challenge, code},
+        }),
+        () => {
+          submit.textContent = "Verified. Signing in...";
+          setNotice("Authentication complete. Opening MaddyWeb...", "success");
+        },
+      );
     } catch (error) {
       handleError(error);
       input.focus();
     } finally {
-      setBusy(false);
-      submit.classList.remove("is-verifying");
-      submit.removeAttribute("aria-busy");
-      submit.textContent = "Verify and sign in";
+      if (!redirecting) {
+        setBusy(false);
+        submit.classList.remove("is-verifying");
+        submit.removeAttribute("aria-busy");
+        submit.textContent = "Verify and sign in";
+      }
     }
   });
 

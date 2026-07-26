@@ -3572,23 +3572,12 @@ html[data-view="message"] .app-footer {
 }
 
 .mail-select-shell {
-  position: relative;
   display: block;
-}
-
-.mail-select-shell .mail-account-mark {
-  position: absolute;
-  z-index: 1;
-  top: 50%;
-  left: 8px;
-  width: 24px;
-  height: 24px;
-  transform: translateY(-50%);
 }
 
 .mail-selector select {
   min-height: 41px;
-  padding: 7px 28px 7px 40px;
+  padding: 7px 28px 7px 12px;
   border-color: var(--border);
   background: var(--surface);
   font-size: 11px;

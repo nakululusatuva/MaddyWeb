@@ -238,6 +238,7 @@ async def test_mailbox_placeholder_cannot_be_selected(
     assert await mailbox.is_hidden()
     assert await placeholder.get_attribute("disabled") is not None
     assert await placeholder.get_attribute("hidden") is not None
+    assert await page.locator(".mail-select-shell .mail-account-mark").count() == 0
 
     folder_pane = await page.locator("#mail-folder-pane").bounding_box()
     account_select = await page.locator("#mail-account").bounding_box()
@@ -531,6 +532,15 @@ async def test_anonymous_browser_loads_only_login_then_completes_password_and_to
             await route.continue_()
 
         await page.route("**/api/v1/auth/totp", pause_totp)
+        await page.evaluate(
+            """() => {
+                window.__pendingLoginNavigation = null;
+                window.requestAnimationFrame = callback => {
+                    window.__pendingLoginNavigation = callback;
+                    return 1;
+                };
+            }"""
+        )
         totp_submit = page.locator("#totp-submit")
         initial_color = await totp_submit.evaluate("node => getComputedStyle(node).backgroundColor")
         try:
@@ -545,6 +555,27 @@ async def test_anonymous_browser_loads_only_login_then_completes_password_and_to
             )
         finally:
             release_totp.set()
+
+        await page.wait_for_function(
+            "() => typeof window.__pendingLoginNavigation === 'function'"
+        )
+        assert "is-verifying" in (await totp_submit.get_attribute("class") or "")
+        assert await totp_submit.inner_text() == "Verified. Signing in..."
+        assert await totp_submit.get_attribute("aria-busy") == "true"
+        assert (
+            await totp_submit.evaluate("node => getComputedStyle(node).backgroundColor")
+            != initial_color
+        )
+        assert "is-success" in (
+            await page.locator("#auth-notice").get_attribute("class") or ""
+        )
+        await page.evaluate(
+            """() => {
+                const callback = window.__pendingLoginNavigation;
+                window.__pendingLoginNavigation = null;
+                callback(performance.now());
+            }"""
+        )
 
         await page.wait_for_url(base_url + "/")
         await page.get_by_role(
