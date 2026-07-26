@@ -1262,6 +1262,21 @@ async def test_message_html_is_sandboxed_and_attachment_filename_is_safe(
     assert len([url for url in requested_urls if "/html?" in url]) == 1
     assert await frame_element.get_attribute("referrerpolicy") == "no-referrer"
     assert not any(".invalid" in url or url.startswith("data:") for url in requested_urls)
+    assert await page.get_by_text("Sanitized HTML body", exact=True).count() == 0
+
+    source_toggle = page.get_by_role("button", name="View source", exact=True)
+    assert await source_toggle.get_attribute("aria-pressed") == "false"
+    assert await frame_element.is_visible()
+    assert not await page.locator("#message-source-body").is_visible()
+    await source_toggle.click()
+    assert not await frame_element.is_visible()
+    assert await page.locator("#message-source-body").is_visible()
+    assert "plain fallback" in await page.locator("#message-source-body").inner_text()
+    html_toggle = page.get_by_role("button", name="View HTML", exact=True)
+    assert await html_toggle.get_attribute("aria-pressed") == "true"
+    await html_toggle.click()
+    assert await frame_element.is_visible()
+    assert not await page.locator("#message-source-body").is_visible()
 
     attachment = page.locator("#attachment-list li").filter(has_text="evil.html")
     assert await attachment.count() == 1

@@ -1502,35 +1502,54 @@
       return;
     }
     const text = stringValue(message.text);
-    if (text) {
-      const section = element("section", {className: "message-part"});
-      section.append(
-        element("h2", {text: "Plain-text body"}),
-        element("pre", {className: "plain-message", text}),
-      );
-      fragment.append(section);
-    }
     if (message.has_html === true) {
       const source = mailResourceUrl(stringValue(message.html_url));
       if (source) {
         const section = element("section", {className: "message-part"});
-        section.append(element("h2", {text: "Sanitized HTML body"}));
+        const toolbar = element("div", {className: "message-body-toolbar"});
+        const toggle = element("button", {
+          className: "button button-secondary message-body-toggle",
+          text: "View source",
+          type: "button",
+        });
+        toggle.setAttribute("aria-controls", "message-html-body message-source-body");
+        toggle.setAttribute("aria-pressed", "false");
         const frame = document.createElement("iframe");
+        frame.id = "message-html-body";
         frame.className = "message-frame";
         frame.title = "Sanitized message body";
         frame.referrerPolicy = "no-referrer";
         frame.setAttribute("sandbox", "");
         frame.src = `${source.pathname}${source.search}`;
-        section.append(frame);
+        const plain = element("pre", {
+          className: "plain-message",
+          text: text || "This message does not include a plain-text alternative.",
+        });
+        plain.id = "message-source-body";
+        plain.hidden = true;
+        toggle.addEventListener("click", () => {
+          const showSource = plain.hidden;
+          plain.hidden = !showSource;
+          frame.hidden = showSource;
+          toggle.textContent = showSource ? "View HTML" : "View source";
+          toggle.setAttribute("aria-pressed", showSource ? "true" : "false");
+        });
+        toolbar.append(toggle);
+        section.append(toolbar, frame, plain);
         fragment.append(section);
       } else {
-        fragment.append(element("div", {
-          className: "empty-state",
-          text: "The sanitized HTML preview is unavailable.",
-        }));
+        fragment.append(
+          text
+            ? element("pre", {className: "plain-message", text})
+            : element("div", {
+              className: "empty-state",
+              text: "The sanitized HTML preview is unavailable.",
+            }),
+        );
       }
-    }
-    if (!text && message.has_html !== true) {
+    } else if (text) {
+      fragment.append(element("pre", {className: "plain-message", text}));
+    } else {
       fragment.append(element("div", {
         className: "empty-state",
         text: "This message has no previewable body.",

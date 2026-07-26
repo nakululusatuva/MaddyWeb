@@ -1344,6 +1344,18 @@ td:last-child .button,
   min-height: 260px;
 }
 
+.message-body-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  margin: 0 0 10px;
+}
+
+.message-body-toggle {
+  min-height: 34px;
+  padding: 6px 11px;
+  font-size: 12px;
+}
+
 #message-body > pre,
 .plain-mail,
 .plain-message {
