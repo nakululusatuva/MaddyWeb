@@ -3701,7 +3701,7 @@ async def static_asset(request: web.Request) -> web.Response:
     else:
         application_versions = {
             "app.css": "16",
-            "app.js": "20",
+            "app.js": "21",
             "preview.css": "1",
         }
         versions = request.query.getall("v", [])

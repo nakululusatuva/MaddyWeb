@@ -784,6 +784,25 @@
     });
   };
 
+  const syncSelectedMessageRow = (route) => {
+    const requested = requestedMailContext();
+    const loaded = objectValue(state.mail);
+    const loadedMailboxMatches = (
+      stringValue(loaded.selected_account) === requested.account
+      && stringValue(loaded.selected_mailbox) === requested.mailbox
+    );
+    const selectedUid = route.name === "message" && loadedMailboxMatches
+      ? route.uid
+      : "";
+    document.querySelectorAll("#message-list-body tr").forEach((row) => {
+      if (!(row instanceof HTMLTableRowElement)) return;
+      const selected = Boolean(selectedUid) && row.dataset.uid === selectedUid;
+      row.classList.toggle("is-selected", selected);
+      if (selected) row.setAttribute("aria-current", "true");
+      else row.removeAttribute("aria-current");
+    });
+  };
+
   const navigate = (target, options = {}) => {
     const url = target instanceof URL ? target : new URL(target, window.location.href);
     if (url.origin !== window.location.origin) return;
@@ -3032,6 +3051,7 @@
       state.message = null;
       setMessagePlaceholder("loading");
     }
+    syncSelectedMessageRow(route);
     const requestedMail = requestedMailContext();
     setMailSwitchLoading(
       mailRouteNeedsRefresh(route),

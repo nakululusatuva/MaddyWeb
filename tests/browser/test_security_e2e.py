@@ -964,7 +964,7 @@ async def test_mail_workspace_fills_the_tall_desktop_viewport(
     assert viewport_height - (workspace["y"] + workspace["height"]) <= 26
 
 
-async def test_message_navigation_hides_stale_content_while_loading(
+async def test_message_navigation_updates_selection_and_hides_stale_content(
     page: Page,
     live_application: LiveApplication,
 ) -> None:
@@ -980,6 +980,15 @@ async def test_message_navigation_hides_stale_content_while_loading(
     await page.get_by_role("heading", name="Security", exact=True).wait_for()
     await page.locator('a[data-section="mail"]').click()
     await page.locator("#message-list-body tr").wait_for()
+    await page.locator("#message-list-body").evaluate(
+        """tbody => {
+            const stale = document.createElement("tr");
+            stale.dataset.uid = "999";
+            stale.className = "is-selected";
+            stale.setAttribute("aria-current", "true");
+            tbody.append(stale);
+        }"""
+    )
 
     request_started = asyncio.Event()
     request_release = asyncio.Event()
@@ -1007,6 +1016,13 @@ async def test_message_navigation_hides_stale_content_while_loading(
         ).is_visible()
         assert await page.locator("#message-view").is_hidden()
         assert await old_heading.is_hidden()
+        selected_rows = page.locator("#message-list-body tr.is-selected")
+        assert await selected_rows.count() == 1
+        assert await selected_rows.get_attribute("data-uid") == MESSAGE_ID
+        assert await selected_rows.get_attribute("aria-current") == "true"
+        assert await page.locator(
+            '#message-list-body tr[data-uid="999"][aria-current]'
+        ).count() == 0
     finally:
         request_release.set()
 
