@@ -340,6 +340,38 @@ async def test_mailbox_read_state_and_bulk_selection_actions(
     )
 
 
+async def test_opening_an_unread_message_marks_it_read(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    await _load_inbox(page, live_application)
+    row = page.locator("#message-list-body tr")
+    assert await row.locator(".message-read-status").text_content() == "Unread"
+
+    async with page.expect_response(
+        lambda response: urlsplit(response.url).path.endswith("/mail-actions")
+    ) as read_response:
+        await row.locator(".message-subject-cell a").click()
+    await page.get_by_role(
+        "heading",
+        name="Browser security fixture",
+        exact=True,
+    ).wait_for()
+    await page.wait_for_function(
+        "() => document.querySelector('.message-read-status')?.textContent === 'Read'"
+    )
+
+    assert (await read_response.value).status == 200
+    assert await row.locator(".message-unread-dot").count() == 0
+    assert await row.get_by_role("button", name="Mark as unread", exact=True).count() == 1
+    assert live_application.gateway.bulk_seen_changes[-1] == (
+        ACCOUNT,
+        MAILBOX,
+        (MESSAGE_ID,),
+        True,
+    )
+
+
 def _message_path() -> str:
     query = urlencode({"account": ACCOUNT, "mailbox": MAILBOX})
     return f"/mail/{MESSAGE_ID}?{query}"

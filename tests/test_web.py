@@ -479,7 +479,7 @@ async def test_home_static_assets_and_strict_headers(
     assert response.status == 200
     assert "Administration overview" in page
     assert 'href="/static/app.css?v=13"' in page
-    assert 'src="/static/app.js?v=15"' in page
+    assert 'src="/static/app.js?v=16"' in page
     assert 'id="compose-sender-name"' in page
     assert 'name="sender_name"' in page
     assert 'maxlength="256"' in page

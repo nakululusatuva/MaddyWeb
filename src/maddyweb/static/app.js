@@ -1068,6 +1068,18 @@
     return button;
   };
 
+  const messageReadActionButton = (unread, context) => (
+    messageActionButton(
+      unread ? "Mark as read" : "Mark as unread",
+      context,
+      () => runBulkMessageAction(
+        unread ? "mark_read" : "mark_unread",
+        [context.uid],
+      ),
+      unread ? "Mark read" : "Mark unread",
+    )
+  );
+
   const archiveMessageFromRow = async (context, row, button) => {
     const signal = state.routeController?.signal;
     if (!(signal instanceof AbortSignal)) return;
@@ -1407,15 +1419,7 @@
           : "This account does not have an available Archive mailbox.";
       }
       actionGroup.append(
-        messageActionButton(
-          message.unread === true ? "Mark as read" : "Mark as unread",
-          context,
-          () => runBulkMessageAction(
-            message.unread === true ? "mark_read" : "mark_unread",
-            [uid],
-          ),
-          message.unread === true ? "Mark read" : "Mark unread",
-        ),
+        messageReadActionButton(message.unread === true, context),
         messageActionButton("Forward", context, () => {
           state.pendingForwardSubject = null;
           navigate(buildForwardUrl({...context, mode: "inline"}));
@@ -1655,6 +1659,92 @@
     byId("message-delete").disabled = !stringValue(message.freshness_token);
   };
 
+  const loadedMessageSummary = (message) => {
+    const mail = objectValue(state.mail);
+    const account = stringValue(message.account, scopedAccount());
+    const mailbox = stringValue(message.mailbox);
+    if (
+      stringValue(mail.selected_account) !== account
+      || stringValue(mail.selected_mailbox) !== mailbox
+    ) return null;
+    const uid = stringValue(message.uid);
+    return arrayValue(mail.messages || mail.items)
+      .map(objectValue)
+      .find((item) => stringValue(item.uid) === uid) || null;
+  };
+
+  const updateLoadedMessageSummaryReadState = (message, unread) => {
+    const summary = loadedMessageSummary(message);
+    if (!summary || summary.unread === unread) return;
+    summary.unread = unread;
+    const uid = stringValue(message.uid);
+    const row = [...document.querySelectorAll("#message-list-body tr")]
+      .find((candidate) => candidate.dataset.uid === uid);
+    if (!(row instanceof HTMLTableRowElement)) return;
+    row.classList.toggle("message-unread", unread);
+    const unreadDot = row.querySelector(".message-unread-dot");
+    if (unread) {
+      if (!unreadDot) {
+        row.querySelector(".message-sender-cell")?.append(
+          element("span", {
+            className: "message-unread-dot",
+            title: "Unread",
+          }),
+        );
+      }
+    } else {
+      unreadDot?.remove();
+    }
+    const status = row.querySelector(".message-read-status");
+    if (status) status.textContent = unread ? "Unread" : "Read";
+    const currentAction = row.querySelector(".message-row-action");
+    if (currentAction instanceof HTMLButtonElement) {
+      currentAction.replaceWith(messageReadActionButton(unread, {
+        account: stringValue(message.account, scopedAccount()),
+        mailbox: stringValue(message.mailbox),
+        uid,
+        sender: stringValue(summary.sender, "Unknown sender"),
+        subject: stringValue(summary.subject, "(No subject)"),
+      }));
+    }
+    updateBulkToolbar();
+  };
+
+  const markOpenedMessageAsRead = async (message, signal) => {
+    const summary = loadedMessageSummary(message);
+    if (summary && summary.unread !== true) return;
+    const optimisticallyUpdated = summary?.unread === true;
+    const account = stringValue(message.account, scopedAccount());
+    const mailbox = stringValue(message.mailbox);
+    const uid = stringValue(message.uid);
+    if (!account || !mailbox || !uid) return;
+    if (optimisticallyUpdated) updateLoadedMessageSummaryReadState(message, false);
+    try {
+      await mutate("/mail-actions", {
+        guardSignal: signal,
+        json: {
+          account,
+          mailbox,
+          action: "mark_read",
+          uids: [uid],
+        },
+      });
+      signal.throwIfAborted();
+      updateLoadedMessageSummaryReadState(message, false);
+    } catch (error) {
+      if (signal.aborted) throw error;
+      if (optimisticallyUpdated) updateLoadedMessageSummaryReadState(message, true);
+      throw new ApiError(
+        "The message opened, but it could not be marked as read.",
+        {
+          code: error instanceof ApiError ? error.code : "read_state_failed",
+          status: error instanceof ApiError ? error.status : 0,
+          ambiguous: error instanceof ApiError && error.ambiguous,
+        },
+      );
+    }
+  };
+
   const loadMessage = async (route, signal) => {
     setLoading("Loading message.");
     const query = new URLSearchParams(window.location.search);
@@ -1670,6 +1760,8 @@
     );
     state.message = data;
     renderMessage(data);
+    await markOpenedMessageAsRead(data, signal);
+    return data;
   };
 
   const htmlTagEnd = (source, tagStart) => {
@@ -2926,8 +3018,10 @@
         const currentMail = objectValue(state.mail);
         const matchesLoadedMail = stringValue(currentMail.selected_account) === (query.get("account") || scopedAccount())
           && stringValue(currentMail.selected_mailbox) === query.get("mailbox");
-        if (matchesLoadedMail) await loadMessage(route, signal);
-        else await Promise.all([loadMail(signal), loadMessage(route, signal)]);
+        let message;
+        if (matchesLoadedMail) message = await loadMessage(route, signal);
+        else [, message] = await Promise.all([loadMail(signal), loadMessage(route, signal)]);
+        updateLoadedMessageSummaryReadState(message, false);
       }
       else if (route.name === "compose") await loadCompose(signal);
       else if (route.name === "accounts") await loadAccounts(signal);
