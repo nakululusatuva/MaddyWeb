@@ -1301,6 +1301,39 @@ async def test_message_html_is_sandboxed_and_attachment_filename_is_safe(
     page.on("request", lambda request: requested_urls.append(request.url))
     await _open_message(page, live_application)
 
+    preview = page.locator(".message-preview-shell")
+    preview_bounds = await preview.bounding_box()
+    assert preview_bounds is not None
+    assert 250 <= preview_bounds["height"] <= 300
+    assert await preview.evaluate(
+        "node => getComputedStyle(node).resize"
+    ) == "none"
+    resize_handle = page.get_by_role("button", name="Resize message body", exact=True)
+    await resize_handle.scroll_into_view_if_needed()
+    preview_bounds = await preview.bounding_box()
+    assert preview_bounds is not None
+    handle_bounds = await resize_handle.bounding_box()
+    assert handle_bounds is not None
+    await page.mouse.move(
+        handle_bounds["x"] + handle_bounds["width"] / 2,
+        handle_bounds["y"] + handle_bounds["height"] / 2,
+    )
+    await page.mouse.down()
+    await page.mouse.move(
+        handle_bounds["x"] + handle_bounds["width"] / 2,
+        handle_bounds["y"] + handle_bounds["height"] / 2 + 118,
+        steps=6,
+    )
+    await page.mouse.up()
+    resized_bounds = await preview.bounding_box()
+    assert resized_bounds is not None
+    assert resized_bounds["height"] >= preview_bounds["height"] + 90
+    await resize_handle.focus()
+    await resize_handle.press("ArrowUp")
+    keyboard_resized_bounds = await preview.bounding_box()
+    assert keyboard_resized_bounds is not None
+    assert keyboard_resized_bounds["height"] <= resized_bounds["height"] - 30
+
     frame_element = page.locator("iframe.message-frame")
     frame = page.frame_locator("iframe.message-frame")
     assert "Safe body" in await frame.locator("body").inner_text()
@@ -1380,6 +1413,32 @@ async def test_message_html_is_sandboxed_and_attachment_filename_is_safe(
     await page.locator("#typed-confirm-dialog").wait_for(state="hidden")
     await page.wait_for_url(f"**{_mailbox_path()}")
     assert live_application.gateway.permanent_deletions == [(ACCOUNT, MAILBOX, MESSAGE_ID)]
+
+
+async def test_message_preview_height_adapts_to_long_content(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    long_lines = [
+        f"Preview line {index}: " + ("message content " * 8)
+        for index in range(40)
+    ]
+    message = EmailMessage()
+    message["From"] = "attacker@example.test"
+    message["To"] = ACCOUNT_ADDRESS
+    message["Subject"] = "Browser security fixture"
+    message.set_content("\n".join(long_lines))
+    message.add_alternative(
+        "".join(f"<p>{line}</p>" for line in long_lines),
+        subtype="html",
+    )
+    live_application.gateway.raw = message.as_bytes(policy=policy.SMTP)
+
+    await _open_message(page, live_application)
+
+    preview_bounds = await page.locator(".message-preview-shell").bounding_box()
+    assert preview_bounds is not None
+    assert 1100 <= preview_bounds["height"] <= 1200
 
 
 async def test_move_to_trash_requires_explicit_confirmation(

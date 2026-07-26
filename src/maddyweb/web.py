@@ -3700,8 +3700,8 @@ async def static_asset(request: web.Request) -> web.Response:
         cache_control = "public, max-age=31536000, immutable"
     else:
         application_versions = {
-            "app.css": "16",
-            "app.js": "21",
+            "app.css": "17",
+            "app.js": "22",
             "preview.css": "1",
         }
         versions = request.query.getall("v", [])

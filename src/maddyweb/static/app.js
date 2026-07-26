@@ -1542,6 +1542,81 @@
     }
   };
 
+  const messagePreviewHeight = (text, width) => {
+    const source = stringValue(text).slice(0, 12000);
+    const charsPerLine = Math.max(
+      38,
+      Math.min(110, Math.floor((Math.max(width, 320) - 36) / 7.5)),
+    );
+    let visualLines = 0;
+    for (const line of source.split(/\r\n?|\n/)) {
+      visualLines += Math.max(1, Math.ceil(line.length / charsPerLine));
+      if (visualLines >= 48) break;
+    }
+    return Math.max(260, Math.min(1200, 46 + visualLines * 24));
+  };
+
+  const messagePreviewShell = (text, width) => {
+    const shell = element("section", {
+      className: "message-part message-preview-shell",
+    });
+    shell.style.setProperty(
+      "--message-preview-height",
+      `${messagePreviewHeight(text, width)}px`,
+    );
+    shell.setAttribute("aria-label", "Resizable message body");
+    shell.title = "Drag the lower-right corner to resize the message body.";
+    return shell;
+  };
+
+  const enableMessagePreviewResize = (shell) => {
+    const handle = element("button", {
+      className: "message-resize-handle",
+      type: "button",
+    });
+    handle.setAttribute("aria-label", "Resize message body");
+    handle.title = "Drag vertically, or use the Up and Down arrow keys.";
+    const resizeTo = (height) => {
+      shell.style.height = `${Math.max(260, Math.min(1600, height))}px`;
+    };
+    handle.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      const startY = event.clientY;
+      const startHeight = shell.getBoundingClientRect().height;
+      handle.setPointerCapture(event.pointerId);
+      const resize = (moveEvent) => {
+        moveEvent.preventDefault();
+        resizeTo(startHeight + moveEvent.clientY - startY);
+      };
+      const finish = (finishEvent) => {
+        handle.removeEventListener("pointermove", resize);
+        handle.removeEventListener("pointerup", finish);
+        handle.removeEventListener("pointercancel", finish);
+        if (handle.hasPointerCapture(finishEvent.pointerId)) {
+          handle.releasePointerCapture(finishEvent.pointerId);
+        }
+      };
+      handle.addEventListener("pointermove", resize);
+      handle.addEventListener("pointerup", finish);
+      handle.addEventListener("pointercancel", finish);
+    });
+    handle.addEventListener("keydown", (event) => {
+      if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+      event.preventDefault();
+      const direction = event.key === "ArrowDown" ? 1 : -1;
+      resizeTo(shell.getBoundingClientRect().height + direction * (event.shiftKey ? 100 : 32));
+    });
+    shell.append(handle);
+  };
+
+  const plainMessagePreview = (text, width) => {
+    const shell = messagePreviewShell(text, width);
+    shell.append(element("pre", {className: "plain-message", text}));
+    enableMessagePreviewResize(shell);
+    return shell;
+  };
+
   const renderMessageBody = (message) => {
     const body = byId("message-body");
     const toggle = byId("message-body-toggle");
@@ -1564,7 +1639,7 @@
     if (message.has_html === true) {
       const source = mailResourceUrl(stringValue(message.html_url));
       if (source) {
-        const section = element("section", {className: "message-part"});
+        const section = messagePreviewShell(text, body.clientWidth);
         const frame = document.createElement("iframe");
         frame.id = "message-html-body";
         frame.className = "message-frame";
@@ -1587,11 +1662,12 @@
           toggle.setAttribute("aria-pressed", showSource ? "true" : "false");
         };
         section.append(frame, plain);
+        enableMessagePreviewResize(section);
         fragment.append(section);
       } else {
         fragment.append(
           text
-            ? element("pre", {className: "plain-message", text})
+            ? plainMessagePreview(text, body.clientWidth)
             : element("div", {
               className: "empty-state",
               text: "The sanitized HTML preview is unavailable.",
@@ -1599,7 +1675,7 @@
         );
       }
     } else if (text) {
-      fragment.append(element("pre", {className: "plain-message", text}));
+      fragment.append(plainMessagePreview(text, body.clientWidth));
     } else {
       fragment.append(element("div", {
         className: "empty-state",
