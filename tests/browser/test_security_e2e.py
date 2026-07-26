@@ -249,6 +249,47 @@ async def test_mailbox_placeholder_cannot_be_selected(
     )
 
 
+async def test_mailbox_switch_shows_a_scoped_loading_state(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    await _load_inbox(page, live_application)
+    request_started = asyncio.Event()
+    release_request = asyncio.Event()
+
+    async def pause_sent_mailbox(route: Route) -> None:
+        if "mailbox=Sent" not in route.request.url:
+            await route.continue_()
+            return
+        request_started.set()
+        await release_request.wait()
+        await route.continue_()
+
+    await page.route("**/api/v1/admin/mail?*", pause_sent_mailbox)
+    try:
+        await page.locator('#mail-folder-list a[data-kind="sent"]').click()
+        await asyncio.wait_for(request_started.wait(), timeout=2)
+
+        loader = page.locator("#mail-switch-loader")
+        assert await loader.is_visible()
+        assert await page.locator("#mail-view").get_attribute("aria-busy") == "true"
+        assert await page.locator("#mail-switch-title").inner_text() == "Opening Sent"
+        assert await page.locator("#message-list-body tr").count() == 1
+        assert (
+            await page.locator('#mail-folder-list a[data-kind="sent"]').get_attribute(
+                "aria-current"
+            )
+            == "page"
+        )
+    finally:
+        release_request.set()
+
+    await page.locator("#mail-switch-loader").wait_for(state="hidden")
+    assert await page.locator("#mail-view").get_attribute("aria-busy") is None
+    assert await page.locator("#mail-title").inner_text() == "Sent"
+    assert await page.locator("#mail-mailbox").input_value() == "Sent"
+
+
 def _message_path() -> str:
     query = urlencode({"account": ACCOUNT, "mailbox": MAILBOX})
     return f"/mail/{MESSAGE_ID}?{query}"
