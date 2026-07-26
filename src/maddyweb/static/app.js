@@ -671,6 +671,47 @@
     return `${titles[route.name] || "MaddyWeb"} - MaddyWeb`;
   };
 
+  const requestedMailContext = () => {
+    const query = new URLSearchParams(window.location.search);
+    return {
+      account: query.get("account") || scopedAccount(),
+      mailbox: query.get("mailbox") || "",
+    };
+  };
+
+  const mailRouteNeedsRefresh = (route) => {
+    if (route.name !== "mail") return false;
+    const requested = requestedMailContext();
+    const loaded = objectValue(state.mail);
+    const loadedAccount = stringValue(loaded.selected_account);
+    const loadedMailbox = stringValue(loaded.selected_mailbox);
+    if (!loadedAccount || !loadedMailbox) return true;
+    if (requested.account && requested.account !== loadedAccount) return true;
+    return Boolean(requested.mailbox && requested.mailbox !== loadedMailbox);
+  };
+
+  const setMailSwitchLoading = (active, mailbox = "") => {
+    const pane = byId("mail-view");
+    const loader = byId("mail-switch-loader");
+    if (!(pane instanceof HTMLElement) || !(loader instanceof HTMLElement)) return;
+    if (!active) {
+      loader.hidden = true;
+      pane.removeAttribute("aria-busy");
+      return;
+    }
+    byId("mail-switch-title").textContent = mailbox
+      ? `Opening ${mailbox}`
+      : "Opening mailbox";
+    pane.setAttribute("aria-busy", "true");
+    loader.hidden = false;
+    document.querySelectorAll(".mail-folder-link").forEach((link) => {
+      if (!(link instanceof HTMLAnchorElement)) return;
+      const linkMailbox = new URL(link.href).searchParams.get("mailbox") || "";
+      if (mailbox && linkMailbox === mailbox) link.setAttribute("aria-current", "page");
+      else link.removeAttribute("aria-current");
+    });
+  };
+
   const navigate = (target, options = {}) => {
     const url = target instanceof URL ? target : new URL(target, window.location.href);
     if (url.origin !== window.location.origin) return;
@@ -2747,6 +2788,11 @@
     }
     document.title = titleForRoute(route);
     showView(route.name, shouldFocus);
+    const requestedMail = requestedMailContext();
+    setMailSwitchLoading(
+      mailRouteNeedsRefresh(route),
+      requestedMail.mailbox,
+    );
     clearAlert();
     if (state.routeController) state.routeController.abort();
     if (confirmDialog instanceof HTMLDialogElement && confirmDialog.open) {
@@ -2773,7 +2819,10 @@
     } catch (error) {
       handleError(error);
     } finally {
-      if (!signal.aborted) setLoading("");
+      if (!signal.aborted) {
+        setLoading("");
+        setMailSwitchLoading(false);
+      }
     }
   };
 

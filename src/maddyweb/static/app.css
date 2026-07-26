@@ -3673,6 +3673,64 @@ html[data-view="message"] .app-footer {
   padding: 14px 16px;
 }
 
+.mail-list-pane {
+  position: relative;
+}
+
+.mail-switch-loader {
+  position: absolute;
+  z-index: 8;
+  inset: 84px 0 48px;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+  background: color-mix(in srgb, var(--surface) 80%, transparent);
+  backdrop-filter: blur(2px);
+}
+
+.mail-switch-card {
+  display: flex;
+  min-width: min(250px, 100%);
+  align-items: center;
+  gap: 13px;
+  padding: 14px 17px;
+  border: 1px solid color-mix(in srgb, var(--primary) 18%, var(--border));
+  border-radius: 14px;
+  background: var(--surface);
+  box-shadow: var(--shadow-soft);
+}
+
+.mail-switch-spinner {
+  width: 27px;
+  height: 27px;
+  flex: 0 0 auto;
+  border: 3px solid var(--primary-soft);
+  border-top-color: var(--primary);
+  border-radius: 50%;
+  animation: mail-switch-spin 720ms linear infinite;
+}
+
+.mail-switch-copy {
+  display: grid;
+  gap: 2px;
+}
+
+.mail-switch-copy strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.mail-switch-copy small {
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+@keyframes mail-switch-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .mail-list-heading h1,
 .reading-pane-heading h1 {
   font-size: 21px;

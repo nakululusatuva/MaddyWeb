@@ -7,8 +7,8 @@
   <meta name="theme-color" content="#f4f6f9">
   <meta name="description" content="MaddyWeb mail workspace and server administration console">
   <title>MaddyWeb</title>
-  <link rel="stylesheet" href="/static/app.css?v=11">
-  <script src="/static/app.js?v=13" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=12">
+  <script src="/static/app.js?v=14" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to main content</a>
@@ -142,6 +142,15 @@
               <p class="eyebrow">Messages</p>
               <h1 id="mail-title">Inbox</h1>
               <p id="mail-list-summary">Select a folder to browse messages.</p>
+            </div>
+          </div>
+          <div id="mail-switch-loader" class="mail-switch-loader" role="status" aria-live="polite" aria-atomic="true" hidden>
+            <div class="mail-switch-card">
+              <span class="mail-switch-spinner" aria-hidden="true"></span>
+              <span class="mail-switch-copy">
+                <strong id="mail-switch-title">Opening mailbox</strong>
+                <small>Fetching the latest messages...</small>
+              </span>
             </div>
           </div>
           <div class="mail-list-table">
