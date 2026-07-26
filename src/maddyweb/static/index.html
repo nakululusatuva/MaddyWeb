@@ -7,8 +7,8 @@
   <meta name="theme-color" content="#f4f6f9">
   <meta name="description" content="MaddyWeb mail workspace and server administration console">
   <title>MaddyWeb</title>
-  <link rel="stylesheet" href="/static/app.css?v=12">
-  <script src="/static/app.js?v=14" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=13">
+  <script src="/static/app.js?v=15" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to main content</a>
@@ -142,6 +142,20 @@
               <p class="eyebrow">Messages</p>
               <h1 id="mail-title">Inbox</h1>
               <p id="mail-list-summary">Select a folder to browse messages.</p>
+            </div>
+          </div>
+          <div id="mail-bulk-toolbar" class="mail-bulk-toolbar" aria-label="Mailbox actions">
+            <label class="mail-bulk-select">
+              <input id="mail-select-page" type="checkbox">
+              <span>Select page</span>
+            </label>
+            <span id="mail-selection-count" class="mail-selection-count" aria-live="polite">0 selected</span>
+            <div class="mail-bulk-actions">
+              <button id="mail-mark-read" class="button button-secondary" type="button" disabled>Mark read</button>
+              <button id="mail-mark-unread" class="button button-secondary" type="button" disabled>Mark unread</button>
+              <button id="mail-bulk-archive" class="button button-secondary" type="button" disabled>Archive</button>
+              <button id="mail-bulk-trash" class="button button-secondary" type="button" disabled>Trash</button>
+              <button id="mail-mark-all-read" class="button button-secondary" type="button" disabled>Mark all as read</button>
             </div>
           </div>
           <div id="mail-switch-loader" class="mail-switch-loader" role="status" aria-live="polite" aria-atomic="true" hidden>

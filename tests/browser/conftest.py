@@ -136,6 +136,9 @@ class BrowserSecurityGateway:
         self.logout_fails = False
         self.password_login_attempts: list[tuple[str, str, str]] = []
         self.totp_login_attempts: list[tuple[str, str, str]] = []
+        self.bulk_seen_changes: list[tuple[str, str, tuple[str, ...] | None, bool]] = []
+        self.bulk_moves: list[tuple[str, str, tuple[str, ...], str]] = []
+        self.message_unread = True
 
         self.principal: dict[str, object] = {
             "account_id": ACCOUNT,
@@ -266,7 +269,7 @@ class BrowserSecurityGateway:
                         '<img src=x onerror="document.body.dataset.listXss=1">Security fixture'
                     ),
                     "date": "2026-07-23 12:00 UTC",
-                    "unread": True,
+                    "unread": self.message_unread,
                 }
             )
         return MessagePage(items, False)
@@ -312,6 +315,38 @@ class BrowserSecurityGateway:
         self.archive_moves.append((account, mailbox, message_id))
         self.message_location = ARCHIVE_MAILBOX
         self.archive_move_finished.set()
+        return ARCHIVE_MAILBOX
+
+    async def set_messages_seen(
+        self,
+        account: str,
+        mailbox: str,
+        message_ids: Sequence[str] | None,
+        *,
+        seen: bool,
+    ) -> None:
+        selected = None if message_ids is None else tuple(message_ids)
+        self.bulk_seen_changes.append((account, mailbox, selected, seen))
+        self.message_unread = not seen
+
+    async def move_messages_to_trash(
+        self,
+        account: str,
+        mailbox: str,
+        message_ids: Sequence[str],
+    ) -> str:
+        self.bulk_moves.append((account, mailbox, tuple(message_ids), TRASH_MAILBOX))
+        self.message_location = TRASH_MAILBOX
+        return TRASH_MAILBOX
+
+    async def move_messages_to_archive(
+        self,
+        account: str,
+        mailbox: str,
+        message_ids: Sequence[str],
+    ) -> str:
+        self.bulk_moves.append((account, mailbox, tuple(message_ids), ARCHIVE_MAILBOX))
+        self.message_location = ARCHIVE_MAILBOX
         return ARCHIVE_MAILBOX
 
     async def delete_message_permanently(

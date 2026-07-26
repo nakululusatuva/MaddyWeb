@@ -80,6 +80,7 @@ MAX_MESSAGE_CURSOR = (1 << 32) - 1
 MAILBOX_CURSOR_CAPACITY = 4096
 MESSAGE_FRESHNESS_CAPACITY = 4096
 MESSAGE_FRESHNESS_PER_SESSION = 64
+MAX_BULK_MESSAGE_UIDS = 50
 MAX_TOTP_QR_SVG_CHARS = 256 * 1024
 _SPA_PATHS = frozenset({"/", "/accounts", "/certificates", "/compose", "/mail", "/security"})
 _SPA_MAIL_PATH_RE = re.compile(r"\A/mail/([1-9][0-9]{0,9})\Z")
@@ -253,6 +254,29 @@ class Gateway(MailGateway, Protocol):
         *,
         seen: bool,
     ) -> None: ...
+
+    async def set_messages_seen(
+        self,
+        account_id: str,
+        mailbox: str,
+        message_ids: Sequence[str] | None,
+        *,
+        seen: bool,
+    ) -> None: ...
+
+    async def move_messages_to_trash(
+        self,
+        account_id: str,
+        mailbox: str,
+        message_ids: Sequence[str],
+    ) -> str: ...
+
+    async def move_messages_to_archive(
+        self,
+        account_id: str,
+        mailbox: str,
+        message_ids: Sequence[str],
+    ) -> str: ...
 
     async def delete_message_permanently(
         self,
@@ -2727,6 +2751,92 @@ async def set_message_read_state(request: web.Request) -> web.Response:
     return _api_response(message="Message marked read." if seen else "Message marked unread.")
 
 
+def _selected_message_uids(values: Mapping[str, Any]) -> tuple[str, ...]:
+    raw = values.get("uids")
+    if not isinstance(raw, list) or not 1 <= len(raw) <= MAX_BULK_MESSAGE_UIDS:
+        raise web.HTTPBadRequest(
+            text=f"Select between 1 and {MAX_BULK_MESSAGE_UIDS} messages."
+        )
+    selected: list[str] = []
+    seen: set[str] = set()
+    for value in raw:
+        if not isinstance(value, str):
+            raise web.HTTPBadRequest(text="Message identifiers must be strings.")
+        uid = _message_uid(value)
+        if uid in seen:
+            raise web.HTTPBadRequest(text="Message selection contains duplicates.")
+        seen.add(uid)
+        selected.append(uid)
+    return tuple(selected)
+
+
+async def bulk_message_action(request: web.Request) -> web.Response:
+    values = await _read_json_object(
+        request,
+        allowed_fields=frozenset({"account", "mailbox", "action", "uids"}),
+    )
+    account, mailbox_name = _mail_context(request, values)
+    action = _json_text(values, "action")
+    if action not in {"mark_read", "mark_unread", "mark_all_read", "archive", "trash"}:
+        raise web.HTTPBadRequest(text="Bulk message action is invalid.")
+    await _authorize_mail_context(request, account, mailbox_name)
+    if action == "mark_all_read":
+        if "uids" in values:
+            raise web.HTTPBadRequest(text="Mark all as read does not accept a message selection.")
+        selected: tuple[str, ...] | None = None
+        affected: int | None = None
+    else:
+        selected = _selected_message_uids(values)
+        affected = len(selected)
+    try:
+        if action == "mark_all_read":
+            await _gateway(request).set_messages_seen(
+                account,
+                mailbox_name,
+                None,
+                seen=True,
+            )
+            message = "All messages marked read."
+        elif action in {"mark_read", "mark_unread"}:
+            if selected is None:
+                raise RuntimeError("Message selection is unexpectedly unavailable.")
+            mark_seen = action == "mark_read"
+            await _gateway(request).set_messages_seen(
+                account,
+                mailbox_name,
+                selected,
+                seen=mark_seen,
+            )
+            message = (
+                f"{affected} message{'s' if affected != 1 else ''} marked "
+                f"{'read' if mark_seen else 'unread'}."
+            )
+        elif action == "archive":
+            if selected is None:
+                raise RuntimeError("Message selection is unexpectedly unavailable.")
+            await _gateway(request).move_messages_to_archive(
+                account,
+                mailbox_name,
+                selected,
+            )
+            message = f"{affected} message{'s' if affected != 1 else ''} archived."
+        else:
+            if selected is None:
+                raise RuntimeError("Message selection is unexpectedly unavailable.")
+            await _gateway(request).move_messages_to_trash(
+                account,
+                mailbox_name,
+                selected,
+            )
+            message = f"{affected} message{'s' if affected != 1 else ''} moved to Trash."
+    except Exception:
+        return await _gateway_error(request, "Bulk message action failed")
+    return _api_response(
+        data={"account": account, "mailbox": mailbox_name, "affected": affected},
+        message=message,
+    )
+
+
 async def move_message_to_folder(request: web.Request) -> web.Response:
     message_id = _message_uid(request.match_info["message_id"])
     values = await _read_json_object(
@@ -3620,6 +3730,7 @@ def create_app(config: object, gateway: Gateway) -> web.Application:
                 renew_certificate_if_due,
             ),
             web.get("/api/v1/me/mail", api_mailbox),
+            web.post("/api/v1/me/mail-actions", bulk_message_action),
             web.get("/api/v1/me/mail/{message_id}/html", message_html),
             web.get(
                 "/api/v1/me/mail/{message_id}/inline/{attachment_id}",
@@ -3672,6 +3783,7 @@ def create_app(config: object, gateway: Gateway) -> web.Application:
                 reset_account_totp,
             ),
             web.get("/api/v1/admin/mail", api_mailbox),
+            web.post("/api/v1/admin/mail-actions", bulk_message_action),
             web.get("/api/v1/admin/mail/{message_id}/html", message_html),
             web.get(
                 "/api/v1/admin/mail/{message_id}/inline/{attachment_id}",

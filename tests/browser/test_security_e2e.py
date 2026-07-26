@@ -290,6 +290,56 @@ async def test_mailbox_switch_shows_a_scoped_loading_state(
     assert await page.locator("#mail-mailbox").input_value() == "Sent"
 
 
+async def test_mailbox_read_state_and_bulk_selection_actions(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    await _load_inbox(page, live_application)
+    row = page.locator("#message-list-body tr")
+    assert await row.locator(".message-read-status").text_content() == "Unread"
+
+    await row.locator(".message-select-checkbox").check()
+    assert await page.locator("#mail-selection-count").inner_text() == "1 selected"
+    assert await page.locator("#mail-select-page").is_checked()
+    assert await page.locator("#mail-mark-read").is_enabled()
+    await page.locator("#mail-mark-read").click()
+    await page.wait_for_function(
+        "() => document.querySelector('.message-read-status')?.textContent === 'Read'"
+    )
+    assert live_application.gateway.bulk_seen_changes[-1] == (
+        ACCOUNT,
+        MAILBOX,
+        (MESSAGE_ID,),
+        True,
+    )
+
+    await page.get_by_role("button", name="Mark as unread", exact=True).click()
+    await page.wait_for_function(
+        "() => document.querySelector('.message-read-status')?.textContent === 'Unread'"
+    )
+    await page.locator("#mail-mark-all-read").click()
+    await page.locator("#confirm-action").click()
+    await page.wait_for_function(
+        "() => document.querySelector('.message-read-status')?.textContent === 'Read'"
+    )
+    assert live_application.gateway.bulk_seen_changes[-1] == (
+        ACCOUNT,
+        MAILBOX,
+        None,
+        True,
+    )
+
+    await page.locator(".message-select-checkbox").check()
+    await page.locator("#mail-bulk-archive").click()
+    await page.locator("#message-empty").wait_for(state="visible")
+    assert live_application.gateway.bulk_moves[-1] == (
+        ACCOUNT,
+        MAILBOX,
+        (MESSAGE_ID,),
+        ARCHIVE_MAILBOX,
+    )
+
+
 def _message_path() -> str:
     query = urlencode({"account": ACCOUNT, "mailbox": MAILBOX})
     return f"/mail/{MESSAGE_ID}?{query}"
@@ -440,7 +490,30 @@ async def test_anonymous_browser_loads_only_login_then_completes_password_and_to
         await page.locator("#login-submit").click()
         await page.locator("#totp-code").wait_for()
         await page.locator("#totp-code").fill(LOGIN_TOTP)
-        await page.locator("#totp-submit").click()
+        totp_started = asyncio.Event()
+        release_totp = asyncio.Event()
+
+        async def pause_totp(route: Route) -> None:
+            totp_started.set()
+            await release_totp.wait()
+            await route.continue_()
+
+        await page.route("**/api/v1/auth/totp", pause_totp)
+        totp_submit = page.locator("#totp-submit")
+        initial_color = await totp_submit.evaluate(
+            "node => getComputedStyle(node).backgroundColor"
+        )
+        try:
+            await totp_submit.click()
+            await asyncio.wait_for(totp_started.wait(), timeout=2)
+            assert "is-verifying" in (await totp_submit.get_attribute("class") or "")
+            assert await totp_submit.inner_text() == "Verifying..."
+            assert await totp_submit.get_attribute("aria-busy") == "true"
+            assert await totp_submit.evaluate(
+                "node => getComputedStyle(node).backgroundColor"
+            ) != initial_color
+        finally:
+            release_totp.set()
 
         await page.wait_for_url(base_url + "/")
         await page.get_by_role(
@@ -786,7 +859,7 @@ async def test_mailbox_auto_opens_inbox_and_rows_support_pointer_and_keyboard_na
     await page.set_viewport_size({"width": 320, "height": 844})
     await _load_mailbox(page, live_application, MAILBOX)
     actions = page.locator(".message-row-action")
-    assert await actions.count() == 4
+    assert await actions.count() == 5
     assert await page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
     for index in range(await actions.count()):
         bounds = await actions.nth(index).bounding_box()

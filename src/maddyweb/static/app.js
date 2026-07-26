@@ -127,6 +127,8 @@
     previewUrl: null,
     sendLocked: false,
     pendingForwardSubject: null,
+    selectedMessageUids: new Set(),
+    mailBulkBusy: false,
     theme: "light",
   };
 
@@ -189,7 +191,11 @@
         ? `/admin${logicalPath}`
         : `/me${logicalPath}`;
       source.searchParams.delete("account");
-    } else if (logicalPath === "/mail" || logicalPath.startsWith("/mail/")) {
+    } else if (
+      logicalPath === "/mail"
+      || logicalPath.startsWith("/mail/")
+      || logicalPath === "/mail-actions"
+    ) {
       mappedPath = state.role === "admin"
         ? `/admin${logicalPath}`
         : `/me${logicalPath}`;
@@ -954,10 +960,89 @@
   const setMessageRowBusy = (row, busy) => {
     if (busy) row.setAttribute("aria-busy", "true");
     else row.removeAttribute("aria-busy");
-    for (const button of row.querySelectorAll(".message-row-action")) {
-      if (button instanceof HTMLButtonElement) {
-        button.disabled = busy || button.dataset.unavailable === "true";
+    for (const control of row.querySelectorAll(".message-row-action, .message-select-checkbox")) {
+      if (control instanceof HTMLButtonElement || control instanceof HTMLInputElement) {
+        control.disabled = busy || control.dataset.unavailable === "true";
       }
+    }
+  };
+
+  const updateBulkToolbar = () => {
+    const mail = objectValue(state.mail);
+    const messages = arrayValue(mail.messages || mail.items).map(objectValue);
+    const selectedCount = state.selectedMessageUids.size;
+    const selectable = messages.length > 0 && !state.mailBulkBusy;
+    const selectPage = byId("mail-select-page");
+    selectPage.disabled = !selectable;
+    selectPage.checked = messages.length > 0 && selectedCount === messages.length;
+    selectPage.indeterminate = selectedCount > 0 && selectedCount < messages.length;
+    byId("mail-selection-count").textContent = `${selectedCount} selected`;
+    byId("mail-mark-read").disabled = selectedCount === 0 || state.mailBulkBusy;
+    byId("mail-mark-unread").disabled = selectedCount === 0 || state.mailBulkBusy;
+    const selectedMailbox = arrayValue(mail.mailboxes || mail.folders)
+      .map(objectValue)
+      .find((item) => stringValue(item.name) === stringValue(mail.selected_mailbox));
+    byId("mail-bulk-archive").disabled = (
+      selectedCount === 0
+      || state.mailBulkBusy
+      || mail.archive_available !== true
+      || objectValue(selectedMailbox).is_archive === true
+    );
+    byId("mail-bulk-trash").disabled = (
+      selectedCount === 0
+      || state.mailBulkBusy
+      || mail.trash_available !== true
+      || objectValue(selectedMailbox).is_trash === true
+    );
+    byId("mail-mark-all-read").disabled = (
+      state.mailBulkBusy
+      || !messages.some((message) => message.unread === true)
+    );
+    document.querySelectorAll(".message-select-checkbox").forEach((control) => {
+      if (control instanceof HTMLInputElement) control.disabled = state.mailBulkBusy;
+    });
+    byId("mail-bulk-toolbar").classList.toggle("is-busy", state.mailBulkBusy);
+  };
+
+  const selectedMailContext = () => {
+    const mail = objectValue(state.mail);
+    return {
+      account: stringValue(mail.selected_account, scopedAccount()),
+      mailbox: stringValue(mail.selected_mailbox),
+    };
+  };
+
+  const runBulkMessageAction = async (action, messageIds = null) => {
+    if (state.mailBulkBusy) return;
+    const context = selectedMailContext();
+    const selected = messageIds === null
+      ? [...state.selectedMessageUids]
+      : [...messageIds];
+    if (!context.account || !context.mailbox) return;
+    if (action !== "mark_all_read" && selected.length === 0) return;
+    const signal = state.routeController?.signal;
+    if (!(signal instanceof AbortSignal)) return;
+    state.mailBulkBusy = true;
+    updateBulkToolbar();
+    clearAlert();
+    try {
+      const payload = await mutate("/mail-actions", {
+        guardSignal: signal,
+        json: {
+          account: context.account,
+          mailbox: context.mailbox,
+          action,
+          ...(action === "mark_all_read" ? {} : {uids: selected}),
+        },
+      });
+      if (signal.aborted) return;
+      finishAction(payload, "Mailbox updated.");
+      refreshMessageList(context);
+    } catch (error) {
+      if (!signal.aborted) handleError(error);
+    } finally {
+      state.mailBulkBusy = false;
+      if (!signal.aborted) updateBulkToolbar();
     }
   };
 
@@ -1057,6 +1142,8 @@
   };
 
   const renderMail = (mail) => {
+    state.selectedMessageUids.clear();
+    state.mailBulkBusy = false;
     const requestedAccount = new URLSearchParams(window.location.search).get("account") || "";
     const account = stringValue(
       mail.selected_account,
@@ -1225,6 +1312,7 @@
       const row = element("tr", {
         className: message.unread === true ? "message-unread" : "",
       });
+      row.dataset.uid = uid;
       if (uid === activeMessageUid) {
         row.classList.add("is-selected");
         row.setAttribute("aria-current", "true");
@@ -1253,7 +1341,19 @@
         openRow();
       });
       const senderCell = element("td", {className: "message-sender-cell"});
+      const selectMessage = element("input", {
+        className: "message-select-checkbox",
+        type: "checkbox",
+      });
+      selectMessage.setAttribute("aria-label", `Select message: ${subject}`);
+      selectMessage.addEventListener("change", () => {
+        if (selectMessage.checked) state.selectedMessageUids.add(uid);
+        else state.selectedMessageUids.delete(uid);
+        row.classList.toggle("is-bulk-selected", selectMessage.checked);
+        updateBulkToolbar();
+      });
       senderCell.append(
+        selectMessage,
         element("span", {
           className: "message-sender-avatar",
           text: sender.trim().slice(0, 1).toUpperCase() || "?",
@@ -1269,13 +1369,19 @@
         );
       }
       row.append(senderCell);
-      const subjectCell = element("td");
+      const subjectCell = element("td", {className: "message-subject-cell"});
       const subjectLink = element("a", {
         text: subject,
       });
       subjectLink.href = `${url.pathname}${url.search}`;
       subjectLink.dataset.route = "";
-      subjectCell.append(subjectLink);
+      subjectCell.append(
+        subjectLink,
+        element("span", {
+          className: "message-read-status",
+          text: message.unread === true ? "Unread" : "Read",
+        }),
+      );
       const actionCell = element("td", {className: "message-actions-cell"});
       const actionGroup = element("div", {className: "message-row-actions"});
       actionGroup.setAttribute("role", "group");
@@ -1301,6 +1407,15 @@
           : "This account does not have an available Archive mailbox.";
       }
       actionGroup.append(
+        messageActionButton(
+          message.unread === true ? "Mark as read" : "Mark as unread",
+          context,
+          () => runBulkMessageAction(
+            message.unread === true ? "mark_read" : "mark_unread",
+            [uid],
+          ),
+          message.unread === true ? "Mark read" : "Mark unread",
+        ),
         messageActionButton("Forward", context, () => {
           state.pendingForwardSubject = null;
           navigate(buildForwardUrl({...context, mode: "inline"}));
@@ -1330,6 +1445,7 @@
       fragment.append(row);
     }
     byId("message-list-body").replaceChildren(fragment);
+    updateBulkToolbar();
     const empty = byId("message-empty");
     empty.hidden = messages.length !== 0;
     empty.textContent = account && mailbox
@@ -2897,6 +3013,57 @@
     const mailbox = event.target instanceof HTMLSelectElement ? event.target.value : "";
     const account = byId("mail-account").value || scopedAccount();
     navigate(buildMailUrl({account, mailbox}));
+  });
+
+  byId("mail-select-page").addEventListener("change", (event) => {
+    const checked = event.currentTarget instanceof HTMLInputElement
+      ? event.currentTarget.checked
+      : false;
+    state.selectedMessageUids.clear();
+    document.querySelectorAll(".message-select-checkbox").forEach((control) => {
+      if (!(control instanceof HTMLInputElement)) return;
+      control.checked = checked;
+      const row = control.closest("tr");
+      const uid = row instanceof HTMLTableRowElement ? stringValue(row.dataset.uid) : "";
+      if (checked && uid) state.selectedMessageUids.add(uid);
+      if (row) row.classList.toggle("is-bulk-selected", checked);
+    });
+    updateBulkToolbar();
+  });
+
+  byId("mail-mark-read").addEventListener("click", () => {
+    void runBulkMessageAction("mark_read");
+  });
+
+  byId("mail-mark-unread").addEventListener("click", () => {
+    void runBulkMessageAction("mark_unread");
+  });
+
+  byId("mail-bulk-archive").addEventListener("click", () => {
+    void runBulkMessageAction("archive");
+  });
+
+  byId("mail-bulk-trash").addEventListener("click", (event) => {
+    const selectedCount = state.selectedMessageUids.size;
+    if (!selectedCount) return;
+    openConfirm({
+      title: `Move ${selectedCount} message${selectedCount === 1 ? "" : "s"} to Trash?`,
+      message: "The selected messages will leave this mailbox and move to Trash.",
+      label: "Move to Trash",
+      danger: true,
+      opener: event.currentTarget,
+      action: () => runBulkMessageAction("trash"),
+    });
+  });
+
+  byId("mail-mark-all-read").addEventListener("click", (event) => {
+    openConfirm({
+      title: "Mark every message in this mailbox as read?",
+      message: "This applies to the entire mailbox, including messages on other pages.",
+      label: "Mark all as read",
+      opener: event.currentTarget,
+      action: () => runBulkMessageAction("mark_all_read"),
+    });
   });
 
   byId("mobile-folders-button").addEventListener("click", () => {

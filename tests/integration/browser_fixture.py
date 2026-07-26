@@ -119,6 +119,15 @@ class BrowserGateway:
     async def move_message_to_archive(self, *_args: object) -> str:
         return "Custom Archive"
 
+    async def set_messages_seen(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
+    async def move_messages_to_trash(self, *_args: object) -> str:
+        return "Custom Trash"
+
+    async def move_messages_to_archive(self, *_args: object) -> str:
+        return "Custom Archive"
+
     async def delete_message_permanently(self, *_args: object) -> None:
         return None
 

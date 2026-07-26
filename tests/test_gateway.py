@@ -122,6 +122,52 @@ async def test_health_has_fixed_schema_discards_accounts_and_is_cached() -> None
 
 
 @pytest.mark.asyncio
+async def test_bulk_message_operations_build_only_valid_uid_sets() -> None:
+    client = FakeClient(
+        {
+            "messages.add_flags": Response.success("template", {"changed": True}),
+            "messages.remove_flags": Response.success("template", {"changed": True}),
+            "messages.move": Response.success(
+                "template",
+                {"moved": True, "target": "Custom Archive"},
+            ),
+        }
+    )
+    gateway = gateway_with(client)
+
+    await gateway.set_messages_seen(
+        "account-id",
+        "INBOX",
+        ("42", "44"),
+        seen=True,
+    )
+    await gateway.set_messages_seen("account-id", "INBOX", None, seen=True)
+    target = await gateway.move_messages_to_archive(
+        "account-id",
+        "INBOX",
+        ("42", "44"),
+    )
+
+    assert target == "Custom Archive"
+    assert [request.params["uid_set"] for request in client.requests] == [
+        "42,44",
+        "1:*",
+        "42,44",
+    ]
+    assert client.requests[-1].params["target_special"] == "archive"
+
+    with pytest.raises(ValueError, match="duplicate"):
+        await gateway.set_messages_seen(
+            "account-id",
+            "INBOX",
+            ("42", "42"),
+            seen=False,
+        )
+    with pytest.raises(ValueError, match="between 1 and 50"):
+        await gateway.move_messages_to_trash("account-id", "INBOX", ())
+
+
+@pytest.mark.asyncio
 async def test_health_cache_ttl_starts_after_slow_probe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

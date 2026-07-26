@@ -398,8 +398,12 @@
     event.preventDefault();
     if (state.busy || !state.challenge) return;
     const input = byId("totp-code");
+    const submit = byId("totp-submit");
     const code = input.value.replace(/\s+/g, "");
     input.value = "";
+    submit.classList.add("is-verifying");
+    submit.setAttribute("aria-busy", "true");
+    submit.textContent = "Verifying...";
     setBusy(true, "Verifying your authenticator code...");
     try {
       finishAuthentication(await authRequest("/totp", {
@@ -411,6 +415,9 @@
       input.focus();
     } finally {
       setBusy(false);
+      submit.classList.remove("is-verifying");
+      submit.removeAttribute("aria-busy");
+      submit.textContent = "Verify and sign in";
     }
   });
 

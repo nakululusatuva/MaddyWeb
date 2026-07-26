@@ -1073,6 +1073,28 @@ def _confirmed(params: Mapping[str, Any]) -> None:
         raise ValueError("destructive operation requires confirm=true")
 
 
+def _selected_message_uid_set(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("message UID selection must be text")
+    values = value.split(",")
+    if not 1 <= len(values) <= 50:
+        raise ValueError("message UID selection must contain between 1 and 50 UIDs")
+    selected: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        if not item.isdecimal() or item.startswith("0"):
+            raise ValueError("message UID selection contains an invalid UID")
+        uid = int(item)
+        if not 1 <= uid <= (1 << 32) - 1:
+            raise ValueError("message UID selection contains an invalid UID")
+        normalized = str(uid)
+        if normalized in seen:
+            raise ValueError("message UID selection contains duplicate UIDs")
+        seen.add(normalized)
+        selected.append(normalized)
+    return ",".join(selected)
+
+
 class PrivilegedDispatcher:
     def __init__(
         self,
@@ -1949,9 +1971,11 @@ class PrivilegedDispatcher:
     def _messages_move(self, request: Request, _spool: TrustedSpool | None) -> Any:
         values = _params(
             request,
-            required={"username", "source", "uid"},
-            optional={"target_special", "target"},
+            required={"username", "source"},
+            optional={"uid", "uid_set", "target_special", "target"},
         )
+        if ("uid" in values) is ("uid_set" in values):
+            raise ValueError("exactly one message UID selector must be supplied")
         if ("target_special" in values) is ("target" in values):
             raise ValueError("exactly one message target must be supplied")
         target = (
@@ -1959,7 +1983,20 @@ class PrivilegedDispatcher:
             if "target_special" in values
             else values["target"]
         )
-        self.maddy.move_message(values["username"], values["source"], values["uid"], target)
+        if "uid_set" in values:
+            self.maddy.move_messages(
+                values["username"],
+                values["source"],
+                _selected_message_uid_set(values["uid_set"]),
+                target,
+            )
+        else:
+            self.maddy.move_message(
+                values["username"],
+                values["source"],
+                values["uid"],
+                target,
+            )
         return {"moved": True, "target": target}
 
     def _message_flags(self, request: Request, method: str) -> Any:

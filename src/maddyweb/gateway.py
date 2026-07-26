@@ -114,6 +114,22 @@ def _single_uid(value: str) -> str:
     return str(uid)
 
 
+def _uid_set(values: Sequence[str] | None) -> str:
+    if values is None:
+        return "1:*"
+    if not 1 <= len(values) <= 50:
+        raise ValueError("message selection must contain between 1 and 50 UIDs")
+    checked: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        uid = _single_uid(value)
+        if uid in seen:
+            raise ValueError("message selection contains duplicate UIDs")
+        seen.add(uid)
+        checked.append(uid)
+    return ",".join(checked)
+
+
 @dataclass(slots=True)
 class _HealthCache:
     expires_at: float = 0.0
@@ -881,6 +897,67 @@ class HelperGateway:
                 "flags": ["\\Seen"],
             },
         )
+
+    async def set_messages_seen(
+        self,
+        account_id: str,
+        mailbox: str,
+        message_ids: Sequence[str] | None,
+        *,
+        seen: bool,
+    ) -> None:
+        if type(seen) is not bool:
+            raise ValueError("seen state must be a boolean")
+        operation = "messages.add_flags" if seen else "messages.remove_flags"
+        await self._call(
+            operation,
+            {
+                "target_account_id": account_id,
+                "mailbox": mailbox,
+                "uid_set": _uid_set(message_ids),
+                "flags": ["\\Seen"],
+            },
+        )
+
+    async def move_messages_to_trash(
+        self,
+        account_id: str,
+        mailbox: str,
+        message_ids: Sequence[str],
+    ) -> str:
+        return await self._move_messages(account_id, mailbox, message_ids, "trash")
+
+    async def move_messages_to_archive(
+        self,
+        account_id: str,
+        mailbox: str,
+        message_ids: Sequence[str],
+    ) -> str:
+        return await self._move_messages(account_id, mailbox, message_ids, "archive")
+
+    async def _move_messages(
+        self,
+        account_id: str,
+        mailbox: str,
+        message_ids: Sequence[str],
+        target_special: str,
+    ) -> str:
+        result = _mapping(
+            await self._call(
+                "messages.move",
+                {
+                    "target_account_id": account_id,
+                    "source": mailbox,
+                    "uid_set": _uid_set(message_ids),
+                    "target_special": target_special,
+                },
+            ),
+            "messages.move",
+        )
+        target = result.get("target")
+        if not isinstance(target, str) or not target:
+            raise HelperCallError("invalid_response", "messages.move returned no target mailbox")
+        return target
 
     async def delete_message_permanently(
         self,

@@ -98,6 +98,7 @@ class FakeMaddy:
         self.message_list_kwargs: list[dict[str, Any]] = []
         self.deleted: list[tuple[str, str, str]] = []
         self.moved: list[tuple[str, str, str, str]] = []
+        self.moved_many: list[tuple[str, str, str, str]] = []
         self.password_changes: list[tuple[str, str]] = []
 
     def require_write_safety(self, capability: Capability) -> None:
@@ -153,6 +154,9 @@ class FakeMaddy:
 
     def move_message(self, username: str, source: str, uid: str, target: str) -> None:
         self.moved.append((username, source, uid, target))
+
+    def move_messages(self, username: str, source: str, uid_set: str, target: str) -> None:
+        self.moved_many.append((username, source, uid_set, target))
 
     def dump_message_to(
         self,
@@ -1133,7 +1137,7 @@ def test_message_pagination_uses_stable_uid_continuation(
     assert limited.response.error.code == "limit_exceeded"
 
 
-def test_destructive_message_operations_accept_only_one_uid_and_resolve_trash(
+def test_message_moves_allow_bounded_selection_but_deletion_requires_one_uid(
     tmp_path: Path,
 ) -> None:
     maddy = FakeMaddy()
@@ -1151,6 +1155,36 @@ def test_destructive_message_operations_accept_only_one_uid_and_resolve_trash(
     )
     assert moved.response.result == {"moved": True, "target": "Custom Trash"}
     assert maddy.moved == [("sender@example.test", "INBOX", "42", "Custom Trash")]
+
+    moved_many = dispatcher.dispatch(
+        Request.create(
+            "messages.move",
+            {
+                "username": "sender@example.test",
+                "source": "INBOX",
+                "uid_set": "41,42",
+                "target_special": "trash",
+            },
+        )
+    )
+    assert moved_many.response.result == {"moved": True, "target": "Custom Trash"}
+    assert maddy.moved_many == [
+        ("sender@example.test", "INBOX", "41,42", "Custom Trash")
+    ]
+
+    move_all = dispatcher.dispatch(
+        Request.create(
+            "messages.move",
+            {
+                "username": "sender@example.test",
+                "source": "INBOX",
+                "uid_set": "1:*",
+                "target_special": "trash",
+            },
+        )
+    )
+    assert move_all.response.error is not None
+    assert move_all.response.error.code == "invalid_request"
 
     injected = dispatcher.dispatch(
         Request.create(

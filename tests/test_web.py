@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 import time
+from collections.abc import Sequence
 from email import policy
 from email.message import EmailMessage
 from email.parser import BytesParser
@@ -312,6 +313,34 @@ class FakeGateway:
         self.operations.append(("archive", account_id, mailbox, message_id))
         return "Archive"
 
+    async def set_messages_seen(
+        self,
+        account_id: str,
+        mailbox: str,
+        message_ids: Sequence[str] | None,
+        *,
+        seen: bool,
+    ) -> None:
+        self.operations.append(("set_messages_seen", account_id, mailbox, message_ids, seen))
+
+    async def move_messages_to_trash(
+        self,
+        account_id: str,
+        mailbox: str,
+        message_ids: Sequence[str],
+    ) -> str:
+        self.operations.append(("trash_many", account_id, mailbox, tuple(message_ids)))
+        return "Trash"
+
+    async def move_messages_to_archive(
+        self,
+        account_id: str,
+        mailbox: str,
+        message_ids: Sequence[str],
+    ) -> str:
+        self.operations.append(("archive_many", account_id, mailbox, tuple(message_ids)))
+        return "Archive"
+
     async def delete_message_permanently(
         self,
         account_id: str,
@@ -449,8 +478,8 @@ async def test_home_static_assets_and_strict_headers(
     page = await response.text()
     assert response.status == 200
     assert "Administration overview" in page
-    assert 'href="/static/app.css?v=12"' in page
-    assert 'src="/static/app.js?v=14"' in page
+    assert 'href="/static/app.css?v=13"' in page
+    assert 'src="/static/app.js?v=15"' in page
     assert 'id="compose-sender-name"' in page
     assert 'name="sender_name"' in page
     assert 'maxlength="256"' in page
@@ -926,6 +955,69 @@ async def test_mailbox_payload_exposes_validated_special_use_flags(
     ]
     assert data["trash_available"] is True
     assert data["archive_available"] is True
+
+
+@pytest.mark.asyncio
+async def test_bulk_message_actions_validate_selection_and_use_fixed_mailbox_scope(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+    token = await _get_token(client)
+    base = {
+        "account": ADMIN_ACCOUNT_ID,
+        "mailbox": "INBOX",
+    }
+
+    marked = await _post_json(
+        client,
+        "/api/v1/admin/mail-actions",
+        token,
+        {**base, "action": "mark_read", "uids": ["42", "43"]},
+    )
+    assert marked.status == 200
+    assert (
+        "set_messages_seen",
+        ADMIN_ACCOUNT_ID,
+        "INBOX",
+        ("42", "43"),
+        True,
+    ) in gateway.operations
+
+    token = await _get_token(client)
+    mark_all = await _post_json(
+        client,
+        "/api/v1/admin/mail-actions",
+        token,
+        {**base, "action": "mark_all_read"},
+    )
+    assert mark_all.status == 200
+    assert (
+        "set_messages_seen",
+        ADMIN_ACCOUNT_ID,
+        "INBOX",
+        None,
+        True,
+    ) in gateway.operations
+
+    token = await _get_token(client)
+    archived = await _post_json(
+        client,
+        "/api/v1/admin/mail-actions",
+        token,
+        {**base, "action": "archive", "uids": ["42"]},
+    )
+    assert archived.status == 200
+    assert ("archive_many", ADMIN_ACCOUNT_ID, "INBOX", ("42",)) in gateway.operations
+
+    token = await _get_token(client)
+    duplicate = await _post_json(
+        client,
+        "/api/v1/admin/mail-actions",
+        token,
+        {**base, "action": "trash", "uids": ["42", "42"]},
+    )
+    assert duplicate.status == 400
+    assert not any(operation[0] == "trash_many" for operation in gateway.operations)
 
 
 @pytest.mark.asyncio
