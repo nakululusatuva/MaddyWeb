@@ -1256,8 +1256,10 @@ async def test_message_html_is_sandboxed_and_attachment_filename_is_safe(
     assert image_sources[0].startswith("data:image/png;base64,")
     assert await frame_element.get_attribute("sandbox") == ""
     frame_source = await frame_element.get_attribute("src")
-    assert frame_source is not None and frame_source.startswith("blob:")
-    assert not any("/html?" in url for url in requested_urls)
+    assert frame_source is not None and "/api/v1/admin/mail/42/html?" in frame_source
+    assert await frame_element.get_attribute("srcdoc") is None
+    assert await frame_element.get_attribute("loading") is None
+    assert len([url for url in requested_urls if "/html?" in url]) == 1
     assert await frame_element.get_attribute("referrerpolicy") == "no-referrer"
     assert not any(".invalid" in url or url.startswith("data:") for url in requested_urls)
 

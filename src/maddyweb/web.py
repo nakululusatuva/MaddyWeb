@@ -45,6 +45,7 @@ from .mail import (
     deliver_and_save,
     derive_reply_recipients,
     detect_safe_image_type,
+    html_to_text,
     parse_message,
     reply_subject,
     reply_thread_headers,
@@ -2530,11 +2531,6 @@ async def api_message_detail(request: web.Request) -> web.Response:
             }
             for attachment in message.attachments
         ]
-        html_document = (
-            await asyncio.to_thread(_message_iframe_document, message)
-            if message.html is not None
-            else None
-        )
         return _api_response(
             data={
                 "uid": message_id,
@@ -2552,7 +2548,6 @@ async def api_message_detail(request: web.Request) -> web.Response:
                 "references": list(message.references),
                 "text": message.text,
                 "has_html": message.html is not None,
-                "html_document": html_document,
                 "html_url": (
                     _message_download_url(
                         request,
@@ -2609,6 +2604,10 @@ def _message_iframe_document(message: ParsedMessage) -> str:
 
 def _iframe_document(message_html: str, cid_urls: Mapping[str, str]) -> str:
     rewritten = rewrite_cid_images(message_html, cid_urls)
+    if not html_to_text(rewritten) and "<img" not in rewritten.lower():
+        rewritten = (
+            '<p class="empty">No safe visible HTML content remained after sanitization.</p>'
+        )
     return sandboxed_html_document(rewritten, already_sanitized=True)
 
 
@@ -3702,7 +3701,7 @@ async def static_asset(request: web.Request) -> web.Response:
     else:
         application_versions = {
             "app.css": "13",
-            "app.js": "17",
+            "app.js": "18",
             "preview.css": "1",
         }
         versions = request.query.getall("v", [])

@@ -30,6 +30,7 @@ from maddyweb.web import (
     MessagePage,
     _eligible_inline_attachments,
     _FreshnessStore,
+    _iframe_document,
     create_app,
 )
 
@@ -83,6 +84,13 @@ def _message_with_attachments(
         html="<p>body</p>",
         attachments=attachments,
     )
+
+
+def test_message_iframe_explains_when_sanitization_removes_all_visible_content() -> None:
+    document = _iframe_document("<p></p>", {})
+
+    assert "No safe visible HTML content remained after sanitization." in document
+    assert "default-src 'none'" in document
 
 
 def test_inline_cid_rendering_bounds_count_bytes_pixels_and_duplicates() -> None:
@@ -481,7 +489,7 @@ async def test_home_static_assets_and_strict_headers(
     assert response.status == 200
     assert "Administration overview" in page
     assert 'href="/static/app.css?v=14"' in page
-    assert 'src="/static/app.js?v=17"' in page
+    assert 'src="/static/app.js?v=18"' in page
     assert 'id="compose-sender-name"' in page
     assert 'name="sender_name"' in page
     assert 'maxlength="256"' in page
@@ -821,12 +829,7 @@ async def test_mail_defaults_to_admin_inbox_and_has_two_delete_levels(
     assert detail_data["subject"] == "Received message"
     assert detail_data["has_html"] is True
     assert detail_data["html_url"].startswith("/api/v1/admin/mail/42/html?")
-    embedded = detail_data["html_document"]
-    assert "tracker.test" not in embedded
-    assert "<script" not in embedded
-    assert "data:image/png;base64," in embedded
-    assert "cid:missing" not in embedded
-    assert "cid:logo" not in embedded
+    assert "html_document" not in detail_data
     assert detail_data["raw_url"].startswith("/api/v1/admin/mail/42/raw?")
     assert detail_data["freshness_token"]
 

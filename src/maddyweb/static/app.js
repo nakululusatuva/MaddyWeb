@@ -1511,30 +1511,23 @@
       fragment.append(section);
     }
     if (message.has_html === true) {
-      const documentSource = stringValue(message.html_document);
       const source = mailResourceUrl(stringValue(message.html_url));
-      if (documentSource || source) {
+      if (source) {
         const section = element("section", {className: "message-part"});
         section.append(element("h2", {text: "Sanitized HTML body"}));
         const frame = document.createElement("iframe");
         frame.className = "message-frame";
         frame.title = "Sanitized message body";
-        frame.loading = "lazy";
         frame.referrerPolicy = "no-referrer";
         frame.setAttribute("sandbox", "");
-        if (documentSource) {
-          const objectUrl = URL.createObjectURL(new Blob([documentSource], {
-            type: "text/html;charset=utf-8",
-          }));
-          const releaseObjectUrl = () => URL.revokeObjectURL(objectUrl);
-          frame.addEventListener("load", releaseObjectUrl, {once: true});
-          frame.addEventListener("error", releaseObjectUrl, {once: true});
-          frame.src = objectUrl;
-        } else if (source) {
-          frame.src = `${source.pathname}${source.search}`;
-        }
+        frame.src = `${source.pathname}${source.search}`;
         section.append(frame);
         fragment.append(section);
+      } else {
+        fragment.append(element("div", {
+          className: "empty-state",
+          text: "The sanitized HTML preview is unavailable.",
+        }));
       }
     }
     if (!text && message.has_html !== true) {
