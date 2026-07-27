@@ -112,8 +112,9 @@
     typedAction: null,
     typedExpected: "",
     typedOpener: null,
-    stepUpTarget: null,
     stepUpOpener: null,
+    stepUpResolve: null,
+    stepUpReject: null,
     disclosedCredentials: null,
     disclosureOpener: null,
     disclosureContinue: null,
@@ -580,8 +581,62 @@
     return objectValue(payload);
   };
 
+  const requestAdministratorStepUp = (options = {}) => {
+    if (typeof state.stepUpResolve === "function") {
+      return Promise.reject(new ApiError(
+        "Administrator verification is already in progress.",
+        {code: "step_up_in_progress", status: 409},
+      ));
+    }
+    const values = objectValue(options);
+    byId("step-up-title").textContent = stringValue(
+      values.title,
+      "Verify administrator",
+    );
+    byId("step-up-account").textContent = stringValue(values.account);
+    byId("step-up-copy").textContent = stringValue(
+      values.copy,
+      "Verify your administrator password and current authenticator code "
+        + "to continue this protected operation.",
+    );
+    byId("step-up-submit").textContent = stringValue(
+      values.submitLabel,
+      "Verify and continue",
+    );
+    byId("step-up-error").hidden = true;
+    byId("step-up-error").textContent = "";
+    byId("step-up-form").reset();
+    state.stepUpOpener = values.opener instanceof HTMLElement
+      ? values.opener
+      : document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+    return new Promise((resolve, reject) => {
+      state.stepUpResolve = resolve;
+      state.stepUpReject = reject;
+      stepUpDialog.showModal();
+      const password = byId("step-up-form").elements.namedItem("password");
+      if (password instanceof HTMLInputElement) password.focus();
+    });
+  };
+
   const mutate = (path, options = {}) => {
-    const run = () => executeMutation(path, options);
+    const run = async () => {
+      try {
+        return await executeMutation(path, options);
+      } catch (error) {
+        if (
+          error instanceof ApiError
+          && error.code === "step_up_required"
+          && options.stepUp !== false
+          && path !== "/auth/step-up"
+        ) {
+          await requestAdministratorStepUp();
+          return executeMutation(path, {...options, stepUp: false});
+        }
+        throw error;
+      }
+    };
     const operation = state.mutationTail.then(run, run);
     state.mutationTail = operation.catch(() => undefined);
     return operation;
@@ -589,6 +644,7 @@
 
   const handleError = (error, fallback = "The request could not be completed.") => {
     if (error && error.name === "AbortError") return;
+    if (error instanceof ApiError && error.code === "step_up_cancelled") return;
     const verificationFailure = error instanceof ApiError && new Set([
       "invalid_credentials",
       "invalid_second_factor",
@@ -3956,36 +4012,57 @@
     }
   });
 
-  byId("reset-account-totp").addEventListener("click", (event) => {
+  byId("reset-account-totp").addEventListener("click", async (event) => {
     const account = objectValue(state.selectedAccount);
     const id = accountId(account);
     const address = accountAddress(account);
     if (!id || !address) return;
-    state.stepUpTarget = {id, address};
-    state.stepUpOpener = state.accountOpener instanceof HTMLElement
+    const opener = state.accountOpener instanceof HTMLElement
       ? state.accountOpener
       : event.currentTarget;
-    byId("step-up-account").textContent = address;
-    byId("step-up-error").hidden = true;
-    byId("step-up-error").textContent = "";
-    byId("step-up-form").reset();
     closeDialog(accountDialog);
-    stepUpDialog.showModal();
-    const password = byId("step-up-form").elements.namedItem("password");
-    if (password instanceof HTMLInputElement) password.focus();
+    try {
+      await requestAdministratorStepUp({
+        title: "Reset account TOTP",
+        account: address,
+        copy: "Verify your administrator password and current authenticator code. "
+          + "The target account will immediately lose its existing TOTP and recovery codes.",
+        submitLabel: "Verify and reset TOTP",
+        opener,
+      });
+      const payload = await mutate(`/accounts/${encodeURIComponent(id)}/totp/reset`, {
+        json: {confirmation: "RESET TOTP"},
+        stepUp: false,
+      });
+      const data = objectValue(payload.data);
+      const secret = stringValue(data.totp_secret);
+      const recoveryCodes = arrayValue(data.recovery_codes);
+      if (!secret || !recoveryCodes.length) {
+        throw new ApiError("The server did not provide the replacement TOTP credentials.");
+      }
+      openCredentialDisclosure({
+        title: "Save the replacement TOTP credentials",
+        account: stringValue(data.email, address),
+        secret,
+        recoveryCodes,
+        opener,
+        onContinue: id === stringValue(objectValue(state.principal).account_id)
+          ? () => window.location.replace("/login")
+          : null,
+      });
+      finishAction(payload, "Account TOTP reset.");
+    } catch (error) {
+      handleError(error, "Account TOTP could not be reset.");
+    }
   });
 
   byId("step-up-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = event.currentTarget;
-    const target = objectValue(state.stepUpTarget);
-    const id = stringValue(target.id);
-    const address = stringValue(target.address);
     if (
       !(form instanceof HTMLFormElement)
       || !form.reportValidity()
-      || !/^[0-9a-f]{32}$/.test(id)
-      || !address
+      || typeof state.stepUpResolve !== "function"
     ) return;
     const passwordInput = form.elements.namedItem("password");
     const codeInput = form.elements.namedItem("code");
@@ -4004,32 +4081,16 @@
     byId("step-up-error").hidden = true;
     byId("step-up-error").textContent = "";
     try {
-      await mutate("/auth/step-up", {json: {password, code}});
-      const payload = await mutate(`/accounts/${encodeURIComponent(id)}/totp/reset`, {
-        json: {confirmation: "RESET TOTP"},
-      });
-      const data = objectValue(payload.data);
-      const secret = stringValue(data.totp_secret);
-      const recoveryCodes = arrayValue(data.recovery_codes);
-      if (!secret || !recoveryCodes.length) {
-        throw new ApiError("The server did not provide the replacement TOTP credentials.");
-      }
+      await executeMutation("/auth/step-up", {json: {password, code}, stepUp: false});
+      const resolve = state.stepUpResolve;
+      state.stepUpResolve = null;
+      state.stepUpReject = null;
       closeDialog(stepUpDialog);
-      openCredentialDisclosure({
-        title: "Save the replacement TOTP credentials",
-        account: stringValue(data.email, address),
-        secret,
-        recoveryCodes,
-        opener: state.stepUpOpener,
-        onContinue: id === stringValue(objectValue(state.principal).account_id)
-          ? () => window.location.replace("/login")
-          : null,
-      });
-      finishAction(payload, "Account TOTP reset.");
+      resolve();
     } catch (error) {
       const message = error instanceof ApiError
         ? error.message
-        : "Account TOTP could not be reset.";
+        : "Administrator verification failed.";
       byId("step-up-error").textContent = message;
       byId("step-up-error").hidden = false;
       button.disabled = false;
@@ -4283,7 +4344,17 @@
     byId("step-up-form").reset();
     byId("step-up-error").hidden = true;
     byId("step-up-error").textContent = "";
-    state.stepUpTarget = null;
+    const submit = byId("step-up-submit");
+    if (submit instanceof HTMLButtonElement) submit.disabled = false;
+    const reject = state.stepUpReject;
+    state.stepUpResolve = null;
+    state.stepUpReject = null;
+    if (typeof reject === "function") {
+      reject(new ApiError(
+        "Administrator verification was cancelled.",
+        {code: "step_up_cancelled", status: 403},
+      ));
+    }
     if (
       !credentialDisclosureDialog.open
       && state.stepUpOpener instanceof HTMLElement

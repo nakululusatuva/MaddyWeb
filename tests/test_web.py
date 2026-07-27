@@ -16,6 +16,7 @@ import pytest_asyncio
 from aiohttp import CookieJar, FormData
 from aiohttp.test_utils import TestClient, TestServer
 
+from maddyweb.gateway import HelperCallError
 from maddyweb.mail import (
     MAX_RENDERED_CID_BYTES,
     MAX_RENDERED_CID_IMAGES,
@@ -167,6 +168,7 @@ class FakeGateway:
             },
         ]
         self.operations: list[tuple[object, ...]] = []
+        self.create_account_error: Exception | None = None
         self.certificate_automation_safe = True
         self.certificate_timer_enabled = True
         self.certificate_timer_active = True
@@ -247,6 +249,8 @@ class FakeGateway:
         return self.accounts
 
     async def create_account(self, username: str, password: str) -> object:
+        if self.create_account_error is not None:
+            raise self.create_account_error
         self.operations.append(("create_account", username, password))
         return {"address": username}
 
@@ -490,7 +494,7 @@ async def test_home_static_assets_and_strict_headers(
     assert response.status == 200
     assert "Administration overview" in page
     assert 'href="/static/app.css?v=20"' in page
-    assert 'src="/static/app.js?v=24"' in page
+    assert 'src="/static/app.js?v=25"' in page
     assert 'id="compose-sender-name"' in page
     assert 'name="sender_name"' in page
     assert 'maxlength="256"' in page
@@ -710,6 +714,30 @@ async def test_account_actions_are_separate_and_mailbox_delete_is_confirmed(
     )
     assert deleted.status == 200
     assert ("delete_mailbox", ADMIN_ACCOUNT_ID) in gateway.operations
+
+
+@pytest.mark.asyncio
+async def test_account_creation_reports_fresh_admin_verification_requirement(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+    gateway.create_account_error = HelperCallError(
+        "step_up_required",
+        "Fresh administrator authentication is required",
+    )
+
+    token = await _get_token(client)
+    response = await _post_json(
+        client,
+        "/api/v1/accounts",
+        token,
+        {"username": "protected", "password": "valid-password"},
+    )
+
+    assert response.status == 403
+    payload = await response.json()
+    assert payload["error"]["code"] == "step_up_required"
+    assert not any(operation[0] == "create_account" for operation in gateway.operations)
 
 
 @pytest.mark.asyncio

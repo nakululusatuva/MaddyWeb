@@ -8,7 +8,7 @@
   <meta name="description" content="MaddyWeb mail workspace and server administration console">
   <title>MaddyWeb</title>
   <link rel="stylesheet" href="/static/app.css?v=20">
-  <script src="/static/app.js?v=24" defer></script>
+  <script src="/static/app.js?v=25" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to main content</a>
@@ -421,13 +421,13 @@
 
   <dialog id="step-up-dialog">
     <div class="dialog-card">
-      <div class="dialog-heading"><div><p class="eyebrow">Fresh administrator verification</p><h2>Reset account TOTP</h2><p id="step-up-account"></p></div><button class="dialog-close" type="button" data-close-dialog aria-label="Close">&times;</button></div>
-      <p>Verify your own administrator password and current authenticator code. The target account will immediately lose its existing TOTP and recovery codes.</p>
+      <div class="dialog-heading"><div><p class="eyebrow">Fresh administrator verification</p><h2 id="step-up-title">Verify administrator</h2><p id="step-up-account"></p></div><button class="dialog-close" type="button" data-close-dialog aria-label="Close">&times;</button></div>
+      <p id="step-up-copy">Verify your administrator password and current authenticator code to continue this protected operation.</p>
       <p id="step-up-error" class="notice notice-error" role="alert" hidden></p>
       <form id="step-up-form" class="stack-form" autocomplete="off">
         <label><span>Administrator password</span><input name="password" type="password" required maxlength="1024" autocomplete="current-password"></label>
         <label><span>Administrator authenticator code</span><input name="code" type="text" required pattern="[0-9]{6}" maxlength="6" inputmode="numeric" autocomplete="one-time-code" placeholder="000000"></label>
-        <div class="dialog-actions"><button class="button button-secondary" type="button" data-close-dialog>Cancel</button><button class="button button-danger" type="submit">Verify and reset TOTP</button></div>
+        <div class="dialog-actions"><button class="button button-secondary" type="button" data-close-dialog>Cancel</button><button id="step-up-submit" class="button button-primary" type="submit">Verify and continue</button></div>
       </form>
     </div>
   </dialog>

@@ -1466,6 +1466,21 @@ async def _gateway_error(_request: web.Request, title: str) -> web.Response:
     )
 
 
+async def _mutation_gateway_error(
+    request: web.Request,
+    title: str,
+    exc: Exception,
+) -> web.Response:
+    if isinstance(exc, HelperCallError) and exc.code == "step_up_required":
+        LOGGER.info("gateway operation requires fresh administrator verification: %s", title)
+        return _api_error(
+            "step_up_required",
+            "Fresh administrator authentication is required.",
+            status=403,
+        )
+    return await _gateway_error(request, title)
+
+
 def _auth_failure(exc: Exception) -> web.Response:
     code = exc.code if isinstance(exc, HelperCallError) else "backend_failure"
     if code == "rate_limited":
@@ -1975,8 +1990,8 @@ async def create_account(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(text="Password must contain 12 to 256 valid characters.")
     try:
         created = await _gateway(request).create_account(username, password)
-    except Exception:
-        return await _gateway_error(request, "Account creation failed")
+    except Exception as exc:
+        return await _mutation_gateway_error(request, "Account creation failed", exc)
     finally:
         password = ""  # Avoid retaining the immutable reference in this frame.
     if not isinstance(created, Mapping):
@@ -2002,8 +2017,8 @@ async def change_password(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(text="Password must contain 12 to 256 valid characters.")
     try:
         await _gateway(request).change_password(account_id, password)
-    except Exception:
-        return await _gateway_error(request, "Password change failed")
+    except Exception as exc:
+        return await _mutation_gateway_error(request, "Password change failed", exc)
     finally:
         password = ""
     return _api_response(message="Password changed.")
@@ -2031,8 +2046,8 @@ async def disable_credentials(request: web.Request) -> web.Response:
     await _read_json_object(request, allowed_fields=frozenset())
     try:
         await _gateway(request).disable_credentials(account_id)
-    except Exception:
-        return await _gateway_error(request, "Failed to disable credentials")
+    except Exception as exc:
+        return await _mutation_gateway_error(request, "Failed to disable credentials", exc)
     return _api_response(message="Credentials disabled; mailbox not deleted.")
 
 
@@ -2046,8 +2061,12 @@ async def delete_mailbox(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(text="Confirmation address mismatch; mailbox not deleted.")
     try:
         await _gateway(request).delete_mailbox(account_id)
-    except Exception:
-        return await _gateway_error(request, "Permanent mailbox deletion failed")
+    except Exception as exc:
+        return await _mutation_gateway_error(
+            request,
+            "Permanent mailbox deletion failed",
+            exc,
+        )
     _parsed_message_cache(request).invalidate(account_id)
     return _api_response(message="Mailbox permanently deleted.")
 
@@ -3581,8 +3600,8 @@ async def set_certificate_timer(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(text="Invalid timer action.")
     try:
         await _gateway(request).set_certificate_timer(action == "enable")
-    except Exception:
-        return await _gateway_error(request, "Renewal timer operation failed")
+    except Exception as exc:
+        return await _mutation_gateway_error(request, "Renewal timer operation failed", exc)
     message = (
         "Automatic renewal timer enabled."
         if action == "enable"
@@ -3606,8 +3625,12 @@ async def renew_certificate_if_due(request: web.Request) -> web.Response:
     certificate_name = await _allowed_certificate_name(request)
     try:
         await _gateway(request).renew_certificate_if_due(certificate_name)
-    except Exception:
-        return await _gateway_error(request, "Certificate renewal-if-due failed")
+    except Exception as exc:
+        return await _mutation_gateway_error(
+            request,
+            "Certificate renewal-if-due failed",
+            exc,
+        )
     return _api_response(message="Due check and any required renewal completed.")
 
 
@@ -3705,7 +3728,7 @@ async def static_asset(request: web.Request) -> web.Response:
     else:
         application_versions = {
             "app.css": "20",
-            "app.js": "24",
+            "app.js": "25",
             "preview.css": "1",
         }
         versions = request.query.getall("v", [])

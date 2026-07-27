@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 import pytest
 from aiohttp import web
 
+from maddyweb.gateway import HelperCallError
 from maddyweb.web import MessagePage, create_app
 
 if TYPE_CHECKING:
@@ -136,6 +137,9 @@ class BrowserSecurityGateway:
         self.logout_fails = False
         self.password_login_attempts: list[tuple[str, str, str]] = []
         self.totp_login_attempts: list[tuple[str, str, str]] = []
+        self.step_up_attempts: list[tuple[str, str, str]] = []
+        self.require_create_step_up = False
+        self.step_up_granted = False
         self.bulk_seen_changes: list[tuple[str, str, tuple[str, ...] | None, bool]] = []
         self.bulk_moves: list[tuple[str, str, tuple[str, ...], str]] = []
         self.message_unread = True
@@ -207,10 +211,28 @@ class BrowserSecurityGateway:
         if self.logout_fails:
             raise RuntimeError("fixture logout failure")
 
+    async def step_up(
+        self,
+        password: str,
+        code: str,
+        *,
+        client_ip: str,
+    ) -> dict[str, object]:
+        self.step_up_attempts.append((password, code, client_ip))
+        if password != LOGIN_PASSWORD or code != LOGIN_TOTP:
+            raise HelperCallError("invalid_second_factor", "invalid fixture verification")
+        self.step_up_granted = True
+        return {"step_up_expires_at": 2_000_000_300}
+
     async def list_accounts(self) -> list[dict[str, object]]:
         return [dict(account) for account in self.accounts]
 
     async def create_account(self, username: str, password: str) -> dict[str, object]:
+        if self.require_create_step_up and not self.step_up_granted:
+            raise HelperCallError(
+                "step_up_required",
+                "Fresh administrator authentication is required",
+            )
         self.created_accounts.append((username, password))
         self.accounts.append(
             {

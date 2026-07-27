@@ -627,9 +627,25 @@ async def test_account_workflows_use_json_mutations_and_typed_deletion(
     assert await username_input.get_attribute("maxlength") == "64"
     await username_input.fill(NEW_ACCOUNT.split("@", 1)[0])
     await create_form.locator('input[name="password"]').fill("fixture-password-123")
+    live_application.gateway.require_create_step_up = True
     await create_form.get_by_role("button", name="Create account").click()
+    step_up_dialog = page.locator("#step-up-dialog")
+    await step_up_dialog.wait_for(state="visible")
+    assert await page.locator("#step-up-title").inner_text() == "Verify administrator"
+    await step_up_dialog.get_by_role("button", name="Cancel").click()
+    await step_up_dialog.wait_for(state="hidden")
+    assert live_application.gateway.created_accounts == []
+    await create_form.locator('input[name="password"]').fill("fixture-password-123")
+    await create_form.get_by_role("button", name="Create account").click()
+    await step_up_dialog.wait_for(state="visible")
+    await step_up_dialog.locator('input[name="password"]').fill(LOGIN_PASSWORD)
+    await step_up_dialog.locator('input[name="code"]').fill(LOGIN_TOTP)
+    await page.locator("#step-up-submit").click()
+    await step_up_dialog.wait_for(state="hidden")
     new_row = page.locator("#accounts-body tr").filter(has_text=NEW_ACCOUNT)
     await new_row.wait_for()
+    assert len(live_application.gateway.step_up_attempts) == 1
+    assert live_application.gateway.step_up_attempts[0][:2] == (LOGIN_PASSWORD, LOGIN_TOTP)
     assert live_application.gateway.created_accounts == [(NEW_ACCOUNT, "fixture-password-123")]
     disclosure = page.locator("#credential-disclosure-dialog")
     await disclosure.wait_for(state="visible")
