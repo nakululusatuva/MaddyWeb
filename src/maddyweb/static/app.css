@@ -3579,12 +3579,35 @@ html[data-view="message"] .app-footer {
   html[data-view="mail"] .app-main,
   html[data-view="message"] .app-main {
     display: flex;
+    height: calc(100dvh - 70px);
+    min-height: 0;
     flex-direction: column;
+    overflow: hidden;
+  }
+
+  html[data-view="mail"] .admin-workspace-indicator,
+  html[data-view="message"] .admin-workspace-indicator {
+    flex: 0 0 auto;
   }
 
   .mail-workspace {
-    min-height: 680px;
-    flex: 1 1 auto;
+    min-height: 0;
+    flex: 1 1 0;
+  }
+
+  .mail-folder-pane,
+  .mail-list-pane,
+  .reading-pane,
+  .message-placeholder {
+    height: 100%;
+    min-height: 0;
+    max-height: 100%;
+  }
+
+  .mail-list-table,
+  .reading-pane {
+    overscroll-behavior: contain;
+    scrollbar-gutter: stable;
   }
 }
 

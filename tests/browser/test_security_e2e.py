@@ -964,6 +964,52 @@ async def test_mail_workspace_fills_the_tall_desktop_viewport(
     assert viewport_height - (workspace["y"] + workspace["height"]) <= 26
 
 
+async def test_desktop_mail_list_and_reading_pane_scroll_independently(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    await page.set_viewport_size({"width": 1440, "height": 820})
+    await _open_message(page, live_application)
+
+    message_list = page.locator(".mail-list-table")
+    reading_pane = page.locator("#message-view")
+    await page.locator("#message-list-body").evaluate(
+        """tbody => {
+            const source = tbody.querySelector("tr");
+            for (let index = 0; index < 16; index += 1) {
+                const clone = source.cloneNode(true);
+                clone.dataset.uid = `scroll-fixture-${index}`;
+                clone.removeAttribute("aria-current");
+                clone.classList.remove("is-selected");
+                tbody.append(clone);
+            }
+        }"""
+    )
+    await page.locator(".message-preview-shell").evaluate(
+        "node => { node.style.height = '1800px'; }"
+    )
+    await message_list.evaluate("node => { node.scrollTop = 0; }")
+    await reading_pane.evaluate("node => { node.scrollTop = 0; }")
+    await page.evaluate("window.scrollTo(0, 0)")
+
+    assert await message_list.evaluate("node => node.scrollHeight > node.clientHeight")
+    assert await reading_pane.evaluate("node => node.scrollHeight > node.clientHeight")
+    assert await page.evaluate("document.documentElement.scrollHeight <= window.innerHeight")
+
+    await message_list.hover()
+    await page.mouse.wheel(0, 700)
+    await page.wait_for_function("() => document.querySelector('.mail-list-table').scrollTop > 0")
+    list_scroll_top = await message_list.evaluate("node => node.scrollTop")
+    assert await reading_pane.evaluate("node => node.scrollTop") == 0
+    assert await page.evaluate("window.scrollY") == 0
+
+    await reading_pane.hover()
+    await page.mouse.wheel(0, 700)
+    await page.wait_for_function("() => document.querySelector('#message-view').scrollTop > 0")
+    assert await message_list.evaluate("node => node.scrollTop") == list_scroll_top
+    assert await page.evaluate("window.scrollY") == 0
+
+
 async def test_message_navigation_updates_selection_and_hides_stale_content(
     page: Page,
     live_application: LiveApplication,
