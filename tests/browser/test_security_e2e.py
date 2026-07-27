@@ -622,7 +622,10 @@ async def test_account_workflows_use_json_mutations_and_typed_deletion(
     assert await page.locator("#runtime-badge").inner_text() == "CONNECTED"
 
     create_form = page.locator("#create-account-form")
-    await create_form.locator('input[name="username"]').fill(NEW_ACCOUNT)
+    username_input = create_form.locator('input[name="username"]')
+    assert await page.locator("#create-account-domain").inner_text() == "@example.test"
+    assert await username_input.get_attribute("maxlength") == "64"
+    await username_input.fill(NEW_ACCOUNT.split("@", 1)[0])
     await create_form.locator('input[name="password"]').fill("fixture-password-123")
     await create_form.get_by_role("button", name="Create account").click()
     new_row = page.locator("#accounts-body tr").filter(has_text=NEW_ACCOUNT)

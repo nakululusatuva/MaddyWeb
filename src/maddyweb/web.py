@@ -1776,6 +1776,7 @@ async def api_auth_session(request: web.Request) -> web.Response:
         data={
             "principal": dict(principal),
             "csrf_token": csrf_token_for_request(request),
+            "login_domain": request.app[_LOGIN_DOMAIN_KEY],
         }
     )
 
@@ -1962,10 +1963,13 @@ async def create_account(request: web.Request) -> web.Response:
         request,
         allowed_fields=frozenset({"username", "password"}),
     )
-    username = _json_text(values, "username").strip()
+    username = _normalize_login_identifier(
+        _json_text(values, "username"),
+        request.app[_LOGIN_DOMAIN_KEY],
+    )
     password = _json_text(values, "password")
     values["password"] = ""
-    if len(username) > 254 or _ACCOUNT_RE.fullmatch(username) is None:
+    if not username or _ACCOUNT_RE.fullmatch(username) is None:
         raise web.HTTPBadRequest(text="Invalid email account format.")
     if not 12 <= len(password) <= 256 or any(char in "\r\n\0" for char in password):
         raise web.HTTPBadRequest(text="Password must contain 12 to 256 valid characters.")
@@ -3700,8 +3704,8 @@ async def static_asset(request: web.Request) -> web.Response:
         cache_control = "public, max-age=31536000, immutable"
     else:
         application_versions = {
-            "app.css": "19",
-            "app.js": "23",
+            "app.css": "20",
+            "app.js": "24",
             "preview.css": "1",
         }
         versions = request.query.getall("v", [])

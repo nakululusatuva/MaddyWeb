@@ -424,6 +424,7 @@ async def web_client(tmp_path: Path) -> tuple[TestClient, FakeGateway]:
             "csrf_cookie_name": "maddyweb-csrf",
             "session_cookie_name": "maddyweb-session",
             "secure_cookies": False,
+            "login_domain": "example.test",
         },
     }
     client = TestClient(
@@ -488,8 +489,8 @@ async def test_home_static_assets_and_strict_headers(
     page = await response.text()
     assert response.status == 200
     assert "Administration overview" in page
-    assert 'href="/static/app.css?v=19"' in page
-    assert 'src="/static/app.js?v=23"' in page
+    assert 'href="/static/app.css?v=20"' in page
+    assert 'src="/static/app.js?v=24"' in page
     assert 'id="compose-sender-name"' in page
     assert 'name="sender_name"' in page
     assert 'maxlength="256"' in page
@@ -649,6 +650,16 @@ async def test_account_actions_are_separate_and_mailbox_delete_is_confirmed(
     )
     assert created.status == 201
     assert ("create_account", "new@example.test", "valid-password") in gateway.operations
+
+    token = await _get_token(client)
+    created_from_local_part = await _post_json(
+        client,
+        "/api/v1/accounts",
+        token,
+        {"username": "local-only", "password": "valid-password"},
+    )
+    assert created_from_local_part.status == 201
+    assert ("create_account", "local-only@example.test", "valid-password") in gateway.operations
 
     token = await _get_token(client)
     changed = await _post_json(

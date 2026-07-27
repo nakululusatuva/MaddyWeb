@@ -166,6 +166,7 @@ def main() -> None:
             "csrf_cookie_name": "__Host-maddyweb-browser-csrf",
             "session_cookie_name": SESSION_COOKIE_NAME,
             "secure_cookies": True,
+            "login_domain": "example.test",
         },
     }
     app = create_app(config, BrowserGateway())  # type: ignore[arg-type]

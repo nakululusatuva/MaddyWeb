@@ -7,8 +7,8 @@
   <meta name="theme-color" content="#f4f6f9">
   <meta name="description" content="MaddyWeb mail workspace and server administration console">
   <title>MaddyWeb</title>
-  <link rel="stylesheet" href="/static/app.css?v=19">
-  <script src="/static/app.js?v=23" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=20">
+  <script src="/static/app.js?v=24" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to main content</a>
@@ -341,7 +341,7 @@
         <div class="page-heading"><div><p class="eyebrow">Mailbox directory</p><h1 id="accounts-title">Account management</h1><p>Create mailboxes, rotate credentials, and control APPENDLIMIT.</p></div></div>
         <div class="split-layout accounts-layout">
           <section class="data-card"><div class="card-heading"><div><p class="eyebrow">Directory</p><h2>Existing accounts</h2></div></div><div class="table-scroll"><table><thead><tr><th scope="col">Account</th><th scope="col">Status</th><th scope="col">APPENDLIMIT</th><th scope="col">Actions</th></tr></thead><tbody id="accounts-body"></tbody></table></div><div id="accounts-empty" class="empty-state" hidden>No accounts.</div></section>
-          <section class="data-card compact-card"><div class="card-heading"><div><p class="eyebrow">New mailbox</p><h2>Create account</h2></div></div><form id="create-account-form" class="stack-form" autocomplete="off"><label><span>Email account</span><input name="username" type="text" required maxlength="254" autocomplete="username" inputmode="email"></label><label><span>Password</span><input name="password" type="password" required minlength="12" maxlength="256" autocomplete="new-password"></label><button class="button button-primary" type="submit">Create account</button></form></section>
+          <section class="data-card compact-card"><div class="card-heading"><div><p class="eyebrow">New mailbox</p><h2>Create account</h2></div></div><form id="create-account-form" class="stack-form" autocomplete="off"><label><span>Mailbox name</span><span class="account-local-field"><input name="username" type="text" required minlength="1" maxlength="64" autocomplete="username" autocapitalize="none" spellcheck="false" pattern="[A-Za-z0-9!#$%&amp;'*+=?^_`{|}~.-]+"><span id="create-account-domain" class="account-domain-suffix" aria-hidden="true">@domain</span></span></label><p class="field-help">Enter only the part before @.</p><label><span>Password</span><input name="password" type="password" required minlength="12" maxlength="256" autocomplete="new-password"></label><button class="button button-primary" type="submit">Create account</button></form></section>
         </div>
       </section>
 

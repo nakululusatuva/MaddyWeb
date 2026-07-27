@@ -550,6 +550,7 @@ async def test_password_totp_login_rotates_csrf_and_sets_session_cookie(
     assert session.status == 200
     session_payload = await session.json()
     assert session_payload["data"]["principal"]["account_id"] == USER_ID
+    assert session_payload["data"]["login_domain"] == ""
 
 
 @pytest.mark.asyncio
@@ -569,7 +570,7 @@ async def test_authenticated_application_bundle_is_never_publicly_cacheable(
         assert "no-store" in directives
         assert "public" not in directives
 
-    versioned = await client.get("/static/app.js?v=23")
+    versioned = await client.get("/static/app.js?v=24")
     assert versioned.status == 200
     directives = {
         directive.strip().casefold() for directive in versioned.headers["Cache-Control"].split(",")

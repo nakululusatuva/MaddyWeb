@@ -450,6 +450,7 @@ async def live_application(tmp_path: Path) -> AsyncIterator[LiveApplication]:
                 "csrf_cookie_name": COOKIE_NAME,
                 "session_cookie_name": SESSION_COOKIE_NAME,
                 "secure_cookies": True,
+                "login_domain": "example.test",
             },
         },
         gateway,

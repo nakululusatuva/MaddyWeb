@@ -92,6 +92,7 @@
     authState: "checking",
     principal: {},
     role: "mailbox",
+    loginDomain: "",
     capabilities: new Set(),
     sessionExpiresAt: 0,
     idleExpiresAt: 0,
@@ -366,6 +367,19 @@
     byId("security-totp-state").className = (
       `status-pill ${totpEnabled ? "status-positive" : "status-warning"}`
     );
+    const loginDomain = stringValue(state.loginDomain);
+    byId("create-account-domain").textContent = loginDomain
+      ? `@${loginDomain}`
+      : "@domain unavailable";
+    const createAccountForm = byId("create-account-form");
+    const createAccountInput = createAccountForm.elements.namedItem("username");
+    const createAccountButton = createAccountForm.querySelector('button[type="submit"]');
+    if (createAccountInput instanceof HTMLInputElement) {
+      createAccountInput.disabled = !loginDomain;
+    }
+    if (createAccountButton instanceof HTMLButtonElement) {
+      createAccountButton.disabled = !loginDomain;
+    }
     const passwordChangeRequired = principal.password_change_required === true;
     byId("password-change-required").hidden = !passwordChangeRequired;
     const recoveryForm = byId("regenerate-recovery-form");
@@ -409,6 +423,7 @@
     state.authState = sessionIsActive(data) ? "active" : "anonymous";
     state.principal = principal;
     state.role = role;
+    state.loginDomain = stringValue(data.login_domain).trim().toLowerCase();
     state.capabilities = new Set(
       arrayValue(data.capabilities).map((value) => stringValue(value)).filter(Boolean),
     );
@@ -3793,15 +3808,46 @@
     }
   });
 
+  const accountLocalPartIsValid = (value) => (
+    /^[A-Za-z0-9!#$%&'*+=?^_`{|}~.-]+$/.test(value)
+    && value.length <= 64
+    && !value.startsWith(".")
+    && !value.endsWith(".")
+    && !value.includes("..")
+  );
+
+  const updateAccountLocalPartValidity = (input) => {
+    const value = input.value.trim();
+    input.setCustomValidity(
+      !value || accountLocalPartIsValid(value)
+        ? ""
+        : "Enter a valid mailbox name without @ or a domain.",
+    );
+  };
+
+  byId("create-account-form").addEventListener("input", (event) => {
+    if (
+      event.target instanceof HTMLInputElement
+      && event.target.name === "username"
+    ) updateAccountLocalPartValidity(event.target);
+  });
+
   byId("create-account-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = event.currentTarget;
-    if (!(form instanceof HTMLFormElement) || !form.reportValidity()) return;
+    if (!(form instanceof HTMLFormElement)) return;
     const usernameInput = form.elements.namedItem("username");
     const passwordInput = form.elements.namedItem("password");
     if (!(usernameInput instanceof HTMLInputElement)
       || !(passwordInput instanceof HTMLInputElement)) return;
+    updateAccountLocalPartValidity(usernameInput);
+    if (!form.reportValidity()) return;
     const username = usernameInput.value.trim();
+    const loginDomain = stringValue(state.loginDomain);
+    if (!loginDomain) {
+      showAlert("The configured mailbox domain is unavailable.");
+      return;
+    }
     const password = passwordInput.value;
     passwordInput.value = "";
     const button = form.querySelector('button[type="submit"]');
@@ -3821,7 +3867,7 @@
         );
       }
       const createdId = accountId(data);
-      const createdAddress = stringValue(data.address, username);
+      const createdAddress = stringValue(data.address, `${username}@${loginDomain}`);
       if (createdId) {
         state.accounts = [
           ...state.accounts.filter((account) => accountId(account) !== createdId),

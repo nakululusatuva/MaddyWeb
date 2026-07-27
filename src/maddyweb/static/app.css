@@ -1009,6 +1009,55 @@ legend {
   gap: 16px;
 }
 
+.account-local-field {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: stretch;
+  margin-bottom: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  background: var(--surface);
+  transition:
+    border-color 130ms ease,
+    box-shadow 130ms ease;
+}
+
+.account-local-field:hover {
+  border-color: color-mix(in srgb, var(--primary) 58%, var(--border-strong));
+}
+
+.account-local-field:focus-within {
+  border-color: var(--focus);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--focus) 15%, transparent);
+}
+
+.account-local-field input {
+  min-width: 0;
+  border: 0;
+  border-radius: 8px 0 0 8px;
+  box-shadow: none;
+}
+
+.account-local-field input:hover,
+.account-local-field input:focus {
+  border-color: transparent;
+  box-shadow: none;
+}
+
+.account-domain-suffix {
+  display: inline-flex;
+  align-items: center;
+  margin: 0;
+  padding: 0 11px;
+  border-left: 1px solid var(--border);
+  border-radius: 0 8px 8px 0;
+  color: var(--text-muted);
+  background: var(--surface-muted);
+  font-size: 12px;
+  font-weight: 740;
+  white-space: nowrap;
+}
+
 .form-columns {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
