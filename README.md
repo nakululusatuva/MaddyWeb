@@ -48,9 +48,11 @@ HTML is displayed only in an empty-sandbox iframe with a dedicated restrictive C
 The login shell and authenticated application use separate static bundles.
 The browser obtains a process-bound CSRF token from `/api/v1/auth/csrf`,
 serializes every mutation globally, and accepts the replacement token only
-from the response header. Mutations are never retried automatically. No
-frontend dependency, build tool, CDN, remote font, or external image is
-required.
+from the response header. Mutations are never retried after an ambiguous
+failure. When the server explicitly requires fresh administrator
+verification, the browser repeats the protected operation once only after a
+successful password-and-TOTP step-up. No frontend dependency, build tool,
+CDN, remote font, or external image is required.
 
 ## Unified mailbox identity
 

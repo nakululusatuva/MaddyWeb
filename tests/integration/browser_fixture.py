@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
+from datetime import datetime
 from email import policy
 from email.message import EmailMessage
+from email.utils import formatdate
 from pathlib import Path
 
 from aiohttp import web
@@ -20,34 +23,79 @@ SESSION_TOKEN = "S" * 43
 
 class BrowserGateway:
     def __init__(self) -> None:
-        message = EmailMessage()
-        message["From"] = "attacker@example.test"
-        message["To"] = ACCOUNT_ADDRESS
-        message["Subject"] = "Browser security fixture"
-        message.set_content("plain fallback")
-        message.add_alternative(
-            '<script>document.body.dataset.xss="executed"</script>'
-            '<img id="remote" src="https://tracker.invalid/pixel">'
-            '<img id="inline" src="cid:logo"><b id="safe">Safe body</b>',
-            subtype="html",
+        definitions = (
+            (
+                "105",
+                "MaddyWeb Operations <operations@example.test>",
+                "Welcome to your private mail workspace",
+                "2026-07-27T08:25:00+00:00",
+                False,
+                (
+                    "<h2>Your private mail workspace is ready</h2>"
+                    "<p>MaddyWeb keeps mailbox access and administration behind one "
+                    "authenticated interface.</p>"
+                    "<ul><li>Read, reply, forward, archive, and organize mail.</li>"
+                    "<li>Manage accounts and certificates with protected actions.</li>"
+                    "<li>Keep the application isolated on its loopback listener.</li></ul>"
+                ),
+            ),
+            (
+                "104",
+                "TLS Automation <certificates@example.test>",
+                "Certificate renewal completed",
+                "2026-07-27T07:40:00+00:00",
+                False,
+                "<p>The scheduled certificate renewal check completed successfully.</p>",
+            ),
+            (
+                "103",
+                "Postmaster <postmaster@example.test>",
+                "Weekly delivery summary",
+                "2026-07-26T18:30:00+00:00",
+                False,
+                "<p>Your weekly delivery summary is ready for review.</p>",
+            ),
+            (
+                "102",
+                "Alex Morgan <alex@example.test>",
+                "Re: Migration checklist",
+                "2026-07-26T14:05:00+00:00",
+                True,
+                "<p>The mailbox migration checklist is complete.</p>",
+            ),
+            (
+                "101",
+                "Security Bot <security@example.test>",
+                "Account security review",
+                "2026-07-25T21:18:00+00:00",
+                False,
+                "<p>No account security issues were detected during the review.</p>",
+            ),
         )
-        html_part = message.get_payload()[-1]
-        assert isinstance(html_part, EmailMessage)
-        html_part.add_related(
-            b"\x89PNG\r\n\x1a\nfixture",
-            maintype="image",
-            subtype="png",
-            cid="<logo>",
-            filename="logo.png",
-            disposition="inline",
-        )
-        message.add_attachment(
-            b"attachment",
-            maintype="text",
-            subtype="html",
-            filename="../../evil.html",
-        )
-        self.raw = message.as_bytes(policy=policy.SMTP)
+        self.messages: list[dict[str, object]] = []
+        self.raw_by_uid: dict[str, bytes] = {}
+        for uid, sender, subject, date, unread, html in definitions:
+            message = EmailMessage()
+            message["From"] = sender
+            message["To"] = ACCOUNT_ADDRESS
+            message["Subject"] = subject
+            message["Date"] = formatdate(
+                datetime.fromisoformat(date).timestamp(),
+                localtime=False,
+                usegmt=True,
+            )
+            message.set_content("Open the HTML view to read this fixture message.")
+            message.add_alternative(html, subtype="html")
+            self.raw_by_uid[uid] = message.as_bytes(policy=policy.SMTP)
+            self.messages.append(
+                {
+                    "id": uid,
+                    "sender": sender,
+                    "subject": subject,
+                    "date": date,
+                    "unread": unread,
+                }
+            )
 
     async def health(self) -> dict[str, object]:
         return {
@@ -63,14 +111,15 @@ class BrowserGateway:
     async def session(self, token: str) -> dict[str, object]:
         if token != SESSION_TOKEN:
             raise RuntimeError("invalid browser fixture session")
+        now = int(time.time())
         return {
             "account_id": ACCOUNT_ID,
             "email": ACCOUNT_ADDRESS,
             "role": "admin",
             "password_change_required": False,
             "enrollment_state": "active",
-            "idle_expires_at": 2_000_000_000,
-            "absolute_expires_at": 2_000_010_000,
+            "idle_expires_at": now + 30 * 60,
+            "absolute_expires_at": now + 12 * 60 * 60,
             "recovery_codes_remaining": 10,
         }
 
@@ -87,31 +136,36 @@ class BrowserGateway:
     async def list_mailboxes(self, _account: str) -> list[dict[str, object]]:
         return [
             {"name": "INBOX", "attributes": []},
-            {"name": "Custom Trash", "attributes": ["\\Trash"]},
-            {"name": "Custom Sent", "attributes": ["\\Sent"]},
-            {"name": "Custom Archive", "attributes": ["\\Archive"]},
+            {"name": "Archive", "attributes": ["\\Archive"]},
+            {"name": "Sent", "attributes": ["\\Sent"]},
+            {"name": "Trash", "attributes": ["\\Trash"]},
         ]
 
-    async def list_messages(self, *_args: object, **_kwargs: object) -> MessagePage:
-        return MessagePage(
-            [{"id": "42", "sender": "attacker@example.test", "subject": "Security fixture"}],
-            False,
-        )
+    async def list_messages(
+        self,
+        _account: str,
+        mailbox: str,
+        **_kwargs: object,
+    ) -> MessagePage:
+        return MessagePage(self.messages if mailbox == "INBOX" else [], False)
 
     async def spool_message(
         self,
         _account: str,
         _mailbox: str,
-        _uid: str,
+        uid: str,
         destination: Path,
         *,
         max_bytes: int,
     ) -> int:
-        if len(self.raw) > max_bytes:
+        raw = self.raw_by_uid.get(str(uid))
+        if raw is None:
+            raise ValueError("unknown fixture message")
+        if len(raw) > max_bytes:
             raise ValueError("fixture exceeds limit")
-        await asyncio.to_thread(destination.write_bytes, self.raw)
+        await asyncio.to_thread(destination.write_bytes, raw)
         await asyncio.to_thread(os.chmod, destination, 0o600)
-        return len(self.raw)
+        return len(raw)
 
     async def move_message_to_trash(self, *_args: object) -> str:
         return "Custom Trash"
