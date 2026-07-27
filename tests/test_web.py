@@ -488,8 +488,8 @@ async def test_home_static_assets_and_strict_headers(
     page = await response.text()
     assert response.status == 200
     assert "Administration overview" in page
-    assert 'href="/static/app.css?v=18"' in page
-    assert 'src="/static/app.js?v=22"' in page
+    assert 'href="/static/app.css?v=19"' in page
+    assert 'src="/static/app.js?v=23"' in page
     assert 'id="compose-sender-name"' in page
     assert 'name="sender_name"' in page
     assert 'maxlength="256"' in page

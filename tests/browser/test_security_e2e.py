@@ -39,7 +39,7 @@ from conftest import (
     _listening_socket,
 )
 
-from maddyweb.web import create_app
+from maddyweb.web import MessagePage, create_app
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -948,6 +948,110 @@ async def test_mailbox_rows_fit_the_desktop_message_pane(
             assert bounds is not None
             assert bounds["x"] >= pane_bounds["x"]
             assert bounds["x"] + bounds["width"] <= pane_bounds["x"] + pane_bounds["width"] + 1
+
+
+async def test_mailbox_search_filters_sender_and_subject_on_the_loaded_page(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    async def searchable_messages(*_args: object, **_kwargs: object) -> MessagePage:
+        return MessagePage(
+            [
+                {
+                    "id": "44",
+                    "sender": "reports@example.test",
+                    "subject": "Quarterly summary",
+                },
+                {
+                    "id": "43",
+                    "sender": "alerts@example.test",
+                    "subject": "Service notice",
+                },
+                {
+                    "id": "42",
+                    "sender": "attacker@example.test",
+                    "subject": "Security fixture",
+                },
+            ],
+            False,
+        )
+
+    live_application.gateway.list_messages = searchable_messages  # type: ignore[method-assign]
+    await page.goto(live_application.base_url + _mailbox_path())
+    await page.locator("#message-list-body tr").first.wait_for()
+    search = page.locator("#mail-search-input")
+    await search.fill("quarterly")
+
+    rows = page.locator("#message-list-body tr")
+    assert await rows.count() == 1
+    assert "Quarterly summary" in await rows.locator(".message-subject-cell").inner_text()
+    assert "search=quarterly" in page.url
+    assert await page.locator("#mail-list-summary").inner_text() == (
+        "1 of 3 messages match on this page"
+    )
+    assert await page.locator("#mail-search-clear").is_visible()
+
+    await search.fill("ALERTS@EXAMPLE.TEST")
+    assert await rows.count() == 1
+    assert "alerts@example.test" in await rows.locator(".message-sender-cell").inner_text()
+
+    await page.locator("#mail-search-clear").click()
+    assert await rows.count() == 3
+    assert "search=" not in page.url
+    assert await page.locator("#mail-search-clear").is_hidden()
+
+
+async def test_refresh_centers_the_open_message_in_the_independent_list_pane(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    async def long_message_page(*_args: object, **_kwargs: object) -> MessagePage:
+        return MessagePage(
+            [
+                {
+                    "id": str(uid),
+                    "sender": f"sender-{uid}@example.test",
+                    "subject": f"Message {uid}",
+                }
+                for uid in range(60, 45, -1)
+            ],
+            False,
+        )
+
+    live_application.gateway.list_messages = long_message_page  # type: ignore[method-assign]
+    await page.set_viewport_size({"width": 1440, "height": 820})
+    await page.goto(live_application.base_url + _mailbox_path())
+    await page.locator("#message-list-body tr").first.wait_for()
+    target = page.locator('#message-list-body tr[data-uid="53"]')
+    await target.locator(".message-subject-cell a").click()
+    await page.get_by_role(
+        "heading",
+        name="Browser security fixture",
+        exact=True,
+    ).wait_for()
+
+    await page.reload()
+    selected = page.locator('#message-list-body tr[data-uid="53"].is-selected')
+    await selected.wait_for()
+    await page.wait_for_function(
+        """() => {
+            const pane = document.querySelector(".mail-list-table");
+            const row = document.querySelector('#message-list-body tr[data-uid="53"]');
+            return pane && row && pane.scrollTop > 0;
+        }"""
+    )
+    center_delta = await selected.evaluate(
+        """row => {
+            const pane = row.closest(".mail-list-table");
+            const rowBounds = row.getBoundingClientRect();
+            const paneBounds = pane.getBoundingClientRect();
+            return Math.abs(
+                (rowBounds.top + rowBounds.height / 2)
+                - (paneBounds.top + paneBounds.height / 2)
+            );
+        }"""
+    )
+    assert center_delta <= 2
 
 
 async def test_mail_workspace_fills_the_tall_desktop_viewport(

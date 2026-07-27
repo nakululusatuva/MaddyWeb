@@ -3765,6 +3765,61 @@ html[data-view="message"] .app-footer {
   position: relative;
 }
 
+.mail-search {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.mail-search-field {
+  position: relative;
+  display: block;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.mail-search-field svg {
+  position: absolute;
+  top: 50%;
+  left: 10px;
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: var(--text-muted);
+  stroke-linecap: round;
+  stroke-width: 2;
+  transform: translateY(-50%);
+  pointer-events: none;
+}
+
+.mail-search-field input {
+  width: 100%;
+  min-width: 0;
+  min-height: 34px;
+  padding: 6px 10px 6px 32px;
+  border-color: var(--border);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--surface-muted) 58%, var(--surface));
+  font-size: 10px;
+}
+
+.mail-search-field input:focus {
+  background: var(--surface);
+}
+
+.mail-search .button {
+  min-height: 34px;
+  flex: 0 0 auto;
+  padding: 6px 9px;
+  border-radius: 9px;
+  box-shadow: none;
+  font-size: 10px;
+}
+
 .mail-bulk-toolbar {
   display: grid;
   flex: 0 0 auto;
@@ -4130,5 +4185,15 @@ html[data-view="message"] .app-footer {
     width: 100%;
     min-height: 45px;
     font-size: 11px;
+  }
+
+  .mail-search {
+    padding: 10px 14px;
+  }
+
+  .mail-search-field input,
+  .mail-search .button {
+    min-height: 44px;
+    font-size: 12px;
   }
 }

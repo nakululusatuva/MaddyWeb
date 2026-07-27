@@ -129,6 +129,9 @@
     pendingForwardSubject: null,
     selectedMessageUids: new Set(),
     mailBulkBusy: false,
+    restoreMessageListPosition: /^\/mail\/[1-9][0-9]{0,9}$/.test(
+      window.location.pathname,
+    ),
     theme: "light",
   };
 
@@ -979,13 +982,20 @@
     select.replaceChildren(fragment);
   };
 
-  const buildMailUrl = ({account = "", mailbox = "", cursor = ""}) => {
+  const buildMailUrl = ({
+    account = "",
+    mailbox = "",
+    cursor = "",
+    search = "",
+  }) => {
     const url = new URL("/mail", window.location.origin);
     if (account && state.role === "admin") {
       url.searchParams.set("account", account);
     }
     if (mailbox) url.searchParams.set("mailbox", mailbox);
     if (cursor) url.searchParams.set("cursor", cursor);
+    const boundedSearch = stringValue(search).trim().slice(0, 120);
+    if (boundedSearch) url.searchParams.set("search", boundedSearch);
     return `${url.pathname}${url.search}`;
   };
 
@@ -1029,9 +1039,32 @@
     }
   };
 
+  const currentMailSearch = () => (
+    stringValue(new URLSearchParams(window.location.search).get("search"))
+      .trim()
+      .slice(0, 120)
+  );
+
+  const messageMatchesSearch = (message, search) => {
+    const needle = stringValue(search).toLocaleLowerCase();
+    if (!needle) return true;
+    return [
+      stringValue(message.sender),
+      stringValue(message.subject),
+    ].some((value) => value.toLocaleLowerCase().includes(needle));
+  };
+
+  const visibleMailMessages = (mail) => {
+    const search = currentMailSearch();
+    return arrayValue(mail.messages || mail.items)
+      .map(objectValue)
+      .filter((message) => messageMatchesSearch(message, search));
+  };
+
   const updateBulkToolbar = () => {
     const mail = objectValue(state.mail);
-    const messages = arrayValue(mail.messages || mail.items).map(objectValue);
+    const allMessages = arrayValue(mail.messages || mail.items).map(objectValue);
+    const messages = visibleMailMessages(mail);
     const selectedCount = state.selectedMessageUids.size;
     const selectable = messages.length > 0 && !state.mailBulkBusy;
     const selectPage = byId("mail-select-page");
@@ -1058,7 +1091,7 @@
     );
     byId("mail-mark-all-read").disabled = (
       state.mailBulkBusy
-      || !messages.some((message) => message.unread === true)
+      || !allMessages.some((message) => message.unread === true)
     );
     document.querySelectorAll(".message-select-checkbox").forEach((control) => {
       if (control instanceof HTMLInputElement) control.disabled = state.mailBulkBusy;
@@ -1129,6 +1162,7 @@
     navigate(buildMailUrl({
       account: context.account,
       mailbox: context.mailbox,
+      search: currentMailSearch(),
     }), {replace: true, focus: false});
   };
 
@@ -1250,7 +1284,9 @@
             : mailboxOrder.get(rightName.toLowerCase()) ?? 20;
         return leftPriority - rightPriority || leftName.localeCompare(rightName);
       });
-    const messages = arrayValue(mail.messages || mail.items).map(objectValue);
+    const allMessages = arrayValue(mail.messages || mail.items).map(objectValue);
+    const search = currentMailSearch();
+    const messages = allMessages.filter((message) => messageMatchesSearch(message, search));
     const selectedMailbox = mailboxes.find(
       (item) => stringValue(item.name) === mailbox,
     );
@@ -1285,15 +1321,25 @@
     byId("current-mailbox-identity").textContent = accountLabel;
     byId("mail-title").textContent = mailbox || "Mail";
     byId("mail-list-summary").textContent = mailbox
-      ? `${messages.length} message${messages.length === 1 ? "" : "s"} on this page`
+      ? search
+        ? `${messages.length} of ${allMessages.length} message${
+          allMessages.length === 1 ? "" : "s"
+        } match on this page`
+        : `${messages.length} message${messages.length === 1 ? "" : "s"} on this page`
       : "Select a folder to browse messages.";
+    const searchInput = byId("mail-search-input");
+    if (searchInput instanceof HTMLInputElement) {
+      if (searchInput.value !== search) searchInput.value = search;
+      searchInput.disabled = !account || !mailbox || allMessages.length === 0;
+    }
+    byId("mail-search-clear").hidden = !search;
 
     const folderFragment = document.createDocumentFragment();
     for (const item of mailboxes) {
       const name = stringValue(item.name);
       if (!name) continue;
       const link = element("a", {className: "mail-folder-link"});
-      link.href = buildMailUrl({account, mailbox: name});
+      link.href = buildMailUrl({account, mailbox: name, search});
       link.dataset.route = "";
       if (name === mailbox) link.setAttribute("aria-current", "page");
       const normalized = name.toLowerCase();
@@ -1340,12 +1386,17 @@
       )
       && !currentQuery.get("mailbox")
     ) {
-      window.history.replaceState(null, "", buildMailUrl({account, mailbox}));
+      window.history.replaceState(
+        null,
+        "",
+        buildMailUrl({account, mailbox, search}),
+      );
     }
 
     const fragment = document.createDocumentFragment();
     const activeRoute = parseRoute();
     const activeMessageUid = activeRoute.name === "message" ? activeRoute.uid : "";
+    const activeCursor = currentQuery.get("cursor") || "";
     for (const message of messages) {
       const uid = stringValue(message.uid);
       const url = new URL(`/mail/${encodeURIComponent(uid)}`, window.location.origin);
@@ -1353,6 +1404,8 @@
         url.searchParams.set("account", account);
       }
       url.searchParams.set("mailbox", mailbox);
+      if (activeCursor) url.searchParams.set("cursor", activeCursor);
+      if (search) url.searchParams.set("search", search);
       const sender = stringValue(message.sender, "Unknown sender");
       const subject = stringValue(message.subject, "(No subject)");
       const context = {account, mailbox, uid, sender, subject};
@@ -1484,11 +1537,38 @@
       fragment.append(row);
     }
     byId("message-list-body").replaceChildren(fragment);
+    if (state.restoreMessageListPosition && activeMessageUid) {
+      const selectedRow = [...document.querySelectorAll("#message-list-body tr")]
+        .find((row) => row instanceof HTMLTableRowElement
+          && row.dataset.uid === activeMessageUid);
+      const scrollPane = document.querySelector(".mail-list-table");
+      if (
+        selectedRow instanceof HTMLTableRowElement
+        && scrollPane instanceof HTMLElement
+      ) {
+        state.restoreMessageListPosition = false;
+        window.requestAnimationFrame(() => {
+          const rowBounds = selectedRow.getBoundingClientRect();
+          const paneBounds = scrollPane.getBoundingClientRect();
+          const centeredOffset = (
+            rowBounds.top
+            - paneBounds.top
+            - (scrollPane.clientHeight - rowBounds.height) / 2
+          );
+          scrollPane.scrollTo({
+            top: Math.max(0, scrollPane.scrollTop + centeredOffset),
+            behavior: "auto",
+          });
+        });
+      }
+    }
     updateBulkToolbar();
     const empty = byId("message-empty");
     empty.hidden = messages.length !== 0;
     empty.textContent = account && mailbox
-      ? mailbox.trim().toLowerCase() === "sent"
+      ? search && allMessages.length
+        ? "No sender or subject on this page matches your search."
+        : mailbox.trim().toLowerCase() === "sent"
         ? (
           "No sent copies are stored here. MaddyWeb saves a copy after it sends; "
           + "other mail clients must save their own Sent copy."
@@ -1503,10 +1583,20 @@
     previous.hidden = !previousCursor;
     next.hidden = !nextCursor;
     if (previousCursor) {
-      previous.href = buildMailUrl({account, mailbox, cursor: previousCursor});
+      previous.href = buildMailUrl({
+        account,
+        mailbox,
+        cursor: previousCursor,
+        search,
+      });
     }
     if (nextCursor) {
-      next.href = buildMailUrl({account, mailbox, cursor: nextCursor});
+      next.href = buildMailUrl({
+        account,
+        mailbox,
+        cursor: nextCursor,
+        search,
+      });
     }
     const page = typeof mail.page === "number" ? mail.page : 1;
     byId("mail-page").textContent = `Page ${page}`;
@@ -1537,6 +1627,7 @@
         buildMailUrl({
           account: stringValue(data.selected_account),
           mailbox: selectedMailbox,
+          search: currentMailSearch(),
         }),
       );
     }
@@ -1747,7 +1838,13 @@
       : stringValue(message.date, "Unknown date");
 
     const mailbox = stringValue(message.mailbox);
-    byId("message-back").href = buildMailUrl({account, mailbox});
+    const routeQuery = new URLSearchParams(window.location.search);
+    byId("message-back").href = buildMailUrl({
+      account,
+      mailbox,
+      cursor: routeQuery.get("cursor") || "",
+      search: routeQuery.get("search") || "",
+    });
     const messageContextUrl = (action) => {
       const url = new URL("/compose", window.location.origin);
       url.searchParams.set(action, stringValue(message.uid));
@@ -3230,6 +3327,34 @@
     }
   });
 
+  const applyMailSearch = (value) => {
+    const search = stringValue(value).trim().slice(0, 120);
+    const url = new URL(window.location.href);
+    if (search) url.searchParams.set("search", search);
+    else url.searchParams.delete("search");
+    window.history.replaceState(null, "", url);
+    if (state.mail) renderMail(state.mail);
+  };
+
+  byId("mail-search-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    applyMailSearch(byId("mail-search-input").value);
+  });
+
+  byId("mail-search-input").addEventListener("input", (event) => {
+    if (event.currentTarget instanceof HTMLInputElement) {
+      applyMailSearch(event.currentTarget.value);
+    }
+  });
+
+  byId("mail-search-clear").addEventListener("click", () => {
+    const input = byId("mail-search-input");
+    if (!(input instanceof HTMLInputElement)) return;
+    input.value = "";
+    applyMailSearch("");
+    input.focus();
+  });
+
   byId("mail-account").addEventListener("change", (event) => {
     const value = event.target instanceof HTMLSelectElement ? event.target.value : "";
     if (state.role === "admin") {
@@ -3241,7 +3366,11 @@
   byId("mail-mailbox").addEventListener("change", (event) => {
     const mailbox = event.target instanceof HTMLSelectElement ? event.target.value : "";
     const account = byId("mail-account").value || scopedAccount();
-    navigate(buildMailUrl({account, mailbox}));
+    navigate(buildMailUrl({
+      account,
+      mailbox,
+      search: currentMailSearch(),
+    }));
   });
 
   byId("mail-select-page").addEventListener("change", (event) => {

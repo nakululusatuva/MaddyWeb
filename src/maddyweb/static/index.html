@@ -7,8 +7,8 @@
   <meta name="theme-color" content="#f4f6f9">
   <meta name="description" content="MaddyWeb mail workspace and server administration console">
   <title>MaddyWeb</title>
-  <link rel="stylesheet" href="/static/app.css?v=18">
-  <script src="/static/app.js?v=22" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=19">
+  <script src="/static/app.js?v=23" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to main content</a>
@@ -143,6 +143,24 @@
               <p id="mail-list-summary">Select a folder to browse messages.</p>
             </div>
           </div>
+          <form id="mail-search-form" class="mail-search" role="search">
+            <label class="sr-only" for="mail-search-input">Search messages on this page</label>
+            <span class="mail-search-field">
+              <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                <circle cx="11" cy="11" r="6"></circle>
+                <path d="m16 16 4 4"></path>
+              </svg>
+              <input
+                id="mail-search-input"
+                type="search"
+                maxlength="120"
+                autocomplete="off"
+                spellcheck="false"
+                placeholder="Search sender or subject on this page"
+              >
+            </span>
+            <button id="mail-search-clear" class="button button-secondary" type="button" hidden>Clear</button>
+          </form>
           <div id="mail-bulk-toolbar" class="mail-bulk-toolbar" aria-label="Mailbox actions">
             <label class="mail-bulk-select">
               <input id="mail-select-page" type="checkbox">
