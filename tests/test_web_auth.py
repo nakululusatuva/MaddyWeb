@@ -389,6 +389,72 @@ async def _login_totp(
 
 
 @pytest.mark.asyncio
+async def test_bulk_permanent_delete_rejects_personal_and_admin_cross_account_idor(
+    auth_client: tuple[TestClient, AuthGateway],
+) -> None:
+    client, gateway = auth_client
+    _login, csrf = await _login_totp(client, gateway)
+    payload = {
+        "account": TARGET_ID,
+        "mailbox": "Trash",
+        "action": "permanent_delete",
+        "uids": ["42"],
+        "confirmation": "PERMANENTLY DELETE",
+        "freshness": [{"uid": "42", "token": "T" * 43}],
+    }
+
+    personal = await _post_json(
+        client,
+        "/api/v1/me/mail-actions",
+        csrf,
+        payload,
+    )
+    assert personal.status == 400
+
+    csrf = await _csrf(client)
+    administrative = await _post_json(
+        client,
+        "/api/v1/admin/mail-actions",
+        csrf,
+        payload,
+    )
+    assert administrative.status == 403
+    assert not any(operation[0] == "delete_messages" for operation in gateway.operations)
+
+
+@pytest.mark.asyncio
+async def test_bulk_permanent_delete_admin_rejects_unknown_target_account(
+    auth_client: tuple[TestClient, AuthGateway],
+) -> None:
+    client, gateway = auth_client
+    _login, csrf = await _login_totp(
+        client,
+        gateway,
+        principal=_principal(
+            account_id=ADMIN_ID,
+            email="admin@example.test",
+            role="admin",
+        ),
+        token=ADMIN_TOKEN,
+    )
+    response = await _post_json(
+        client,
+        "/api/v1/admin/mail-actions",
+        csrf,
+        {
+            "account": "f" * 32,
+            "mailbox": "Trash",
+            "action": "permanent_delete",
+            "uids": ["42"],
+            "confirmation": "PERMANENTLY DELETE",
+            "freshness": [{"uid": "42", "token": "T" * 43}],
+        },
+    )
+    assert response.status == 400
+    assert not any(operation[0] == "delete_messages" for operation in gateway.operations)
+
+
+@pytest.mark.asyncio
 async def test_short_login_identifier_uses_the_configured_local_domain(tmp_path: Path) -> None:
     gateway = AuthGateway()
     client = TestClient(

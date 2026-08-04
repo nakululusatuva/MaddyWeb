@@ -1021,6 +1021,11 @@ ALLOWED_OPERATIONS: Mapping[str, _Operation] = {
         permission="account",
     ),
     "messages.delete": _Operation("_messages_delete", mutating=True, permission="account"),
+    "messages.delete_many": _Operation(
+        "_messages_delete_many",
+        mutating=True,
+        permission="account",
+    ),
     "messages.copy": _Operation("_messages_copy", mutating=True, permission="account"),
     "messages.move": _Operation("_messages_move", mutating=True, permission="account"),
     "messages.set_flags": _Operation(
@@ -1096,7 +1101,7 @@ def _selected_message_uid_set(value: Any) -> str:
     selected: list[str] = []
     seen: set[str] = set()
     for item in values:
-        if not item.isdecimal() or item.startswith("0"):
+        if not item.isascii() or not item.isdecimal() or item.startswith("0"):
             raise ValueError("message UID selection contains an invalid UID")
         uid = int(item)
         if not 1 <= uid <= (1 << 32) - 1:
@@ -1984,6 +1989,19 @@ class PrivilegedDispatcher:
         values = _params(request, required={"username", "mailbox", "uid", "confirm"})
         _confirmed(values)
         self.maddy.delete_message(values["username"], values["mailbox"], values["uid"])
+        return {"deleted": True}
+
+    def _messages_delete_many(self, request: Request, _spool: TrustedSpool | None) -> Any:
+        values = _params(
+            request,
+            required={"username", "mailbox", "uid_set", "confirm"},
+        )
+        _confirmed(values)
+        uid_set = _selected_message_uid_set(values["uid_set"])
+        trash = self.maddy.resolve_special_mailbox(values["username"], "trash")
+        if values["mailbox"] != trash:
+            raise ValueError("bulk permanent deletion is restricted to the Trash mailbox")
+        self.maddy.delete_messages(values["username"], trash, uid_set)
         return {"deleted": True}
 
     def _messages_copy(self, request: Request, _spool: TrustedSpool | None) -> Any:

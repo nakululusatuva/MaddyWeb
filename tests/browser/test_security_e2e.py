@@ -231,6 +231,7 @@ async def test_new_mail_notice_is_server_pushed_without_frontend_mailbox_polling
     page: Page,
     live_application: LiveApplication,
 ) -> None:
+    await page.set_viewport_size({"width": 1280, "height": 800})
     requests: list[str] = []
     page.on("request", lambda request: requests.append(urlsplit(request.url).path))
     await _load_inbox(page, live_application)
@@ -248,22 +249,64 @@ async def test_new_mail_notice_is_server_pushed_without_frontend_mailbox_polling
     assert event_streams == 1
 
     live_application.gateway.notification_uid += 1
+    banner = page.locator("#new-mail-banner")
     notice = page.locator("#new-mail-notice")
-    await notice.wait_for(state="visible", timeout=3_000)
-    assert (await notice.inner_text()).strip() == "New mail"
-    assert await page.locator("#toast").inner_text() == "New mail arrived in Inbox."
-    visible_notice = " ".join(
-        [
-            await notice.inner_text(),
-            await page.locator("#toast").inner_text(),
-        ]
+    await banner.wait_for(state="visible", timeout=3_000)
+    assert await page.locator("#new-mail-title").inner_text() == "New mail"
+    assert await page.locator("#new-mail-summary").inner_text() == (
+        "A new message arrived in Inbox."
     )
+    assert await page.locator("#new-mail-time").count() == 0
+    assert await page.locator("#new-mail-announcer").inner_text() == ("New mail arrived in Inbox.")
+    assert await page.locator("#toast").is_hidden()
+    assert await notice.get_attribute("href") == _mailbox_path()
+    visible_notice = await banner.inner_text()
     assert "attacker@example.test" not in visible_notice
     assert "Browser security fixture" not in visible_notice
+
+    bounds = await banner.bounding_box()
+    assert bounds is not None
+    assert abs((bounds["x"] + bounds["width"] / 2) - 640) <= 2
+    assert bounds["y"] <= 28
+    assert await banner.evaluate("node => getComputedStyle(node).borderRadius") == "20px"
 
     await asyncio.sleep(0.65)
     assert requests.count("/api/v1/admin/mail") == mailbox_loads
     assert requests.count("/api/v1/admin/mail-events") == event_streams
+
+    requests_before_dismiss = list(requests)
+    await page.locator("#new-mail-dismiss").click()
+    await banner.wait_for(state="hidden")
+    assert requests == requests_before_dismiss
+
+    live_application.gateway.notification_uid += 1
+    await banner.wait_for(state="visible", timeout=3_000)
+    await page.evaluate(
+        """() => {
+          history.pushState(null, "", "/security");
+          window.dispatchEvent(new PopStateEvent("popstate"));
+        }"""
+    )
+    await page.get_by_role("heading", name="Security", exact=True).wait_for()
+    assert await banner.is_visible()
+    await notice.click()
+    await page.wait_for_url(f"**{_mailbox_path()}")
+    await page.locator("#message-list-body tr").wait_for()
+    assert await banner.is_hidden()
+
+    event_streams_before_restore = requests.count("/api/v1/admin/mail-events")
+    await page.evaluate(
+        """() => {
+          window.dispatchEvent(new PageTransitionEvent("pagehide", {persisted: true}));
+          window.dispatchEvent(new PageTransitionEvent("pageshow", {persisted: true}));
+        }"""
+    )
+    for _ in range(40):
+        if requests.count("/api/v1/admin/mail-events") > event_streams_before_restore:
+            break
+        await asyncio.sleep(0.05)
+    else:
+        pytest.fail("the mail event stream did not reconnect after a BFCache restore")
 
 
 async def test_mailbox_placeholder_cannot_be_selected(
@@ -444,7 +487,7 @@ async def _load_mailbox(
 ) -> None:
     query = urlencode({"account": ACCOUNT, "mailbox": mailbox})
     await page.goto(f"{live_application.base_url}/mail?{query}")
-    await page.locator("#message-list-body tr").wait_for()
+    await page.locator("#message-list-body tr").first.wait_for()
     assert await page.locator("#mail-mailbox").input_value() == mailbox
 
 
@@ -598,9 +641,7 @@ async def test_anonymous_browser_loads_only_login_then_completes_password_and_to
         finally:
             release_totp.set()
 
-        await page.wait_for_function(
-            "() => typeof window.__pendingLoginNavigation === 'function'"
-        )
+        await page.wait_for_function("() => typeof window.__pendingLoginNavigation === 'function'")
         assert "is-verifying" in (await totp_submit.get_attribute("class") or "")
         assert await totp_submit.inner_text() == "Verified. Signing in..."
         assert await totp_submit.get_attribute("aria-busy") == "true"
@@ -608,9 +649,7 @@ async def test_anonymous_browser_loads_only_login_then_completes_password_and_to
             await totp_submit.evaluate("node => getComputedStyle(node).backgroundColor")
             != initial_color
         )
-        assert "is-success" in (
-            await page.locator("#auth-notice").get_attribute("class") or ""
-        )
+        assert "is-success" in (await page.locator("#auth-notice").get_attribute("class") or "")
         await page.evaluate(
             """() => {
                 const callback = window.__pendingLoginNavigation;
@@ -1231,9 +1270,9 @@ async def test_message_navigation_updates_selection_and_hides_stale_content(
         assert await selected_rows.count() == 1
         assert await selected_rows.get_attribute("data-uid") == MESSAGE_ID
         assert await selected_rows.get_attribute("aria-current") == "true"
-        assert await page.locator(
-            '#message-list-body tr[data-uid="999"][aria-current]'
-        ).count() == 0
+        assert (
+            await page.locator('#message-list-body tr[data-uid="999"][aria-current]').count() == 0
+        )
     finally:
         request_release.set()
 
@@ -1450,9 +1489,175 @@ async def test_trash_row_permanent_delete_requires_typed_confirmation_and_snapsh
         ("GET", f"/api/v1/admin/mail/{MESSAGE_ID}/action-snapshot"),
         ("POST", f"/api/v1/admin/mail/{MESSAGE_ID}/delete"),
     ]
-    assert live_application.gateway.permanent_deletions == [
-        (ACCOUNT, TRASH_MAILBOX, MESSAGE_ID)
+    assert live_application.gateway.permanent_deletions == [(ACCOUNT, TRASH_MAILBOX, MESSAGE_ID)]
+
+
+async def test_trash_bulk_permanent_delete_requires_per_message_freshness_and_one_write(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    second_message_id = "43"
+
+    async def two_messages(
+        _account: str,
+        mailbox: str,
+        **_kwargs: object,
+    ) -> MessagePage:
+        if live_application.gateway.message_location != mailbox:
+            return MessagePage([], False)
+        return MessagePage(
+            [
+                {
+                    "id": uid,
+                    "sender": "attacker@example.test",
+                    "subject": f"Security fixture {uid}",
+                    "date": "2026-07-23 12:00 UTC",
+                    "unread": True,
+                }
+                for uid in (MESSAGE_ID, second_message_id)
+            ],
+            False,
+        )
+
+    live_application.gateway.list_messages = two_messages  # type: ignore[method-assign]
+    live_application.gateway.message_location = TRASH_MAILBOX
+    await _load_mailbox(page, live_application, TRASH_MAILBOX)
+    live_application.gateway.message_read_started.clear()
+    action_requests: list[object] = []
+
+    def capture_action_request(request: object) -> None:
+        path = urlsplit(getattr(request, "url", "")).path
+        if path.endswith("/action-snapshot") or path.endswith("/mail-actions"):
+            action_requests.append(request)
+
+    page.on("request", capture_action_request)
+    bulk_delete = page.locator("#mail-bulk-permanent-delete")
+    assert await bulk_delete.is_visible()
+    assert await bulk_delete.is_disabled()
+    assert await page.locator("#mail-bulk-trash").is_hidden()
+
+    await page.locator("#mail-select-page").check()
+    assert await page.locator("#mail-selection-count").inner_text() == "2 selected"
+    assert await bulk_delete.is_enabled()
+    await bulk_delete.click()
+
+    dialog = page.locator("#typed-confirm-dialog")
+    await dialog.wait_for(state="visible")
+    assert await page.locator("#typed-confirm-title").inner_text() == (
+        "Permanently delete 2 messages from Trash?"
+    )
+    assert "cannot be undone" in (await page.locator("#typed-confirm-message").inner_text()).lower()
+    assert action_requests == []
+    assert not live_application.gateway.message_read_started.is_set()
+
+    typed_action = page.locator("#typed-confirm-action")
+    assert await typed_action.inner_text() == "Delete 2 permanently"
+    await page.locator("#typed-confirm-input").fill("PERMANENTLY DELETE ")
+    assert await typed_action.is_disabled()
+    await page.locator("#typed-confirm-input").fill("PERMANENTLY DELETE")
+    assert await typed_action.is_enabled()
+    await typed_action.click()
+
+    await dialog.wait_for(state="hidden")
+    await page.locator("#message-empty").wait_for(state="visible")
+    assert live_application.gateway.message_read_started.is_set()
+    action_records = [
+        (getattr(request, "method", ""), urlsplit(getattr(request, "url", "")).path)
+        for request in action_requests
     ]
+    assert set(action_records[:-1]) == {
+        ("GET", f"/api/v1/admin/mail/{MESSAGE_ID}/action-snapshot"),
+        ("GET", f"/api/v1/admin/mail/{second_message_id}/action-snapshot"),
+    }
+    assert action_records[-1] == ("POST", "/api/v1/admin/mail-actions")
+    payload = getattr(action_requests[-1], "post_data_json", None)
+    assert isinstance(payload, dict)
+    assert payload == {
+        "account": ACCOUNT,
+        "mailbox": TRASH_MAILBOX,
+        "action": "permanent_delete",
+        "uids": [MESSAGE_ID, second_message_id],
+        "confirmation": "PERMANENTLY DELETE",
+        "freshness": [
+            {
+                "uid": MESSAGE_ID,
+                "token": payload["freshness"][0]["token"],
+            },
+            {
+                "uid": second_message_id,
+                "token": payload["freshness"][1]["token"],
+            },
+        ],
+    }
+    assert all(isinstance(item["token"], str) and item["token"] for item in payload["freshness"])
+    assert live_application.gateway.permanent_deletions == []
+    assert live_application.gateway.bulk_permanent_deletions == [
+        (ACCOUNT, TRASH_MAILBOX, (MESSAGE_ID, second_message_id))
+    ]
+
+
+async def test_unknown_bulk_delete_result_locks_stale_mail_ui_when_reload_fails(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    live_application.gateway.message_location = TRASH_MAILBOX
+    await _load_mailbox(page, live_application, TRASH_MAILBOX)
+    mutation_requests = 0
+
+    async def fail_delete(route: Route) -> None:
+        nonlocal mutation_requests
+        mutation_requests += 1
+        await route.fulfill(
+            status=502,
+            content_type="application/json",
+            body=json.dumps(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "helper_failed",
+                        "message": "The deletion result is unknown.",
+                    },
+                }
+            ),
+        )
+
+    async def fail_mail_reload(route: Route) -> None:
+        await route.fulfill(
+            status=502,
+            content_type="application/json",
+            body=json.dumps(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "mailbox_unavailable",
+                        "message": "The mailbox could not be refreshed.",
+                    },
+                }
+            ),
+        )
+
+    await page.route("**/api/v1/admin/mail-actions", fail_delete)
+    await page.route("**/api/v1/admin/mail?*", fail_mail_reload)
+    await page.locator("#mail-select-page").check()
+    await page.locator("#mail-bulk-permanent-delete").click()
+    await page.locator("#typed-confirm-input").fill("PERMANENTLY DELETE")
+    await page.locator("#typed-confirm-action").click()
+
+    await page.locator("#typed-confirm-dialog").wait_for(state="hidden")
+    empty = page.locator("#message-empty")
+    await empty.wait_for(state="visible")
+    assert "Reload this page" in await empty.inner_text()
+    assert await page.locator("#message-list-body tr").count() == 0
+    assert await page.locator("#mail-selection-count").inner_text() == "0 selected"
+    assert await page.locator("#mail-select-page").is_disabled()
+    assert await page.locator("#mail-mark-read").is_disabled()
+    assert await page.locator("#mail-mark-unread").is_disabled()
+    assert await page.locator("#mail-bulk-archive").is_disabled()
+    assert await page.locator("#mail-bulk-trash").is_disabled()
+    assert await page.locator("#mail-bulk-permanent-delete").is_hidden()
+    assert await page.locator("#mail-mark-all-read").is_disabled()
+    assert await page.locator("#mail-search-input").is_disabled()
+    assert mutation_requests == 1
 
 
 async def test_trash_row_permanent_delete_confirmation_does_not_survive_navigation(
@@ -1469,11 +1674,15 @@ async def test_trash_row_permanent_delete_confirmation_does_not_survive_navigati
             action_requests.append(path)
 
     page.on("request", capture_action_request)
-    await page.locator("#message-list-body tr").get_by_role(
-        "button",
-        name="Permanently delete",
-        exact=True,
-    ).click()
+    await (
+        page.locator("#message-list-body tr")
+        .get_by_role(
+            "button",
+            name="Permanently delete",
+            exact=True,
+        )
+        .click()
+    )
     dialog = page.locator("#typed-confirm-dialog")
     await dialog.wait_for(state="visible")
 
@@ -1613,9 +1822,7 @@ async def test_message_html_is_sandboxed_and_attachment_filename_is_safe(
     preview_bounds = await preview.bounding_box()
     assert preview_bounds is not None
     assert 250 <= preview_bounds["height"] <= 300
-    assert await preview.evaluate(
-        "node => getComputedStyle(node).resize"
-    ) == "none"
+    assert await preview.evaluate("node => getComputedStyle(node).resize") == "none"
     resize_handle = page.get_by_role("button", name="Resize message body", exact=True)
     await resize_handle.scroll_into_view_if_needed()
     preview_bounds = await preview.bounding_box()
@@ -1710,9 +1917,7 @@ async def test_message_html_is_sandboxed_and_attachment_filename_is_safe(
     assert await page.get_by_text("Sanitized HTML body", exact=True).count() == 0
 
     source_toggle = page.get_by_role("button", name="View source", exact=True)
-    assert await source_toggle.evaluate(
-        "node => node.parentElement?.id"
-    ) == "message-toolbar"
+    assert await source_toggle.evaluate("node => node.parentElement?.id") == "message-toolbar"
     assert await source_toggle.get_attribute("aria-pressed") == "false"
     assert await frame_element.is_visible()
     assert not await page.locator("#message-source-body").is_visible()
@@ -1751,10 +1956,7 @@ async def test_message_preview_height_adapts_to_long_content(
     page: Page,
     live_application: LiveApplication,
 ) -> None:
-    long_lines = [
-        f"Preview line {index}: " + ("message content " * 8)
-        for index in range(40)
-    ]
+    long_lines = [f"Preview line {index}: " + ("message content " * 8) for index in range(40)]
     message = EmailMessage()
     message["From"] = "attacker@example.test"
     message["To"] = ACCOUNT_ADDRESS

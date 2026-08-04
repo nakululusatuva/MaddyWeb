@@ -85,6 +85,7 @@ PARSED_MESSAGE_CACHE_SECONDS = 60.0
 PARSED_MESSAGE_CACHE_CAPACITY = 32
 PARSED_MESSAGE_CACHE_MAX_BYTES = 32 * 1024 * 1024
 MAX_BULK_MESSAGE_UIDS = 50
+BULK_FRESHNESS_CONCURRENCY = 2
 MAX_TOTP_QR_SVG_CHARS = 256 * 1024
 DEFAULT_MAIL_EVENT_POLL_SECONDS = 30.0
 MAIL_EVENT_KEEPALIVE_SECONDS = 15.0
@@ -301,6 +302,13 @@ class Gateway(MailGateway, Protocol):
         account_id: str,
         mailbox: str,
         message_id: str,
+    ) -> None: ...
+
+    async def delete_messages_permanently(
+        self,
+        account_id: str,
+        mailbox: str,
+        message_ids: Sequence[str],
     ) -> None: ...
 
     async def certificate_status(self) -> object: ...
@@ -2638,8 +2646,11 @@ async def _spool_raw_message(
     mailbox_name: str,
     *,
     authorized: bool = False,
+    message_id: str | None = None,
 ) -> RawMessageSpool:
-    message_id = _message_uid(request.match_info["message_id"])
+    selected_message_id = _message_uid(
+        request.match_info["message_id"] if message_id is None else message_id
+    )
     if not authorized:
         await _authorize_mail_context(request, account, mailbox_name)
     settings = _settings(request)
@@ -2655,7 +2666,7 @@ async def _spool_raw_message(
         reported_size = await _gateway(request).spool_message(
             account,
             mailbox_name,
-            message_id,
+            selected_message_id,
             path,
             max_bytes=MAX_RAW_DOWNLOAD_BYTES,
         )
@@ -2690,7 +2701,7 @@ async def _authorize_mail_context(
     request: web.Request,
     account: str,
     mailbox_name: str,
-) -> None:
+) -> list[dict[str, object]]:
     try:
         if request.path.startswith("/api/v1/me/"):
             if account != _principal_account_id(request):
@@ -2709,8 +2720,10 @@ async def _authorize_mail_context(
             await _gateway(request).list_mailboxes(account),
             "mailbox list",
         )
-        if mailbox_name not in _mailbox_names(mailboxes_found):
+        mailbox_payloads = [_mailbox_payload(record) for record in mailboxes_found]
+        if mailbox_name not in {str(record["name"]) for record in mailbox_payloads}:
             raise web.HTTPBadRequest(text="Mailbox is not in the allowed list.")
+        return mailbox_payloads
     except web.HTTPException:
         raise
     except Exception as exc:
@@ -2729,17 +2742,30 @@ async def _verify_message_freshness(
     entry = _freshness_store(request).consume(token, _freshness_owner(request))
     if entry is None or entry.account != account or entry.mailbox != mailbox or entry.uid != uid:
         raise web.HTTPConflict(text="Message confirmation expired; refresh and try again.")
+    await _verify_consumed_message_freshness(request, entry)
+
+
+async def _verify_consumed_message_freshness(
+    request: web.Request,
+    entry: _FreshnessEntry,
+) -> None:
     try:
-        spool = await _spool_raw_message(request, account, mailbox)
+        spool = await _spool_raw_message(
+            request,
+            entry.account,
+            entry.mailbox,
+            authorized=True,
+            message_id=entry.uid,
+        )
     except web.HTTPException as exc:
-        _parsed_message_cache(request).invalidate(account, mailbox, (uid,))
+        _parsed_message_cache(request).invalidate(entry.account, entry.mailbox, (entry.uid,))
         raise web.HTTPConflict(text="Message state changed; refresh and try again.") from exc
     try:
         current_digest = await asyncio.to_thread(_file_sha256, spool.path)
     finally:
         await asyncio.to_thread(spool.cleanup)
     if not secrets.compare_digest(entry.digest, current_digest):
-        _parsed_message_cache(request).invalidate(account, mailbox, (uid,))
+        _parsed_message_cache(request).invalidate(entry.account, entry.mailbox, (entry.uid,))
         raise web.HTTPConflict(text="Message state changed; refresh and try again.")
 
 
@@ -3237,16 +3263,95 @@ def _selected_message_uids(values: Mapping[str, Any]) -> tuple[str, ...]:
     return tuple(selected)
 
 
+def _bulk_freshness_tokens(
+    values: Mapping[str, Any],
+    selected: Sequence[str],
+) -> tuple[str, ...]:
+    raw = values.get("freshness")
+    if not isinstance(raw, list) or len(raw) != len(selected):
+        raise web.HTTPBadRequest(text="Freshness proofs must exactly match the selected messages.")
+    proofs: dict[str, str] = {}
+    tokens: set[str] = set()
+    for value in raw:
+        if not isinstance(value, dict) or set(value) != {"uid", "token"}:
+            raise web.HTTPBadRequest(text="Each freshness proof must contain one UID and token.")
+        uid_value = value.get("uid")
+        token_value = value.get("token")
+        if not isinstance(uid_value, str) or not isinstance(token_value, str):
+            raise web.HTTPBadRequest(text="Freshness proof values must be strings.")
+        uid = _message_uid(uid_value)
+        if uid in proofs:
+            raise web.HTTPBadRequest(text="Freshness proofs contain duplicate UIDs.")
+        if token_value in tokens:
+            raise web.HTTPBadRequest(text="Freshness proofs contain duplicate tokens.")
+        proofs[uid] = token_value
+        tokens.add(token_value)
+    if set(proofs) != set(selected):
+        raise web.HTTPBadRequest(text="Freshness proofs must exactly match the selected messages.")
+    return tuple(proofs[uid] for uid in selected)
+
+
+async def _verify_bulk_message_freshness(
+    request: web.Request,
+    *,
+    account: str,
+    mailbox: str,
+    selected: Sequence[str],
+    tokens: Sequence[str],
+) -> None:
+    owner = _freshness_owner(request)
+    entries: list[_FreshnessEntry] = []
+    for uid, token in zip(selected, tokens, strict=True):
+        entry = _freshness_store(request).consume(token, owner)
+        if (
+            entry is None
+            or entry.account != account
+            or entry.mailbox != mailbox
+            or entry.uid != uid
+        ):
+            raise web.HTTPConflict(text="Message confirmation expired; refresh and try again.")
+        entries.append(entry)
+
+    semaphore = asyncio.Semaphore(BULK_FRESHNESS_CONCURRENCY)
+
+    async def verify(entry: _FreshnessEntry) -> None:
+        async with semaphore:
+            await _verify_consumed_message_freshness(request, entry)
+
+    # Complete the entire bounded preflight before deciding whether the single
+    # destructive helper operation may run.  A stale proof therefore produces
+    # zero deletion calls even when another verification is still in flight.
+    results = await asyncio.gather(*(verify(entry) for entry in entries), return_exceptions=True)
+    failure = next((result for result in results if isinstance(result, BaseException)), None)
+    if failure is not None:
+        if isinstance(failure, asyncio.CancelledError):
+            raise failure
+        if isinstance(failure, web.HTTPException):
+            raise failure
+        raise web.HTTPConflict(text="Message state changed; refresh and try again.") from failure
+
+
 async def bulk_message_action(request: web.Request) -> web.Response:
     values = await _read_json_object(
         request,
-        allowed_fields=frozenset({"account", "mailbox", "action", "uids"}),
+        allowed_fields=frozenset(
+            {"account", "mailbox", "action", "uids", "confirmation", "freshness"}
+        ),
     )
     account, mailbox_name = _mail_context(request, values)
     action = _json_text(values, "action")
-    if action not in {"mark_read", "mark_unread", "mark_all_read", "archive", "trash"}:
+    if action not in {
+        "mark_read",
+        "mark_unread",
+        "mark_all_read",
+        "archive",
+        "trash",
+        "permanent_delete",
+    }:
         raise web.HTTPBadRequest(text="Bulk message action is invalid.")
-    await _authorize_mail_context(request, account, mailbox_name)
+    if action != "permanent_delete" and ({"confirmation", "freshness"} & set(values)):
+        raise web.HTTPBadRequest(text="Bulk message action contains disallowed fields.")
+    mailbox_payloads = await _authorize_mail_context(request, account, mailbox_name)
     if action == "mark_all_read":
         if "uids" in values:
             raise web.HTTPBadRequest(text="Mark all as read does not accept a message selection.")
@@ -3254,7 +3359,29 @@ async def bulk_message_action(request: web.Request) -> web.Response:
         affected: int | None = None
     else:
         selected = _selected_message_uids(values)
+        if action == "permanent_delete":
+            selected = tuple(sorted(selected, key=int))
         affected = len(selected)
+
+    if action == "permanent_delete":
+        if _json_text(values, "confirmation") != "PERMANENTLY DELETE":
+            raise web.HTTPBadRequest(text="Confirmation text mismatch; messages not deleted.")
+        trash = _resolved_special_mailbox(mailbox_payloads, "trash")
+        if trash is None or mailbox_name != trash:
+            raise web.HTTPBadRequest(
+                text="Bulk permanent deletion is restricted to the Trash mailbox."
+            )
+        if selected is None:
+            raise RuntimeError("Message selection is unexpectedly unavailable.")
+        freshness_tokens = _bulk_freshness_tokens(values, selected)
+        async with _mail_work_slot(request):
+            await _verify_bulk_message_freshness(
+                request,
+                account=account,
+                mailbox=mailbox_name,
+                selected=selected,
+                tokens=freshness_tokens,
+            )
     try:
         if action == "mark_all_read":
             await _gateway(request).set_messages_seen(
@@ -3287,7 +3414,7 @@ async def bulk_message_action(request: web.Request) -> web.Response:
                 selected,
             )
             message = f"{affected} message{'s' if affected != 1 else ''} archived."
-        else:
+        elif action == "trash":
             if selected is None:
                 raise RuntimeError("Message selection is unexpectedly unavailable.")
             await _gateway(request).move_messages_to_trash(
@@ -3296,9 +3423,24 @@ async def bulk_message_action(request: web.Request) -> web.Response:
                 selected,
             )
             message = f"{affected} message{'s' if affected != 1 else ''} moved to Trash."
+        else:
+            if selected is None:
+                raise RuntimeError("Message selection is unexpectedly unavailable.")
+            _parsed_message_cache(request).invalidate(account, mailbox_name, selected)
+            try:
+                await _gateway(request).delete_messages_permanently(
+                    account,
+                    mailbox_name,
+                    selected,
+                )
+            finally:
+                # The helper transport can fail after Maddy has acted.  Do not
+                # retry, and do not retain previews for an unknowable outcome.
+                _parsed_message_cache(request).invalidate(account, mailbox_name, selected)
+            message = f"{affected} message{'s' if affected != 1 else ''} permanently deleted."
     except Exception:
         return await _gateway_error(request, "Bulk message action failed")
-    if action in {"archive", "trash"} and selected is not None:
+    if action in {"archive", "trash", "permanent_delete"} and selected is not None:
         _parsed_message_cache(request).invalidate(account, mailbox_name, selected)
     return _api_response(
         data={"account": account, "mailbox": mailbox_name, "affected": affected},

@@ -110,7 +110,7 @@ def _sequence(value: Any, operation: str) -> Sequence[Any]:
 
 
 def _single_uid(value: str) -> str:
-    if not value.isdecimal() or value.startswith("0"):
+    if not value.isascii() or not value.isdecimal() or value.startswith("0"):
         raise ValueError("message identifier must be one positive UID")
     uid = int(value)
     if not 1 <= uid <= (1 << 32) - 1:
@@ -209,6 +209,14 @@ class HelperGateway:
             tuple[bytes, str, str, int, int],
             _MessageListCacheEntry,
         ] = {}
+        self._message_account_generation: dict[str, int] = {}
+        self._message_mailbox_generation: dict[tuple[str, str], int] = {}
+        self._message_mutations_inflight: dict[tuple[str, str], int] = {}
+        self._message_mutation_tasks: dict[
+            tuple[str, str],
+            set[asyncio.Task[Any]],
+        ] = {}
+        self._message_cache_quarantined: set[tuple[str, str]] = set()
         self._session_cache: dict[bytes, _SessionCacheEntry] = {}
         self._session_flights: dict[bytes, asyncio.Task[Mapping[str, Any]]] = {}
 
@@ -707,10 +715,97 @@ class HelperGateway:
         account_id: str,
         mailbox: str | None = None,
     ) -> None:
+        if mailbox is None:
+            self._message_account_generation[account_id] = (
+                self._message_account_generation.get(account_id, 0) + 1
+            )
+        else:
+            scope = (account_id, mailbox)
+            self._message_mailbox_generation[scope] = (
+                self._message_mailbox_generation.get(scope, 0) + 1
+            )
         for key in tuple(self._message_list_cache):
             _auth_key, key_account, key_mailbox, _limit, _offset = key
             if key_account == account_id and (mailbox is None or key_mailbox == mailbox):
                 del self._message_list_cache[key]
+
+    def _message_generation(self, account_id: str, mailbox: str) -> tuple[int, int]:
+        return (
+            self._message_account_generation.get(account_id, 0),
+            self._message_mailbox_generation.get((account_id, mailbox), 0),
+        )
+
+    def _release_message_mutation_task(
+        self,
+        scope: tuple[str, str],
+        task: asyncio.Task[Any],
+    ) -> None:
+        tasks = self._message_mutation_tasks.get(scope)
+        if tasks is not None:
+            tasks.discard(task)
+            if not tasks:
+                del self._message_mutation_tasks[scope]
+        self._consume_task_exception(task)
+
+    async def _run_message_mutation(
+        self,
+        scope: tuple[str, str],
+        operation: str,
+        params: Mapping[str, Any],
+    ) -> _TaskOutcome:
+        try:
+            return _TaskOutcome(value=await self._call(operation, params))
+        except HelperCallError as exc:
+            return _TaskOutcome(error=exc)
+        except asyncio.CancelledError:
+            self._message_cache_quarantined.add(scope)
+            raise
+        except Exception as exc:
+            # A transport failure cannot prove when the root-side mutation
+            # settled.  The next read must bypass cache and serialize behind
+            # every still-tracked writer for this mailbox.
+            self._message_cache_quarantined.add(scope)
+            return _TaskOutcome(error=exc)
+        finally:
+            remaining = self._message_mutations_inflight.get(scope, 0) - 1
+            if remaining > 0:
+                self._message_mutations_inflight[scope] = remaining
+            else:
+                self._message_mutations_inflight.pop(scope, None)
+            self._invalidate_message_lists(*scope)
+
+    async def _message_mutation(
+        self,
+        account_id: str,
+        mailbox: str,
+        operation: str,
+        params: Mapping[str, Any],
+    ) -> Any:
+        scope = (account_id, mailbox)
+        self._invalidate_message_lists(account_id, mailbox)
+        self._message_mutations_inflight[scope] = self._message_mutations_inflight.get(scope, 0) + 1
+        task = asyncio.create_task(self._run_message_mutation(scope, operation, params))
+        self._message_mutation_tasks.setdefault(scope, set()).add(task)
+        task.add_done_callback(
+            lambda completed: self._release_message_mutation_task(scope, completed)
+        )
+        outcome = await asyncio.shield(task)
+        if outcome.error is not None:
+            raise outcome.error
+        return outcome.value
+
+    async def _wait_for_message_mutations(self, scope: tuple[str, str]) -> None:
+        while self._message_mutations_inflight.get(scope, 0):
+            tasks = self._message_mutation_tasks.get(scope, set())
+            for task in tuple(tasks):
+                if task.done():
+                    tasks.discard(task)
+            if not tasks:
+                raise RuntimeError("message mutation task tracking was lost")
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in tuple(tasks)),
+                return_exceptions=True,
+            )
 
     def _prune_message_list_cache(self, now: float) -> None:
         for key, entry in tuple(self._message_list_cache.items()):
@@ -849,6 +944,7 @@ class HelperGateway:
         limit: int,
         offset: int,
     ) -> Mapping[str, object]:
+        scope = (account_id, mailbox)
         cache_key = (
             _authorization_cache_key(_AUTH_TOKEN.get()),
             account_id,
@@ -856,30 +952,44 @@ class HelperGateway:
             limit,
             offset,
         )
-        now = time.monotonic()
-        cached = self._message_list_cache.get(cache_key)
-        if cached is not None and cached.expires_at > now:
-            return copy.deepcopy(cached.value)
-        result = _mapping(
-            await self._call(
+        while True:
+            if self._message_mutations_inflight.get(scope, 0):
+                await self._wait_for_message_mutations(scope)
+                continue
+            generation = self._message_generation(account_id, mailbox)
+            now = time.monotonic()
+            cached = self._message_list_cache.get(cache_key)
+            if (
+                scope not in self._message_cache_quarantined
+                and cached is not None
+                and cached.expires_at > now
+            ):
+                return copy.deepcopy(cached.value)
+            result = _mapping(
+                await self._call(
+                    "messages.list",
+                    {
+                        "target_account_id": account_id,
+                        "mailbox": mailbox,
+                        "limit": limit,
+                        "offset": offset,
+                    },
+                ),
                 "messages.list",
-                {
-                    "target_account_id": account_id,
-                    "mailbox": mailbox,
-                    "limit": limit,
-                    "offset": offset,
-                },
-            ),
-            "messages.list",
-        )
-        _sequence(result.get("items"), "messages.list.items")
-        snapshot = copy.deepcopy(dict(result))
-        self._prune_message_list_cache(time.monotonic())
-        self._message_list_cache[cache_key] = _MessageListCacheEntry(
-            expires_at=time.monotonic() + _MESSAGE_LIST_CACHE_SECONDS,
-            value=snapshot,
-        )
-        return copy.deepcopy(snapshot)
+            )
+            _sequence(result.get("items"), "messages.list.items")
+            snapshot = copy.deepcopy(dict(result))
+            if generation != self._message_generation(
+                account_id, mailbox
+            ) or self._message_mutations_inflight.get(scope, 0):
+                continue
+            self._message_cache_quarantined.discard(scope)
+            self._prune_message_list_cache(time.monotonic())
+            self._message_list_cache[cache_key] = _MessageListCacheEntry(
+                expires_at=time.monotonic() + _MESSAGE_LIST_CACHE_SECONDS,
+                value=snapshot,
+            )
+            return copy.deepcopy(snapshot)
 
     async def latest_message_uid(self, account_id: str, mailbox: str) -> int:
         result = _mapping(
@@ -1134,19 +1244,38 @@ class HelperGateway:
         mailbox: str,
         message_id: str,
     ) -> None:
-        self._invalidate_message_lists(account_id, mailbox)
-        try:
-            await self._call(
-                "messages.delete",
-                {
-                    "target_account_id": account_id,
-                    "mailbox": mailbox,
-                    "uid": _single_uid(message_id),
-                    "confirm": True,
-                },
-            )
-        finally:
-            self._invalidate_message_lists(account_id, mailbox)
+        await self._message_mutation(
+            account_id,
+            mailbox,
+            "messages.delete",
+            {
+                "target_account_id": account_id,
+                "mailbox": mailbox,
+                "uid": _single_uid(message_id),
+                "confirm": True,
+            },
+        )
+
+    async def delete_messages_permanently(
+        self,
+        account_id: str,
+        mailbox: str,
+        message_ids: Sequence[str],
+    ) -> None:
+        """Delete one bounded UID set with one privileged helper mutation."""
+
+        uid_set = _uid_set(message_ids)
+        await self._message_mutation(
+            account_id,
+            mailbox,
+            "messages.delete_many",
+            {
+                "target_account_id": account_id,
+                "mailbox": mailbox,
+                "uid_set": uid_set,
+                "confirm": True,
+            },
+        )
 
     async def certificate_status(self) -> object:
         if not self._config.certificates.enabled:

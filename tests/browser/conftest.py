@@ -114,6 +114,7 @@ class BrowserSecurityGateway:
         self.trash_moves: list[tuple[str, str, str]] = []
         self.archive_moves: list[tuple[str, str, str]] = []
         self.permanent_deletions: list[tuple[str, str, str]] = []
+        self.bulk_permanent_deletions: list[tuple[str, str, tuple[str, ...]]] = []
         self.message_read_started = asyncio.Event()
         self.message_read_release = asyncio.Event()
         self.message_read_release.set()
@@ -394,6 +395,15 @@ class BrowserSecurityGateway:
         message_id: str,
     ) -> None:
         self.permanent_deletions.append((account, mailbox, message_id))
+        self.message_location = None
+
+    async def delete_messages_permanently(
+        self,
+        account: str,
+        mailbox: str,
+        message_ids: Sequence[str],
+    ) -> None:
+        self.bulk_permanent_deletions.append((account, mailbox, tuple(message_ids)))
         self.message_location = None
 
     async def deliver_message(

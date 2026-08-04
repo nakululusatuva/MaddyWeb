@@ -98,6 +98,7 @@ class FakeMaddy:
         self.message_list_kwargs: list[dict[str, Any]] = []
         self.latest_message_uid_calls: list[tuple[str, str]] = []
         self.deleted: list[tuple[str, str, str]] = []
+        self.deleted_many: list[tuple[str, str, str]] = []
         self.moved: list[tuple[str, str, str, str]] = []
         self.moved_many: list[tuple[str, str, str, str]] = []
         self.password_changes: list[tuple[str, str]] = []
@@ -156,6 +157,9 @@ class FakeMaddy:
 
     def delete_message(self, username: str, mailbox: str, uid: str) -> None:
         self.deleted.append((username, mailbox, uid))
+
+    def delete_messages(self, username: str, mailbox: str, uid_set: str) -> None:
+        self.deleted_many.append((username, mailbox, uid_set))
 
     def move_message(self, username: str, source: str, uid: str, target: str) -> None:
         self.moved.append((username, source, uid, target))
@@ -1312,6 +1316,165 @@ def test_message_moves_allow_bounded_selection_but_deletion_requires_one_uid(
     assert injected.response.error is not None
     assert injected.response.error.code == "invalid_request"
     assert maddy.deleted == []
+
+
+def test_bulk_permanent_delete_is_one_audited_trash_only_mutation(tmp_path: Path) -> None:
+    maddy = FakeMaddy()
+    audit_records: list[tuple[str, str, dict[str, Any]]] = []
+
+    def audit(action: str, *, outcome: str, fields: dict[str, Any]) -> None:
+        audit_records.append((action, outcome, fields))
+
+    dispatcher = make_dispatcher(tmp_path, maddy, audit=audit)
+    deleted = dispatcher.dispatch(
+        Request.create(
+            "messages.delete_many",
+            {
+                "username": "sender@example.test",
+                "mailbox": "Custom Trash",
+                "uid_set": "42,44",
+                "confirm": True,
+            },
+        )
+    )
+
+    assert deleted.response.result == {"deleted": True}
+    assert maddy.deleted_many == [("sender@example.test", "Custom Trash", "42,44")]
+    assert audit_records[-1] == (
+        "helper.operation",
+        "ok",
+        {
+            "request_id": deleted.response.request_id,
+            "operation": "messages.delete_many",
+            "actor": None,
+            "params": {
+                "username": "sender@example.test",
+                "mailbox": "Custom Trash",
+                "uid_set": "42,44",
+                "confirm": True,
+            },
+            "stream_length": 0,
+        },
+    )
+
+    invalid_requests = (
+        {
+            "username": "sender@example.test",
+            "mailbox": "INBOX",
+            "uid_set": "42,44",
+            "confirm": True,
+        },
+        {
+            "username": "sender@example.test",
+            "mailbox": "Custom Trash",
+            "uid_set": "42,42",
+            "confirm": True,
+        },
+        {
+            "username": "sender@example.test",
+            "mailbox": "Custom Trash",
+            "uid_set": "1:*",
+            "confirm": True,
+        },
+        {
+            "username": "sender@example.test",
+            "mailbox": "Custom Trash",
+            "uid_set": "\u0661",
+            "confirm": True,
+        },
+        {
+            "username": "sender@example.test",
+            "mailbox": "Custom Trash",
+            "uid_set": "42",
+            "confirm": False,
+        },
+    )
+    for params in invalid_requests:
+        rejected = dispatcher.dispatch(Request.create("messages.delete_many", params))
+        assert rejected.response.error is not None
+        assert rejected.response.error.code == "invalid_request"
+
+    assert maddy.deleted_many == [("sender@example.test", "Custom Trash", "42,44")]
+    assert all(record[0] == "helper.operation" for record in audit_records)
+
+
+def test_bulk_permanent_delete_derives_identity_and_enforces_helper_account_scope(
+    tmp_path: Path,
+) -> None:
+    maddy = FakeMaddy(
+        accounts=[
+            {
+                "username": email,
+                "has_credentials": True,
+                "has_mailbox": True,
+            }
+            for email in (
+                "sender@example.test",
+                "admin@example.test",
+                "target@example.test",
+            )
+        ]
+    )
+    with make_auth_store(tmp_path) as store:
+        user, user_token = provision_session(store, "sender@example.test")
+        admin, admin_token = provision_session(
+            store,
+            "admin@example.test",
+            role=Role.ADMIN,
+        )
+        target = store.create_account(
+            "target@example.test",
+            password_change_required=False,
+        )
+        dispatcher = make_dispatcher(tmp_path, maddy, auth_store=store)
+
+        derived_self = dispatcher.dispatch(
+            Request.create(
+                "messages.delete_many",
+                {
+                    "target_account_id": user.account_id,
+                    "username": "target@example.test",
+                    "mailbox": "Custom Trash",
+                    "uid_set": "42,44",
+                    "confirm": True,
+                },
+                auth_token=user_token,
+            )
+        )
+        cross_account = dispatcher.dispatch(
+            Request.create(
+                "messages.delete_many",
+                {
+                    "target_account_id": target.account_id,
+                    "mailbox": "Custom Trash",
+                    "uid_set": "45",
+                    "confirm": True,
+                },
+                auth_token=user_token,
+            )
+        )
+        administrative = dispatcher.dispatch(
+            Request.create(
+                "messages.delete_many",
+                {
+                    "target_account_id": target.account_id,
+                    "username": admin.email,
+                    "mailbox": "Custom Trash",
+                    "uid_set": "46",
+                    "confirm": True,
+                },
+                auth_token=admin_token,
+            )
+        )
+
+    assert derived_self.response.ok is True
+    assert cross_account.response.error is not None
+    assert cross_account.response.error.code == "forbidden"
+    assert administrative.response.ok is True
+    assert maddy.deleted_many == [
+        ("sender@example.test", "Custom Trash", "42,44"),
+        ("target@example.test", "Custom Trash", "46"),
+    ]
 
 
 def test_message_frame_truncation_continues_at_first_undisplayed_uid(tmp_path: Path) -> None:

@@ -99,6 +99,7 @@
     sessionTimer: 0,
     mailEventSource: null,
     mailEventAccount: "",
+    newMailNotices: [],
     effectiveAccount: "",
     routeController: null,
     mutationTail: Promise.resolve(),
@@ -133,6 +134,7 @@
     pendingForwardSubject: null,
     selectedMessageUids: new Set(),
     mailBulkBusy: false,
+    mailReloadedError: null,
     restoreMessageListPosition: /^\/mail\/[1-9][0-9]{0,9}$/.test(
       window.location.pathname,
     ),
@@ -656,6 +658,7 @@
     if (error instanceof ApiError && error.status === 401 && !verificationFailure) {
       window.clearInterval(state.sessionTimer);
       closeMailEvents();
+      clearNewMailNotices();
       state.csrfToken = "";
       state.mail = null;
       state.message = null;
@@ -1082,11 +1085,56 @@
     state.mailEventAccount = "";
   };
 
-  const showNewMailNotice = (account, mailbox) => {
+  const clearNewMailNotices = () => {
+    state.newMailNotices = [];
+    const banner = byId("new-mail-banner");
+    if (banner instanceof HTMLElement) banner.hidden = true;
+    const announcer = byId("new-mail-announcer");
+    if (announcer instanceof HTMLElement) announcer.textContent = "";
+  };
+
+  const renderNewMailNotice = () => {
+    const banner = byId("new-mail-banner");
     const notice = byId("new-mail-notice");
-    notice.href = buildMailUrl({account, mailbox});
-    notice.hidden = false;
-    showToast("New mail arrived in Inbox.");
+    const next = state.newMailNotices[0];
+    if (!(banner instanceof HTMLElement) || !(notice instanceof HTMLAnchorElement)) return;
+    if (!next) {
+      banner.hidden = true;
+      return;
+    }
+    const summary = "A new message arrived in Inbox.";
+    notice.href = buildMailUrl({account: next.account, mailbox: next.mailbox});
+    notice.setAttribute("aria-label", "Open Inbox to view new mail");
+    byId("new-mail-title").textContent = "New mail";
+    byId("new-mail-summary").textContent = summary;
+    banner.hidden = false;
+  };
+
+  const dismissCurrentNewMailNotice = ({restoreFocus = false} = {}) => {
+    state.newMailNotices.shift();
+    renderNewMailNotice();
+    if (!restoreFocus) return;
+    if (state.newMailNotices.length) {
+      byId("new-mail-dismiss")?.focus();
+    } else {
+      document.querySelector(".brand")?.focus();
+    }
+  };
+
+  const showNewMailNotice = (account, mailbox) => {
+    const key = `${account}\n${mailbox}`;
+    const existing = state.newMailNotices.find((item) => item.key === key);
+    if (!existing) {
+      state.newMailNotices.push({key, account, mailbox});
+      if (state.newMailNotices.length > 8) {
+        state.newMailNotices.splice(state.newMailNotices.length > 1 ? 1 : 0, 1);
+      }
+    }
+    renderNewMailNotice();
+    const announcer = byId("new-mail-announcer");
+    if (announcer instanceof HTMLElement) {
+      announcer.textContent = "New mail arrived in Inbox.";
+    }
     if (
       document.visibilityState !== "visible"
       && "Notification" in window
@@ -1099,8 +1147,11 @@
       notification.addEventListener("click", () => {
         window.focus();
         state.mail = null;
-        notice.hidden = true;
-        navigate(notice.href, {focus: false});
+        const target = buildMailUrl({account, mailbox});
+        const index = state.newMailNotices.findIndex((item) => item.key === key);
+        if (index >= 0) state.newMailNotices.splice(index, 1);
+        renderNewMailNotice();
+        navigate(target, {focus: false});
         notification.close();
       });
     }
@@ -1138,6 +1189,7 @@
     source.addEventListener("session_expired", () => {
       if (state.mailEventSource !== source) return;
       closeMailEvents();
+      clearNewMailNotices();
       window.location.replace("/login");
     });
   };
@@ -1220,6 +1272,7 @@
     const selectedMailbox = arrayValue(mail.mailboxes || mail.folders)
       .map(objectValue)
       .find((item) => stringValue(item.name) === stringValue(mail.selected_mailbox));
+    const isTrash = objectValue(selectedMailbox).is_trash === true;
     byId("mail-bulk-archive").disabled = (
       selectedCount === 0
       || state.mailBulkBusy
@@ -1230,8 +1283,12 @@
       selectedCount === 0
       || state.mailBulkBusy
       || mail.trash_available !== true
-      || objectValue(selectedMailbox).is_trash === true
+      || isTrash
     );
+    byId("mail-bulk-trash").hidden = isTrash;
+    const permanentDelete = byId("mail-bulk-permanent-delete");
+    permanentDelete.hidden = !isTrash;
+    permanentDelete.disabled = !isTrash || selectedCount === 0 || state.mailBulkBusy;
     byId("mail-mark-all-read").disabled = (
       state.mailBulkBusy
       || !allMessages.some((message) => message.unread === true)
@@ -1384,6 +1441,117 @@
       });
     }
     return freshness;
+  };
+
+  const loadMessageActionSnapshots = async (context, uids, signal) => {
+    const snapshots = new Array(uids.length);
+    const actionButton = byId("typed-confirm-action");
+    let nextIndex = 0;
+    let completed = 0;
+    let failure = null;
+    const worker = async () => {
+      while (!failure && nextIndex < uids.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        const uid = uids[index];
+        try {
+          signal.throwIfAborted();
+          const token = await loadMessageActionSnapshot({...context, uid}, signal);
+          snapshots[index] = {uid, token};
+          completed += 1;
+          if (actionButton instanceof HTMLButtonElement) {
+            actionButton.textContent = `Verifying ${completed} of ${uids.length}`;
+          }
+        } catch (error) {
+          failure = error;
+        }
+      }
+    };
+    await Promise.all(
+      Array.from({length: Math.min(2, uids.length)}, () => worker()),
+    );
+    if (failure) throw failure;
+    return snapshots;
+  };
+
+  const requireMailRefreshAfterUnknownResult = () => {
+    state.mail = null;
+    state.message = null;
+    state.selectedMessageUids.clear();
+    byId("message-list-body").replaceChildren();
+    const empty = byId("message-empty");
+    empty.textContent = (
+      "Mailbox state could not be refreshed. Reload this page before making another change."
+    );
+    empty.hidden = false;
+    byId("mail-list-summary").textContent = "Mailbox state is unavailable.";
+    byId("mail-previous").hidden = true;
+    byId("mail-next").hidden = true;
+    byId("mail-search-input").disabled = true;
+    byId("mail-search-clear").hidden = true;
+    updateBulkToolbar();
+    if (parseRoute().name === "message") setMessagePlaceholder("error");
+  };
+
+  const permanentlyDeleteSelectedMessages = async (context, uids, routeSignal) => {
+    if (state.mailBulkBusy || routeSignal.aborted) return;
+    state.mailBulkBusy = true;
+    updateBulkToolbar();
+    clearAlert();
+    try {
+      const freshness = await loadMessageActionSnapshots(context, uids, routeSignal);
+      routeSignal.throwIfAborted();
+      const actionButton = byId("typed-confirm-action");
+      if (actionButton instanceof HTMLButtonElement) {
+        actionButton.textContent = `Deleting ${uids.length} message${uids.length === 1 ? "" : "s"}`;
+      }
+      const payload = await mutate("/mail-actions", {
+        guardSignal: routeSignal,
+        json: {
+          account: context.account,
+          mailbox: context.mailbox,
+          action: "permanent_delete",
+          uids,
+          confirmation: DELETE_MESSAGE_CONFIRMATION,
+          freshness,
+        },
+      });
+      routeSignal.throwIfAborted();
+      finishAction(
+        payload,
+        `${uids.length} message${uids.length === 1 ? "" : "s"} permanently deleted.`,
+      );
+      const mail = objectValue(state.mail);
+      const selectedSet = new Set(uids);
+      const remaining = arrayValue(mail.messages || mail.items)
+        .map(objectValue)
+        .filter((message) => !selectedSet.has(stringValue(message.uid)));
+      if (Array.isArray(mail.messages)) mail.messages = remaining;
+      else mail.items = remaining;
+      state.selectedMessageUids.clear();
+      const route = parseRoute();
+      if (route.name === "message" && selectedSet.has(route.uid)) {
+        state.message = null;
+        refreshMessageList(context);
+      } else {
+        renderMail(mail);
+      }
+    } catch (error) {
+      if (!routeSignal.aborted) {
+        state.mail = null;
+        try {
+          await loadMail(routeSignal);
+          state.mailReloadedError = error;
+        } catch {
+          // Preserve the original deletion result and never retry the mutation.
+          requireMailRefreshAfterUnknownResult();
+        }
+      }
+      throw error;
+    } finally {
+      state.mailBulkBusy = false;
+      if (!routeSignal.aborted) updateBulkToolbar();
+    }
   };
 
   const permanentlyDeleteMessageFromRow = (context, row, button) => {
@@ -3505,6 +3673,9 @@
 
   window.addEventListener("popstate", () => void renderRoute());
   window.addEventListener("pagehide", closeMailEvents);
+  window.addEventListener("pageshow", (event) => {
+    if (event.persisted && state.authState === "active") startMailEvents();
+  });
 
   const logout = async () => {
     const buttons = [
@@ -3526,6 +3697,7 @@
     }
     window.clearInterval(state.sessionTimer);
     closeMailEvents();
+    clearNewMailNotices();
     state.csrfToken = "";
     state.accounts = [];
     state.mail = null;
@@ -3631,6 +3803,34 @@
     });
   });
 
+  byId("mail-bulk-permanent-delete").addEventListener("click", (event) => {
+    if (state.mailBulkBusy) return;
+    const context = selectedMailContext();
+    const selectedMailbox = arrayValue(objectValue(state.mail).mailboxes || objectValue(state.mail).folders)
+      .map(objectValue)
+      .find((item) => stringValue(item.name) === context.mailbox);
+    const uids = [...state.selectedMessageUids];
+    const routeSignal = state.routeController?.signal;
+    if (
+      !context.account
+      || !context.mailbox
+      || objectValue(selectedMailbox).is_trash !== true
+      || !uids.length
+      || !(routeSignal instanceof AbortSignal)
+    ) return;
+    const count = uids.length;
+    openTypedConfirm({
+      title: `Permanently delete ${count} message${count === 1 ? "" : "s"} from Trash?`,
+      message: `This permanently deletes the ${count} selected message${
+        count === 1 ? "" : "s"
+      } from Trash. This cannot be undone.`,
+      expected: DELETE_MESSAGE_CONFIRMATION,
+      label: `Delete ${count} permanently`,
+      opener: event.currentTarget,
+      action: () => permanentlyDeleteSelectedMessages(context, uids, routeSignal),
+    });
+  });
+
   byId("mail-mark-all-read").addEventListener("click", (event) => {
     openConfirm({
       title: "Mark every message in this mailbox as read?",
@@ -3654,9 +3854,18 @@
   byId("logout-button").addEventListener("click", () => void logout());
   byId("security-logout-button").addEventListener("click", () => void logout());
   byId("access-denied-logout").addEventListener("click", () => void logout());
-  byId("new-mail-notice").addEventListener("click", () => {
+  byId("new-mail-notice").addEventListener("click", (event) => {
+    event.preventDefault();
+    const notice = event.currentTarget;
+    if (!(notice instanceof HTMLAnchorElement) || !state.newMailNotices.length) return;
+    const target = notice.href;
     state.mail = null;
-    byId("new-mail-notice").hidden = true;
+    dismissCurrentNewMailNotice();
+    navigate(target, {focus: false});
+  });
+
+  byId("new-mail-dismiss").addEventListener("click", () => {
+    dismissCurrentNewMailNotice({restoreFocus: true});
   });
 
   const FORMAT_COMMANDS = new Map([
@@ -4453,9 +4662,14 @@
     } catch (error) {
       closeDialog(typedDialog);
       handleError(error);
-      if (error instanceof ApiError && error.status === 409) {
+      if (
+        error instanceof ApiError
+        && error.status === 409
+        && state.mailReloadedError !== error
+      ) {
         void renderRoute(false);
       }
+      state.mailReloadedError = null;
     } finally {
       input.value = "";
       button.disabled = true;

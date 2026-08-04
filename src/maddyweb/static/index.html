@@ -7,11 +7,25 @@
   <meta name="theme-color" content="#f4f6f9">
   <meta name="description" content="MaddyWeb mail workspace and server administration console">
   <title>MaddyWeb</title>
-  <link rel="stylesheet" href="/static/app.css?v=21">
-  <script src="/static/app.js?v=26" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=22">
+  <script src="/static/app.js?v=27" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to main content</a>
+  <aside id="new-mail-banner" class="new-mail-banner" aria-label="New mail notification" hidden>
+    <a id="new-mail-notice" class="new-mail-notice" href="/mail" data-route>
+      <span class="new-mail-app-icon" aria-hidden="true">MW</span>
+      <span class="new-mail-copy">
+        <span class="new-mail-meta"><strong>MaddyWeb</strong></span>
+        <strong id="new-mail-title" class="new-mail-title">New mail</strong>
+        <span id="new-mail-summary" class="new-mail-summary">A new message arrived in Inbox.</span>
+      </span>
+    </a>
+    <button id="new-mail-dismiss" class="new-mail-dismiss" type="button" aria-label="Dismiss new mail notification">
+      <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="m6 6 8 8M14 6l-8 8"></path></svg>
+    </button>
+  </aside>
+  <div id="new-mail-announcer" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
   <header class="app-header">
     <a class="brand" href="/" data-route>
       <span class="brand-mark" aria-hidden="true">MW</span>
@@ -19,10 +33,6 @@
     </a>
     <div class="header-actions">
       <span id="runtime-badge" class="status-pill status-neutral">Connecting</span>
-      <a id="new-mail-notice" class="new-mail-notice" href="/mail" data-route hidden>
-        <span aria-hidden="true"></span>
-        New mail
-      </a>
       <span id="session-expiry" class="session-expiry" hidden>Session active</span>
       <span id="account-identity" class="account-identity" hidden>
         <span id="account-avatar" class="account-avatar" aria-hidden="true">M</span>
@@ -176,6 +186,7 @@
               <button id="mail-mark-unread" class="button button-secondary" type="button" disabled>Mark unread</button>
               <button id="mail-bulk-archive" class="button button-secondary" type="button" disabled>Archive</button>
               <button id="mail-bulk-trash" class="button button-secondary" type="button" disabled>Trash</button>
+              <button id="mail-bulk-permanent-delete" class="button button-danger" type="button" hidden disabled>Permanently delete</button>
               <button id="mail-mark-all-read" class="button button-secondary" type="button" disabled>Mark all as read</button>
             </div>
           </div>

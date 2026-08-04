@@ -103,9 +103,7 @@ async def test_session_peek_uses_dedicated_uncached_helper_operation() -> None:
         "email": "user@example.test",
         "role": "user",
     }
-    client = FakeClient(
-        {"auth.session_peek": Response.success("template", principal)}
-    )
+    client = FakeClient({"auth.session_peek": Response.success("template", principal)})
     gateway = gateway_with(client)
 
     assert await gateway.peek_session(token) == principal
@@ -180,6 +178,7 @@ async def test_bulk_message_operations_build_only_valid_uid_sets() -> None:
                 "template",
                 {"moved": True, "target": "Custom Archive"},
             ),
+            "messages.delete_many": Response.success("template", {"deleted": True}),
         }
     )
     gateway = gateway_with(client)
@@ -196,14 +195,27 @@ async def test_bulk_message_operations_build_only_valid_uid_sets() -> None:
         "INBOX",
         ("42", "44"),
     )
+    await gateway.delete_messages_permanently(
+        "account-id",
+        "Custom Trash",
+        ("44", "42"),
+    )
 
     assert target == "Custom Archive"
     assert [request.params["uid_set"] for request in client.requests] == [
         "42,44",
         "1:*",
         "42,44",
+        "44,42",
     ]
-    assert client.requests[-1].params["target_special"] == "archive"
+    assert client.requests[-2].params["target_special"] == "archive"
+    assert client.requests[-1].operation == "messages.delete_many"
+    assert client.requests[-1].params == {
+        "target_account_id": "account-id",
+        "mailbox": "Custom Trash",
+        "uid_set": "44,42",
+        "confirm": True,
+    }
 
     with pytest.raises(ValueError, match="duplicate"):
         await gateway.set_messages_seen(
@@ -214,6 +226,13 @@ async def test_bulk_message_operations_build_only_valid_uid_sets() -> None:
         )
     with pytest.raises(ValueError, match="between 1 and 50"):
         await gateway.move_messages_to_trash("account-id", "INBOX", ())
+    with pytest.raises(ValueError, match="positive UID"):
+        await gateway.delete_messages_permanently(
+            "account-id",
+            "Custom Trash",
+            ("\u0661",),
+        )
+    assert sum(request.operation == "messages.delete_many" for request in client.requests) == 1
 
 
 @pytest.mark.asyncio
@@ -241,6 +260,82 @@ async def test_message_pages_are_cached_briefly_and_invalidated_by_flag_changes(
         "messages.add_flags",
         "messages.list",
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bulk", [False, True], ids=["single", "bulk"])
+async def test_cancelled_permanent_delete_finishes_once_before_cache_refresh(
+    bulk: bool,
+) -> None:
+    mutation_started = threading.Event()
+    finish_mutation = threading.Event()
+    mutation_finished = threading.Event()
+    state: dict[str, Any] = {
+        "items": [{"uid": 42, "flags": []}],
+        "list_calls": 0,
+    }
+
+    class CancellationClient(FakeClient):
+        def call(self, request: Request) -> Response:
+            self.requests.append(request)
+            if request.operation in {"messages.delete", "messages.delete_many"}:
+                mutation_started.set()
+                assert finish_mutation.wait(timeout=2.0)
+                state["items"] = []
+                mutation_finished.set()
+                return Response.success(request.request_id, {"deleted": True})
+            if request.operation == "messages.list":
+                state["list_calls"] = int(state["list_calls"]) + 1
+                return Response.success(
+                    request.request_id,
+                    {"items": list(state["items"]), "has_next": False},
+                )
+            raise AssertionError(f"unexpected operation: {request.operation}")
+
+    client = CancellationClient({})
+    gateway = gateway_with(client)
+    try:
+        cached = await gateway.list_messages("account-id", "Trash", limit=50, offset=0)
+        assert cached["items"] == [{"uid": 42, "flags": []}]
+
+        deletion = asyncio.create_task(
+            gateway.delete_messages_permanently("account-id", "Trash", ("42",))
+            if bulk
+            else gateway.delete_message_permanently("account-id", "Trash", "42")
+        )
+        assert await asyncio.to_thread(mutation_started.wait, 1.0)
+        deletion.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await deletion
+
+        refresh = asyncio.create_task(
+            gateway.list_messages("account-id", "Trash", limit=50, offset=0)
+        )
+        await asyncio.sleep(0.05)
+        assert refresh.done() is False
+        assert state["list_calls"] == 1
+
+        finish_mutation.set()
+        assert await asyncio.to_thread(mutation_finished.wait, 1.0)
+        fresh = await asyncio.wait_for(refresh, timeout=1.0)
+        assert fresh["items"] == []
+        assert state["list_calls"] == 2
+        operation = "messages.delete_many" if bulk else "messages.delete"
+        assert sum(request.operation == operation for request in client.requests) == 1
+        assert (
+            sum(
+                request.operation in {"messages.delete", "messages.delete_many"}
+                for request in client.requests
+            )
+            == 1
+        )
+        for _attempt in range(100):
+            if not gateway._message_mutation_tasks:  # type: ignore[attr-defined]
+                break
+            await asyncio.sleep(0.01)
+        assert not gateway._message_mutation_tasks  # type: ignore[attr-defined]
+    finally:
+        finish_mutation.set()
 
 
 @pytest.mark.asyncio
@@ -819,9 +914,7 @@ async def test_message_page_preserves_authoritative_continuation() -> None:
 @pytest.mark.asyncio
 async def test_latest_message_uid_uses_minimal_uncached_helper_operation() -> None:
     account_id = "a" * 32
-    client = FakeClient(
-        {"messages.latest": Response.success("template", {"uid": 42})}
-    )
+    client = FakeClient({"messages.latest": Response.success("template", {"uid": 42})})
     gateway = gateway_with(client)
 
     assert await gateway.latest_message_uid(account_id, "INBOX") == 42

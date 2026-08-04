@@ -187,6 +187,7 @@ class FakeGateway:
         self.delivered: bytes | None = None
         self.sent: bytes | None = None
         self.delivery_error: Exception | None = None
+        self.bulk_delete_error: Exception | None = None
         self.spool_gate: asyncio.Event | None = None
         self.spool_active = 0
         self.spool_calls = 0
@@ -230,6 +231,7 @@ class FakeGateway:
             filename="page.html",
         )
         self.raw_message = incoming.as_bytes(policy=policy.SMTP)
+        self.raw_messages: dict[str, bytes] = {}
 
     async def health(self) -> dict[str, object]:
         return self.health_payload
@@ -316,9 +318,10 @@ class FakeGateway:
                 await self.spool_gate.wait()
             finally:
                 self.spool_active -= 1
-        if len(self.raw_message) > max_bytes:
+        raw_message = self.raw_messages.get(message_id, self.raw_message)
+        if len(raw_message) > max_bytes:
             raise ValueError("message too large")
-        return await asyncio.to_thread(destination_path.write_bytes, self.raw_message)
+        return await asyncio.to_thread(destination_path.write_bytes, raw_message)
 
     async def move_message_to_trash(
         self,
@@ -373,6 +376,16 @@ class FakeGateway:
         message_id: str,
     ) -> None:
         self.operations.append(("delete_message", account_id, mailbox, message_id))
+
+    async def delete_messages_permanently(
+        self,
+        account_id: str,
+        mailbox: str,
+        message_ids: Sequence[str],
+    ) -> None:
+        self.operations.append(("delete_messages", account_id, mailbox, tuple(message_ids)))
+        if self.bulk_delete_error is not None:
+            raise self.bulk_delete_error
 
     async def certificate_status(self) -> dict[str, object]:
         return {
@@ -505,9 +518,13 @@ async def test_home_static_assets_and_strict_headers(
     page = await response.text()
     assert response.status == 200
     assert "Administration overview" in page
-    assert 'href="/static/app.css?v=21"' in page
-    assert 'src="/static/app.js?v=26"' in page
+    assert 'href="/static/app.css?v=22"' in page
+    assert 'src="/static/app.js?v=27"' in page
+    assert 'id="new-mail-banner"' in page
     assert 'id="new-mail-notice"' in page
+    assert 'id="new-mail-dismiss"' in page
+    assert 'id="new-mail-announcer"' in page
+    assert 'id="mail-bulk-permanent-delete"' in page
     assert 'id="compose-sender-name"' in page
     assert 'name="sender_name"' in page
     assert 'maxlength="256"' in page
@@ -864,9 +881,7 @@ async def test_mail_event_catch_up_is_ordered_private_unbuffered_and_metadata_fr
     try:
         assert response.status == 200
         assert response.headers["Content-Type"] == "text/event-stream; charset=utf-8"
-        assert response.headers["Cache-Control"] == (
-            "private, no-store, no-cache, no-transform"
-        )
+        assert response.headers["Cache-Control"] == ("private, no-store, no-cache, no-transform")
         assert response.headers["X-Accel-Buffering"] == "no"
         assert response.headers["Cross-Origin-Resource-Policy"] == "same-origin"
         assert response.headers["Content-Security-Policy"] == (
@@ -876,16 +891,8 @@ async def test_mail_event_catch_up_is_ordered_private_unbuffered_and_metadata_fr
         ready = await response.content.readuntil(b"\n\n")
         new_mail = await response.content.readuntil(b"\n\n")
         payload = ready + new_mail
-        assert ready == (
-            b"retry: 15000\n"
-            b"event: ready\n"
-            b'data: {"mailbox":"INBOX"}\n\n'
-        )
-        assert new_mail == (
-            b"event: new_mail\n"
-            b"id: 42\n"
-            b'data: {"mailbox":"INBOX"}\n\n'
-        )
+        assert ready == (b'retry: 15000\nevent: ready\ndata: {"mailbox":"INBOX"}\n\n')
+        assert new_mail == (b'event: new_mail\nid: 42\ndata: {"mailbox":"INBOX"}\n\n')
         assert payload.count(b'data: {"mailbox":"INBOX"}\n') == 2
         for sensitive in (
             ADMIN_ACCOUNT_ID.encode(),
@@ -941,10 +948,13 @@ async def test_mail_event_tabs_share_one_per_session_backend_watcher(
             headers={"Last-Event-ID": "42"},
         )
         assert b"event: ready\n" in await second.content.readuntil(b"\n\n")
-        assert sum(
-            operation == ("latest_message_uid", ADMIN_ACCOUNT_ID, "INBOX")
-            for operation in gateway.operations
-        ) == 1
+        assert (
+            sum(
+                operation == ("latest_message_uid", ADMIN_ACCOUNT_ID, "INBOX")
+                for operation in gateway.operations
+            )
+            == 1
+        )
         assert sum(operation[0] == "peek_session" for operation in gateway.operations) == 2
     finally:
         if second is not None:
@@ -979,11 +989,7 @@ async def test_mail_event_notifies_after_inbox_uid_reset(
                 event = await response.content.readuntil(b"\n\n")
                 if b"event: new_mail\n" in event:
                     break
-        assert event == (
-            b"event: new_mail\n"
-            b"id: 1\n"
-            b'data: {"mailbox":"INBOX"}\n\n'
-        )
+        assert event == (b'event: new_mail\nid: 1\ndata: {"mailbox":"INBOX"}\n\n')
     finally:
         response.close()
 
@@ -1216,6 +1222,245 @@ async def test_bulk_message_actions_validate_selection_and_use_fixed_mailbox_sco
         {**base, "action": "trash", "uids": ["42", "42"]},
     )
     assert duplicate.status == 400
+    assert not any(operation[0] == "trash_many" for operation in gateway.operations)
+
+
+async def _message_action_token(
+    client: TestClient,
+    uid: str,
+    *,
+    mailbox: str = "Trash",
+) -> str:
+    context = urlencode({"account": ADMIN_ACCOUNT_ID, "mailbox": mailbox})
+    response, payload = await _api_data(
+        client,
+        f"/api/v1/mail/{uid}/action-snapshot?{context}",
+    )
+    assert response.status == 200
+    return str(payload["freshness_token"])
+
+
+@pytest.mark.asyncio
+async def test_bulk_permanent_delete_preflights_every_snapshot_then_calls_gateway_once(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+    proofs = {
+        uid: await _message_action_token(client, uid) for uid in ("42", "43", "44", "45", "46")
+    }
+    gateway.spool_gate = asyncio.Event()
+    token = await _get_token(client)
+    request = asyncio.create_task(
+        _post_json(
+            client,
+            "/api/v1/admin/mail-actions",
+            token,
+            {
+                "account": ADMIN_ACCOUNT_ID,
+                "mailbox": "Trash",
+                "action": "permanent_delete",
+                "uids": ["46", "42", "45", "43", "44"],
+                "confirmation": "PERMANENTLY DELETE",
+                "freshness": [
+                    {"uid": uid, "token": proofs[uid]} for uid in ("44", "42", "46", "43", "45")
+                ],
+            },
+        )
+    )
+    await asyncio.wait_for(gateway.two_spools_started.wait(), timeout=1)
+    assert not any(operation[0] == "delete_messages" for operation in gateway.operations)
+    assert gateway.spool_active <= 2
+    gateway.spool_gate.set()
+
+    response = await request
+    assert response.status == 200
+    assert [operation for operation in gateway.operations if operation[0] == "delete_messages"] == [
+        (
+            "delete_messages",
+            ADMIN_ACCOUNT_ID,
+            "Trash",
+            ("42", "43", "44", "45", "46"),
+        )
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"confirmation": "permanently delete"},
+        {"freshness": []},
+        {
+            "uids": ["\u0661"],
+            "freshness": [{"uid": "\u0661", "token": "T" * 43}],
+        },
+        {
+            "uids": ["42", "43"],
+            "freshness": [
+                {"uid": "42", "token": "T" * 43},
+                {"uid": "44", "token": "X" * 43},
+            ],
+        },
+        {
+            "uids": ["42", "43"],
+            "freshness": [
+                {"uid": "42", "token": "T" * 43},
+                {"uid": "42", "token": "X" * 43},
+            ],
+        },
+        {"freshness": [{"uid": "42", "token": "T" * 43, "extra": True}]},
+        {
+            "uids": ["42", "43"],
+            "freshness": [
+                {"uid": "42", "token": "T" * 43},
+                {"uid": "43", "token": "T" * 43},
+            ],
+        },
+    ],
+)
+async def test_bulk_permanent_delete_rejects_invalid_confirmation_and_proof_sets(
+    web_client: tuple[TestClient, FakeGateway],
+    changes: dict[str, object],
+) -> None:
+    client, gateway = web_client
+    token = await _get_token(client)
+    body: dict[str, object] = {
+        "account": ADMIN_ACCOUNT_ID,
+        "mailbox": "Trash",
+        "action": "permanent_delete",
+        "uids": ["42"],
+        "confirmation": "PERMANENTLY DELETE",
+        "freshness": [{"uid": "42", "token": "T" * 43}],
+    }
+    body.update(changes)
+
+    response = await _post_json(client, "/api/v1/admin/mail-actions", token, body)
+    assert response.status in {400, 409}
+    assert not any(operation[0] == "delete_messages" for operation in gateway.operations)
+
+
+@pytest.mark.asyncio
+async def test_bulk_permanent_delete_requires_authoritative_trash_and_fresh_content(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+    inbox_token = await _message_action_token(client, "42", mailbox="INBOX")
+    csrf = await _get_token(client)
+    wrong_mailbox = await _post_json(
+        client,
+        "/api/v1/admin/mail-actions",
+        csrf,
+        {
+            "account": ADMIN_ACCOUNT_ID,
+            "mailbox": "INBOX",
+            "action": "permanent_delete",
+            "uids": ["42"],
+            "confirmation": "PERMANENTLY DELETE",
+            "freshness": [{"uid": "42", "token": inbox_token}],
+        },
+    )
+    assert wrong_mailbox.status == 400
+
+    stale_token = await _message_action_token(client, "42")
+    gateway.raw_message = gateway.raw_message.replace(b"Subject:", b"Subject: changed ", 1)
+    csrf = await _get_token(client)
+    stale = await _post_json(
+        client,
+        "/api/v1/admin/mail-actions",
+        csrf,
+        {
+            "account": ADMIN_ACCOUNT_ID,
+            "mailbox": "Trash",
+            "action": "permanent_delete",
+            "uids": ["42"],
+            "confirmation": "PERMANENTLY DELETE",
+            "freshness": [{"uid": "42", "token": stale_token}],
+        },
+    )
+    assert stale.status == 409
+    assert not any(operation[0] == "delete_messages" for operation in gateway.operations)
+
+
+@pytest.mark.asyncio
+async def test_bulk_permanent_delete_mixed_stale_set_completes_preflight_without_a_write(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+    proofs = {uid: await _message_action_token(client, uid) for uid in ("42", "43")}
+    gateway.raw_messages["43"] = gateway.raw_message.replace(
+        b"Subject:",
+        b"Subject: changed ",
+        1,
+    )
+    operation_start = len(gateway.operations)
+    csrf = await _get_token(client)
+    response = await _post_json(
+        client,
+        "/api/v1/admin/mail-actions",
+        csrf,
+        {
+            "account": ADMIN_ACCOUNT_ID,
+            "mailbox": "Trash",
+            "action": "permanent_delete",
+            "uids": ["42", "43"],
+            "confirmation": "PERMANENTLY DELETE",
+            "freshness": [{"uid": uid, "token": proofs[uid]} for uid in ("42", "43")],
+        },
+    )
+
+    assert response.status == 409
+    verification_operations = gateway.operations[operation_start:]
+    assert sorted(
+        operation[3] for operation in verification_operations if operation[0] == "spool_message"
+    ) == ["42", "43"]
+    assert not any(operation[0] == "delete_messages" for operation in gateway.operations)
+
+
+@pytest.mark.asyncio
+async def test_bulk_permanent_delete_backend_failure_is_not_retried(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+    freshness = await _message_action_token(client, "42")
+    gateway.bulk_delete_error = ConnectionError("ambiguous transport outcome")
+    token = await _get_token(client)
+    response = await _post_json(
+        client,
+        "/api/v1/admin/mail-actions",
+        token,
+        {
+            "account": ADMIN_ACCOUNT_ID,
+            "mailbox": "Trash",
+            "action": "permanent_delete",
+            "uids": ["42"],
+            "confirmation": "PERMANENTLY DELETE",
+            "freshness": [{"uid": "42", "token": freshness}],
+        },
+    )
+    assert response.status == 502
+    assert sum(operation[0] == "delete_messages" for operation in gateway.operations) == 1
+
+
+@pytest.mark.asyncio
+async def test_other_bulk_actions_reject_permanent_delete_fields(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+    token = await _get_token(client)
+    response = await _post_json(
+        client,
+        "/api/v1/admin/mail-actions",
+        token,
+        {
+            "account": ADMIN_ACCOUNT_ID,
+            "mailbox": "INBOX",
+            "action": "trash",
+            "uids": ["42"],
+            "confirmation": "PERMANENTLY DELETE",
+            "freshness": [],
+        },
+    )
+    assert response.status == 400
     assert not any(operation[0] == "trash_many" for operation in gateway.operations)
 
 
