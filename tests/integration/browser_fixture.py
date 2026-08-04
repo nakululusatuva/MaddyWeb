@@ -123,6 +123,9 @@ class BrowserGateway:
             "recovery_codes_remaining": 10,
         }
 
+    async def peek_session(self, token: str) -> dict[str, object]:
+        return await self.session(token)
+
     async def list_accounts(self) -> list[dict[str, object]]:
         return [
             {
@@ -148,6 +151,11 @@ class BrowserGateway:
         **_kwargs: object,
     ) -> MessagePage:
         return MessagePage(self.messages if mailbox == "INBOX" else [], False)
+
+    async def latest_message_uid(self, _account: str, mailbox: str) -> int:
+        if mailbox != "INBOX" or not self.messages:
+            return 0
+        return max(int(str(message["id"])) for message in self.messages)
 
     async def spool_message(
         self,

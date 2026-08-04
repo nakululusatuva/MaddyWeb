@@ -249,6 +249,19 @@ class _CidImageRewriter(HTMLParser):
         allowed = _HTML_ATTRIBUTES.get(tag, set())
         rendered: list[str] = []
         seen: set[str] = set()
+        if tag == "a" and any(
+            name.lower() == "href" and value
+            for name, value in attrs
+        ):
+            # Mail links are user-initiated escapes from the otherwise inert
+            # preview.  Force a separate browsing context with no opener and
+            # never preserve an attacker-controlled target or rel value.
+            rendered.extend(
+                (
+                    ' target="_blank"',
+                    ' rel="noopener noreferrer nofollow"',
+                )
+            )
         if tag == "img":
             source = next((value for name, value in attrs if name.lower() == "src"), None)
             if source is None or not source.lower().startswith("cid:"):

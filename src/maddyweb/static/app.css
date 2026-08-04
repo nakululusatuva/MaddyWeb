@@ -316,6 +316,29 @@ h2 {
   background: #981e33;
 }
 
+.new-mail-notice {
+  display: inline-flex;
+  min-height: 30px;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 10px;
+  border: 1px solid color-mix(in srgb, var(--primary) 28%, var(--border));
+  border-radius: 999px;
+  color: var(--primary);
+  background: var(--primary-soft);
+  font-size: 11px;
+  font-weight: 780;
+  text-decoration: none;
+}
+
+.new-mail-notice > span {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--primary);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--primary) 14%, transparent);
+}
+
 :root[data-theme="dark"] .button-danger:hover:not(:disabled) {
   background: #a52638;
 }
@@ -4172,6 +4195,12 @@ html[data-view="message"] .app-footer {
   box-shadow: none;
   font-size: 9px;
   font-weight: 740;
+}
+
+.mail-list-table .message-row-action-danger {
+  border-color: color-mix(in srgb, var(--negative) 42%, var(--border));
+  color: var(--negative);
+  background: color-mix(in srgb, var(--negative-soft) 72%, var(--surface));
 }
 
 .mail-list-footer {

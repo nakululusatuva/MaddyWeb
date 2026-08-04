@@ -182,6 +182,8 @@ class FakeGateway:
         ]
         self.message_next_offset: int | None = None
         self.message_initial_offset = 42
+        self.latest_message_uid_value = 42
+        self.latest_message_uid_checked = asyncio.Event()
         self.delivered: bytes | None = None
         self.sent: bytes | None = None
         self.delivery_error: Exception | None = None
@@ -245,6 +247,10 @@ class FakeGateway:
             "absolute_expires_at": 2_000_010_000,
         }
 
+    async def peek_session(self, token: str) -> dict[str, object]:
+        self.operations.append(("peek_session", token))
+        return await self.session(token)
+
     async def list_accounts(self) -> list[dict[str, object]]:
         return self.accounts
 
@@ -285,6 +291,11 @@ class FakeGateway:
             self.message_next_offset,
             offset or self.message_initial_offset,
         )
+
+    async def latest_message_uid(self, account_id: str, mailbox: str) -> int:
+        self.operations.append(("latest_message_uid", account_id, mailbox))
+        self.latest_message_uid_checked.set()
+        return self.latest_message_uid_value
 
     async def spool_message(
         self,
@@ -420,6 +431,7 @@ async def web_client(tmp_path: Path) -> tuple[TestClient, FakeGateway]:
             "concurrency": 4,
             "max_upload_bytes": 4 * 1024 * 1024,
             "page_size": 20,
+            "mail_event_poll_seconds": 0.25,
             "temp_dir": tmp_path,
         },
         "security": {
@@ -493,8 +505,9 @@ async def test_home_static_assets_and_strict_headers(
     page = await response.text()
     assert response.status == 200
     assert "Administration overview" in page
-    assert 'href="/static/app.css?v=20"' in page
-    assert 'src="/static/app.js?v=25"' in page
+    assert 'href="/static/app.css?v=21"' in page
+    assert 'src="/static/app.js?v=26"' in page
+    assert 'id="new-mail-notice"' in page
     assert 'id="compose-sender-name"' in page
     assert 'name="sender_name"' in page
     assert 'maxlength="256"' in page
@@ -835,6 +848,147 @@ async def test_mail_summary_boundary_removes_directional_controls(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path",
+    (
+        "/api/v1/me/mail-events",
+        f"/api/v1/admin/mail-events?account={ADMIN_ACCOUNT_ID}",
+    ),
+)
+async def test_mail_event_catch_up_is_ordered_private_unbuffered_and_metadata_free(
+    web_client: tuple[TestClient, FakeGateway],
+    path: str,
+) -> None:
+    client, gateway = web_client
+    response = await client.get(path, headers={"Last-Event-ID": "41"})
+    try:
+        assert response.status == 200
+        assert response.headers["Content-Type"] == "text/event-stream; charset=utf-8"
+        assert response.headers["Cache-Control"] == (
+            "private, no-store, no-cache, no-transform"
+        )
+        assert response.headers["X-Accel-Buffering"] == "no"
+        assert response.headers["Cross-Origin-Resource-Policy"] == "same-origin"
+        assert response.headers["Content-Security-Policy"] == (
+            "default-src 'none'; frame-ancestors 'none'"
+        )
+
+        ready = await response.content.readuntil(b"\n\n")
+        new_mail = await response.content.readuntil(b"\n\n")
+        payload = ready + new_mail
+        assert ready == (
+            b"retry: 15000\n"
+            b"event: ready\n"
+            b'data: {"mailbox":"INBOX"}\n\n'
+        )
+        assert new_mail == (
+            b"event: new_mail\n"
+            b"id: 42\n"
+            b'data: {"mailbox":"INBOX"}\n\n'
+        )
+        assert payload.count(b'data: {"mailbox":"INBOX"}\n') == 2
+        for sensitive in (
+            ADMIN_ACCOUNT_ID.encode(),
+            b"admin@example.test",
+            b"sender@example.test",
+            b"Received message",
+            b"message_id",
+            b"subject",
+        ):
+            assert sensitive not in payload
+    finally:
+        response.close()
+
+    assert ("latest_message_uid", ADMIN_ACCOUNT_ID, "INBOX") in gateway.operations
+    assert ("peek_session", ADMIN_SESSION_TOKEN) in gateway.operations
+    assert not any(operation[0] == "list_mailboxes" for operation in gateway.operations)
+    assert not any(operation[0] == "list_messages" for operation in gateway.operations)
+
+
+@pytest.mark.asyncio
+async def test_mail_events_reject_invalid_resume_cursor_before_streaming(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+    response = await client.get(
+        "/api/v1/me/mail-events",
+        headers={"Last-Event-ID": "-1"},
+    )
+
+    assert response.status == 400
+    payload = await response.json()
+    assert payload["error"] == {
+        "code": "invalid_request",
+        "message": "Invalid mail event cursor.",
+    }
+    assert not any(operation[0] == "latest_message_uid" for operation in gateway.operations)
+
+
+@pytest.mark.asyncio
+async def test_mail_event_tabs_share_one_per_session_backend_watcher(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+    first = await client.get(
+        "/api/v1/me/mail-events",
+        headers={"Last-Event-ID": "42"},
+    )
+    second = None
+    try:
+        assert b"event: ready\n" in await first.content.readuntil(b"\n\n")
+        second = await client.get(
+            "/api/v1/me/mail-events",
+            headers={"Last-Event-ID": "42"},
+        )
+        assert b"event: ready\n" in await second.content.readuntil(b"\n\n")
+        assert sum(
+            operation == ("latest_message_uid", ADMIN_ACCOUNT_ID, "INBOX")
+            for operation in gateway.operations
+        ) == 1
+        assert sum(operation[0] == "peek_session" for operation in gateway.operations) == 2
+    finally:
+        if second is not None:
+            second.close()
+        first.close()
+
+
+@pytest.mark.asyncio
+async def test_mail_event_notifies_after_inbox_uid_reset(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+    gateway.latest_message_uid_value = 100
+    response = await client.get(
+        "/api/v1/me/mail-events",
+        headers={"Last-Event-ID": "100"},
+    )
+    try:
+        ready = await response.content.readuntil(b"\n\n")
+        assert b"event: ready\n" in ready
+        assert b"id: 100\n" in ready
+
+        gateway.latest_message_uid_checked.clear()
+        gateway.latest_message_uid_value = 0
+        async with asyncio.timeout(1):
+            await gateway.latest_message_uid_checked.wait()
+
+        gateway.latest_message_uid_checked.clear()
+        gateway.latest_message_uid_value = 1
+        async with asyncio.timeout(2):
+            while True:
+                event = await response.content.readuntil(b"\n\n")
+                if b"event: new_mail\n" in event:
+                    break
+        assert event == (
+            b"event: new_mail\n"
+            b"id: 1\n"
+            b'data: {"mailbox":"INBOX"}\n\n'
+        )
+    finally:
+        response.close()
+
+
+@pytest.mark.asyncio
 async def test_mail_defaults_to_admin_inbox_and_has_two_delete_levels(
     web_client: tuple[TestClient, FakeGateway],
 ) -> None:
@@ -875,9 +1029,10 @@ async def test_mail_defaults_to_admin_inbox_and_has_two_delete_levels(
     html_body = await client.get(f"/api/v1/mail/42/html?{context}")
     rendered = await html_body.text()
     assert html_body.status == 200
+    assert html_body.headers["Cache-Control"] == "private, no-store, no-transform"
     assert html_body.headers["Referrer-Policy"] == "no-referrer"
     iframe_csp = html_body.headers["Content-Security-Policy"]
-    assert "sandbox" in iframe_csp
+    assert "sandbox allow-popups allow-popups-to-escape-sandbox" in iframe_csp
     assert "img-src data:" in iframe_csp
     assert "cid:" not in iframe_csp
     assert "tracker.test" not in rendered

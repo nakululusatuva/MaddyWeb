@@ -7,8 +7,8 @@
   <meta name="theme-color" content="#f4f6f9">
   <meta name="description" content="MaddyWeb mail workspace and server administration console">
   <title>MaddyWeb</title>
-  <link rel="stylesheet" href="/static/app.css?v=20">
-  <script src="/static/app.js?v=25" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=21">
+  <script src="/static/app.js?v=26" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to main content</a>
@@ -19,6 +19,10 @@
     </a>
     <div class="header-actions">
       <span id="runtime-badge" class="status-pill status-neutral">Connecting</span>
+      <a id="new-mail-notice" class="new-mail-notice" href="/mail" data-route hidden>
+        <span aria-hidden="true"></span>
+        New mail
+      </a>
       <span id="session-expiry" class="session-expiry" hidden>Session active</span>
       <span id="account-identity" class="account-identity" hidden>
         <span id="account-avatar" class="account-avatar" aria-hidden="true">M</span>

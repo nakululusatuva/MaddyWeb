@@ -96,6 +96,7 @@ class FakeMaddy:
         self.write_safety_calls: list[Capability] = []
         self.message_list_args: list[tuple[Any, ...]] = []
         self.message_list_kwargs: list[dict[str, Any]] = []
+        self.latest_message_uid_calls: list[tuple[str, str]] = []
         self.deleted: list[tuple[str, str, str]] = []
         self.moved: list[tuple[str, str, str, str]] = []
         self.moved_many: list[tuple[str, str, str, str]] = []
@@ -132,6 +133,10 @@ class FakeMaddy:
             start = 0
         limit = int(kwargs["limit"])
         return [dict(item) for item in ordered[start : start + limit + 1]]
+
+    def latest_message_uid(self, username: str, mailbox: str) -> int:
+        self.latest_message_uid_calls.append((username, mailbox))
+        return max((int(item["uid"]) for item in self.messages), default=0)
 
     def append_message(
         self,
@@ -313,6 +318,45 @@ def test_production_auth_store_denies_missing_and_invalid_sessions(tmp_path: Pat
     assert missing.response.error.code == "forbidden"
     assert invalid.response.error is not None
     assert invalid.response.error.code == "unauthorized"
+
+
+def test_session_peek_neither_touches_session_nor_audits_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audit_records: list[tuple[str, str, dict[str, Any]]] = []
+
+    def audit(action: str, *, outcome: str, fields: dict[str, Any]) -> None:
+        audit_records.append((action, outcome, fields))
+
+    with make_auth_store(tmp_path) as store:
+        account, token = provision_session(store, "sender@example.test")
+        authenticate_session = store.authenticate_session
+        touches: list[bool] = []
+
+        def recording_authenticate_session(
+            session_token: str,
+            *,
+            touch: bool = True,
+        ) -> Any:
+            touches.append(touch)
+            return authenticate_session(session_token, touch=touch)
+
+        monkeypatch.setattr(store, "authenticate_session", recording_authenticate_session)
+        result = make_dispatcher(
+            tmp_path,
+            FakeMaddy(),
+            auth_store=store,
+            audit=audit,
+        ).dispatch(Request.create("auth.session_peek", auth_token=token))
+
+    assert result.response.ok is True
+    assert result.response.result["account_id"] == account.account_id
+    assert touches == [False]
+    assert not any(
+        action == "helper.operation" and outcome == "ok"
+        for action, outcome, _fields in audit_records
+    )
 
 
 def test_user_mailbox_scope_accepts_only_the_principal_opaque_target(
@@ -1137,6 +1181,74 @@ def test_message_pagination_uses_stable_uid_continuation(
     )
     assert limited.response.error is not None
     assert limited.response.error.code == "limit_exceeded"
+
+
+def test_latest_message_probe_neither_touches_session_nor_audits_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    maddy = FakeMaddy([{"uid": 42, "subject": "private metadata"}])
+    audit_records: list[tuple[str, str, dict[str, Any]]] = []
+
+    def audit(action: str, *, outcome: str, fields: dict[str, Any]) -> None:
+        audit_records.append((action, outcome, fields))
+
+    with make_auth_store(tmp_path) as store:
+        account, token = provision_session(store, "sender@example.test")
+        authenticate_session = store.authenticate_session
+        touches: list[bool] = []
+
+        def recording_authenticate_session(
+            session_token: str,
+            *,
+            touch: bool = True,
+        ) -> Any:
+            touches.append(touch)
+            return authenticate_session(session_token, touch=touch)
+
+        monkeypatch.setattr(store, "authenticate_session", recording_authenticate_session)
+        dispatcher = make_dispatcher(
+            tmp_path,
+            maddy,
+            auth_store=store,
+            audit=audit,
+        )
+        result = dispatcher.dispatch(
+            Request.create(
+                "messages.latest",
+                {
+                    "target_account_id": account.account_id,
+                    "mailbox": "INBOX",
+                },
+                auth_token=token,
+            )
+        )
+
+        assert result.response.result == {"uid": 42}
+        assert touches == [False]
+        assert maddy.latest_message_uid_calls == [("sender@example.test", "INBOX")]
+        assert not any(
+            action == "helper.operation" and outcome == "ok"
+            for action, outcome, _fields in audit_records
+        )
+
+        failed = dispatcher.dispatch(
+            Request.create(
+                "messages.latest",
+                {"target_account_id": account.account_id},
+                auth_token=token,
+            )
+        )
+
+    assert failed.response.error is not None
+    assert failed.response.error.code == "invalid_request"
+    assert touches == [False, False]
+    assert any(
+        action == "helper.operation"
+        and outcome == "invalid_request"
+        and fields["operation"] == "messages.latest"
+        for action, outcome, fields in audit_records
+    )
 
 
 def test_message_moves_allow_bounded_selection_but_deletion_requires_one_uid(

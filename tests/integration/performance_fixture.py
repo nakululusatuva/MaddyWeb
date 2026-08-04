@@ -55,6 +55,9 @@ class PerformanceGateway:
             "recovery_codes_remaining": 10,
         }
 
+    async def peek_session(self, token: str) -> dict[str, object]:
+        return await self.session(token)
+
     async def list_accounts(self) -> list[dict[str, object]]:
         return [
             {
@@ -86,6 +89,9 @@ class PerformanceGateway:
             ],
             False,
         )
+
+    async def latest_message_uid(self, _account: str, mailbox: str) -> int:
+        return 50 if mailbox == "INBOX" else 0
 
     async def spool_message(
         self,

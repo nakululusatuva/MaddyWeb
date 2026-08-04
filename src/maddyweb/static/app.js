@@ -97,6 +97,8 @@
     sessionExpiresAt: 0,
     idleExpiresAt: 0,
     sessionTimer: 0,
+    mailEventSource: null,
+    mailEventAccount: "",
     effectiveAccount: "",
     routeController: null,
     mutationTail: Promise.resolve(),
@@ -200,6 +202,7 @@
       logicalPath === "/mail"
       || logicalPath.startsWith("/mail/")
       || logicalPath === "/mail-actions"
+      || logicalPath === "/mail-events"
     ) {
       mappedPath = state.role === "admin"
         ? `/admin${logicalPath}`
@@ -652,6 +655,7 @@
     ]).has(error.code);
     if (error instanceof ApiError && error.status === 401 && !verificationFailure) {
       window.clearInterval(state.sessionTimer);
+      closeMailEvents();
       state.csrfToken = "";
       state.mail = null;
       state.message = null;
@@ -1070,6 +1074,74 @@
     return `${url.pathname}${url.search}`;
   };
 
+  const closeMailEvents = () => {
+    if (state.mailEventSource && typeof state.mailEventSource.close === "function") {
+      state.mailEventSource.close();
+    }
+    state.mailEventSource = null;
+    state.mailEventAccount = "";
+  };
+
+  const showNewMailNotice = (account, mailbox) => {
+    const notice = byId("new-mail-notice");
+    notice.href = buildMailUrl({account, mailbox});
+    notice.hidden = false;
+    showToast("New mail arrived in Inbox.");
+    if (
+      document.visibilityState !== "visible"
+      && "Notification" in window
+      && window.Notification.permission === "granted"
+    ) {
+      const notification = new window.Notification("New mail", {
+        body: "A new message arrived in Inbox.",
+        tag: "maddyweb-new-mail",
+      });
+      notification.addEventListener("click", () => {
+        window.focus();
+        state.mail = null;
+        notice.hidden = true;
+        navigate(notice.href, {focus: false});
+        notification.close();
+      });
+    }
+  };
+
+  const startMailEvents = () => {
+    if (state.authState !== "active" || !("EventSource" in window)) return;
+    const account = scopedAccount();
+    if (!account) return;
+    if (
+      state.mailEventSource instanceof window.EventSource
+      && state.mailEventAccount === account
+      && state.mailEventSource.readyState !== EventSource.CLOSED
+    ) return;
+    closeMailEvents();
+    const query = new URLSearchParams();
+    if (state.role === "admin") query.set("account", account);
+    const suffix = query.size ? `?${query.toString()}` : "";
+    const source = new window.EventSource(apiPath(`/mail-events${suffix}`), {
+      withCredentials: true,
+    });
+    state.mailEventSource = source;
+    state.mailEventAccount = account;
+    source.addEventListener("new_mail", (event) => {
+      if (state.mailEventSource !== source || state.mailEventAccount !== account) return;
+      try {
+        const payload = objectValue(JSON.parse(stringValue(event.data)));
+        const mailbox = stringValue(payload.mailbox);
+        if (!mailbox || mailbox.length > 255) return;
+        showNewMailNotice(account, mailbox);
+      } catch {
+        // Ignore malformed events and retain the last known safe UI state.
+      }
+    });
+    source.addEventListener("session_expired", () => {
+      if (state.mailEventSource !== source) return;
+      closeMailEvents();
+      window.location.replace("/login");
+    });
+  };
+
   const buildForwardUrl = ({account, mailbox, uid, mode}) => {
     const url = new URL("/compose", window.location.origin);
     url.searchParams.set("forward", mode);
@@ -1293,6 +1365,66 @@
     });
   };
 
+  const loadMessageActionSnapshot = async (context, signal) => {
+    const query = messageApiQuery(context);
+    const data = await apiData(
+      `/mail/${encodeURIComponent(context.uid)}/action-snapshot?${query.toString()}`,
+      {signal},
+    );
+    const freshness = stringValue(data.freshness_token);
+    if (
+      stringValue(data.uid) !== context.uid
+      || stringValue(data.account) !== context.account
+      || stringValue(data.mailbox) !== context.mailbox
+      || !freshness
+    ) {
+      throw new ApiError("The message changed; refresh the mailbox before deleting it.", {
+        code: "stale_message",
+        status: 409,
+      });
+    }
+    return freshness;
+  };
+
+  const permanentlyDeleteMessageFromRow = (context, row, button) => {
+    clearAlert();
+    const routeSignal = state.routeController?.signal;
+    if (!(routeSignal instanceof AbortSignal)) return;
+    openTypedConfirm({
+      title: "Permanently delete message?",
+      message: "This removes the selected message immediately and cannot be undone.",
+      expected: DELETE_MESSAGE_CONFIRMATION,
+      opener: button,
+      action: async () => {
+        if (routeSignal.aborted) return;
+        setMessageRowBusy(row, true);
+        try {
+          const freshness = await loadMessageActionSnapshot(context, routeSignal);
+          const payload = await mutate(`/mail/${encodeURIComponent(context.uid)}/delete`, {
+            guardSignal: routeSignal,
+            json: {
+              account: context.account,
+              mailbox: context.mailbox,
+              freshness,
+              confirmation: DELETE_MESSAGE_CONFIRMATION,
+            },
+          });
+          if (routeSignal.aborted) return;
+          finishAction(payload, "Message permanently deleted.");
+          const mail = objectValue(state.mail);
+          const remaining = arrayValue(mail.messages || mail.items)
+            .map(objectValue)
+            .filter((message) => stringValue(message.uid) !== context.uid);
+          if (Array.isArray(mail.messages)) mail.messages = remaining;
+          else mail.items = remaining;
+          renderMail(mail);
+        } finally {
+          setMessageRowBusy(row, false);
+        }
+      },
+    });
+  };
+
   const renderMail = (mail) => {
     state.selectedMessageUids.clear();
     state.mailBulkBusy = false;
@@ -1306,6 +1438,7 @@
     if (state.role === "admin" && account) {
       state.effectiveAccount = account;
     }
+    startMailEvents();
     const workspaceIndicator = byId("admin-workspace-indicator");
     workspaceIndicator.hidden = !(
       state.role === "admin" && account
@@ -1557,16 +1690,18 @@
       const actionGroup = element("div", {className: "message-row-actions"});
       actionGroup.setAttribute("role", "group");
       actionGroup.setAttribute("aria-label", `Actions for ${subject}`);
-      const deleteButton = messageActionButton("Delete", context, (button) => (
-        deleteMessageFromRow(context, row, button)
-      ));
-      if (currentIsTrash || !trashAvailable) {
-        deleteButton.dataset.unavailable = "true";
-        deleteButton.disabled = true;
-        deleteButton.title = currentIsTrash
-          ? "This message is already in Trash."
-          : "This account does not have an available Trash mailbox.";
-      }
+      const permanentDelete = currentIsTrash || !trashAvailable;
+      const deleteButton = permanentDelete
+        ? messageActionButton(
+          "Permanently delete",
+          context,
+          (button) => permanentlyDeleteMessageFromRow(context, row, button),
+          "Delete permanently",
+        )
+        : messageActionButton("Delete", context, (button) => (
+          deleteMessageFromRow(context, row, button)
+        ));
+      if (permanentDelete) deleteButton.classList.add("message-row-action-danger");
       const archiveButton = messageActionButton("Archive", context, (button) => (
         archiveMessageFromRow(context, row, button)
       ));
@@ -1807,7 +1942,10 @@
         frame.className = "message-frame";
         frame.title = "Sanitized message body";
         frame.referrerPolicy = "no-referrer";
-        frame.setAttribute("sandbox", "");
+        frame.setAttribute(
+          "sandbox",
+          "allow-popups allow-popups-to-escape-sandbox",
+        );
         frame.src = `${source.pathname}${source.search}`;
         const plain = element("pre", {
           className: "plain-message",
@@ -3307,6 +3445,12 @@
       state.confirmOpener = null;
       confirmDialog.close();
     }
+    if (typedDialog instanceof HTMLDialogElement && typedDialog.open) {
+      state.typedAction = null;
+      state.typedExpected = "";
+      state.typedOpener = null;
+      typedDialog.close();
+    }
     state.routeController = new AbortController();
     const signal = state.routeController.signal;
     try {
@@ -3360,6 +3504,7 @@
   });
 
   window.addEventListener("popstate", () => void renderRoute());
+  window.addEventListener("pagehide", closeMailEvents);
 
   const logout = async () => {
     const buttons = [
@@ -3380,6 +3525,7 @@
       return;
     }
     window.clearInterval(state.sessionTimer);
+    closeMailEvents();
     state.csrfToken = "";
     state.accounts = [];
     state.mail = null;
@@ -3508,6 +3654,10 @@
   byId("logout-button").addEventListener("click", () => void logout());
   byId("security-logout-button").addEventListener("click", () => void logout());
   byId("access-denied-logout").addEventListener("click", () => void logout());
+  byId("new-mail-notice").addEventListener("click", () => {
+    state.mail = null;
+    byId("new-mail-notice").hidden = true;
+  });
 
   const FORMAT_COMMANDS = new Map([
     ["bold", ["bold", null]],
@@ -4383,6 +4533,7 @@
       if (state.authState !== "active") return;
     }
     await renderRoute(false);
+    startMailEvents();
   };
 
   void initialize();

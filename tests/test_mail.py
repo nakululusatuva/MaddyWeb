@@ -115,6 +115,7 @@ def test_cid_rewriter_only_maps_exact_known_safe_url() -> None:
     sanitized = sanitize_html_email(
         '<img src="cid:known" alt="logo"><img src="cid:missing">'
         '<img src="data:image/png;base64,AAAA"><img src="https://tracker.test/x">'
+        '<a href="https://example.test/path" target="_self" rel="opener">Open</a>'
     )
     rewritten = rewrite_cid_images(
         sanitized,
@@ -125,6 +126,10 @@ def test_cid_rewriter_only_maps_exact_known_safe_url() -> None:
     assert "data:" not in rewritten
     assert "tracker.test" not in rewritten
     assert rewritten.count("<img") == 1
+    assert 'target="_blank"' in rewritten
+    assert 'rel="noopener noreferrer nofollow"' in rewritten
+    assert 'target="_self"' not in rewritten
+    assert 'rel="opener"' not in rewritten
     assert detect_safe_image_type(VALID_PNG) == "image/png"
     assert detect_safe_image_type(b"<svg></svg>") is None
 

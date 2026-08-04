@@ -96,6 +96,29 @@ async def test_session_checks_coalesce_and_return_independent_short_lived_snapsh
 
 
 @pytest.mark.asyncio
+async def test_session_peek_uses_dedicated_uncached_helper_operation() -> None:
+    token = "P" * 43
+    principal = {
+        "account_id": "account-id",
+        "email": "user@example.test",
+        "role": "user",
+    }
+    client = FakeClient(
+        {"auth.session_peek": Response.success("template", principal)}
+    )
+    gateway = gateway_with(client)
+
+    assert await gateway.peek_session(token) == principal
+    assert await gateway.peek_session(token) == principal
+    assert [request.operation for request in client.requests] == [
+        "auth.session_peek",
+        "auth.session_peek",
+    ]
+    assert all(request.auth_token == token for request in client.requests)
+    assert all(request.params == {} for request in client.requests)
+
+
+@pytest.mark.asyncio
 async def test_health_has_fixed_schema_discards_accounts_and_is_cached() -> None:
     client = FakeClient(
         {
@@ -791,6 +814,41 @@ async def test_message_page_preserves_authoritative_continuation() -> None:
     assert "username" not in client.requests[0].params
     assert client.requests[0].params["limit"] == 50
     assert client.requests[0].params["offset"] == 100
+
+
+@pytest.mark.asyncio
+async def test_latest_message_uid_uses_minimal_uncached_helper_operation() -> None:
+    account_id = "a" * 32
+    client = FakeClient(
+        {"messages.latest": Response.success("template", {"uid": 42})}
+    )
+    gateway = gateway_with(client)
+
+    assert await gateway.latest_message_uid(account_id, "INBOX") == 42
+    assert await gateway.latest_message_uid(account_id, "INBOX") == 42
+    assert [request.operation for request in client.requests] == [
+        "messages.latest",
+        "messages.latest",
+    ]
+    assert all(
+        request.params
+        == {
+            "target_account_id": account_id,
+            "mailbox": "INBOX",
+        }
+        for request in client.requests
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("uid", (True, -1, 1 << 32, "42", None))
+async def test_latest_message_uid_rejects_invalid_helper_payload(uid: object) -> None:
+    gateway = gateway_with(
+        FakeClient({"messages.latest": Response.success("template", {"uid": uid})})
+    )
+
+    with pytest.raises(HelperCallError, match="invalid message UID"):
+        await gateway.latest_message_uid("a" * 32, "INBOX")
 
 
 @pytest.mark.asyncio

@@ -360,6 +360,14 @@ class HelperGateway:
         )
         return copy.deepcopy(snapshot)
 
+    async def peek_session(self, token: str) -> Mapping[str, Any]:
+        """Validate a session without extending its idle expiration."""
+
+        return _mapping(
+            await self._call("auth.session_peek", auth_token=token),
+            "auth.session_peek",
+        )
+
     async def logout(self, token: str) -> None:
         cache_key = _authorization_cache_key(token)
         self._session_cache.pop(cache_key, None)
@@ -872,6 +880,26 @@ class HelperGateway:
             value=snapshot,
         )
         return copy.deepcopy(snapshot)
+
+    async def latest_message_uid(self, account_id: str, mailbox: str) -> int:
+        result = _mapping(
+            await self._call(
+                "messages.latest",
+                {
+                    "target_account_id": account_id,
+                    "mailbox": mailbox,
+                },
+            ),
+            "messages.latest",
+        )
+        uid = result.get("uid")
+        if type(uid) is not int or not 0 <= uid <= (1 << 32) - 1:
+            raise HelperCallError(
+                "invalid_response",
+                "messages.latest returned an invalid message UID",
+            )
+        self._invalidate_message_lists(account_id, mailbox)
+        return uid
 
     @staticmethod
     def _open_destination(path: Path) -> BinaryIO:

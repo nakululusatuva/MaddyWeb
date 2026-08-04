@@ -375,6 +375,60 @@ async def test_bounded_concurrency_returns_429_with_retry_after() -> None:
 
 
 @pytest.mark.asyncio
+async def test_long_lived_requests_use_an_independent_concurrency_pool() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    app = web.Application(
+        middlewares=[
+            bounded_concurrency_middleware(
+                1,
+                wait_timeout=0.02,
+                long_lived_paths=frozenset({"/stream"}),
+                long_lived_capacity=1,
+            )
+        ]
+    )
+
+    async def stream(_request: web.Request) -> web.Response:
+        entered.set()
+        await release.wait()
+        return web.Response(text="stream complete")
+
+    async def fast(_request: web.Request) -> web.Response:
+        return web.Response(text="fast")
+
+    app.router.add_get("/stream", stream)
+    app.router.add_get("/fast", fast)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        first_stream = asyncio.create_task(client.get("/stream"))
+        await entered.wait()
+
+        normal = await client.get("/fast")
+        assert normal.status == 200
+        assert await normal.text() == "fast"
+
+        rejected_stream = await client.get("/stream")
+        assert rejected_stream.status == 429
+        assert rejected_stream.headers["Retry-After"] == "1"
+
+        release.set()
+        assert (await first_stream).status == 200
+    finally:
+        release.set()
+        await client.close()
+
+
+def test_long_lived_paths_require_explicit_capacity() -> None:
+    with pytest.raises(ValueError, match="long-lived request capacity"):
+        bounded_concurrency_middleware(
+            1,
+            long_lived_paths=frozenset({"/stream"}),
+        )
+
+
+@pytest.mark.asyncio
 async def test_slow_csrf_body_times_out_and_releases_concurrency_slot() -> None:
     config = SecurityConfig(
         allowed_hosts=("127.0.0.1",),

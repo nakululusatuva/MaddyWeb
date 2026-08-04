@@ -20,6 +20,7 @@ from maddyweb.maddy import (
     CommandResult,
     CommandTimeout,
     InvalidMaddyArgument,
+    MaddyError,
     MaddyService,
     MaddyTarget,
     PartialOperationError,
@@ -858,6 +859,30 @@ def test_message_window_uses_stable_uid_anchor_and_bounded_sequence_range() -> N
     assert "--uid" not in runner.calls[1]["argv"]
     assert "1:*" not in runner.calls[0]["argv"]
     assert "1:*" not in runner.calls[1]["argv"]
+
+
+def test_latest_message_uid_uses_one_bounded_uid_probe() -> None:
+    populated_runner = QueueRunner([(full_message_record(42, 9), b"", 0)])
+    populated = service_with(populated_runner)
+
+    assert populated.latest_message_uid("user@example.test", "INBOX") == 42
+    assert len(populated_runner.calls) == 1
+    assert populated_runner.calls[0]["argv"][-3:] == ("user@example.test", "INBOX", "*")
+    assert "--uid" in populated_runner.calls[0]["argv"]
+
+    empty_runner = QueueRunner([(b"", b"", 0)])
+    assert service_with(empty_runner).latest_message_uid("user@example.test", "INBOX") == 0
+    assert len(empty_runner.calls) == 1
+
+
+def test_latest_message_uid_rejects_multiple_records() -> None:
+    runner = QueueRunner(
+        [(full_message_record(41, 8) + full_message_record(42, 9), b"", 0)]
+    )
+
+    with pytest.raises(MaddyError, match="invalid latest-message result"):
+        service_with(runner).latest_message_uid("user@example.test", "INBOX")
+    assert len(runner.calls) == 1
 
 
 def test_message_window_rejects_cursor_race_instead_of_skipping() -> None:

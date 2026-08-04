@@ -866,15 +866,29 @@ def bounded_concurrency_middleware(
     capacity: int,
     *,
     wait_timeout: float = 1.0,
+    long_lived_paths: frozenset[str] = frozenset(),
+    long_lived_capacity: int | None = None,
 ) -> web.middleware:
     """Bound in-flight requests and reject queues that cannot drain quickly."""
 
     limiter = RequestLimiter(capacity, wait_timeout)
+    stream_limiter = (
+        RequestLimiter(long_lived_capacity, wait_timeout)
+        if long_lived_paths and long_lived_capacity is not None
+        else None
+    )
+    if long_lived_paths and stream_limiter is None:
+        raise ValueError("long-lived request capacity must be configured")
 
     @web.middleware
     async def middleware(request: web.Request, handler: web.RequestHandler) -> web.StreamResponse:
+        selected_limiter = (
+            stream_limiter
+            if stream_limiter is not None and request.path in long_lived_paths
+            else limiter
+        )
         try:
-            await limiter.acquire()
+            await selected_limiter.acquire()
         except TimeoutError:
             response = _error_response(
                 request,
@@ -888,7 +902,7 @@ def bounded_concurrency_middleware(
         try:
             return await handler(request)
         finally:
-            limiter.release()
+            selected_limiter.release()
 
     return middleware
 
@@ -897,9 +911,10 @@ def email_document_headers() -> dict[str, str]:
     """Headers for the separately served, sandboxed HTML-mail document."""
 
     return {
-        "Cache-Control": "no-store",
+        "Cache-Control": "private, no-store, no-transform",
         "Content-Security-Policy": (
-            "sandbox; default-src 'none'; base-uri 'none'; form-action 'none'; "
+            "sandbox allow-popups allow-popups-to-escape-sandbox; "
+            "default-src 'none'; base-uri 'none'; form-action 'none'; "
             "frame-ancestors 'self'; img-src data:; object-src 'none'; "
             "style-src 'unsafe-inline'"
         ),

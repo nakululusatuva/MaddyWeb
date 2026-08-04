@@ -53,6 +53,7 @@ class AuthGateway:
         self.password_error: HelperCallError | None = None
         self.session_error: HelperCallError | None = None
         self.logout_error: HelperCallError | None = None
+        self.latest_message_uid_value = 42
         self.enrollment_uri = (
             "otpauth://totp/MaddyWeb%3Auser%40example.test?"
             f"secret={AUTHENTICATOR_KEY}&issuer=MaddyWeb&algorithm=SHA1&digits=6&period=30"
@@ -161,6 +162,15 @@ class AuthGateway:
         except KeyError as exc:
             raise HelperCallError("unauthorized") from exc
 
+    async def peek_session(self, token: str) -> Mapping[str, object]:
+        self.operations.append(("peek_session", token))
+        if self.session_error is not None:
+            raise self.session_error
+        try:
+            return dict(self.sessions[token])
+        except KeyError as exc:
+            raise HelperCallError("unauthorized") from exc
+
     async def logout(self, token: str) -> None:
         self.operations.append(("logout", token))
         if self.logout_error is not None:
@@ -239,6 +249,10 @@ class AuthGateway:
     ) -> MessagePage:
         self.operations.append(("list_messages", account_id, mailbox, limit, offset))
         return MessagePage((), False, None, offset)
+
+    async def latest_message_uid(self, account_id: str, mailbox: str) -> int:
+        self.operations.append(("latest_message_uid", account_id, mailbox))
+        return self.latest_message_uid_value
 
 
 def _config(
@@ -489,7 +503,9 @@ async def test_unauthenticated_browser_is_confined_to_login_surface(
         "/api/v1/health",
         "/api/v1/accounts",
         "/api/v1/me/mail",
+        "/api/v1/me/mail-events",
         "/api/v1/admin/accounts",
+        f"/api/v1/admin/mail-events?account={TARGET_ID}",
         "/static/app.css",
         "/static/app.js",
     ):
@@ -500,6 +516,39 @@ async def test_unauthenticated_browser_is_confined_to_login_surface(
     assert health.status == 200
     assert "accounts" not in await health.json()
     assert ("list_accounts",) not in gateway.operations
+
+
+@pytest.mark.asyncio
+async def test_personal_mail_events_accept_user_session_but_admin_stream_does_not(
+    auth_client: tuple[TestClient, AuthGateway],
+) -> None:
+    client, gateway = auth_client
+    await _login_totp(client, gateway)
+    gateway.operations.clear()
+
+    personal = await client.get(
+        "/api/v1/me/mail-events",
+        headers={"Last-Event-ID": "42"},
+    )
+    try:
+        assert personal.status == 200
+        ready = await personal.content.readuntil(b"\n\n")
+        assert b"event: ready\n" in ready
+        assert b"id: 42\n" in ready
+        assert b'data: {"mailbox":"INBOX"}\n' in ready
+    finally:
+        personal.close()
+
+    assert ("latest_message_uid", USER_ID, "INBOX") in gateway.operations
+    assert ("peek_session", USER_TOKEN) in gateway.operations
+    assert not any(operation[0] == "session" for operation in gateway.operations)
+    assert not any(operation[0] == "list_mailboxes" for operation in gateway.operations)
+
+    gateway.operations.clear()
+    admin = await client.get(f"/api/v1/admin/mail-events?account={TARGET_ID}")
+    assert admin.status == 403
+    assert not any(operation[0] == "list_mailboxes" for operation in gateway.operations)
+    assert not any(operation[0] == "latest_message_uid" for operation in gateway.operations)
 
 
 @pytest.mark.asyncio
@@ -570,14 +619,16 @@ async def test_authenticated_application_bundle_is_never_publicly_cacheable(
         assert "no-store" in directives
         assert "public" not in directives
 
-    versioned = await client.get("/static/app.js?v=25")
-    assert versioned.status == 200
-    directives = {
-        directive.strip().casefold() for directive in versioned.headers["Cache-Control"].split(",")
-    }
-    assert "private" in directives
-    assert "immutable" in directives
-    assert "public" not in directives
+    for path in ("/static/app.css?v=21", "/static/app.js?v=26"):
+        versioned = await client.get(path)
+        assert versioned.status == 200
+        directives = {
+            directive.strip().casefold()
+            for directive in versioned.headers["Cache-Control"].split(",")
+        }
+        assert "private" in directives
+        assert "immutable" in directives
+        assert "public" not in directives
 
 
 @pytest.mark.asyncio

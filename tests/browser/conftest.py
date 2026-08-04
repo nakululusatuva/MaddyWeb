@@ -75,6 +75,7 @@ class BrowserSecurityGateway:
             '<img id="data-image" src="data:image/png;base64,iVBORw0KGgo=">'
             '<img id="inline-image" src="cid:logo">'
             '<a id="unsafe-link" href="javascript:window.top.linkXss=true">Unsafe link</a>'
+            '<a id="safe-link" href="https://example.test/path" target="_self">Safe link</a>'
             '<b id="safe-content">Safe body</b>',
             subtype="html",
         )
@@ -143,6 +144,8 @@ class BrowserSecurityGateway:
         self.bulk_seen_changes: list[tuple[str, str, tuple[str, ...] | None, bool]] = []
         self.bulk_moves: list[tuple[str, str, tuple[str, ...], str]] = []
         self.message_unread = True
+        self.notification_uid = int(MESSAGE_ID)
+        self.notification_checks = 0
 
         self.principal: dict[str, object] = {
             "account_id": ACCOUNT,
@@ -176,6 +179,9 @@ class BrowserSecurityGateway:
         if token != SESSION_TOKEN:
             raise RuntimeError("invalid browser fixture session")
         return self._principal()
+
+    async def peek_session(self, token: str) -> dict[str, object]:
+        return await self.session(token)
 
     async def begin_password_login(
         self,
@@ -295,6 +301,10 @@ class BrowserSecurityGateway:
                 }
             )
         return MessagePage(items, False)
+
+    async def latest_message_uid(self, _account: str, _mailbox: str) -> int:
+        self.notification_checks += 1
+        return self.notification_uid
 
     async def spool_message(
         self,
@@ -465,6 +475,7 @@ async def live_application(tmp_path: Path) -> AsyncIterator[LiveApplication]:
                 "request_body_timeout_seconds": 5,
                 "page_size": 20,
                 "temp_dir": tmp_path,
+                "mail_event_poll_seconds": 0.25,
             },
             "security": {
                 "session_signing_key": secrets.token_bytes(32),
@@ -477,7 +488,7 @@ async def live_application(tmp_path: Path) -> AsyncIterator[LiveApplication]:
         },
         gateway,
     )
-    runner = web.AppRunner(app, access_log=None)
+    runner = web.AppRunner(app, access_log=None, shutdown_timeout=0.25)
     await runner.setup()
     listener, port = _listening_socket()
     site = web.SockSite(runner, listener)

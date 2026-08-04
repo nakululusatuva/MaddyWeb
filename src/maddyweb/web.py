@@ -17,7 +17,7 @@ import tempfile
 import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -86,6 +86,14 @@ PARSED_MESSAGE_CACHE_CAPACITY = 32
 PARSED_MESSAGE_CACHE_MAX_BYTES = 32 * 1024 * 1024
 MAX_BULK_MESSAGE_UIDS = 50
 MAX_TOTP_QR_SVG_CHARS = 256 * 1024
+DEFAULT_MAIL_EVENT_POLL_SECONDS = 30.0
+MAIL_EVENT_KEEPALIVE_SECONDS = 15.0
+_MAIL_EVENT_PATHS = frozenset(
+    {
+        "/api/v1/me/mail-events",
+        "/api/v1/admin/mail-events",
+    }
+)
 _SPA_PATHS = frozenset({"/", "/accounts", "/certificates", "/compose", "/mail", "/security"})
 _SPA_MAIL_PATH_RE = re.compile(r"\A/mail/([1-9][0-9]{0,9})\Z")
 
@@ -95,6 +103,7 @@ _MAIL_WORK_KEY = web.AppKey("mail_work_semaphore", object)
 _MAIL_CURSOR_KEY = web.AppKey("mail_cursor_store", object)
 _FRESHNESS_KEY = web.AppKey("message_freshness_store", object)
 _PARSED_MESSAGE_CACHE_KEY = web.AppKey("parsed_message_cache", object)
+_MAIL_EVENT_HUB_KEY = web.AppKey("mail_event_hub", object)
 _AUTH_PRINCIPAL_KEY = web.RequestKey("authenticated_principal", object)
 _AUTH_TOKEN_KEY = web.RequestKey("authenticated_session_token", str)
 _CLIENT_IP_KEY = web.RequestKey("authenticated_client_ip", str)
@@ -157,6 +166,8 @@ class Gateway(MailGateway, Protocol):
 
     async def session(self, token: str) -> Mapping[str, object]: ...
 
+    async def peek_session(self, token: str) -> Mapping[str, object]: ...
+
     async def logout(self, token: str) -> None: ...
 
     async def change_own_password(
@@ -218,6 +229,8 @@ class Gateway(MailGateway, Protocol):
         limit: int,
         offset: int,
     ) -> MessagePage | Mapping[str, object]: ...
+
+    async def latest_message_uid(self, account_id: str, mailbox: str) -> int: ...
 
     async def spool_message(
         self,
@@ -315,6 +328,138 @@ class WebSettings:
     max_upload_bytes: int
     request_body_timeout_seconds: float
     temp_dir: Path
+    mail_event_poll_seconds: float
+
+
+@dataclass(slots=True, eq=False)
+class _MailEventWatcher:
+    gateway: Gateway
+    account: str
+    mailbox: str
+    latest_uid: int
+    subscribers: set[asyncio.Queue[tuple[str, int]]] = field(default_factory=set)
+    task: asyncio.Task[None] | None = None
+
+
+class _MailEventHub:
+    """Share one backend Inbox probe across tabs in the same session."""
+
+    def __init__(self, *, poll_seconds: float) -> None:
+        self._poll_seconds = poll_seconds
+        self._watchers: dict[tuple[bytes, str, str], _MailEventWatcher] = {}
+        self._lock = asyncio.Lock()
+
+    @staticmethod
+    def _valid_uid(value: object) -> bool:
+        return type(value) is int and 0 <= value <= MAX_MESSAGE_CURSOR
+
+    @staticmethod
+    def _publish(watcher: _MailEventWatcher, event: tuple[str, int]) -> None:
+        for queue in tuple(watcher.subscribers):
+            if queue.full():
+                with contextlib.suppress(asyncio.QueueEmpty):
+                    queue.get_nowait()
+            with contextlib.suppress(asyncio.QueueFull):
+                queue.put_nowait(event)
+
+    async def _watch(self, watcher: _MailEventWatcher) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self._poll_seconds)
+                try:
+                    current_uid = await watcher.gateway.latest_message_uid(
+                        watcher.account,
+                        watcher.mailbox,
+                    )
+                except HelperCallError as exc:
+                    if exc.code in {
+                        "forbidden",
+                        "password_change_required",
+                        "unauthorized",
+                    }:
+                        self._publish(watcher, ("session_expired", watcher.latest_uid))
+                        return
+                    LOGGER.warning("mail event probe temporarily unavailable", exc_info=True)
+                    continue
+                except Exception:
+                    LOGGER.warning("mail event probe temporarily unavailable", exc_info=True)
+                    continue
+                if not self._valid_uid(current_uid):
+                    LOGGER.warning("mail event probe returned an invalid UID")
+                    continue
+                if current_uid > watcher.latest_uid:
+                    self._publish(watcher, ("new_mail", current_uid))
+                watcher.latest_uid = current_uid
+        except asyncio.CancelledError:
+            raise
+
+    async def subscribe(
+        self,
+        key: tuple[bytes, str, str],
+        gateway: Gateway,
+        account: str,
+        mailbox: str,
+    ) -> tuple[int, asyncio.Queue[tuple[str, int]]]:
+        queue: asyncio.Queue[tuple[str, int]] = asyncio.Queue(maxsize=1)
+        async with self._lock:
+            watcher = self._watchers.get(key)
+            if watcher is not None and watcher.task is not None and not watcher.task.done():
+                watcher.subscribers.add(queue)
+                return watcher.latest_uid, queue
+
+        latest_uid = await gateway.latest_message_uid(account, mailbox)
+        if not self._valid_uid(latest_uid):
+            raise ValueError("mail event probe returned an invalid UID")
+
+        async with self._lock:
+            watcher = self._watchers.get(key)
+            if watcher is None or watcher.task is None or watcher.task.done():
+                watcher = _MailEventWatcher(
+                    gateway=gateway,
+                    account=account,
+                    mailbox=mailbox,
+                    latest_uid=latest_uid,
+                )
+                self._watchers[key] = watcher
+                watcher.task = asyncio.create_task(
+                    self._watch(watcher),
+                    name="maddyweb-mail-events",
+                )
+            watcher.subscribers.add(queue)
+            return watcher.latest_uid, queue
+
+    async def unsubscribe(
+        self,
+        key: tuple[bytes, str, str],
+        queue: asyncio.Queue[tuple[str, int]],
+    ) -> None:
+        task: asyncio.Task[None] | None = None
+        async with self._lock:
+            watcher = self._watchers.get(key)
+            if watcher is None:
+                return
+            watcher.subscribers.discard(queue)
+            if not watcher.subscribers:
+                self._watchers.pop(key, None)
+                task = watcher.task
+                if task is not None and not task.done():
+                    task.cancel()
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def close(self) -> None:
+        async with self._lock:
+            tasks = [
+                watcher.task
+                for watcher in self._watchers.values()
+                if watcher.task is not None
+            ]
+            self._watchers.clear()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -791,6 +936,13 @@ def _parsed_message_cache(request: web.Request) -> _ParsedMessageCache:
     return cache_store
 
 
+def _mail_event_hub(request: web.Request) -> _MailEventHub:
+    hub = request.app[_MAIL_EVENT_HUB_KEY]
+    if not isinstance(hub, _MailEventHub):
+        raise RuntimeError("mail event hub is not configured")
+    return hub
+
+
 def _freshness_owner(request: web.Request) -> str:
     token = request.get(_AUTH_TOKEN_KEY)
     if not isinstance(token, str) or re.fullmatch(r"[A-Za-z0-9_-]{43}", token) is None:
@@ -997,6 +1149,7 @@ _TOKENLESS_PUBLIC_STATIC_PATHS = frozenset(
         "/static/login.js",
     }
 )
+_TOKENLESS_CSRF_PATHS = _TOKENLESS_PUBLIC_STATIC_PATHS | _MAIL_EVENT_PATHS
 
 
 def _session_cookie_name(request: web.Request) -> str:
@@ -1126,7 +1279,12 @@ def _authentication_middleware() -> web.middleware:
         invalid_session = bool(token)
         if token and re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
             try:
-                principal = await _gateway(request).session(token)
+                gateway = _gateway(request)
+                principal = (
+                    await gateway.peek_session(token)
+                    if request.path in _MAIL_EVENT_PATHS
+                    else await gateway.session(token)
+                )
                 invalid_session = False
             except HelperCallError as exc:
                 if exc.code not in {"unauthorized", "forbidden"}:
@@ -2264,6 +2422,146 @@ async def api_mailbox(request: web.Request) -> web.Response:
             status=502,
         )
     return _api_response(data=payload)
+
+
+def _mail_event_bytes(
+    event: str,
+    data: Mapping[str, object],
+    *,
+    event_id: int | None = None,
+) -> bytes:
+    if re.fullmatch(r"[a-z_]{1,32}", event) is None:
+        raise ValueError("invalid server-sent event name")
+    lines = [f"event: {event}\n"]
+    if event_id is not None:
+        if not 0 <= event_id <= MAX_MESSAGE_CURSOR:
+            raise ValueError("invalid server-sent event identifier")
+        lines.append(f"id: {event_id}\n")
+    lines.append(f"data: {_json_dumps(dict(data))}\n\n")
+    return "".join(lines).encode("utf-8")
+
+
+def _last_mail_event_id(request: web.Request) -> int | None:
+    values = request.headers.getall("Last-Event-ID", [])
+    if not values:
+        return None
+    if len(values) != 1 or re.fullmatch(r"(?:0|[1-9][0-9]{0,9})", values[0]) is None:
+        raise web.HTTPBadRequest(text="Invalid mail event cursor.")
+    value = int(values[0])
+    if value > MAX_MESSAGE_CURSOR:
+        raise web.HTTPBadRequest(text="Invalid mail event cursor.")
+    return value
+
+
+def _mail_event_context(request: web.Request) -> tuple[str, str]:
+    query = _read_query(request, allowed_fields=frozenset({"account"}))
+    account = _account_context(request, query)
+    # INBOX is the one case-insensitive mandatory IMAP mailbox, so monitoring
+    # it does not require a second helper call that could extend session idle
+    # time or reveal a user's folder inventory to the event channel.
+    return account, "INBOX"
+
+
+async def mail_events(request: web.Request) -> web.StreamResponse:
+    """Push generic new-mail events without exposing message metadata."""
+
+    account, mailbox = _mail_event_context(request)
+    resume_from = _last_mail_event_id(request)
+    token = request.get(_AUTH_TOKEN_KEY)
+    if not isinstance(token, str):
+        raise web.HTTPUnauthorized(text="Authentication is required.")
+    watcher_key = (
+        hashlib.sha256(token.encode("ascii")).digest(),
+        account,
+        mailbox,
+    )
+    try:
+        latest_uid, events = await _mail_event_hub(request).subscribe(
+            watcher_key,
+            _gateway(request),
+            account,
+            mailbox,
+        )
+    except Exception as exc:
+        LOGGER.warning("could not read initial mail event cursor", exc_info=True)
+        raise web.HTTPBadGateway(text="Could not monitor the mailbox.") from exc
+
+    response = web.StreamResponse(
+        status=200,
+        headers={
+            "Cache-Control": "private, no-store, no-cache, no-transform",
+            "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+            "Cross-Origin-Resource-Policy": "same-origin",
+            "Referrer-Policy": "no-referrer",
+            "X-Accel-Buffering": "no",
+            "X-Content-Type-Options": "nosniff",
+            "X-Frame-Options": "DENY",
+        },
+    )
+    response.content_type = "text/event-stream"
+    response.charset = "utf-8"
+    try:
+        await response.prepare(request)
+        baseline = latest_uid if resume_from is None else resume_from
+        await response.write(b"retry: 15000\n")
+        await response.write(
+            _mail_event_bytes(
+                "ready",
+                {"mailbox": mailbox},
+                # Establish the initial cursor, but never advance a resumed
+                # connection past a catch-up notification that is still to be
+                # written.  This preserves both first-connect and reconnect
+                # delivery across a disconnect between the two events.
+                event_id=(
+                    None
+                    if resume_from is not None and latest_uid > resume_from
+                    else latest_uid
+                ),
+            )
+        )
+        if latest_uid > baseline:
+            await response.write(
+                _mail_event_bytes(
+                    "new_mail",
+                    {"mailbox": mailbox},
+                    event_id=latest_uid,
+                )
+            )
+        baseline = latest_uid
+        keepalive_seconds = min(
+            MAIL_EVENT_KEEPALIVE_SECONDS,
+            _settings(request).mail_event_poll_seconds,
+        )
+        while True:
+            try:
+                event, current_uid = await asyncio.wait_for(
+                    events.get(),
+                    timeout=keepalive_seconds,
+                )
+            except TimeoutError:
+                await response.write(b": keepalive\n\n")
+                continue
+            if event == "session_expired":
+                await response.write(_mail_event_bytes("session_expired", {}))
+                break
+            if event == "new_mail":
+                await response.write(
+                    _mail_event_bytes(
+                        "new_mail",
+                        {"mailbox": mailbox},
+                        event_id=current_uid,
+                    )
+                )
+            baseline = current_uid
+    except asyncio.CancelledError:
+        raise
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+    finally:
+        await _mail_event_hub(request).unsubscribe(watcher_key, events)
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError, RuntimeError):
+            await response.write_eof()
+    return response
 
 
 def _mail_context(request: web.Request, values: Mapping[str, Any]) -> tuple[str, str]:
@@ -3727,8 +4025,8 @@ async def static_asset(request: web.Request) -> web.Response:
         cache_control = "public, max-age=31536000, immutable"
     else:
         application_versions = {
-            "app.css": "20",
-            "app.js": "25",
+            "app.css": "21",
+            "app.js": "26",
             "preview.css": "1",
         }
         versions = request.query.getall("v", [])
@@ -3784,6 +4082,15 @@ def create_app(config: object, gateway: Gateway) -> web.Application:
     request_body_timeout = float(_config_value(config, "server.request_body_timeout_seconds", 15.0))
     concurrency = int(_config_value(config, "server.concurrency", 8))
     page_size = int(_config_value(config, "server.page_size", 50))
+    mail_event_poll_seconds = float(
+        _config_value(
+            config,
+            "server.mail_event_poll_seconds",
+            DEFAULT_MAIL_EVENT_POLL_SECONDS,
+        )
+    )
+    if not 0.25 <= mail_event_poll_seconds <= 300:
+        raise ValueError("mail event poll interval must be between 0.25 and 300 seconds")
     temp_dir = Path(
         _config_value(
             config,
@@ -3830,16 +4137,21 @@ def create_app(config: object, gateway: Gateway) -> web.Application:
         max_upload_bytes=max_upload,
         request_body_timeout_seconds=request_body_timeout,
         temp_dir=temp_dir,
+        mail_event_poll_seconds=mail_event_poll_seconds,
     )
     app = web.Application(
         middlewares=[
             security_headers_middleware(browser_security),
-            bounded_concurrency_middleware(concurrency),
+            bounded_concurrency_middleware(
+                concurrency,
+                long_lived_paths=_MAIL_EVENT_PATHS,
+                long_lived_capacity=max(4, min(32, concurrency * 2)),
+            ),
             _authentication_middleware(),
             security_middleware(
                 browser_security,
                 scope_resolver=_csrf_scope,
-                tokenless_safe_paths=_TOKENLESS_PUBLIC_STATIC_PATHS,
+                tokenless_safe_paths=_TOKENLESS_CSRF_PATHS,
             ),
         ],
         client_max_size=max_upload,
@@ -3854,6 +4166,7 @@ def create_app(config: object, gateway: Gateway) -> web.Application:
     app[_MAIL_CURSOR_KEY] = _MailboxCursorStore(ttl_seconds=csrf_ttl)
     app[_FRESHNESS_KEY] = _FreshnessStore(ttl_seconds=csrf_ttl)
     app[_PARSED_MESSAGE_CACHE_KEY] = _ParsedMessageCache()
+    app[_MAIL_EVENT_HUB_KEY] = _MailEventHub(poll_seconds=mail_event_poll_seconds)
     app[_SESSION_COOKIE_KEY] = session_cookie_name
     app[_PUBLIC_ORIGIN_KEY] = public_origin
     app[_SECURE_COOKIE_KEY] = secure_cookies
@@ -3921,6 +4234,7 @@ def create_app(config: object, gateway: Gateway) -> web.Application:
                 renew_certificate_if_due,
             ),
             web.get("/api/v1/me/mail", api_mailbox),
+            web.get("/api/v1/me/mail-events", mail_events, allow_head=False),
             web.post("/api/v1/me/mail-actions", bulk_message_action),
             web.get("/api/v1/me/mail/{message_id}/html", message_html),
             web.get(
@@ -3974,6 +4288,7 @@ def create_app(config: object, gateway: Gateway) -> web.Application:
                 reset_account_totp,
             ),
             web.get("/api/v1/admin/mail", api_mailbox),
+            web.get("/api/v1/admin/mail-events", mail_events, allow_head=False),
             web.post("/api/v1/admin/mail-actions", bulk_message_action),
             web.get("/api/v1/admin/mail/{message_id}/html", message_html),
             web.get(
@@ -4033,6 +4348,13 @@ def create_app(config: object, gateway: Gateway) -> web.Application:
             web.route("*", "/{tail:.*}", not_found),
         ]
     )
+
+    async def close_mail_event_hub(application: web.Application) -> None:
+        hub = application[_MAIL_EVENT_HUB_KEY]
+        if isinstance(hub, _MailEventHub):
+            await hub.close()
+
+    app.on_cleanup.append(close_mail_event_hub)
     return app
 
 

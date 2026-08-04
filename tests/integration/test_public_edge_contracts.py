@@ -76,6 +76,8 @@ def test_cloudflare_peer_and_login_limit_use_independent_addresses() -> None:
         in http
     )
     assert "limit_req_zone $binary_remote_addr zone=maddyweb_send:1m rate=10r/m;" in http
+    assert "limit_conn_zone $binary_remote_addr zone=maddyweb_mail_events:1m;" in http
+    assert "limit_conn_status 429;" in http
     assert "real_ip_header CF-Connecting-IP;" in realip
     assert "real_ip_recursive off;" in realip
 
@@ -148,6 +150,20 @@ def test_public_vhosts_pin_host_headers_health_rate_limit_and_tls() -> None:
             "/api/v1/admin/send",
         ):
             assert f"location = {send_path} {{" in source
+        for event_path in (
+            "/api/v1/me/mail-events",
+            "/api/v1/admin/mail-events",
+        ):
+            marker = f"location = {event_path} {{"
+            assert marker in source
+            event_location = source.split(marker, maxsplit=1)[1].split("\n    }", maxsplit=1)[0]
+            assert "gzip off;" in event_location
+            assert "proxy_buffering off;" in event_location
+            assert "proxy_cache off;" in event_location
+            assert "proxy_read_timeout 75s;" in event_location
+            assert "limit_req zone=maddyweb_general burst=20 nodelay;" in event_location
+            assert "limit_conn maddyweb_mail_events 2;" in event_location
+            assert "proxy_pass http://127.0.0.1:8787;" in event_location
         assert (
             f"ssl_certificate /var/lib/maddyweb-web-cert/config/live/{domain}/fullchain.pem;"
         ) in source

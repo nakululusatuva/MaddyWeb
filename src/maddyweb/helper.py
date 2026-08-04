@@ -919,6 +919,8 @@ class _Operation:
     stream_out: bool = False
     permission: Literal["public", "session", "admin", "admin_account", "account"] = "admin"
     step_up: bool = False
+    touch_session: bool = True
+    audit_success: bool = True
 
 
 ALLOWED_OPERATIONS: Mapping[str, _Operation] = {
@@ -947,6 +949,12 @@ ALLOWED_OPERATIONS: Mapping[str, _Operation] = {
         permission="public",
     ),
     "auth.session": _Operation("_auth_session", permission="session"),
+    "auth.session_peek": _Operation(
+        "_auth_session",
+        permission="session",
+        touch_session=False,
+        audit_success=False,
+    ),
     "auth.logout": _Operation("_auth_logout", mutating=True, permission="session"),
     "auth.change_password": _Operation(
         "_auth_change_password",
@@ -999,6 +1007,12 @@ ALLOWED_OPERATIONS: Mapping[str, _Operation] = {
     "mailboxes.delete": _Operation("_mailboxes_delete", mutating=True, permission="account"),
     "mailboxes.rename": _Operation("_mailboxes_rename", mutating=True, permission="account"),
     "messages.list": _Operation("_messages_list", permission="account"),
+    "messages.latest": _Operation(
+        "_messages_latest",
+        permission="account",
+        touch_session=False,
+        audit_success=False,
+    ),
     "messages.get": _Operation("_messages_get", stream_out=True, permission="account"),
     "messages.append": _Operation(
         "_messages_append",
@@ -1187,6 +1201,7 @@ class PrivilegedDispatcher:
         self._require_active_principal(principal)
         if getattr(principal, "password_change_required", False) and request.operation not in {
             "auth.session",
+            "auth.session_peek",
             "auth.logout",
             "auth.change_password",
         }:
@@ -1326,7 +1341,7 @@ class PrivilegedDispatcher:
             request, principal = self._authorize_request(
                 request,
                 operation,
-                touch=True,
+                touch=operation.touch_session,
                 audit_fields=fields,
             )
             if principal is not None:
@@ -1356,7 +1371,8 @@ class PrivilegedDispatcher:
             authentication_fields = getattr(self._request_context, "auth_audit", None)
             if isinstance(authentication_fields, Mapping):
                 fields.update(authentication_fields)
-            self.audit("helper.operation", outcome="ok", fields=fields)
+            if operation.audit_success:
+                self.audit("helper.operation", outcome="ok", fields=fields)
             return result
         except Exception as exc:
             code, message = self._safe_error(exc)
@@ -1919,6 +1935,15 @@ class PrivilegedDispatcher:
             "limit": limit,
             "total": None,
             "next_offset": (int(messages[len(page)]["uid"]) if len(page) < len(messages) else None),
+        }
+
+    def _messages_latest(self, request: Request, _spool: TrustedSpool | None) -> Any:
+        values = _params(request, required={"username", "mailbox"})
+        return {
+            "uid": self.maddy.latest_message_uid(
+                values["username"],
+                values["mailbox"],
+            )
         }
 
     def _messages_get(self, request: Request, _spool: TrustedSpool | None) -> TrustedSpool:

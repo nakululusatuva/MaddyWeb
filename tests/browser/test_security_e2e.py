@@ -114,6 +114,7 @@ async def normal_user_application(tmp_path: Path) -> AsyncIterator[LiveApplicati
                 "request_body_timeout_seconds": 5,
                 "page_size": 20,
                 "temp_dir": tmp_path,
+                "mail_event_poll_seconds": 0.25,
             },
             "security": {
                 "session_signing_key": secrets.token_bytes(32),
@@ -125,7 +126,7 @@ async def normal_user_application(tmp_path: Path) -> AsyncIterator[LiveApplicati
         },
         gateway,
     )
-    runner = web.AppRunner(app, access_log=None)
+    runner = web.AppRunner(app, access_log=None, shutdown_timeout=0.25)
     await runner.setup()
     listener, port = _listening_socket()
     site = web.SockSite(runner, listener)
@@ -173,6 +174,7 @@ async def test_normal_user_mail_defaults_to_own_inbox_with_minimal_requests(
     assert _api_request_paths(requests) == [
         "/api/v1/auth/session",
         "/api/v1/me/mail",
+        "/api/v1/me/mail-events",
     ]
 
 
@@ -221,7 +223,47 @@ async def test_admin_mail_defaults_to_the_admins_own_inbox(
     assert _api_request_paths(requests) == [
         "/api/v1/auth/session",
         "/api/v1/admin/mail",
+        "/api/v1/admin/mail-events",
     ]
+
+
+async def test_new_mail_notice_is_server_pushed_without_frontend_mailbox_polling(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    requests: list[str] = []
+    page.on("request", lambda request: requests.append(urlsplit(request.url).path))
+    await _load_inbox(page, live_application)
+
+    for _ in range(40):
+        if live_application.gateway.notification_checks:
+            break
+        await asyncio.sleep(0.05)
+    else:
+        pytest.fail("the browser did not establish the mail event stream")
+
+    mailbox_loads = requests.count("/api/v1/admin/mail")
+    event_streams = requests.count("/api/v1/admin/mail-events")
+    assert mailbox_loads >= 1
+    assert event_streams == 1
+
+    live_application.gateway.notification_uid += 1
+    notice = page.locator("#new-mail-notice")
+    await notice.wait_for(state="visible", timeout=3_000)
+    assert (await notice.inner_text()).strip() == "New mail"
+    assert await page.locator("#toast").inner_text() == "New mail arrived in Inbox."
+    visible_notice = " ".join(
+        [
+            await notice.inner_text(),
+            await page.locator("#toast").inner_text(),
+        ]
+    )
+    assert "attacker@example.test" not in visible_notice
+    assert "Browser security fixture" not in visible_notice
+
+    await asyncio.sleep(0.65)
+    assert requests.count("/api/v1/admin/mail") == mailbox_loads
+    assert requests.count("/api/v1/admin/mail-events") == event_streams
 
 
 async def test_mailbox_placeholder_cannot_be_selected(
@@ -1353,7 +1395,12 @@ async def test_special_use_mailboxes_disable_same_target_actions(
     live_application.gateway.message_location = TRASH_MAILBOX
     await _load_mailbox(page, live_application, TRASH_MAILBOX)
     trash_row = page.locator("#message-list-body tr")
-    assert await trash_row.get_by_role("button", name="Delete", exact=True).is_disabled()
+    assert await trash_row.get_by_role(
+        "button",
+        name="Permanently delete",
+        exact=True,
+    ).is_enabled()
+    assert await trash_row.get_by_role("button", name="Delete", exact=True).count() == 0
     assert await trash_row.get_by_role("button", name="Archive", exact=True).is_enabled()
 
     live_application.gateway.message_location = ARCHIVE_MAILBOX
@@ -1361,6 +1408,94 @@ async def test_special_use_mailboxes_disable_same_target_actions(
     archive_row = page.locator("#message-list-body tr")
     assert await archive_row.get_by_role("button", name="Archive", exact=True).is_disabled()
     assert await archive_row.get_by_role("button", name="Delete", exact=True).is_enabled()
+
+
+async def test_trash_row_permanent_delete_requires_typed_confirmation_and_snapshot(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    live_application.gateway.message_location = TRASH_MAILBOX
+    await _load_mailbox(page, live_application, TRASH_MAILBOX)
+    live_application.gateway.message_read_started.clear()
+    action_requests: list[tuple[str, str]] = []
+
+    def capture_action_request(request: object) -> None:
+        path = urlsplit(getattr(request, "url", "")).path
+        if path.endswith(("/action-snapshot", "/delete")):
+            action_requests.append((getattr(request, "method", ""), path))
+
+    page.on("request", capture_action_request)
+    row = page.locator("#message-list-body tr")
+    await row.get_by_role(
+        "button",
+        name="Permanently delete",
+        exact=True,
+    ).click()
+
+    dialog = page.locator("#typed-confirm-dialog")
+    await dialog.wait_for(state="visible")
+    assert action_requests == []
+    assert not live_application.gateway.message_read_started.is_set()
+    typed_action = page.locator("#typed-confirm-action")
+    await page.locator("#typed-confirm-input").fill("delete")
+    assert await typed_action.is_disabled()
+    await page.locator("#typed-confirm-input").fill("PERMANENTLY DELETE")
+    assert await typed_action.is_enabled()
+    await typed_action.click()
+
+    await dialog.wait_for(state="hidden")
+    await page.locator("#message-empty").wait_for(state="visible")
+    assert live_application.gateway.message_read_started.is_set()
+    assert action_requests == [
+        ("GET", f"/api/v1/admin/mail/{MESSAGE_ID}/action-snapshot"),
+        ("POST", f"/api/v1/admin/mail/{MESSAGE_ID}/delete"),
+    ]
+    assert live_application.gateway.permanent_deletions == [
+        (ACCOUNT, TRASH_MAILBOX, MESSAGE_ID)
+    ]
+
+
+async def test_trash_row_permanent_delete_confirmation_does_not_survive_navigation(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    live_application.gateway.message_location = TRASH_MAILBOX
+    await _load_mailbox(page, live_application, TRASH_MAILBOX)
+    action_requests: list[str] = []
+
+    def capture_action_request(request: object) -> None:
+        path = urlsplit(getattr(request, "url", "")).path
+        if path.endswith(("/action-snapshot", "/delete")):
+            action_requests.append(path)
+
+    page.on("request", capture_action_request)
+    await page.locator("#message-list-body tr").get_by_role(
+        "button",
+        name="Permanently delete",
+        exact=True,
+    ).click()
+    dialog = page.locator("#typed-confirm-dialog")
+    await dialog.wait_for(state="visible")
+
+    await page.evaluate(
+        """() => {
+          history.pushState(null, "", "/");
+          window.dispatchEvent(new PopStateEvent("popstate"));
+        }"""
+    )
+    await page.get_by_role(
+        "heading",
+        name="Administration overview",
+        exact=True,
+    ).wait_for()
+    await dialog.wait_for(state="hidden")
+    await page.go_back()
+    await page.locator("#message-list-body tr").wait_for()
+
+    assert urlsplit(page.url).path == "/mail"
+    assert await dialog.is_hidden()
+    assert action_requests == []
+    assert live_application.gateway.permanent_deletions == []
 
 
 async def test_missing_special_use_targets_disable_move_actions(
@@ -1373,7 +1508,11 @@ async def test_missing_special_use_targets_disable_move_actions(
     live_application.gateway.list_mailboxes = inbox_only  # type: ignore[method-assign]
     await _load_inbox(page, live_application)
     row = page.locator("#message-list-body tr")
-    assert await row.get_by_role("button", name="Delete", exact=True).is_disabled()
+    assert await row.get_by_role(
+        "button",
+        name="Permanently delete",
+        exact=True,
+    ).is_enabled()
     assert await row.get_by_role("button", name="Archive", exact=True).is_disabled()
     assert await row.get_by_role("button", name="Forward", exact=True).is_enabled()
     assert await row.get_by_role("button", name="Forward as attachment", exact=True).is_enabled()
@@ -1536,7 +1675,31 @@ async def test_message_html_is_sandboxed_and_attachment_filename_is_safe(
     )
     assert len(image_sources) == 1
     assert image_sources[0].startswith("data:image/png;base64,")
-    assert await frame_element.get_attribute("sandbox") == ""
+    assert await frame_element.get_attribute("sandbox") == (
+        "allow-popups allow-popups-to-escape-sandbox"
+    )
+    safe_link = frame.get_by_role("link", name="Safe link", exact=True)
+    assert await safe_link.get_attribute("href") == "https://example.test/path"
+    assert await safe_link.get_attribute("target") == "_blank"
+    assert await safe_link.get_attribute("rel") == "noopener noreferrer nofollow"
+
+    async def serve_safe_destination(route: Route) -> None:
+        await route.fulfill(
+            status=200,
+            content_type="text/html",
+            body="<!doctype html><title>Safe destination</title>",
+        )
+
+    await page.context.route("https://example.test/path", serve_safe_destination)
+    async with page.expect_popup() as popup_info:
+        await safe_link.click()
+    popup = await popup_info.value
+    try:
+        await popup.wait_for_load_state("domcontentloaded")
+        assert popup.url == "https://example.test/path"
+        assert await popup.evaluate("window.opener === null")
+    finally:
+        await popup.close()
     frame_source = await frame_element.get_attribute("src")
     assert frame_source is not None and "/api/v1/admin/mail/42/html?" in frame_source
     assert await frame_element.get_attribute("srcdoc") is None
@@ -2358,4 +2521,4 @@ async def test_client_uses_safe_dom_construction_without_unsafe_html_sinks() -> 
         assert sink not in source
     assert "document.createElement" in source
     assert ".textContent" in source
-    assert 'frame.setAttribute("sandbox", "")' in source
+    assert '"allow-popups allow-popups-to-escape-sandbox"' in source

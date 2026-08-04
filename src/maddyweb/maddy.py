@@ -2176,6 +2176,25 @@ class MaddyService:
             use_uids=True,
         )
 
+    def latest_message_uid(self, username: str, mailbox: str) -> int:
+        """Return the newest stable UID with one bounded Maddy invocation."""
+
+        records = self._list_message_set(
+            username,
+            mailbox,
+            message_set="*",
+            full=False,
+            use_uids=True,
+        )
+        if not records:
+            return 0
+        if len(records) != 1:
+            raise MaddyError("Maddy returned an invalid latest-message result")
+        uid = records[0].get("uid")
+        if type(uid) is not int or not 1 <= uid <= MAX_IMAP_UID:
+            raise MaddyError("Maddy omitted the latest message UID")
+        return uid
+
     def list_message_window(
         self,
         username: str,
