@@ -187,6 +187,15 @@ def test_mail_preview_and_download_contracts_remain_inert() -> None:
         '<script>run()</script><form action="https://outside.invalid/">x</form>'
         '<img src="https://outside.invalid/pixel">'
         '<img src="cid:logo" onerror="run()">'
+        '<table width="640" height="120" align="center" '
+        'style="color:#123456;background-color:#f5f7fa;border:2px solid #345678;'
+        'font-family:Arial,sans-serif;width:640px;min-width:320px;height:120px;'
+        'text-align:center"><tr><td style="border:1px solid #789abc;padding:8px;'
+        'vertical-align:middle">Quarterly summary</td></tr></table>'
+        '<div style="position:fixed;color:#112233">position probe</div>'
+        '<div style="background-image:url(https://css.invalid/pixel)">network probe</div>'
+        '<span style="width:expression(run())">expression probe</span>'
+        '<style>@import url(https://sheet.invalid/layout.css);</style>'
         '<a href="javascript:run()">bad</a>'
         '<a href="https://example.test/path" target="_self" rel="opener">safe</a>'
     )
@@ -196,6 +205,22 @@ def test_mail_preview_and_download_contracts_remain_inert() -> None:
     assert "outside.invalid" not in rewritten
     assert "javascript:" not in rewritten
     assert "onerror" not in rewritten
+    assert "color:#123456" in rewritten
+    assert "background-color:#f5f7fa" in rewritten
+    assert "border:2px solid #345678" in rewritten
+    assert "font-family:" in rewritten
+    assert "width:640px" in rewritten
+    assert "min-width:320px" in rewritten
+    assert "height:120px" in rewritten
+    assert "text-align:center" in rewritten
+    assert "vertical-align:middle" in rewritten
+    assert "position:" not in rewritten
+    assert "background-image" not in rewritten
+    assert "url(" not in rewritten
+    assert "expression(" not in rewritten
+    assert "<style" not in rewritten
+    assert "css.invalid" not in rewritten
+    assert "sheet.invalid" not in rewritten
     assert 'target="_blank"' in rewritten
     assert 'rel="noopener noreferrer nofollow"' in rewritten
 
@@ -203,6 +228,8 @@ def test_mail_preview_and_download_contracts_remain_inert() -> None:
     response_headers = email_document_headers()
     assert "default-src 'none'" in document
     assert "form-action 'none'" in document
+    assert "color:#123456" in document
+    assert "background-color:#f5f7fa" in document
     assert "sandbox" in response_headers["Content-Security-Policy"]
     assert "default-src 'none'" in response_headers["Content-Security-Policy"]
     assert response_headers["Referrer-Policy"] == "no-referrer"

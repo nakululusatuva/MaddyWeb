@@ -64,6 +64,11 @@ _CID_DATA_URL_RE = re.compile(
     r"\Adata:image/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/]*={0,2}\Z",
     re.ASCII,
 )
+_UNSAFE_INLINE_STYLE_RE = re.compile(
+    r"(?:url|expression|image|image-set|cross-fade|element|attr|var)\s*\("
+    r"|(?:javascript|vbscript|data)\s*:|@|\\|/\*",
+    re.IGNORECASE,
+)
 _UNSAFE_FILENAME_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
 _UNSAFE_HEADER_CATEGORIES = _UNSAFE_FILENAME_CATEGORIES
 
@@ -129,17 +134,110 @@ _HTML_TAGS = {
     "var",
 }
 _HTML_ATTRIBUTES = {
+    "*": {"style"},
     "a": {"href", "title"},
     "blockquote": {"cite"},
     "col": {"span", "width"},
     "colgroup": {"span", "width"},
-    "img": {"alt", "height", "src", "title", "width"},
+    "div": {"align"},
+    "img": {"align", "alt", "height", "src", "title", "width"},
     "ol": {"start", "type"},
+    "p": {"align"},
     "q": {"cite"},
-    "table": {"summary"},
-    "td": {"colspan", "headers", "rowspan"},
-    "th": {"colspan", "headers", "rowspan", "scope"},
+    "table": {
+        "align",
+        "bgcolor",
+        "border",
+        "cellpadding",
+        "cellspacing",
+        "height",
+        "summary",
+        "width",
+    },
+    "td": {
+        "align",
+        "bgcolor",
+        "colspan",
+        "headers",
+        "height",
+        "rowspan",
+        "valign",
+        "width",
+    },
+    "th": {
+        "align",
+        "bgcolor",
+        "colspan",
+        "headers",
+        "height",
+        "rowspan",
+        "scope",
+        "valign",
+        "width",
+    },
+    "tr": {"align", "bgcolor", "height", "valign"},
 }
+_HTML_STYLE_PROPERTIES = frozenset(
+    {
+        "background-color",
+        "border",
+        "border-bottom",
+        "border-bottom-color",
+        "border-bottom-style",
+        "border-bottom-width",
+        "border-collapse",
+        "border-color",
+        "border-left",
+        "border-left-color",
+        "border-left-style",
+        "border-left-width",
+        "border-right",
+        "border-right-color",
+        "border-right-style",
+        "border-right-width",
+        "border-spacing",
+        "border-style",
+        "border-top",
+        "border-top-color",
+        "border-top-style",
+        "border-top-width",
+        "border-width",
+        "box-sizing",
+        "color",
+        "font-family",
+        "font-size",
+        "font-style",
+        "font-variant",
+        "font-weight",
+        "height",
+        "letter-spacing",
+        "line-height",
+        "margin",
+        "margin-bottom",
+        "margin-left",
+        "margin-right",
+        "margin-top",
+        "max-height",
+        "max-width",
+        "min-height",
+        "min-width",
+        "overflow-wrap",
+        "padding",
+        "padding-bottom",
+        "padding-left",
+        "padding-right",
+        "padding-top",
+        "text-align",
+        "text-decoration",
+        "text-indent",
+        "text-transform",
+        "vertical-align",
+        "white-space",
+        "width",
+        "word-break",
+        "word-spacing",
+    }
+)
 _REMOVE_CONTENT_TAGS = {
     "applet",
     "embed",
@@ -246,7 +344,7 @@ class _CidImageRewriter(HTMLParser):
         tag = tag.lower()
         if tag not in _HTML_TAGS:
             return
-        allowed = _HTML_ATTRIBUTES.get(tag, set())
+        allowed = _HTML_ATTRIBUTES.get("*", set()) | _HTML_ATTRIBUTES.get(tag, set())
         rendered: list[str] = []
         seen: set[str] = set()
         if tag == "a" and any(
@@ -571,9 +669,11 @@ def sanitize_html_email(value: str) -> str:
     """Sanitize HTML mail and remove every network-capable image source.
 
     Only ``cid:`` image URLs survive.  In particular, HTTP(S), protocol-relative,
-    ``file:``, SVG/data URLs, forms, scripts, CSS and active embedded content are
-    removed.  If nh3 is unavailable, the function fails closed and renders the
-    whole input as escaped text.
+    ``file:``, SVG/data URLs, forms, scripts, network-capable CSS and active
+    embedded content are removed.  A bounded allow-list of passive inline CSS
+    remains so ordinary email layouts retain their typography, spacing, colors,
+    borders and table dimensions.  If nh3 is unavailable, the function fails
+    closed and renders the whole input as escaped text.
     """
 
     if len(value) > MAX_BODY_CHARACTERS:
@@ -591,6 +691,7 @@ def sanitize_html_email(value: str) -> str:
             strip_comments=True,
             url_schemes={"cid", "http", "https", "mailto"},
             attribute_filter=_mail_attribute_filter,
+            filter_style_properties=_HTML_STYLE_PROPERTIES,
         )
     )
 
@@ -598,6 +699,10 @@ def sanitize_html_email(value: str) -> str:
 def _mail_attribute_filter(tag: str, attribute: str, value: str) -> str | None:
     """nh3 callback that permits links but restricts images to ``cid:``."""
 
+    if attribute == "style":
+        if _UNSAFE_INLINE_STYLE_RE.search(value):
+            return None
+        return value
     if tag == "img" and attribute == "src":
         if not value.lower().startswith("cid:"):
             return None

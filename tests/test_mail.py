@@ -102,6 +102,61 @@ def test_html_sanitizer_blocks_active_content_and_remote_images() -> None:
     assert "noopener" in cleaned
 
 
+def test_html_sanitizer_preserves_passive_table_css_and_drops_active_css() -> None:
+    cleaned = sanitize_html_email(
+        '<table width="640" height="120" align="center" bgcolor="#f5f7fa" '
+        'border="2" cellpadding="8" cellspacing="0" '
+        'style="color:#123456;background-color:#f5f7fa;border:2px solid #345678;'
+        'font-family:Arial,sans-serif;font-size:16px;width:640px;min-width:320px;'
+        'height:120px;text-align:center;vertical-align:middle;border-collapse:collapse">'
+        '<tr><td style="border:1px solid #789abc;padding:8px;text-align:right;'
+        'vertical-align:middle">Quarterly summary</td></tr></table>'
+        '<div style="position:fixed;color:#112233">Position probe</div>'
+        '<div style="background-image:url(https://style.invalid/pixel);color:#445566">'
+        "Network probe</div>"
+        '<span style="width:expression(alert(1));color:#778899">Expression probe</span>'
+        '<style>@import url(https://sheet.invalid/layout.css);</style>'
+        '<img src="https://image.invalid/pixel">'
+    )
+
+    for passive_value in (
+        'width="640"',
+        'height="120"',
+        'align="center"',
+        'bgcolor="#f5f7fa"',
+        'border="2"',
+        'cellpadding="8"',
+        'cellspacing="0"',
+        "color:#123456",
+        "background-color:#f5f7fa",
+        "border:2px solid #345678",
+        "font-family:",
+        "font-size:16px",
+        "width:640px",
+        "min-width:320px",
+        "height:120px",
+        "text-align:center",
+        "vertical-align:middle",
+        "border-collapse:collapse",
+        "padding:8px",
+    ):
+        assert passive_value in cleaned
+
+    assert "Position probe" in cleaned
+    assert "color:#112233" in cleaned
+    for unsafe_value in (
+        "position:",
+        "background-image",
+        "url(",
+        "expression(",
+        "<style",
+        "style.invalid",
+        "sheet.invalid",
+        "image.invalid",
+    ):
+        assert unsafe_value not in cleaned
+
+
 def test_sandbox_document_has_no_network_capability() -> None:
     document = sandboxed_html_document('<img src="https://tracker.test/x"><b>Body</b>')
     assert "tracker.test" not in document

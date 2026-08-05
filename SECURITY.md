@@ -131,8 +131,11 @@ impersonation of another mailbox, re-verifies the selected sender mailbox's
 current password.
 
 Incoming mail is always untrusted. HTML is sanitized before storage in the
-preview model, active elements and remote resources are removed, and the
-result is served in a scriptless sandboxed iframe with an independent CSP.
+preview model, active elements and remote resources are removed, and only a
+fixed set of passive inline presentation properties can survive CSS filtering.
+The result is served in a scriptless sandboxed iframe with an independent CSP;
+style sheets, resource-bearing CSS, positioning and overlay properties remain
+blocked.
 Only unique CID references backed by structurally valid, bounded,
 non-animated PNG, JPEG, GIF, or WebP data can render. Eligible CID images are
 embedded into the isolated document so viewing a message does not trigger

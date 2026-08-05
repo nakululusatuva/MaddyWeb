@@ -2005,7 +2005,11 @@ async def test_message_html_is_sandboxed_and_attachment_filename_is_safe(
     assert await frame.locator('head meta[http-equiv="Content-Security-Policy"]').count() == 1
     assert await frame.locator("head style").count() == 1
     assert await frame.locator("body").get_attribute("data-xss") is None
-    assert await frame.locator("[onerror], [srcset], [style]").count() == 0
+    assert await frame.locator("[onerror], [srcset]").count() == 0
+    assert await frame.locator(
+        '[style*="position"], [style*="background-image"], '
+        '[style*="url("], [style*="expression("]'
+    ).count() == 0
     assert await frame.locator("#unsafe-link").count() == 0
     assert await page.evaluate(
         "typeof window.svgXss === 'undefined' "
@@ -2018,6 +2022,69 @@ async def test_message_html_is_sandboxed_and_attachment_filename_is_safe(
     )
     assert len(image_sources) == 1
     assert image_sources[0].startswith("data:image/png;base64,")
+
+    styled_table = frame.locator("table").filter(has_text="Quarterly summary")
+    assert await styled_table.count() == 1
+    assert await styled_table.get_attribute("width") == "640"
+    assert await styled_table.get_attribute("height") == "120"
+    assert await styled_table.get_attribute("align") == "center"
+    assert await styled_table.get_attribute("bgcolor") == "#f5f7fa"
+    assert await styled_table.get_attribute("border") == "2"
+    assert await styled_table.get_attribute("cellpadding") == "8"
+    assert await styled_table.get_attribute("cellspacing") == "0"
+    table_styles = await styled_table.evaluate(
+        """node => {
+            const style = getComputedStyle(node);
+            return {
+                backgroundColor: style.backgroundColor,
+                borderCollapse: style.borderCollapse,
+                borderTopColor: style.borderTopColor,
+                borderTopStyle: style.borderTopStyle,
+                borderTopWidth: style.borderTopWidth,
+                color: style.color,
+                declaredWidth: node.style.width,
+                fontFamily: style.fontFamily,
+                fontSize: style.fontSize,
+                height: style.height,
+                minWidth: style.minWidth,
+                textAlign: style.textAlign,
+                width: style.width,
+            };
+        }"""
+    )
+    computed_width = table_styles.pop("width")
+    assert table_styles == {
+        "backgroundColor": "rgb(245, 247, 250)",
+        "borderCollapse": "collapse",
+        "borderTopColor": "rgb(52, 86, 120)",
+        "borderTopStyle": "solid",
+        "borderTopWidth": "2px",
+        "color": "rgb(18, 52, 86)",
+        "declaredWidth": "640px",
+        "fontFamily": "Arial, sans-serif",
+        "fontSize": "16px",
+        "height": "120px",
+        "minWidth": "320px",
+        "textAlign": "center",
+    }
+    assert 320 <= float(computed_width.removesuffix("px")) <= 640
+    styled_cell = styled_table.locator("td")
+    assert await styled_cell.evaluate(
+        """node => {
+            const style = getComputedStyle(node);
+            return style.borderTopWidth === "1px"
+                && style.paddingTop === "8px"
+                && style.textAlign === "right"
+                && style.verticalAlign === "middle";
+        }"""
+    )
+    position_probe = frame.get_by_text("Position probe", exact=True)
+    assert await position_probe.evaluate("node => getComputedStyle(node).position") == "static"
+    assert await position_probe.evaluate("node => getComputedStyle(node).color") == (
+        "rgb(17, 34, 51)"
+    )
+    assert await frame.get_by_text("CSS network probe", exact=True).get_attribute("style") is None
+    assert await frame.get_by_text("Expression probe", exact=True).get_attribute("style") is None
     assert await frame_element.get_attribute("sandbox") == (
         "allow-popups allow-popups-to-escape-sandbox"
     )
