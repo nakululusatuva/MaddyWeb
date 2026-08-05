@@ -9,9 +9,24 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from webauthn.authentication.verify_authentication_response import VerifiedAuthentication
+from webauthn.helpers.structs import (
+    AttestationFormat,
+    AuthenticationCredential,
+    AuthenticatorAssertionResponse,
+    AuthenticatorAttestationResponse,
+    AuthenticatorTransport,
+    CredentialDeviceType,
+    PublicKeyCredentialType,
+    RegistrationCredential,
+)
+from webauthn.registration.verify_registration_response import VerifiedRegistration
 
+import maddyweb.auth as auth_module
 from maddyweb.auth import (
     CHALLENGE_FAILURE_LIMIT,
+    CHALLENGE_LIFETIME_SECONDS,
+    MAX_PASSKEYS_PER_ACCOUNT,
     MAX_SESSIONS_PER_ACCOUNT,
     RECOVERY_CODE_COUNT,
     SESSION_ABSOLUTE_SECONDS,
@@ -24,10 +39,12 @@ from maddyweb.auth import (
     EnrollmentState,
     EnrollmentStateError,
     InvalidChallengeError,
+    InvalidPasskeyError,
     InvalidSecondFactorError,
     InvalidSessionError,
     LoginRateLimitedError,
     MasterKeyError,
+    PasskeyLimitError,
     Role,
     StepUpRequiredError,
     canonicalize_email,
@@ -80,6 +97,8 @@ class StoreFactory:
         name: str = "auth.db",
         master_key: bytes = MASTER_KEY,
         seed: bytes | None = None,
+        webauthn_rp_id: str | None = None,
+        webauthn_origin: str | None = None,
     ) -> AuthStore:
         random_seed = seed or f"store-{self.counter}".encode("ascii")
         self.counter += 1
@@ -89,6 +108,8 @@ class StoreFactory:
             "MaddyWeb",
             clock=self.clock,
             random_bytes=DeterministicRandom(random_seed),
+            webauthn_rp_id=webauthn_rp_id,
+            webauthn_origin=webauthn_origin,
         )
         self.stores.append(store)
         return store
@@ -134,6 +155,70 @@ def _bootstrap_codes(prefix: int = 0) -> tuple[str, ...]:
 
 def _decode_token(token: str) -> bytes:
     return base64.urlsafe_b64decode(token + "=" * ((4 - len(token) % 4) % 4))
+
+
+def _encode_base64url(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
+
+
+def _registration_credential(credential_id: bytes) -> RegistrationCredential:
+    return RegistrationCredential(
+        id=_encode_base64url(credential_id),
+        raw_id=credential_id,
+        response=AuthenticatorAttestationResponse(
+            client_data_json=b"test-client-data",
+            attestation_object=b"test-attestation",
+            transports=[AuthenticatorTransport.INTERNAL, AuthenticatorTransport.HYBRID],
+        ),
+    )
+
+
+def _verified_registration(
+    credential_id: bytes,
+    *,
+    sign_count: int = 0,
+) -> VerifiedRegistration:
+    return VerifiedRegistration(
+        credential_id=credential_id,
+        credential_public_key=b"test-cose-public-key",
+        sign_count=sign_count,
+        aaguid="00000000-0000-0000-0000-000000000000",
+        fmt=AttestationFormat.NONE,
+        credential_type=PublicKeyCredentialType.PUBLIC_KEY,
+        user_verified=True,
+        attestation_object=b"test-attestation",
+        credential_device_type=CredentialDeviceType.MULTI_DEVICE,
+        credential_backed_up=True,
+    )
+
+
+def _authentication_credential(
+    credential_id: bytes,
+    account_id: str,
+) -> AuthenticationCredential:
+    return AuthenticationCredential(
+        id=_encode_base64url(credential_id),
+        raw_id=credential_id,
+        response=AuthenticatorAssertionResponse(
+            client_data_json=b"test-client-data",
+            authenticator_data=b"test-authenticator-data",
+            signature=b"test-signature",
+            user_handle=bytes.fromhex(account_id),
+        ),
+    )
+
+
+def _verified_authentication(
+    credential_id: bytes,
+    sign_count: int,
+) -> VerifiedAuthentication:
+    return VerifiedAuthentication(
+        credential_id=credential_id,
+        new_sign_count=sign_count,
+        credential_device_type=CredentialDeviceType.MULTI_DEVICE,
+        credential_backed_up=True,
+        user_verified=True,
+    )
 
 
 def _create_schema_v3_pending_database(path: Path) -> None:
@@ -848,6 +933,437 @@ def test_schema_version_three_pending_enrollment_migrates_to_required(
 
     challenge = store.create_pending_challenge(account.email)
     assert store.begin_totp_enrollment(challenge).secret
+
+
+def test_session_metadata_listing_current_and_targeted_revoke(
+    store_factory: StoreFactory,
+    clock: FakeClock,
+) -> None:
+    store = store_factory()
+    account, enrollment, _codes = store.provision_active_account("user@example.test")
+    challenge = store.create_pending_challenge(account.email)
+    issued = store.complete_totp_challenge(
+        challenge,
+        totp_code(enrollment.secret, timestamp=clock.value),
+        client_ip="2001:0db8::1",
+        user_agent="  MaddyWeb Test Browser  ",
+    )
+
+    assert SESSION_IDLE_SECONDS == 72 * 60 * 60
+    assert SESSION_ABSOLUTE_SECONDS == 30 * 24 * 60 * 60
+    assert issued.principal.session_id is not None
+    assert issued.principal.client_ip == "2001:db8::1"
+    assert issued.principal.user_agent == "MaddyWeb Test Browser"
+    sessions = store.list_sessions(
+        account.account_id,
+        current_session_token=issued.token,
+    )
+    assert len(sessions) == 1
+    assert sessions[0].session_id == issued.principal.session_id
+    assert sessions[0].current is True
+    assert sessions[0].client_ip == "2001:db8::1"
+    assert sessions[0].user_agent == "MaddyWeb Test Browser"
+    assert issued.token not in repr(sessions[0])
+
+    assert store.revoke_session_by_id(account.account_id, sessions[0].session_id) is True
+    assert store.revoke_session_by_id(account.account_id, sessions[0].session_id) is False
+    with pytest.raises(InvalidSessionError):
+        store.authenticate_session(issued.token)
+
+
+def test_passkey_session_extension_migrates_additively_from_schema_v4(
+    store_factory: StoreFactory,
+    clock: FakeClock,
+) -> None:
+    store = store_factory(name="legacy-v4.db")
+    account, enrollment, _codes = store.provision_active_account("user@example.test")
+    token = _login(store, account.email, enrollment.secret, clock)
+    store.close()
+    path = store_factory.tmp_path / "legacy-v4.db"
+
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TABLE auth_passkey_challenges")
+        connection.execute("DROP TABLE auth_passkey_credentials")
+        connection.execute("DROP INDEX auth_sessions_public_id_idx")
+        connection.execute("ALTER TABLE auth_sessions DROP COLUMN user_agent")
+        connection.execute("ALTER TABLE auth_sessions DROP COLUMN client_ip")
+        connection.execute("ALTER TABLE auth_sessions DROP COLUMN session_id")
+        connection.execute(
+            "DELETE FROM auth_metadata WHERE key = 'passkey_session_extension_version'"
+        )
+        assert (
+            connection.execute(
+                "SELECT value FROM auth_metadata WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            == b"4"
+        )
+
+    reopened = store_factory(name="legacy-v4.db", seed=b"extension-migration")
+    principal = reopened.authenticate_session(token)
+    assert principal.session_id is not None
+    with sqlite3.connect(path) as connection:
+        assert (
+            connection.execute(
+                "SELECT value FROM auth_metadata WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            == b"4"
+        )
+        assert (
+            connection.execute(
+                """
+            SELECT value FROM auth_metadata
+            WHERE key = 'passkey_session_extension_version'
+            """
+            ).fetchone()[0]
+            == b"1"
+        )
+        columns = {row[1]: row for row in connection.execute("PRAGMA table_info(auth_sessions)")}
+        assert {"session_id", "client_ip", "user_agent"} <= columns.keys()
+        assert all(columns[name][3] == 0 for name in ("session_id", "client_ip", "user_agent"))
+        tables = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        assert {"auth_passkey_credentials", "auth_passkey_challenges"} <= tables
+        challenge_columns = {
+            row[1]: row for row in connection.execute("PRAGMA table_info(auth_passkey_challenges)")
+        }
+        assert challenge_columns["account_id"][3] == 0
+
+
+def test_passkey_session_extension_does_not_revive_legacy_idle_session(
+    store_factory: StoreFactory,
+    clock: FakeClock,
+) -> None:
+    store = store_factory(name="legacy-idle-v4.db")
+    account, enrollment, _codes = store.provision_active_account("user@example.test")
+    token = _login(store, account.email, enrollment.secret, clock)
+    store.close()
+    path = store_factory.tmp_path / "legacy-idle-v4.db"
+
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "DELETE FROM auth_metadata WHERE key = 'passkey_session_extension_version'"
+        )
+    clock.advance(30 * 60)
+
+    reopened = store_factory(name="legacy-idle-v4.db", seed=b"idle-migration")
+    with pytest.raises(InvalidSessionError):
+        reopened.authenticate_session(token)
+
+
+def test_passkey_registration_login_and_session_bound_step_up(
+    store_factory: StoreFactory,
+    clock: FakeClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = store_factory(
+        webauthn_rp_id="example.test",
+        webauthn_origin="https://admin.example.test",
+    )
+    account, enrollment, _codes = store.provision_active_account("user@example.test")
+    totp_session = _login(store, account.email, enrollment.secret, clock)
+    store.mark_step_up(totp_session)
+    credential_id = b"synced-platform-passkey"
+
+    registration = store.begin_passkey_registration(totp_session)
+    assert len(_decode_token(registration.challenge_token)) == 32
+    assert registration.options["rp"] == {"id": "example.test", "name": "MaddyWeb"}
+    assert registration.options["attestation"] == "none"
+    assert registration.options["authenticatorSelection"] == {
+        "requireResidentKey": True,
+        "residentKey": "required",
+        "userVerification": "required",
+    }
+    registration_call: dict[str, object] = {}
+
+    def verify_registration(**kwargs: object) -> VerifiedRegistration:
+        registration_call.update(kwargs)
+        return _verified_registration(credential_id)
+
+    monkeypatch.setattr(auth_module, "verify_registration_response", verify_registration)
+    passkey = store.complete_passkey_registration(
+        totp_session,
+        registration.challenge_token,
+        _registration_credential(credential_id),
+        name="Laptop passkey",
+    )
+    assert registration_call["expected_rp_id"] == "example.test"
+    assert registration_call["expected_origin"] == "https://admin.example.test"
+    assert registration_call["require_user_verification"] is True
+    assert len(passkey.public_id) == 32
+    assert not hasattr(passkey, "credential_id")
+    assert store.list_passkeys(account.account_id) == (passkey,)
+
+    with sqlite3.connect(store_factory.tmp_path / "auth.db") as connection:
+        stored_challenge_count = connection.execute(
+            "SELECT COUNT(*) FROM auth_passkey_challenges"
+        ).fetchone()[0]
+        stored_credential_id = connection.execute(
+            "SELECT credential_id FROM auth_passkey_credentials"
+        ).fetchone()[0]
+    assert stored_challenge_count == 0
+    assert stored_credential_id == credential_id
+    assert credential_id not in bytes.fromhex(passkey.public_id)
+
+    login = store.begin_passkey_login()
+    assert login.options["rpId"] == "example.test"
+    assert login.options["userVerification"] == "required"
+    assert login.options["allowCredentials"] == []
+    authentication_calls: list[dict[str, object]] = []
+
+    def verify_authentication(**kwargs: object) -> VerifiedAuthentication:
+        authentication_calls.append(dict(kwargs))
+        return _verified_authentication(credential_id, len(authentication_calls))
+
+    monkeypatch.setattr(auth_module, "verify_authentication_response", verify_authentication)
+    with sqlite3.connect(store_factory.tmp_path / "auth.db") as connection:
+        session_count_before = connection.execute("SELECT COUNT(*) FROM auth_sessions").fetchone()[
+            0
+        ]
+    identity = store.verify_passkey_login(
+        login.challenge_token,
+        _authentication_credential(credential_id, account.account_id),
+    )
+    assert identity.account_id == account.account_id
+    assert identity.email == account.email
+    with sqlite3.connect(store_factory.tmp_path / "auth.db") as connection:
+        assert (
+            connection.execute("SELECT COUNT(*) FROM auth_sessions").fetchone()[0]
+            == session_count_before
+        )
+    passkey_session = store.issue_verified_passkey_session(
+        identity,
+        client_ip="203.0.113.20",
+        user_agent="Passkey Browser",
+    )
+    assert passkey_session.principal.step_up_until == 0
+    assert passkey_session.principal.client_ip == "203.0.113.20"
+    assert authentication_calls[0]["expected_origin"] == "https://admin.example.test"
+    assert authentication_calls[0]["require_user_verification"] is True
+    with pytest.raises(InvalidChallengeError):
+        store.complete_passkey_login(
+            login.challenge_token,
+            _authentication_credential(credential_id, account.account_id),
+        )
+
+    step_up = store.begin_passkey_step_up(passkey_session.token)
+    with pytest.raises(InvalidChallengeError):
+        store.complete_passkey_step_up(
+            totp_session,
+            step_up.challenge_token,
+            _authentication_credential(credential_id, account.account_id),
+        )
+    elevated = store.complete_passkey_step_up(
+        passkey_session.token,
+        step_up.challenge_token,
+        _authentication_credential(credential_id, account.account_id),
+    )
+    assert elevated.step_up_until == clock.value + STEP_UP_SECONDS
+    assert store.require_step_up(passkey_session.token).account_id == account.account_id
+
+
+def test_passkey_counter_rollback_failure_limit_and_expiry(
+    store_factory: StoreFactory,
+    clock: FakeClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = store_factory(
+        webauthn_rp_id="example.test",
+        webauthn_origin="https://example.test",
+    )
+    account, enrollment, _codes = store.provision_active_account("user@example.test")
+    session = _login(store, account.email, enrollment.secret, clock)
+    store.mark_step_up(session)
+    credential_id = b"counter-passkey"
+    registration = store.begin_passkey_registration(session)
+    monkeypatch.setattr(
+        auth_module,
+        "verify_registration_response",
+        lambda **_kwargs: _verified_registration(credential_id, sign_count=7),
+    )
+    store.complete_passkey_registration(
+        session,
+        registration.challenge_token,
+        _registration_credential(credential_id),
+    )
+
+    login = store.begin_passkey_login()
+    monkeypatch.setattr(
+        auth_module,
+        "verify_authentication_response",
+        lambda **_kwargs: _verified_authentication(credential_id, 7),
+    )
+    assertion = _authentication_credential(credential_id, account.account_id)
+    for _ in range(CHALLENGE_FAILURE_LIMIT):
+        with pytest.raises(InvalidPasskeyError):
+            store.complete_passkey_login(login.challenge_token, assertion)
+    with pytest.raises(InvalidChallengeError):
+        store.complete_passkey_login(login.challenge_token, assertion)
+    assert store.list_passkeys(account.account_id)[0].sign_count == 7
+
+    expired = store.begin_passkey_login()
+    clock.advance(CHALLENGE_LIFETIME_SECONDS)
+    with pytest.raises(InvalidChallengeError):
+        store.complete_passkey_login(expired.challenge_token, assertion)
+
+
+def test_discoverable_passkey_login_is_account_unbound_and_requires_user_handle(
+    store_factory: StoreFactory,
+    clock: FakeClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = store_factory(
+        webauthn_rp_id="example.test",
+        webauthn_origin="https://example.test",
+    )
+    account, enrollment, _codes = store.provision_active_account("user@example.test")
+    session = _login(store, account.email, enrollment.secret, clock)
+    store.mark_step_up(session)
+    credential_id = b"discoverable-passkey"
+    registration = store.begin_passkey_registration(session)
+    monkeypatch.setattr(
+        auth_module,
+        "verify_registration_response",
+        lambda **_kwargs: _verified_registration(credential_id),
+    )
+    store.complete_passkey_registration(
+        session,
+        registration.challenge_token,
+        _registration_credential(credential_id),
+    )
+
+    login = store.begin_passkey_login()
+    assert login.options["allowCredentials"] == []
+    with sqlite3.connect(store_factory.tmp_path / "auth.db") as connection:
+        stored = connection.execute(
+            """
+            SELECT purpose, account_id, session_digest
+            FROM auth_passkey_challenges
+            WHERE purpose = 'login'
+            """
+        ).fetchone()
+    assert stored == ("login", None, None)
+
+    missing_handle = AuthenticationCredential(
+        id=_encode_base64url(credential_id),
+        raw_id=credential_id,
+        response=AuthenticatorAssertionResponse(
+            client_data_json=b"test-client-data",
+            authenticator_data=b"test-authenticator-data",
+            signature=b"test-signature",
+            user_handle=None,
+        ),
+    )
+    with pytest.raises(InvalidPasskeyError):
+        store.complete_passkey_login(login.challenge_token, missing_handle)
+
+
+def test_anonymous_login_challenge_eviction_is_isolated_from_session_ceremonies(
+    store_factory: StoreFactory,
+    clock: FakeClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = store_factory(
+        webauthn_rp_id="example.test",
+        webauthn_origin="https://example.test",
+    )
+    account, enrollment, _codes = store.provision_active_account("user@example.test")
+    session = _login(store, account.email, enrollment.secret, clock)
+    store.mark_step_up(session)
+    registration = store.begin_passkey_registration(session)
+
+    for _ in range(auth_module._MAX_ANONYMOUS_PASSKEY_LOGIN_CHALLENGES + 1):
+        store.begin_passkey_login()
+
+    with sqlite3.connect(store_factory.tmp_path / "auth.db") as connection:
+        counts = dict(
+            connection.execute(
+                """
+                SELECT purpose, COUNT(*)
+                FROM auth_passkey_challenges
+                GROUP BY purpose
+                """
+            ).fetchall()
+        )
+    assert counts == {
+        "login": auth_module._MAX_ANONYMOUS_PASSKEY_LOGIN_CHALLENGES,
+        "registration": 1,
+    }
+
+    credential_id = b"registration-survives-login-pressure"
+    monkeypatch.setattr(
+        auth_module,
+        "verify_registration_response",
+        lambda **_kwargs: _verified_registration(credential_id),
+    )
+    registered = store.complete_passkey_registration(
+        session,
+        registration.challenge_token,
+        _registration_credential(credential_id),
+    )
+    assert registered.account_id == account.account_id
+
+
+def test_account_unbound_passkey_login_has_dedicated_global_and_ip_rate_buckets(
+    store_factory: StoreFactory,
+) -> None:
+    store = store_factory()
+    client_ip = "203.0.113.77"
+    for _ in range(30):
+        store.check_passkey_login_rate(client_ip)
+    with pytest.raises(LoginRateLimitedError):
+        store.check_passkey_login_rate(client_ip)
+
+    with sqlite3.connect(store_factory.tmp_path / "auth.db") as connection:
+        rows = connection.execute(
+            """
+            SELECT scope, account_id, account_identity_digest
+            FROM auth_login_rate_limits
+            ORDER BY scope
+            """
+        ).fetchall()
+    assert rows == [("global", None, None), ("ip", None, None)]
+
+    store.record_passkey_login_result(client_ip, success=True)
+    store.check_passkey_login_rate(client_ip)
+
+
+def test_passkey_limit_and_https_configuration(
+    store_factory: StoreFactory,
+    clock: FakeClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ValueError, match="HTTPS"):
+        store_factory(
+            name="bad-origin.db",
+            webauthn_rp_id="example.test",
+            webauthn_origin="http://example.test",
+        )
+    store = store_factory(
+        webauthn_rp_id="example.test",
+        webauthn_origin="https://example.test",
+    )
+    account, enrollment, _codes = store.provision_active_account("user@example.test")
+    session = _login(store, account.email, enrollment.secret, clock)
+    store.mark_step_up(session)
+    for index in range(MAX_PASSKEYS_PER_ACCOUNT):
+        credential_id = f"credential-{index}".encode()
+        verified_registration = _verified_registration(credential_id)
+        registration = store.begin_passkey_registration(session)
+        monkeypatch.setattr(
+            auth_module,
+            "verify_registration_response",
+            lambda value=verified_registration, **_kwargs: value,
+        )
+        store.complete_passkey_registration(
+            session,
+            registration.challenge_token,
+            _registration_credential(credential_id),
+            name=f"Passkey {index}",
+        )
+    with pytest.raises(PasskeyLimitError):
+        store.begin_passkey_registration(session)
 
 
 def test_rate_limit_pair_is_atomic_and_success_clears_only_pair(

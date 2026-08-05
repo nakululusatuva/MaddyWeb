@@ -472,9 +472,12 @@ def test_auth_store_revalidates_runtime_after_auth_module_load(
 ) -> None:
     events: list[str] = []
 
+    captured: dict[str, object] = {}
+
     class RecordingStore:
-        def __init__(self, *_args: object, **_kwargs: object) -> None:
+        def __init__(self, *_args: object, **kwargs: object) -> None:
             events.append("store")
+            captured.update(kwargs)
 
     monkeypatch.setattr(auth_module, "AuthStore", RecordingStore)
     monkeypatch.setattr(cli, "_private_auth_directory", lambda _config: tmp_path)
@@ -485,9 +488,20 @@ def test_auth_store_revalidates_runtime_after_auth_module_load(
         lambda: events.append("runtime"),
     )
 
-    cli._auth_store(_config())
+    config = AppConfig.from_dict(
+        {
+            "server": {
+                "allowed_hosts": ["127.0.0.1", "localhost", "maddy.example.test"],
+            },
+            "maddy": {"mode": "docker"},
+            "security": {"public_origin": "https://maddy.example.test"},
+        }
+    )
+    cli._auth_store(config)
 
     assert events == ["store", "runtime"]
+    assert captured["webauthn_rp_id"] == "maddy.example.test"
+    assert captured["webauthn_origin"] == "https://maddy.example.test"
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX ownership and mode contract")

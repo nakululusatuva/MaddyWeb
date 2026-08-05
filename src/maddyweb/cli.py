@@ -16,6 +16,7 @@ import sysconfig
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Never
+from urllib.parse import urlsplit
 
 from aiohttp import web
 
@@ -187,10 +188,16 @@ def _auth_store(config: AppConfig) -> Any:
     from .auth import AuthStore
 
     directory = _private_auth_directory(config)
+    public_origin = config.security.public_origin or None
+    relying_party_id = urlsplit(public_origin).hostname if public_origin is not None else None
+    if public_origin is not None and relying_party_id is None:
+        raise RuntimeError("validated public origin has no relying-party hostname")
     store = AuthStore(
         directory / _AUTH_DATABASE_NAME,
         _auth_master_key(directory),
         config.security.totp_issuer,
+        webauthn_rp_id=relying_party_id,
+        webauthn_origin=public_origin,
     )
     _validate_python_runtime()
     return store

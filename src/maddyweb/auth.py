@@ -13,6 +13,7 @@ import base64
 import hashlib
 import hmac
 import ipaddress
+import json
 import math
 import os
 import re
@@ -28,10 +29,33 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Final
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from webauthn import (
+    generate_authentication_options,
+    generate_registration_options,
+    verify_authentication_response,
+    verify_registration_response,
+)
+from webauthn.authentication.verify_authentication_response import VerifiedAuthentication
+from webauthn.helpers import (
+    options_to_json,
+    parse_authentication_credential_json,
+    parse_registration_credential_json,
+)
+from webauthn.helpers.exceptions import WebAuthnException
+from webauthn.helpers.structs import (
+    AttestationConveyancePreference,
+    AuthenticationCredential,
+    AuthenticatorSelectionCriteria,
+    PublicKeyCredentialDescriptor,
+    RegistrationCredential,
+    ResidentKeyRequirement,
+    UserVerificationRequirement,
+)
+from webauthn.registration.verify_registration_response import VerifiedRegistration
 
 TOTP_PERIOD_SECONDS: Final[int] = 30
 TOTP_WINDOW: Final[int] = 1
@@ -39,27 +63,42 @@ TOTP_SECRET_BYTES: Final[int] = 20
 RECOVERY_CODE_COUNT: Final[int] = 10
 CHALLENGE_LIFETIME_SECONDS: Final[int] = 5 * 60
 CHALLENGE_FAILURE_LIMIT: Final[int] = 5
-SESSION_IDLE_SECONDS: Final[int] = 30 * 60
-SESSION_ABSOLUTE_SECONDS: Final[int] = 12 * 60 * 60
+SESSION_IDLE_SECONDS: Final[int] = 72 * 60 * 60
+SESSION_ABSOLUTE_SECONDS: Final[int] = 30 * 24 * 60 * 60
 STEP_UP_SECONDS: Final[int] = 5 * 60
+_LEGACY_SESSION_IDLE_SECONDS: Final[int] = 30 * 60
 MAX_SESSIONS_PER_ACCOUNT: Final[int] = 5
+MAX_PASSKEYS_PER_ACCOUNT: Final[int] = 10
 
 _TOKEN_BYTES: Final[int] = 32
 _ACCOUNT_ID_BYTES: Final[int] = 16
+_SESSION_ID_BYTES: Final[int] = 16
 _AES_GCM_NONCE_BYTES: Final[int] = 12
 _SCHEMA_VERSION: Final[int] = 4
+_PASSKEY_SESSION_EXTENSION_VERSION: Final[int] = 1
+_PASSKEY_SESSION_EXTENSION_KEY: Final[str] = "passkey_session_extension_version"
 _MAX_CHALLENGES_PER_ACCOUNT: Final[int] = 5
+_MAX_PASSKEY_CHALLENGES_PER_ACCOUNT: Final[int] = 5
+_MAX_ANONYMOUS_PASSKEY_LOGIN_CHALLENGES: Final[int] = 256
 _MAX_RATE_LIMIT_ROWS: Final[int] = 1024
+_MAX_CREDENTIAL_ID_BYTES: Final[int] = 1024
+_MAX_PASSKEY_NAME_LENGTH: Final[int] = 100
+_MAX_USER_AGENT_LENGTH: Final[int] = 512
 _EMAIL_PATTERN: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~.-]+")
 _DOMAIN_LABEL_PATTERN: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9-]+")
 _ACCOUNT_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"[0-9a-f]{32}")
 _OPAQUE_TOKEN_PATTERN: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9_-]{43}")
 _RECOVERY_CODE_PATTERN: Final[re.Pattern[str]] = re.compile(r"[0-9a-f]{32}")
+_SESSION_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"[0-9a-f]{32}")
 _RATE_POLICIES: Final[tuple[tuple[str, int, int], ...]] = (
     ("global", 120, 5 * 60),
     ("ip", 30, 5 * 60),
     ("account", 15, 15 * 60),
     ("pair", 10, 15 * 60),
+)
+_PASSKEY_LOGIN_RATE_POLICIES: Final[tuple[tuple[str, int, int], ...]] = (
+    ("global", 120, 5 * 60),
+    ("ip", 30, 5 * 60),
 )
 
 _SCHEMA = """
@@ -172,6 +211,65 @@ CREATE TABLE IF NOT EXISTS auth_login_rate_limits (
 ) STRICT;
 """
 
+_PASSKEY_SCHEMA = """
+CREATE UNIQUE INDEX IF NOT EXISTS auth_sessions_public_id_idx
+    ON auth_sessions(session_id)
+    WHERE session_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS auth_passkey_credentials (
+    credential_id BLOB PRIMARY KEY
+        CHECK(length(credential_id) BETWEEN 1 AND 1024),
+    public_id TEXT NOT NULL UNIQUE
+        CHECK(length(public_id) = 32),
+    account_id TEXT NOT NULL
+        REFERENCES auth_accounts(account_id) ON DELETE CASCADE,
+    public_key BLOB NOT NULL
+        CHECK(length(public_key) > 0),
+    sign_count INTEGER NOT NULL
+        CHECK(sign_count >= 0),
+    name TEXT NOT NULL
+        CHECK(length(name) BETWEEN 1 AND 100),
+    device_type TEXT NOT NULL
+        CHECK(device_type IN ('single_device', 'multi_device')),
+    backed_up INTEGER NOT NULL
+        CHECK(backed_up IN (0, 1)),
+    transports TEXT,
+    created_at INTEGER NOT NULL,
+    last_used_at INTEGER
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS auth_passkey_credentials_account_idx
+    ON auth_passkey_credentials(account_id, created_at, credential_id);
+
+CREATE TABLE IF NOT EXISTS auth_passkey_challenges (
+    challenge_digest BLOB PRIMARY KEY
+        CHECK(length(challenge_digest) = 32),
+    purpose TEXT NOT NULL
+        CHECK(purpose IN ('registration', 'login', 'step_up')),
+    account_id TEXT
+        REFERENCES auth_accounts(account_id) ON DELETE CASCADE,
+    session_digest BLOB
+        REFERENCES auth_sessions(session_digest) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    failure_count INTEGER NOT NULL DEFAULT 0
+        CHECK(failure_count BETWEEN 0 AND 5),
+    CHECK(
+        (purpose = 'login' AND account_id IS NULL AND session_digest IS NULL)
+        OR (
+            purpose IN ('registration', 'step_up')
+            AND account_id IS NOT NULL
+            AND session_digest IS NOT NULL
+        )
+    )
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS auth_passkey_challenges_account_idx
+    ON auth_passkey_challenges(account_id, created_at, challenge_digest);
+CREATE INDEX IF NOT EXISTS auth_passkey_challenges_expiry_idx
+    ON auth_passkey_challenges(expires_at);
+"""
+
 
 class Role(StrEnum):
     ADMIN = "admin"
@@ -221,6 +319,9 @@ class SessionPrincipal:
     idle_expires_at: int
     absolute_expires_at: int
     step_up_until: int
+    session_id: str | None = None
+    client_ip: str | None = None
+    user_agent: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,9 +331,48 @@ class IssuedSession:
 
 
 @dataclass(frozen=True, slots=True)
+class VerifiedPasskeyIdentity:
+    account_id: str
+    email: str
+
+
+@dataclass(frozen=True, slots=True)
 class EnrollmentResult:
     session: IssuedSession
     recovery_codes: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SessionInfo:
+    session_id: str
+    account_id: str
+    created_at: int
+    last_seen_at: int
+    idle_expires_at: int
+    absolute_expires_at: int
+    step_up_until: int
+    client_ip: str | None
+    user_agent: str | None
+    current: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PasskeyCredential:
+    public_id: str
+    account_id: str
+    name: str
+    sign_count: int
+    device_type: str
+    backed_up: bool
+    transports: tuple[str, ...]
+    created_at: int
+    last_used_at: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class PasskeyCeremony:
+    challenge_token: str
+    options: dict[str, object]
 
 
 class AuthenticationError(RuntimeError):
@@ -267,6 +407,10 @@ class InvalidSecondFactorError(AuthenticationError):
     pass
 
 
+class InvalidPasskeyError(InvalidSecondFactorError):
+    pass
+
+
 class StepUpRequiredError(InvalidSecondFactorError):
     pass
 
@@ -283,6 +427,10 @@ class LoginRateLimitedError(AuthenticationError):
     def __init__(self, retry_after: int) -> None:
         super().__init__("login rate limit exceeded")
         self.retry_after = max(1, retry_after)
+
+
+class PasskeyLimitError(AuthenticationError):
+    pass
 
 
 def canonicalize_email(value: str) -> str:
@@ -379,10 +527,16 @@ class AuthStore:
         *,
         clock: Callable[[], float] = time.time,
         random_bytes: Callable[[int], bytes] = secrets.token_bytes,
+        webauthn_rp_id: str | None = None,
+        webauthn_origin: str | None = None,
     ) -> None:
         if not isinstance(master_key, bytes) or len(master_key) != 32:
             raise ValueError("authentication master key must contain exactly 32 bytes")
         self.issuer = _validate_issuer(issuer)
+        self.webauthn_rp_id, self.webauthn_origin = _validate_webauthn_configuration(
+            webauthn_rp_id,
+            webauthn_origin,
+        )
         self._clock = clock
         self._random_bytes_source = random_bytes
         self._lock = threading.RLock()
@@ -394,6 +548,10 @@ class AuthStore:
 
         self._encryption_key = _derive_key(master_key, b"totp-encryption")
         self._challenge_digest_key = _derive_key(master_key, b"challenge-digest")
+        self._passkey_challenge_digest_key = _derive_key(
+            master_key,
+            b"passkey-challenge-digest",
+        )
         self._session_digest_key = _derive_key(master_key, b"session-digest")
         self._recovery_digest_key = _derive_key(master_key, b"recovery-digest")
         self._rate_digest_key = _derive_key(master_key, b"rate-digest")
@@ -584,6 +742,9 @@ class AuthStore:
                 "DELETE FROM auth_pending_challenges WHERE account_id = ?", (normalized_id,)
             )
             self._connection.execute(
+                "DELETE FROM auth_passkey_challenges WHERE account_id = ?", (normalized_id,)
+            )
+            self._connection.execute(
                 "DELETE FROM auth_sessions WHERE account_id = ?", (normalized_id,)
             )
             row = self._account_row_by_id_locked(normalized_id)
@@ -625,6 +786,9 @@ class AuthStore:
                 "DELETE FROM auth_pending_challenges WHERE account_id = ?", (normalized_id,)
             )
             self._connection.execute(
+                "DELETE FROM auth_passkey_challenges WHERE account_id = ?", (normalized_id,)
+            )
+            self._connection.execute(
                 "DELETE FROM auth_sessions WHERE account_id = ?", (normalized_id,)
             )
         return self._enrollment(canonical, secret), recovery_codes
@@ -649,6 +813,9 @@ class AuthStore:
             self._store_recovery_codes_locked(normalized_id, recovery_codes, now)
             self._connection.execute(
                 "DELETE FROM auth_pending_challenges WHERE account_id = ?", (normalized_id,)
+            )
+            self._connection.execute(
+                "DELETE FROM auth_passkey_challenges WHERE account_id = ?", (normalized_id,)
             )
             self._connection.execute(
                 "DELETE FROM auth_sessions WHERE account_id = ?", (normalized_id,)
@@ -854,6 +1021,10 @@ class AuthStore:
                     (account_id,),
                 )
                 self._connection.execute(
+                    "DELETE FROM auth_passkey_challenges WHERE account_id = ?",
+                    (account_id,),
+                )
+                self._connection.execute(
                     "DELETE FROM auth_sessions WHERE account_id = ?",
                     (account_id,),
                 )
@@ -956,6 +1127,9 @@ class AuthStore:
                     "DELETE FROM auth_recovery_codes WHERE account_id = ?", (account_id,)
                 )
                 self._connection.execute(
+                    "DELETE FROM auth_passkey_challenges WHERE account_id = ?", (account_id,)
+                )
+                self._connection.execute(
                     "DELETE FROM auth_sessions WHERE account_id = ?", (account_id,)
                 )
             secret = _encode_totp_secret(secret_bytes)
@@ -965,6 +1139,9 @@ class AuthStore:
         self,
         challenge_token: str,
         code: str,
+        *,
+        client_ip: str | None = None,
+        user_agent: str | None = None,
     ) -> EnrollmentResult:
         digest = self._opaque_digest(self._challenge_digest_key, challenge_token)
         now = self._now()
@@ -1020,6 +1197,8 @@ class AuthStore:
                     session = self._issue_session_locked(
                         _required_row(account_row),
                         now,
+                        client_ip=client_ip,
+                        user_agent=user_agent,
                     )
                     result = EnrollmentResult(
                         session=session,
@@ -1029,7 +1208,14 @@ class AuthStore:
             raise InvalidSecondFactorError("second-factor verification failed")
         return _required_result(result)
 
-    def complete_totp_challenge(self, challenge_token: str, code: str) -> IssuedSession:
+    def complete_totp_challenge(
+        self,
+        challenge_token: str,
+        code: str,
+        *,
+        client_ip: str | None = None,
+        user_agent: str | None = None,
+    ) -> IssuedSession:
         digest = self._opaque_digest(self._challenge_digest_key, challenge_token)
         now = self._now()
         failure = False
@@ -1068,7 +1254,12 @@ class AuthStore:
                         (digest,),
                     )
                     account_row = self._account_row_by_id_locked(account_id)
-                    issued = self._issue_session_locked(_required_row(account_row), now)
+                    issued = self._issue_session_locked(
+                        _required_row(account_row),
+                        now,
+                        client_ip=client_ip,
+                        user_agent=user_agent,
+                    )
         if failure:
             raise InvalidSecondFactorError("second-factor verification failed")
         return _required_session(issued)
@@ -1077,6 +1268,9 @@ class AuthStore:
         self,
         challenge_token: str,
         recovery_code: str,
+        *,
+        client_ip: str | None = None,
+        user_agent: str | None = None,
     ) -> IssuedSession:
         digest = self._opaque_digest(self._challenge_digest_key, challenge_token)
         normalized_code = _normalize_recovery_code(recovery_code)
@@ -1108,6 +1302,10 @@ class AuthStore:
                     (account_id,),
                 )
                 self._connection.execute(
+                    "DELETE FROM auth_passkey_challenges WHERE account_id = ?",
+                    (account_id,),
+                )
+                self._connection.execute(
                     """
                     DELETE FROM auth_sessions
                     WHERE account_id = ?
@@ -1115,7 +1313,12 @@ class AuthStore:
                     (account_id,),
                 )
                 account_row = self._account_row_by_id_locked(account_id)
-                issued = self._issue_session_locked(_required_row(account_row), now)
+                issued = self._issue_session_locked(
+                    _required_row(account_row),
+                    now,
+                    client_ip=client_ip,
+                    user_agent=user_agent,
+                )
         if failure:
             raise InvalidSecondFactorError("second-factor verification failed")
         return _required_session(issued)
@@ -1198,6 +1401,62 @@ class AuthStore:
             )
         return deleted.rowcount == 1
 
+    def list_sessions(
+        self,
+        account_id: str,
+        *,
+        current_session_token: str | None = None,
+    ) -> tuple[SessionInfo, ...]:
+        """List active sessions using non-secret public identifiers."""
+
+        normalized_id = _validate_account_id(account_id)
+        current_digest = (
+            self._opaque_digest(self._session_digest_key, current_session_token)
+            if current_session_token is not None
+            else None
+        )
+        now = self._now()
+        with self._transaction():
+            self._require_account_by_id_locked(normalized_id)
+            self._delete_expired_sessions_locked(now)
+            rows = self._connection.execute(
+                """
+                SELECT
+                    session_digest, session_id, account_id, created_at, last_seen_at,
+                    absolute_expires_at, step_up_until, client_ip, user_agent
+                FROM auth_sessions
+                WHERE account_id = ?
+                ORDER BY last_seen_at DESC, created_at DESC, session_id
+                """,
+                (normalized_id,),
+            ).fetchall()
+        return tuple(
+            _session_info_from_row(
+                row,
+                current=(
+                    current_digest is not None
+                    and hmac.compare_digest(bytes(row["session_digest"]), current_digest)
+                ),
+            )
+            for row in rows
+        )
+
+    def revoke_session_by_id(self, account_id: str, session_id: str) -> bool:
+        """Revoke one account session without accepting or exposing its bearer token."""
+
+        normalized_account_id = _validate_account_id(account_id)
+        normalized_session_id = _validate_session_id(session_id)
+        with self._transaction():
+            self._require_account_by_id_locked(normalized_account_id)
+            deleted = self._connection.execute(
+                """
+                DELETE FROM auth_sessions
+                WHERE account_id = ? AND session_id = ?
+                """,
+                (normalized_account_id, normalized_session_id),
+            )
+        return deleted.rowcount == 1
+
     def revoke_sessions(self, account_id: str) -> int:
         """Revoke sessions and incomplete login challenges for one account."""
 
@@ -1206,6 +1465,483 @@ class AuthStore:
             self._require_account_by_id_locked(normalized_id)
             session_count = self._revoke_account_authentication_locked(normalized_id)
         return session_count
+
+    def begin_passkey_registration(self, session_token: str) -> PasskeyCeremony:
+        """Begin a user-verified registration bound to one stepped-up session."""
+
+        rp_id, _origin = self._require_passkey_configuration()
+        session_digest = self._opaque_digest(self._session_digest_key, session_token)
+        now = self._now()
+        ceremony: PasskeyCeremony | None = None
+        invalid_session = False
+        step_up_missing = False
+        with self._transaction():
+            loaded = self._valid_session_row_locked(session_digest, now, touch=True)
+            if loaded is None:
+                invalid_session = True
+            else:
+                session_row, _effective_last_seen = loaded
+                if now >= int(session_row["step_up_until"]):
+                    step_up_missing = True
+                else:
+                    account_id = str(session_row["account_id"])
+                    credentials = self._connection.execute(
+                        """
+                        SELECT credential_id
+                        FROM auth_passkey_credentials
+                        WHERE account_id = ?
+                        ORDER BY created_at, credential_id
+                        """,
+                        (account_id,),
+                    ).fetchall()
+                    if len(credentials) >= MAX_PASSKEYS_PER_ACCOUNT:
+                        raise PasskeyLimitError("passkey credential limit reached")
+                    challenge, challenge_token = self._create_passkey_challenge_locked(
+                        purpose="registration",
+                        account_id=account_id,
+                        session_digest=session_digest,
+                        now=now,
+                    )
+                    options = generate_registration_options(
+                        rp_id=rp_id,
+                        rp_name=self.issuer,
+                        user_id=bytes.fromhex(account_id),
+                        user_name=str(session_row["canonical_email"]),
+                        user_display_name=str(session_row["canonical_email"]),
+                        challenge=challenge,
+                        timeout=CHALLENGE_LIFETIME_SECONDS * 1000,
+                        attestation=AttestationConveyancePreference.NONE,
+                        authenticator_selection=AuthenticatorSelectionCriteria(
+                            authenticator_attachment=None,
+                            resident_key=ResidentKeyRequirement.REQUIRED,
+                            require_resident_key=True,
+                            user_verification=UserVerificationRequirement.REQUIRED,
+                        ),
+                        exclude_credentials=[
+                            PublicKeyCredentialDescriptor(id=bytes(row["credential_id"]))
+                            for row in credentials
+                        ],
+                    )
+                    ceremony = PasskeyCeremony(
+                        challenge_token=challenge_token,
+                        options=_options_to_payload(options),
+                    )
+        if ceremony is not None:
+            return ceremony
+        if step_up_missing:
+            raise StepUpRequiredError("recent second-factor verification is required")
+        if invalid_session:
+            raise InvalidSessionError("session is invalid")
+        raise AuthenticationDataError("passkey registration challenge was not issued")
+
+    def complete_passkey_registration(
+        self,
+        session_token: str,
+        challenge_token: str,
+        credential: object,
+        *,
+        name: str = "Passkey",
+    ) -> PasskeyCredential:
+        """Verify and store a passkey registration as one atomic operation."""
+
+        rp_id, origin = self._require_passkey_configuration()
+        normalized_name = _normalize_passkey_name(name)
+        challenge = _decode_opaque_token(challenge_token)
+        if challenge is None:
+            raise InvalidChallengeError("passkey challenge is invalid")
+        challenge_digest = self._passkey_challenge_digest(challenge)
+        session_digest = self._opaque_digest(self._session_digest_key, session_token)
+        now = self._now()
+        result: PasskeyCredential | None = None
+        invalid_session = False
+        step_up_missing = False
+        verification_failed = False
+        with self._transaction():
+            loaded = self._valid_session_row_locked(session_digest, now, touch=True)
+            if loaded is None:
+                invalid_session = True
+            else:
+                session_row, _effective_last_seen = loaded
+                if now >= int(session_row["step_up_until"]):
+                    step_up_missing = True
+                else:
+                    account_id = str(session_row["account_id"])
+                    challenge_row = self._passkey_challenge_row_locked(
+                        challenge_digest,
+                        now,
+                        purpose="registration",
+                        account_id=account_id,
+                        session_digest=session_digest,
+                    )
+                    credential_count = int(
+                        self._connection.execute(
+                            """
+                            SELECT COUNT(*) FROM auth_passkey_credentials
+                            WHERE account_id = ?
+                            """,
+                            (account_id,),
+                        ).fetchone()[0]
+                    )
+                    if credential_count >= MAX_PASSKEYS_PER_ACCOUNT:
+                        raise PasskeyLimitError("passkey credential limit reached")
+                    try:
+                        parsed = _parse_registration_credential(credential)
+                        verified = verify_registration_response(
+                            credential=parsed,
+                            expected_challenge=challenge,
+                            expected_rp_id=rp_id,
+                            expected_origin=origin,
+                            require_user_presence=True,
+                            require_user_verification=True,
+                        )
+                        self._validate_registration_result(parsed, verified)
+                    except TypeError, ValueError, WebAuthnException, InvalidPasskeyError:
+                        self._record_passkey_challenge_failure_locked(
+                            challenge_digest,
+                            int(challenge_row["failure_count"]),
+                        )
+                        verification_failed = True
+                    else:
+                        transports = tuple(
+                            transport.value for transport in (parsed.response.transports or [])
+                        )
+                        try:
+                            self._connection.execute(
+                                """
+                                INSERT INTO auth_passkey_credentials(
+                                    credential_id, public_id, account_id, public_key, sign_count,
+                                    name, device_type, backed_up, transports,
+                                    created_at, last_used_at
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                                """,
+                                (
+                                    verified.credential_id,
+                                    self._new_passkey_public_id_locked(),
+                                    account_id,
+                                    verified.credential_public_key,
+                                    verified.sign_count,
+                                    normalized_name,
+                                    verified.credential_device_type.value,
+                                    int(verified.credential_backed_up),
+                                    json.dumps(transports, separators=(",", ":")),
+                                    now,
+                                ),
+                            )
+                        except sqlite3.IntegrityError:
+                            self._record_passkey_challenge_failure_locked(
+                                challenge_digest,
+                                int(challenge_row["failure_count"]),
+                            )
+                            verification_failed = True
+                        else:
+                            self._connection.execute(
+                                """
+                                DELETE FROM auth_passkey_challenges
+                                WHERE challenge_digest = ?
+                                """,
+                                (challenge_digest,),
+                            )
+                            stored = self._passkey_credential_row_locked(
+                                verified.credential_id,
+                                account_id=account_id,
+                            )
+                            result = _passkey_credential_from_row(_required_row(stored))
+        if result is not None:
+            return result
+        if step_up_missing:
+            raise StepUpRequiredError("recent second-factor verification is required")
+        if invalid_session:
+            raise InvalidSessionError("session is invalid")
+        if verification_failed:
+            raise InvalidPasskeyError("passkey registration failed")
+        raise AuthenticationDataError("passkey registration did not complete")
+
+    def list_passkeys(self, account_id: str) -> tuple[PasskeyCredential, ...]:
+        normalized_id = _validate_account_id(account_id)
+        with self._transaction():
+            self._require_account_by_id_locked(normalized_id)
+            rows = self._connection.execute(
+                """
+                SELECT * FROM auth_passkey_credentials
+                WHERE account_id = ?
+                ORDER BY created_at, credential_id
+                """,
+                (normalized_id,),
+            ).fetchall()
+        return tuple(_passkey_credential_from_row(row) for row in rows)
+
+    def delete_passkey(self, account_id: str, public_id: str) -> bool:
+        normalized_account_id = _validate_account_id(account_id)
+        normalized_public_id = _validate_passkey_public_id(public_id)
+        with self._transaction():
+            self._require_account_by_id_locked(normalized_account_id)
+            deleted = self._connection.execute(
+                """
+                DELETE FROM auth_passkey_credentials
+                WHERE account_id = ? AND public_id = ?
+                """,
+                (normalized_account_id, normalized_public_id),
+            )
+        return deleted.rowcount == 1
+
+    def begin_passkey_login(self) -> PasskeyCeremony:
+        """Begin an account-unbound, user-verified discoverable passkey login."""
+
+        rp_id, _origin = self._require_passkey_configuration()
+        now = self._now()
+        with self._transaction():
+            challenge, challenge_token = self._create_passkey_challenge_locked(
+                purpose="login",
+                account_id=None,
+                session_digest=None,
+                now=now,
+            )
+            options = generate_authentication_options(
+                rp_id=rp_id,
+                challenge=challenge,
+                timeout=CHALLENGE_LIFETIME_SECONDS * 1000,
+                allow_credentials=[],
+                user_verification=UserVerificationRequirement.REQUIRED,
+            )
+        return PasskeyCeremony(
+            challenge_token=challenge_token,
+            options=_options_to_payload(options),
+        )
+
+    def complete_passkey_login(
+        self,
+        challenge_token: str,
+        credential: object,
+        *,
+        client_ip: str | None = None,
+        user_agent: str | None = None,
+    ) -> IssuedSession:
+        """Verify a discoverable assertion and issue one ordinary session."""
+
+        identity = self.verify_passkey_login(challenge_token, credential)
+        return self.issue_verified_passkey_session(
+            identity,
+            client_ip=client_ip,
+            user_agent=user_agent,
+        )
+
+    def verify_passkey_login(
+        self,
+        challenge_token: str,
+        credential: object,
+    ) -> VerifiedPasskeyIdentity:
+        """Verify a discoverable assertion without changing active sessions."""
+
+        rp_id, origin = self._require_passkey_configuration()
+        challenge = _decode_opaque_token(challenge_token)
+        if challenge is None:
+            raise InvalidChallengeError("passkey challenge is invalid")
+        challenge_digest = self._passkey_challenge_digest(challenge)
+        now = self._now()
+        identity: VerifiedPasskeyIdentity | None = None
+        verification_failed = False
+        with self._transaction():
+            challenge_row = self._passkey_challenge_row_locked(
+                challenge_digest,
+                now,
+                purpose="login",
+                account_id=None,
+                session_digest=None,
+            )
+            try:
+                parsed = _parse_authentication_credential(credential)
+                credential_id = bytes(parsed.raw_id)
+                if not 1 <= len(credential_id) <= _MAX_CREDENTIAL_ID_BYTES:
+                    raise InvalidPasskeyError("passkey authentication failed")
+                credential_row = self._passkey_credential_row_by_id_locked(credential_id)
+                if credential_row is None:
+                    raise InvalidPasskeyError("passkey authentication failed")
+                account_id = str(credential_row["account_id"])
+                user_handle = parsed.response.user_handle
+                if user_handle is None or not hmac.compare_digest(
+                    bytes(user_handle),
+                    bytes.fromhex(account_id),
+                ):
+                    raise InvalidPasskeyError("passkey authentication failed")
+                self._verify_passkey_assertion_locked(
+                    parsed,
+                    challenge=challenge,
+                    account_id=account_id,
+                    rp_id=rp_id,
+                    origin=origin,
+                    now=now,
+                )
+            except TypeError, ValueError, WebAuthnException, InvalidPasskeyError:
+                self._record_passkey_challenge_failure_locked(
+                    challenge_digest,
+                    int(challenge_row["failure_count"]),
+                )
+                verification_failed = True
+            else:
+                self._connection.execute(
+                    "DELETE FROM auth_passkey_challenges WHERE challenge_digest = ?",
+                    (challenge_digest,),
+                )
+                account_row = _required_row(self._account_row_by_id_locked(account_id))
+                identity = VerifiedPasskeyIdentity(
+                    account_id=account_id,
+                    email=str(account_row["canonical_email"]),
+                )
+        if identity is not None:
+            return identity
+        if verification_failed:
+            raise InvalidPasskeyError("passkey authentication failed")
+        raise AuthenticationDataError("passkey identity was not verified")
+
+    def issue_verified_passkey_session(
+        self,
+        identity: VerifiedPasskeyIdentity,
+        *,
+        client_ip: str | None = None,
+        user_agent: str | None = None,
+    ) -> IssuedSession:
+        """Issue a session after the caller validates the verified live identity."""
+
+        if not isinstance(identity, VerifiedPasskeyIdentity):
+            raise TypeError("verified passkey identity is required")
+        account_id = _validate_account_id(identity.account_id)
+        email = canonicalize_email(identity.email)
+        now = self._now()
+        issued: IssuedSession | None = None
+        with self._transaction():
+            account_row = self._account_row_by_id_locked(account_id)
+            if account_row is None or str(account_row["canonical_email"]) != email:
+                raise AccountNotFoundError(email)
+            issued = self._issue_session_locked(
+                account_row,
+                now,
+                client_ip=client_ip,
+                user_agent=user_agent,
+            )
+        return _required_session(issued)
+
+    def begin_passkey_step_up(self, session_token: str) -> PasskeyCeremony:
+        """Begin a user-verified assertion bound to one valid session."""
+
+        rp_id, _origin = self._require_passkey_configuration()
+        session_digest = self._opaque_digest(self._session_digest_key, session_token)
+        now = self._now()
+        ceremony: PasskeyCeremony | None = None
+        with self._transaction():
+            loaded = self._valid_session_row_locked(session_digest, now, touch=True)
+            if loaded is not None:
+                session_row, _effective_last_seen = loaded
+                account_id = str(session_row["account_id"])
+                credentials = self._connection.execute(
+                    """
+                    SELECT credential_id FROM auth_passkey_credentials
+                    WHERE account_id = ?
+                    ORDER BY created_at, credential_id
+                    """,
+                    (account_id,),
+                ).fetchall()
+                if not credentials:
+                    raise InvalidPasskeyError("account has no registered passkey")
+                challenge, challenge_token = self._create_passkey_challenge_locked(
+                    purpose="step_up",
+                    account_id=account_id,
+                    session_digest=session_digest,
+                    now=now,
+                )
+                options = generate_authentication_options(
+                    rp_id=rp_id,
+                    challenge=challenge,
+                    timeout=CHALLENGE_LIFETIME_SECONDS * 1000,
+                    allow_credentials=[
+                        PublicKeyCredentialDescriptor(id=bytes(row["credential_id"]))
+                        for row in credentials
+                    ],
+                    user_verification=UserVerificationRequirement.REQUIRED,
+                )
+                ceremony = PasskeyCeremony(
+                    challenge_token=challenge_token,
+                    options=_options_to_payload(options),
+                )
+        if ceremony is None:
+            raise InvalidSessionError("session is invalid")
+        return ceremony
+
+    def complete_passkey_step_up(
+        self,
+        session_token: str,
+        challenge_token: str,
+        credential: object,
+    ) -> SessionPrincipal:
+        """Verify a session-bound assertion and grant five minutes of step-up."""
+
+        rp_id, origin = self._require_passkey_configuration()
+        challenge = _decode_opaque_token(challenge_token)
+        if challenge is None:
+            raise InvalidChallengeError("passkey challenge is invalid")
+        challenge_digest = self._passkey_challenge_digest(challenge)
+        session_digest = self._opaque_digest(self._session_digest_key, session_token)
+        now = self._now()
+        principal: SessionPrincipal | None = None
+        invalid_session = False
+        verification_failed = False
+        with self._transaction():
+            loaded = self._valid_session_row_locked(session_digest, now, touch=True)
+            if loaded is None:
+                invalid_session = True
+            else:
+                session_row, effective_last_seen = loaded
+                account_id = str(session_row["account_id"])
+                challenge_row = self._passkey_challenge_row_locked(
+                    challenge_digest,
+                    now,
+                    purpose="step_up",
+                    account_id=account_id,
+                    session_digest=session_digest,
+                )
+                try:
+                    self._verify_passkey_assertion_locked(
+                        credential,
+                        challenge=challenge,
+                        account_id=account_id,
+                        rp_id=rp_id,
+                        origin=origin,
+                        now=now,
+                    )
+                except TypeError, ValueError, WebAuthnException, InvalidPasskeyError:
+                    self._record_passkey_challenge_failure_locked(
+                        challenge_digest,
+                        int(challenge_row["failure_count"]),
+                    )
+                    verification_failed = True
+                else:
+                    step_up_until = min(
+                        now + STEP_UP_SECONDS,
+                        int(session_row["absolute_expires_at"]),
+                    )
+                    self._connection.execute(
+                        """
+                        UPDATE auth_sessions
+                        SET step_up_until = ?
+                        WHERE session_digest = ?
+                        """,
+                        (step_up_until, session_digest),
+                    )
+                    self._connection.execute(
+                        "DELETE FROM auth_passkey_challenges WHERE challenge_digest = ?",
+                        (challenge_digest,),
+                    )
+                    principal = _principal_from_session_row(
+                        session_row,
+                        effective_last_seen,
+                        step_up_until=step_up_until,
+                    )
+        if principal is not None:
+            return principal
+        if invalid_session:
+            raise InvalidSessionError("session is invalid")
+        if verification_failed:
+            raise InvalidPasskeyError("passkey authentication failed")
+        raise AuthenticationDataError("passkey step-up did not complete")
 
     def check_login_rate(self, email: str, client_ip: str) -> None:
         """Atomically reserve one login attempt or raise with a retry delay."""
@@ -1331,6 +2067,103 @@ class AuthStore:
                 (pair_digest,),
             )
 
+    def check_passkey_login_rate(self, client_ip: str) -> None:
+        """Reserve one account-unbound passkey attempt for the global and IP buckets."""
+
+        normalized_ip = _canonical_ip(client_ip)
+        now = self._now()
+        identities = self._passkey_login_rate_identities(normalized_ip)
+        retry_after = 0
+        with self._transaction():
+            for scope, _limit, window_seconds in _PASSKEY_LOGIN_RATE_POLICIES:
+                self._connection.execute(
+                    """
+                    DELETE FROM auth_login_rate_limits
+                    WHERE scope = ? AND window_started_at <= ?
+                    """,
+                    (scope, now - window_seconds),
+                )
+            retained_rows = int(
+                self._connection.execute("SELECT COUNT(*) FROM auth_login_rate_limits").fetchone()[
+                    0
+                ]
+            )
+            if retained_rows > _MAX_RATE_LIMIT_ROWS:
+                self._connection.execute(
+                    """
+                    DELETE FROM auth_login_rate_limits
+                    WHERE rowid IN (
+                        SELECT rowid
+                        FROM auth_login_rate_limits
+                        ORDER BY (scope = 'global'), window_started_at, rowid
+                        LIMIT ?
+                    )
+                    """,
+                    (retained_rows - _MAX_RATE_LIMIT_ROWS,),
+                )
+                retry_after = max(window for _scope, _limit, window in _PASSKEY_LOGIN_RATE_POLICIES)
+            rows_by_scope: dict[str, sqlite3.Row | None] = {}
+            for scope, limit, window_seconds in _PASSKEY_LOGIN_RATE_POLICIES:
+                row = self._connection.execute(
+                    """
+                    SELECT window_started_at, attempt_count
+                    FROM auth_login_rate_limits
+                    WHERE scope = ? AND identity_digest = ?
+                    """,
+                    (scope, identities[scope]),
+                ).fetchone()
+                rows_by_scope[scope] = row
+                if row is None:
+                    continue
+                elapsed = max(0, now - int(row["window_started_at"]))
+                if int(row["attempt_count"]) >= limit:
+                    retry_after = max(retry_after, window_seconds - elapsed)
+            if retry_after == 0:
+                current_rows = int(
+                    self._connection.execute(
+                        "SELECT COUNT(*) FROM auth_login_rate_limits"
+                    ).fetchone()[0]
+                )
+                if current_rows + sum(row is None for row in rows_by_scope.values()) > (
+                    _MAX_RATE_LIMIT_ROWS
+                ):
+                    retry_after = max(
+                        window for _scope, _limit, window in _PASSKEY_LOGIN_RATE_POLICIES
+                    )
+            if retry_after == 0:
+                for scope, _limit, _window_seconds in _PASSKEY_LOGIN_RATE_POLICIES:
+                    self._connection.execute(
+                        """
+                        INSERT INTO auth_login_rate_limits(
+                            scope, identity_digest, account_id, account_identity_digest,
+                            window_started_at, attempt_count
+                        ) VALUES (?, ?, NULL, NULL, ?, 1)
+                        ON CONFLICT(scope, identity_digest) DO UPDATE SET
+                            attempt_count = auth_login_rate_limits.attempt_count + 1
+                        """,
+                        (scope, identities[scope], now),
+                    )
+        if retry_after:
+            raise LoginRateLimitedError(retry_after)
+
+    def record_passkey_login_result(self, client_ip: str, *, success: bool) -> None:
+        """Clear only the account-unbound IP bucket after a completed login."""
+
+        if not isinstance(success, bool):
+            raise ValueError("success must be a boolean")
+        normalized_ip = _canonical_ip(client_ip)
+        if not success:
+            return
+        digest = self._passkey_login_rate_identities(normalized_ip)["ip"]
+        with self._transaction():
+            self._connection.execute(
+                """
+                DELETE FROM auth_login_rate_limits
+                WHERE scope = 'ip' AND identity_digest = ?
+                """,
+                (digest,),
+            )
+
     def _configure_connection(self) -> None:
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._connection.execute("PRAGMA trusted_schema = OFF")
@@ -1371,6 +2204,29 @@ class AuthStore:
                     ADD COLUMN step_up_until INTEGER NOT NULL DEFAULT 0
                     """
                 )
+            if "session_id" not in session_columns:
+                self._connection.execute(
+                    """
+                    ALTER TABLE auth_sessions
+                    ADD COLUMN session_id TEXT
+                        CHECK(session_id IS NULL OR length(session_id) = 32)
+                    """
+                )
+            if "client_ip" not in session_columns:
+                self._connection.execute(
+                    """
+                    ALTER TABLE auth_sessions
+                    ADD COLUMN client_ip TEXT
+                    """
+                )
+            if "user_agent" not in session_columns:
+                self._connection.execute(
+                    """
+                    ALTER TABLE auth_sessions
+                    ADD COLUMN user_agent TEXT
+                        CHECK(user_agent IS NULL OR length(user_agent) <= 512)
+                    """
+                )
             rate_columns = {
                 str(row["name"])
                 for row in self._connection.execute(
@@ -1396,6 +2252,7 @@ class AuthStore:
                         )
                     """
                 )
+            self._connection.executescript(_PASSKEY_SCHEMA)
         with self._transaction():
             version = self._connection.execute(
                 "SELECT value FROM auth_metadata WHERE key = 'schema_version'"
@@ -1484,6 +2341,49 @@ class AuthStore:
                     """,
                     (str(_SCHEMA_VERSION).encode("ascii"),),
                 )
+            extension = self._connection.execute(
+                "SELECT value FROM auth_metadata WHERE key = ?",
+                (_PASSKEY_SESSION_EXTENSION_KEY,),
+            ).fetchone()
+            if extension is None:
+                migration_now = self._now()
+                self._connection.execute(
+                    """
+                    DELETE FROM auth_sessions
+                    WHERE absolute_expires_at <= ?
+                       OR last_seen_at + ? <= ?
+                    """,
+                    (migration_now, _LEGACY_SESSION_IDLE_SECONDS, migration_now),
+                )
+                self._connection.execute(
+                    "INSERT INTO auth_metadata(key, value) VALUES (?, ?)",
+                    (
+                        _PASSKEY_SESSION_EXTENSION_KEY,
+                        str(_PASSKEY_SESSION_EXTENSION_VERSION).encode("ascii"),
+                    ),
+                )
+            else:
+                try:
+                    extension_version = int(bytes(extension["value"]).decode("ascii"))
+                except (UnicodeDecodeError, ValueError) as exc:
+                    raise AuthenticationDataError(
+                        "invalid passkey/session extension schema version"
+                    ) from exc
+                if extension_version != _PASSKEY_SESSION_EXTENSION_VERSION:
+                    raise AuthenticationDataError(
+                        "unsupported passkey/session extension schema version"
+                    )
+            legacy_sessions = self._connection.execute(
+                "SELECT session_digest FROM auth_sessions WHERE session_id IS NULL"
+            ).fetchall()
+            for legacy_session in legacy_sessions:
+                self._connection.execute(
+                    "UPDATE auth_sessions SET session_id = ? WHERE session_digest = ?",
+                    (
+                        self._new_session_id_locked(),
+                        bytes(legacy_session["session_digest"]),
+                    ),
+                )
             verifier = self._connection.execute(
                 "SELECT value FROM auth_metadata WHERE key = 'master_key_verifier'"
             ).fetchone()
@@ -1536,6 +2436,306 @@ class AuthStore:
             if exists is None:
                 return account_id
         raise AuthenticationError("unable to allocate a unique account identifier")
+
+    def _new_session_id_locked(self) -> str:
+        for _ in range(8):
+            session_id = self._random_bytes(_SESSION_ID_BYTES).hex()
+            exists = self._connection.execute(
+                "SELECT 1 FROM auth_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if exists is None:
+                return session_id
+        raise AuthenticationError("unable to allocate a unique session identifier")
+
+    def _new_passkey_public_id_locked(self) -> str:
+        for _ in range(8):
+            public_id = self._random_bytes(_SESSION_ID_BYTES).hex()
+            exists = self._connection.execute(
+                "SELECT 1 FROM auth_passkey_credentials WHERE public_id = ?",
+                (public_id,),
+            ).fetchone()
+            if exists is None:
+                return public_id
+        raise AuthenticationError("unable to allocate a unique passkey identifier")
+
+    def _require_passkey_configuration(self) -> tuple[str, str]:
+        if self.webauthn_rp_id is None or self.webauthn_origin is None:
+            raise AuthenticationError("passkey authentication is not configured")
+        return self.webauthn_rp_id, self.webauthn_origin
+
+    def _passkey_challenge_digest(self, challenge: bytes) -> bytes:
+        return hmac.digest(self._passkey_challenge_digest_key, challenge, "sha256")
+
+    def _create_passkey_challenge_locked(
+        self,
+        *,
+        purpose: str,
+        account_id: str | None,
+        session_digest: bytes | None,
+        now: int,
+    ) -> tuple[bytes, str]:
+        self._delete_expired_passkey_challenges_locked(now)
+        if purpose == "login":
+            if account_id is not None or session_digest is not None:
+                raise ValueError("login passkey challenges must not bind an account or session")
+            challenge_count = int(
+                self._connection.execute(
+                    """
+                    SELECT COUNT(*) FROM auth_passkey_challenges
+                    WHERE purpose = 'login'
+                    """
+                ).fetchone()[0]
+            )
+            if challenge_count >= _MAX_ANONYMOUS_PASSKEY_LOGIN_CHALLENGES:
+                remove_count = challenge_count - _MAX_ANONYMOUS_PASSKEY_LOGIN_CHALLENGES + 1
+                self._connection.execute(
+                    """
+                    DELETE FROM auth_passkey_challenges
+                    WHERE challenge_digest IN (
+                        SELECT challenge_digest
+                        FROM auth_passkey_challenges
+                        WHERE purpose = 'login'
+                        ORDER BY created_at, challenge_digest
+                        LIMIT ?
+                    )
+                    """,
+                    (remove_count,),
+                )
+        else:
+            if purpose not in {"registration", "step_up"}:
+                raise ValueError("invalid passkey challenge purpose")
+            if account_id is None or session_digest is None:
+                raise ValueError("authenticated passkey challenges require an account and session")
+            challenge_count = int(
+                self._connection.execute(
+                    """
+                    SELECT COUNT(*) FROM auth_passkey_challenges
+                    WHERE purpose != 'login' AND account_id = ?
+                    """,
+                    (account_id,),
+                ).fetchone()[0]
+            )
+            if challenge_count >= _MAX_PASSKEY_CHALLENGES_PER_ACCOUNT:
+                remove_count = challenge_count - _MAX_PASSKEY_CHALLENGES_PER_ACCOUNT + 1
+                self._connection.execute(
+                    """
+                    DELETE FROM auth_passkey_challenges
+                    WHERE challenge_digest IN (
+                        SELECT challenge_digest
+                        FROM auth_passkey_challenges
+                        WHERE purpose != 'login' AND account_id = ?
+                        ORDER BY created_at, challenge_digest
+                        LIMIT ?
+                    )
+                    """,
+                    (account_id, remove_count),
+                )
+        for _ in range(8):
+            challenge = self._random_bytes(_TOKEN_BYTES)
+            challenge_digest = self._passkey_challenge_digest(challenge)
+            exists = self._connection.execute(
+                """
+                SELECT 1 FROM auth_passkey_challenges
+                WHERE challenge_digest = ?
+                """,
+                (challenge_digest,),
+            ).fetchone()
+            if exists is not None:
+                continue
+            self._connection.execute(
+                """
+                INSERT INTO auth_passkey_challenges(
+                    challenge_digest, purpose, account_id, session_digest,
+                    created_at, expires_at, failure_count
+                ) VALUES (?, ?, ?, ?, ?, ?, 0)
+                """,
+                (
+                    challenge_digest,
+                    purpose,
+                    account_id,
+                    session_digest,
+                    now,
+                    now + CHALLENGE_LIFETIME_SECONDS,
+                ),
+            )
+            return challenge, _encode_opaque_token(challenge)
+        raise AuthenticationError("unable to allocate a unique passkey challenge")
+
+    def _passkey_challenge_row_locked(
+        self,
+        challenge_digest: bytes,
+        now: int,
+        *,
+        purpose: str,
+        account_id: str | None,
+        session_digest: bytes | None,
+    ) -> sqlite3.Row:
+        row = self._connection.execute(
+            """
+            SELECT * FROM auth_passkey_challenges
+            WHERE challenge_digest = ?
+            """,
+            (challenge_digest,),
+        ).fetchone()
+        if row is None or now >= int(row["expires_at"]):
+            raise InvalidChallengeError("passkey challenge is invalid")
+        if not hmac.compare_digest(str(row["purpose"]), purpose):
+            raise InvalidChallengeError("passkey challenge is invalid")
+        stored_account_id = row["account_id"]
+        if account_id is None:
+            if stored_account_id is not None:
+                raise InvalidChallengeError("passkey challenge is invalid")
+        elif not isinstance(stored_account_id, str) or not hmac.compare_digest(
+            stored_account_id,
+            account_id,
+        ):
+            raise InvalidChallengeError("passkey challenge is invalid")
+        stored_session_digest = row["session_digest"]
+        if session_digest is None:
+            if stored_session_digest is not None:
+                raise InvalidChallengeError("passkey challenge is invalid")
+        elif not isinstance(stored_session_digest, bytes) or not hmac.compare_digest(
+            stored_session_digest,
+            session_digest,
+        ):
+            raise InvalidChallengeError("passkey challenge is invalid")
+        return row
+
+    def _record_passkey_challenge_failure_locked(
+        self,
+        challenge_digest: bytes,
+        failure_count: int,
+    ) -> None:
+        next_count = failure_count + 1
+        if next_count >= CHALLENGE_FAILURE_LIMIT:
+            self._connection.execute(
+                "DELETE FROM auth_passkey_challenges WHERE challenge_digest = ?",
+                (challenge_digest,),
+            )
+        else:
+            self._connection.execute(
+                """
+                UPDATE auth_passkey_challenges
+                SET failure_count = ?
+                WHERE challenge_digest = ?
+                """,
+                (next_count, challenge_digest),
+            )
+
+    def _delete_expired_passkey_challenges_locked(self, now: int) -> None:
+        self._connection.execute(
+            "DELETE FROM auth_passkey_challenges WHERE expires_at <= ?",
+            (now,),
+        )
+
+    def _passkey_credential_row_locked(
+        self,
+        credential_id: bytes,
+        *,
+        account_id: str,
+    ) -> sqlite3.Row | None:
+        return self._connection.execute(
+            """
+            SELECT * FROM auth_passkey_credentials
+            WHERE credential_id = ? AND account_id = ?
+            """,
+            (credential_id, account_id),
+        ).fetchone()
+
+    def _passkey_credential_row_by_id_locked(
+        self,
+        credential_id: bytes,
+    ) -> sqlite3.Row | None:
+        return self._connection.execute(
+            """
+            SELECT * FROM auth_passkey_credentials
+            WHERE credential_id = ?
+            """,
+            (credential_id,),
+        ).fetchone()
+
+    @staticmethod
+    def _validate_registration_result(
+        credential: RegistrationCredential,
+        verified: VerifiedRegistration,
+    ) -> None:
+        credential_id = bytes(verified.credential_id)
+        public_key = bytes(verified.credential_public_key)
+        if (
+            not verified.user_verified
+            or credential.raw_id != credential_id
+            or not 1 <= len(credential_id) <= _MAX_CREDENTIAL_ID_BYTES
+            or not public_key
+            or verified.sign_count < 0
+            or verified.credential_device_type.value not in {"single_device", "multi_device"}
+        ):
+            raise InvalidPasskeyError("passkey registration failed")
+
+    def _verify_passkey_assertion_locked(
+        self,
+        credential: object,
+        *,
+        challenge: bytes,
+        account_id: str,
+        rp_id: str,
+        origin: str,
+        now: int,
+    ) -> VerifiedAuthentication:
+        parsed = _parse_authentication_credential(credential)
+        credential_id = bytes(parsed.raw_id)
+        if not 1 <= len(credential_id) <= _MAX_CREDENTIAL_ID_BYTES:
+            raise InvalidPasskeyError("passkey authentication failed")
+        credential_row = self._passkey_credential_row_locked(
+            credential_id,
+            account_id=account_id,
+        )
+        if credential_row is None:
+            raise InvalidPasskeyError("passkey authentication failed")
+        user_handle = parsed.response.user_handle
+        if user_handle is not None and bytes(user_handle) != bytes.fromhex(account_id):
+            raise InvalidPasskeyError("passkey authentication failed")
+        current_sign_count = int(credential_row["sign_count"])
+        verified = verify_authentication_response(
+            credential=parsed,
+            expected_challenge=challenge,
+            expected_rp_id=rp_id,
+            expected_origin=origin,
+            credential_public_key=bytes(credential_row["public_key"]),
+            credential_current_sign_count=current_sign_count,
+            require_user_verification=True,
+        )
+        new_sign_count = int(verified.new_sign_count)
+        if (
+            not verified.user_verified
+            or bytes(verified.credential_id) != credential_id
+            or new_sign_count < 0
+            or (
+                (new_sign_count > 0 or current_sign_count > 0)
+                and new_sign_count <= current_sign_count
+            )
+            or verified.credential_device_type.value not in {"single_device", "multi_device"}
+        ):
+            raise InvalidPasskeyError("passkey authentication failed")
+        updated = self._connection.execute(
+            """
+            UPDATE auth_passkey_credentials
+            SET sign_count = ?, device_type = ?, backed_up = ?, last_used_at = ?
+            WHERE credential_id = ? AND account_id = ? AND sign_count = ?
+            """,
+            (
+                new_sign_count,
+                verified.credential_device_type.value,
+                int(verified.credential_backed_up),
+                now,
+                credential_id,
+                account_id,
+                current_sign_count,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise InvalidPasskeyError("passkey authentication failed")
+        return verified
 
     def _new_unique_token_locked(
         self,
@@ -1692,6 +2892,10 @@ class AuthStore:
             "DELETE FROM auth_pending_challenges WHERE account_id = ?",
             (account_id,),
         )
+        self._connection.execute(
+            "DELETE FROM auth_passkey_challenges WHERE account_id = ?",
+            (account_id,),
+        )
 
     def _consume_totp_locked(self, row: sqlite3.Row, code: str, now: int) -> bool:
         if EnrollmentState(str(row["enrollment_state"])) is not EnrollmentState.ACTIVE:
@@ -1726,6 +2930,9 @@ class AuthStore:
                 s.last_seen_at,
                 s.absolute_expires_at,
                 s.step_up_until,
+                s.session_id,
+                s.client_ip,
+                s.user_agent,
                 a.*
             FROM auth_sessions AS s
             JOIN auth_accounts AS a ON a.account_id = s.account_id
@@ -1753,6 +2960,16 @@ class AuthStore:
                 (effective_last_seen, digest),
             )
         return row, effective_last_seen
+
+    def _delete_expired_sessions_locked(self, now: int) -> None:
+        self._connection.execute(
+            """
+            DELETE FROM auth_sessions
+            WHERE absolute_expires_at <= ?
+               OR last_seen_at + ? <= ?
+            """,
+            (now, SESSION_IDLE_SECONDS, now),
+        )
 
     def _encrypt_totp(
         self,
@@ -1828,16 +3045,20 @@ class AuthStore:
         )
         return hmac.digest(key, bounded.encode("ascii"), "sha256")
 
-    def _issue_session_locked(self, account_row: sqlite3.Row, now: int) -> IssuedSession:
+    def _issue_session_locked(
+        self,
+        account_row: sqlite3.Row,
+        now: int,
+        *,
+        client_ip: str | None = None,
+        user_agent: str | None = None,
+    ) -> IssuedSession:
         account_id = str(account_row["account_id"])
-        self._connection.execute(
-            """
-            DELETE FROM auth_sessions
-            WHERE absolute_expires_at <= ?
-               OR last_seen_at + ? <= ?
-            """,
-            (now, SESSION_IDLE_SECONDS, now),
+        normalized_ip, normalized_user_agent = _normalize_session_metadata(
+            client_ip,
+            user_agent,
         )
+        self._delete_expired_sessions_locked(now)
         session_count = int(
             self._connection.execute(
                 "SELECT COUNT(*) FROM auth_sessions WHERE account_id = ?",
@@ -1864,15 +3085,25 @@ class AuthStore:
             table="auth_sessions",
             digest_column="session_digest",
         )
+        session_id = self._new_session_id_locked()
         absolute_expires = now + SESSION_ABSOLUTE_SECONDS
         self._connection.execute(
             """
             INSERT INTO auth_sessions(
                 session_digest, account_id, created_at, last_seen_at,
-                absolute_expires_at, step_up_until
-            ) VALUES (?, ?, ?, ?, ?, 0)
+                absolute_expires_at, step_up_until, session_id, client_ip, user_agent
+            ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
             """,
-            (digest, account_id, now, now, absolute_expires),
+            (
+                digest,
+                account_id,
+                now,
+                now,
+                absolute_expires,
+                session_id,
+                normalized_ip,
+                normalized_user_agent,
+            ),
         )
         principal = SessionPrincipal(
             account_id=account_id,
@@ -1884,6 +3115,9 @@ class AuthStore:
             idle_expires_at=min(now + SESSION_IDLE_SECONDS, absolute_expires),
             absolute_expires_at=absolute_expires,
             step_up_until=0,
+            session_id=session_id,
+            client_ip=normalized_ip,
+            user_agent=normalized_user_agent,
         )
         return IssuedSession(token=token, principal=principal)
 
@@ -1905,6 +3139,13 @@ class AuthStore:
             "ip": self._rate_digest(b"ip", ip_bytes),
             "account": self._rate_digest(b"account", email_bytes),
             "pair": self._rate_digest(b"pair", email_bytes + b"\0" + ip_bytes),
+        }
+
+    def _passkey_login_rate_identities(self, normalized_ip: str) -> dict[str, bytes]:
+        ip_bytes = normalized_ip.encode("ascii")
+        return {
+            "global": self._rate_digest(b"passkey-global", b"all"),
+            "ip": self._rate_digest(b"passkey-ip", ip_bytes),
         }
 
     def _rate_digest(self, scope: bytes, value: bytes) -> bytes:
@@ -1930,6 +3171,77 @@ def _validate_issuer(value: str) -> str:
     return issuer
 
 
+def _validate_webauthn_configuration(
+    rp_id: str | None,
+    origin: str | None,
+) -> tuple[str | None, str | None]:
+    if rp_id is None and origin is None:
+        return None, None
+    if not isinstance(rp_id, str) or not isinstance(origin, str):
+        raise ValueError("WebAuthn RP ID and origin must be configured together")
+    normalized_rp_id = rp_id.strip().lower()
+    if (
+        not normalized_rp_id
+        or len(normalized_rp_id) > 253
+        or not normalized_rp_id.isascii()
+        or normalized_rp_id.endswith(".")
+    ):
+        raise ValueError("WebAuthn RP ID must be an ASCII host name or IP address")
+    try:
+        ipaddress.ip_address(normalized_rp_id)
+        rp_is_ip = True
+    except ValueError:
+        rp_is_ip = False
+        if any(
+            not label
+            or len(label) > 63
+            or label.startswith("-")
+            or label.endswith("-")
+            or _DOMAIN_LABEL_PATTERN.fullmatch(label) is None
+            for label in normalized_rp_id.split(".")
+        ):
+            raise ValueError("WebAuthn RP ID must be an ASCII host name or IP address") from None
+
+    configured_origin = origin.strip()
+    parsed = urlsplit(configured_origin)
+    try:
+        parsed_port = parsed.port
+    except ValueError as exc:
+        raise ValueError("WebAuthn origin must contain a valid port") from exc
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("WebAuthn origin must be an exact HTTPS origin without a path")
+    origin_host = parsed.hostname.lower()
+    if not origin_host.isascii():
+        raise ValueError("WebAuthn origin host must be ASCII")
+    if rp_is_ip:
+        rp_matches_origin = origin_host == normalized_rp_id
+    else:
+        rp_matches_origin = origin_host == normalized_rp_id or origin_host.endswith(
+            f".{normalized_rp_id}"
+        )
+    if not rp_matches_origin:
+        raise ValueError("WebAuthn RP ID must equal or be a parent of the origin host")
+    try:
+        origin_ip = ipaddress.ip_address(origin_host)
+    except ValueError:
+        origin_host_text = origin_host
+    else:
+        origin_host_text = f"[{origin_ip}]" if origin_ip.version == 6 else str(origin_ip)
+    normalized_origin = f"https://{origin_host_text}"
+    if parsed_port is not None:
+        normalized_origin = f"{normalized_origin}:{parsed_port}"
+    return normalized_rp_id, normalized_origin
+
+
 def _coerce_role(value: Role | str) -> Role:
     try:
         return Role(value)
@@ -1949,12 +3261,89 @@ def _validate_account_id(value: str) -> str:
     return value
 
 
+def _validate_session_id(value: str) -> str:
+    if not isinstance(value, str) or _SESSION_ID_PATTERN.fullmatch(value) is None:
+        raise ValueError("session identifier must be 32 lowercase hexadecimal characters")
+    return value
+
+
+def _validate_passkey_public_id(value: str) -> str:
+    if not isinstance(value, str) or _SESSION_ID_PATTERN.fullmatch(value) is None:
+        raise ValueError("passkey identifier must be 32 lowercase hexadecimal characters")
+    return value
+
+
+def _normalize_passkey_name(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("passkey name must be text")
+    normalized = value.strip()
+    if (
+        not normalized
+        or len(normalized) > _MAX_PASSKEY_NAME_LENGTH
+        or any(character in "\r\n\0" for character in normalized)
+    ):
+        raise ValueError("passkey name must contain 1 to 100 safe characters")
+    return normalized
+
+
+def _normalize_session_metadata(
+    client_ip: str | None,
+    user_agent: str | None,
+) -> tuple[str | None, str | None]:
+    normalized_ip = None if client_ip is None else _canonical_ip(client_ip)
+    if user_agent is None:
+        return normalized_ip, None
+    if not isinstance(user_agent, str):
+        raise ValueError("user agent must be text")
+    normalized_user_agent = user_agent.strip()
+    if not normalized_user_agent:
+        return normalized_ip, None
+    if len(normalized_user_agent) > _MAX_USER_AGENT_LENGTH or any(
+        character in "\r\n\0" for character in normalized_user_agent
+    ):
+        raise ValueError("user agent must contain at most 512 safe characters")
+    return normalized_ip, normalized_user_agent
+
+
 def _encode_totp_secret(value: bytes) -> str:
     return base64.b32encode(value).decode("ascii").rstrip("=")
 
 
 def _encode_opaque_token(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
+
+
+def _decode_opaque_token(value: str) -> bytes | None:
+    if not isinstance(value, str) or _OPAQUE_TOKEN_PATTERN.fullmatch(value) is None:
+        return None
+    try:
+        decoded = base64.b64decode(value + "=", altchars=b"-_", validate=True)
+    except ValueError, base64.binascii.Error:
+        return None
+    return decoded if len(decoded) == _TOKEN_BYTES else None
+
+
+def _options_to_payload(options: object) -> dict[str, object]:
+    payload = json.loads(options_to_json(options))  # type: ignore[arg-type]
+    if not isinstance(payload, dict):
+        raise AuthenticationDataError("WebAuthn options did not serialize to an object")
+    return payload
+
+
+def _parse_registration_credential(value: object) -> RegistrationCredential:
+    if isinstance(value, RegistrationCredential):
+        return value
+    if isinstance(value, str | dict):
+        return parse_registration_credential_json(value)
+    raise ValueError("passkey registration credential must be a WebAuthn response")
+
+
+def _parse_authentication_credential(value: object) -> AuthenticationCredential:
+    if isinstance(value, AuthenticationCredential):
+        return value
+    if isinstance(value, str | dict):
+        return parse_authentication_credential_json(value)
+    raise ValueError("passkey authentication credential must be a WebAuthn response")
 
 
 def _normalize_recovery_code(value: str) -> str:
@@ -2064,6 +3453,51 @@ def _account_from_row(row: sqlite3.Row) -> Account:
     )
 
 
+def _session_info_from_row(row: sqlite3.Row, *, current: bool) -> SessionInfo:
+    session_id = row["session_id"]
+    if not isinstance(session_id, str) or _SESSION_ID_PATTERN.fullmatch(session_id) is None:
+        raise AuthenticationDataError("session has an invalid public identifier")
+    last_seen = int(row["last_seen_at"])
+    absolute_expires = int(row["absolute_expires_at"])
+    return SessionInfo(
+        session_id=session_id,
+        account_id=str(row["account_id"]),
+        created_at=int(row["created_at"]),
+        last_seen_at=last_seen,
+        idle_expires_at=min(last_seen + SESSION_IDLE_SECONDS, absolute_expires),
+        absolute_expires_at=absolute_expires,
+        step_up_until=int(row["step_up_until"]),
+        client_ip=(None if row["client_ip"] is None else str(row["client_ip"])),
+        user_agent=(None if row["user_agent"] is None else str(row["user_agent"])),
+        current=current,
+    )
+
+
+def _passkey_credential_from_row(row: sqlite3.Row) -> PasskeyCredential:
+    try:
+        raw_transports = json.loads(str(row["transports"])) if row["transports"] else []
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise AuthenticationDataError("passkey transports are invalid") from exc
+    if not isinstance(raw_transports, list) or any(
+        not isinstance(transport, str) for transport in raw_transports
+    ):
+        raise AuthenticationDataError("passkey transports are invalid")
+    public_id = row["public_id"]
+    if not isinstance(public_id, str) or _SESSION_ID_PATTERN.fullmatch(public_id) is None:
+        raise AuthenticationDataError("passkey has an invalid public identifier")
+    return PasskeyCredential(
+        public_id=public_id,
+        account_id=str(row["account_id"]),
+        name=str(row["name"]),
+        sign_count=int(row["sign_count"]),
+        device_type=str(row["device_type"]),
+        backed_up=bool(row["backed_up"]),
+        transports=tuple(raw_transports),
+        created_at=int(row["created_at"]),
+        last_used_at=(None if row["last_used_at"] is None else int(row["last_used_at"])),
+    )
+
+
 def _principal_from_session_row(
     row: sqlite3.Row,
     last_seen: int,
@@ -2081,6 +3515,9 @@ def _principal_from_session_row(
         idle_expires_at=min(last_seen + SESSION_IDLE_SECONDS, absolute_expires),
         absolute_expires_at=absolute_expires,
         step_up_until=(int(row["step_up_until"]) if step_up_until is None else step_up_until),
+        session_id=(None if row["session_id"] is None else str(row["session_id"])),
+        client_ip=(None if row["client_ip"] is None else str(row["client_ip"])),
+        user_agent=(None if row["user_agent"] is None else str(row["user_agent"])),
     )
 
 
@@ -2105,6 +3542,7 @@ def _required_result(value: EnrollmentResult | None) -> EnrollmentResult:
 __all__ = [
     "CHALLENGE_FAILURE_LIMIT",
     "CHALLENGE_LIFETIME_SECONDS",
+    "MAX_PASSKEYS_PER_ACCOUNT",
     "MAX_SESSIONS_PER_ACCOUNT",
     "RECOVERY_CODE_COUNT",
     "SESSION_ABSOLUTE_SECONDS",
@@ -2125,15 +3563,21 @@ __all__ = [
     "EnrollmentState",
     "EnrollmentStateError",
     "InvalidChallengeError",
+    "InvalidPasskeyError",
     "InvalidSecondFactorError",
     "InvalidSessionError",
     "IssuedSession",
     "LoginRateLimitedError",
     "MasterKeyError",
+    "PasskeyCeremony",
+    "PasskeyCredential",
+    "PasskeyLimitError",
     "Role",
+    "SessionInfo",
     "SessionPrincipal",
     "StepUpRequiredError",
     "TotpEnrollment",
+    "VerifiedPasskeyIdentity",
     "canonicalize_email",
     "decode_totp_secret",
     "totp_code",

@@ -123,7 +123,7 @@ CI covers four interpreter states:
 | CPython 3.14t | `-X gil=0` | disabled |
 
 `scripts/check-python314t.py` verifies the interpreter build, runtime GIL state, and
-distribution wheel tags for extensions including `aiohttp` and `nh3`. A free-threaded environment requires
+distribution wheel tags for extensions including `aiohttp`, `cbor2`, and `nh3`. A free-threaded environment requires
 `cp314t`-compatible wheels; the presence of only `abi3` or standard `cp314` wheels does not constitute a validated
 free-threaded deployment.
 

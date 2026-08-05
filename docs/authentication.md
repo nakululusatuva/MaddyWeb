@@ -49,9 +49,10 @@ redirect to `/login`; protected APIs and main application assets return 401.
 The public Nginx edge returns 404 for `/healthz`, which remains available only
 as an exact loopback health probe.
 
-The sign-in sequence is:
+Password-based sign-in uses this sequence:
 
-1. Submit the full mailbox address and current Maddy password.
+1. Submit the full mailbox address, or its local name on this deployment, and
+   the current Maddy password.
 2. Maddy verifies the password through local SMTP AUTH. MaddyWeb does not
    persist it.
 3. For an enrolled account, submit the current TOTP code or one unused
@@ -65,6 +66,26 @@ password produce the same external credential error. Login limits apply to
 the visitor address, mailbox, mailbox/address pair, and the whole service.
 A password challenge lasts five minutes. Five failed second-factor attempts
 invalidate it and require another mailbox-password check.
+
+After completing that flow, the user may register a Passkey from the Security
+workspace. Later sign-ins can use Windows Hello, macOS Touch ID, iOS Face ID,
+a synced platform Passkey, or a security key without entering the mailbox
+password and TOTP again. Password and TOTP remain a recovery path. A Passkey
+registration requires a fresh five-minute identity verification.
+
+Passkey sign-in begins without an email address. The browser or authenticator
+shows its discoverable credential chooser, and the verified credential selects
+the mailbox. This keeps the password form available for enrollment and
+recovery without making it a prerequisite for Passkey sign-in.
+
+MaddyWeb uses discoverable WebAuthn credentials with required user
+verification and no attestation. The root helper validates the exact HTTPS
+origin and relying-party ID derived from the deployment configuration; it
+does not accept either value from a browser header or request body. Ceremony
+challenges are random, short-lived, single-use, and stored only as keyed
+digests. The helper verifies signatures and authenticator counters. Browser
+APIs receive an opaque public Passkey identifier for management, never the
+stored raw credential ID.
 
 MaddyWeb implements [RFC 6238](https://www.rfc-editor.org/rfc/rfc6238) with a
 160-bit Base32 secret, HMAC-SHA-1, six digits, and a 30-second period. It
@@ -111,7 +132,7 @@ forced to change it on first login.
   fresh login.
 - An administrator password reset marks the target for a mandatory password
   change and revokes its authentication state before changing Maddy.
-- An administrator TOTP reset requires a fresh administrator step-up and
+- An administrator TOTP reset requires a fresh identity step-up and
   returns the replacement factor and recovery codes once. Existing sessions,
   challenges, factors, and recovery codes are revoked.
 - Recovery-code regeneration requires the mailbox password and a fresh TOTP
@@ -124,16 +145,26 @@ forced to change it on first login.
 
 The browser receives a random 256-bit opaque token only in a Secure,
 HttpOnly, SameSite=Strict, path-rooted `__Host-` cookie. It is never written to
-a URL, `localStorage`, or `sessionStorage`. Sessions have a 30-minute idle
-limit, a 12-hour absolute limit, and a maximum of five active sessions per
-mailbox. A newly issued session evicts the oldest excess session.
+a URL, `localStorage`, or `sessionStorage`. Sessions have a 72-hour idle limit,
+a 30-day absolute limit, and a maximum of five active sessions per mailbox. A
+newly issued session evicts the oldest excess session. The browser refreshes
+the idle deadline only after real visible user activity; background event
+streams and polling do not keep an abandoned session alive.
 
-Administrator danger operations require mailbox password plus TOTP step-up;
-that elevation lasts five minutes. Password changes, role changes, TOTP
-changes, credential disable, mailbox deletion, and security recovery revoke
-the affected authentication state. Logout is complete only after the helper
-confirms server-side revocation; a helper failure does not falsely clear the
-browser cookie.
+The Security workspace lists the account's active sessions with bounded,
+untrusted browser and address labels. Each record uses a random public session
+identifier that is separate from the bearer token. A user can remotely revoke
+another session after fresh verification, but cannot use that endpoint to
+revoke the current session; normal logout handles the current browser.
+
+Password, TOTP, account, certificate, and permanent-message-deletion
+operations require a Passkey or mailbox-password-plus-TOTP step-up completed
+within the preceding five minutes. The elevation belongs only to that server
+session; ordinary activity and the longer idle deadline never extend it.
+Password changes, role changes, TOTP changes, credential disable, mailbox
+deletion, and security recovery revoke the affected authentication state.
+Logout is complete only after the helper confirms server-side revocation; a
+helper failure does not falsely clear the browser cookie.
 
 TOTP seeds are encrypted with AES-256-GCM under a separate 32-byte root-only
 master key. Authentication metadata, encrypted factors, recovery digests,

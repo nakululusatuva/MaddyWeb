@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-auth-state="checking">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -7,8 +7,8 @@
   <meta name="theme-color" content="#f4f6f9">
   <meta name="description" content="MaddyWeb mail workspace and server administration console">
   <title>MaddyWeb</title>
-  <link rel="stylesheet" href="/static/app.css?v=22">
-  <script src="/static/app.js?v=27" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=23">
+  <script src="/static/app.js?v=28" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to main content</a>
@@ -401,6 +401,24 @@
               </form>
             </div>
           </section>
+          <section class="data-card security-wide-card">
+            <div class="card-heading"><div><p class="eyebrow">Passwordless access</p><h2>Passkeys</h2><p>Use Windows Hello, Touch ID, Face ID, or a security key without entering your mailbox password and authenticator code.</p></div><span id="security-passkey-state" class="status-pill status-neutral">Loading</span></div>
+            <div class="security-card-body">
+              <form id="passkey-registration-form" class="security-inline-form" autocomplete="off">
+                <label><span>Passkey name</span><input name="name" type="text" required minlength="1" maxlength="64" value="This device" autocomplete="off"></label>
+                <button id="passkey-registration-button" class="button button-primary" type="submit">Add passkey</button>
+              </form>
+              <div id="passkeys-list" class="security-item-list" aria-live="polite"></div>
+              <p id="passkeys-empty" class="empty-state" hidden>No passkeys are registered.</p>
+            </div>
+          </section>
+          <section class="data-card security-wide-card">
+            <div class="card-heading"><div><p class="eyebrow">Browser access</p><h2>Active sessions</h2><p>Review browsers signed in to this mailbox and revoke access you no longer recognize.</p></div><button id="refresh-security-sessions" class="button button-secondary" type="button">Refresh</button></div>
+            <div class="security-card-body">
+              <div id="security-sessions-list" class="security-item-list" aria-live="polite"></div>
+              <p id="security-sessions-empty" class="empty-state" hidden>No active sessions.</p>
+            </div>
+          </section>
         </div>
       </section>
 
@@ -421,7 +439,7 @@
     </main>
   </div>
 
-  <footer class="app-footer"><span>MaddyWeb secure mail workspace</span><span>Same-origin access with short-lived sessions.</span></footer>
+  <footer class="app-footer"><span>MaddyWeb secure mail workspace</span><span>Sessions continue across trusted browser use.</span></footer>
 
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 
@@ -436,12 +454,14 @@
 
   <dialog id="step-up-dialog">
     <div class="dialog-card">
-      <div class="dialog-heading"><div><p class="eyebrow">Fresh administrator verification</p><h2 id="step-up-title">Verify administrator</h2><p id="step-up-account"></p></div><button class="dialog-close" type="button" data-close-dialog aria-label="Close">&times;</button></div>
-      <p id="step-up-copy">Verify your administrator password and current authenticator code to continue this protected operation.</p>
+      <div class="dialog-heading"><div><p class="eyebrow">Fresh security verification</p><h2 id="step-up-title">Verify your identity</h2><p id="step-up-account"></p></div><button class="dialog-close" type="button" data-close-dialog aria-label="Close">&times;</button></div>
+      <p id="step-up-copy">Confirm your identity to continue this protected operation.</p>
       <p id="step-up-error" class="notice notice-error" role="alert" hidden></p>
+      <button id="step-up-passkey" class="button button-primary" type="button">Use a passkey</button>
+      <div id="step-up-divider" class="dialog-divider"><span>or use your mailbox password</span></div>
       <form id="step-up-form" class="stack-form" autocomplete="off">
-        <label><span>Administrator password</span><input name="password" type="password" required maxlength="1024" autocomplete="current-password"></label>
-        <label><span>Administrator authenticator code</span><input name="code" type="text" required pattern="[0-9]{6}" maxlength="6" inputmode="numeric" autocomplete="one-time-code" placeholder="000000"></label>
+        <label><span>Mailbox password</span><input name="password" type="password" required maxlength="1024" autocomplete="current-password"></label>
+        <label><span>Authenticator code</span><input name="code" type="text" required pattern="[0-9]{6}" maxlength="6" inputmode="numeric" autocomplete="one-time-code" placeholder="000000"></label>
         <div class="dialog-actions"><button class="button button-secondary" type="button" data-close-dialog>Cancel</button><button id="step-up-submit" class="button button-primary" type="submit">Verify and continue</button></div>
       </form>
     </div>

@@ -7,7 +7,7 @@ paths must be absolute Linux paths. Complete a full rehearsal on a non-productio
 
 - Linux with systemd available; WSL must have systemd enabled.
 - Exactly CPython 3.14. Both the standard build and free-threaded `3.14t` are supported, but
-  the wheelhouse must provide ABI-compatible extension wheels such as `aiohttp` and `nh3`.
+  the wheelhouse must provide ABI-compatible extension wheels such as `aiohttp`, `cbor2`, and `nh3`.
 - Maddy must be an exact release of `0.8.2`, or `0.9.0` through `0.9.5`.
 - `bash`, `systemctl`, `systemd-sysusers`, `systemd-tmpfiles`, `ss`,
   `tar`, and a SHA-256 utility. Docker mode also requires the Docker CLI at an absolute executable path.

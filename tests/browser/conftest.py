@@ -140,6 +140,9 @@ class BrowserSecurityGateway:
         self.password_login_attempts: list[tuple[str, str, str]] = []
         self.totp_login_attempts: list[tuple[str, str, str]] = []
         self.step_up_attempts: list[tuple[str, str, str]] = []
+        self.passkey_login_attempts = 0
+        self.passkeys: list[dict[str, object]] = []
+        self.revoked_session_ids: list[str] = []
         self.require_create_step_up = False
         self.step_up_granted = False
         self.bulk_seen_changes: list[tuple[str, str, tuple[str, ...] | None, bool]] = []
@@ -202,7 +205,9 @@ class BrowserSecurityGateway:
         code: str,
         *,
         client_ip: str,
+        user_agent: str,
     ) -> dict[str, object]:
+        assert user_agent
         self.totp_login_attempts.append((challenge, code, client_ip))
         if challenge != LOGIN_CHALLENGE or code != LOGIN_TOTP:
             raise RuntimeError("invalid browser fixture second factor")
@@ -211,6 +216,119 @@ class BrowserSecurityGateway:
             "principal": self._principal(),
             "recovery_codes": [],
         }
+
+    @staticmethod
+    def _passkey_options() -> dict[str, object]:
+        return {
+            "challenge": "Q" * 43,
+            "rpId": "127.0.0.1",
+            "timeout": 300_000,
+            "userVerification": "required",
+        }
+
+    async def begin_passkey_login(self, *, client_ip: str) -> dict[str, object]:
+        assert client_ip
+        self.passkey_login_attempts += 1
+        return {"challenge": LOGIN_CHALLENGE, "options": self._passkey_options()}
+
+    async def complete_passkey_login(
+        self,
+        challenge: str,
+        credential: dict[str, object],
+        *,
+        client_ip: str,
+        user_agent: str,
+    ) -> dict[str, object]:
+        assert challenge == LOGIN_CHALLENGE
+        assert credential
+        assert client_ip
+        assert user_agent
+        return {
+            "session_token": SESSION_TOKEN,
+            "principal": self._principal(),
+            "recovery_codes": [],
+        }
+
+    async def list_passkeys(self) -> dict[str, object]:
+        return {"passkeys": [dict(item) for item in self.passkeys]}
+
+    async def begin_passkey_registration(self) -> dict[str, object]:
+        options = self._passkey_options()
+        options.update(
+            {
+                "rp": {"id": "127.0.0.1", "name": "MaddyWeb"},
+                "user": {
+                    "id": "Y" * 43,
+                    "name": ACCOUNT_ADDRESS,
+                    "displayName": ACCOUNT_ADDRESS,
+                },
+                "pubKeyCredParams": [{"alg": -7, "type": "public-key"}],
+                "authenticatorSelection": {
+                    "residentKey": "required",
+                    "requireResidentKey": True,
+                    "userVerification": "required",
+                },
+                "attestation": "none",
+            }
+        )
+        return {"challenge": LOGIN_CHALLENGE, "options": options}
+
+    async def complete_passkey_registration(
+        self,
+        challenge: str,
+        credential: dict[str, object],
+        *,
+        name: str,
+    ) -> dict[str, object]:
+        assert challenge == LOGIN_CHALLENGE
+        assert credential
+        record = {
+            "id": "e" * 32,
+            "name": name,
+            "backed_up": False,
+            "created_at": 1_900_000_000,
+            "last_used_at": None,
+        }
+        self.passkeys.append(record)
+        return {"passkey": dict(record)}
+
+    async def delete_passkey(self, passkey_id: str) -> dict[str, object]:
+        before = len(self.passkeys)
+        self.passkeys = [item for item in self.passkeys if item["id"] != passkey_id]
+        return {"deleted": len(self.passkeys) != before}
+
+    async def begin_passkey_step_up(self) -> dict[str, object]:
+        return {"challenge": LOGIN_CHALLENGE, "options": self._passkey_options()}
+
+    async def complete_passkey_step_up(
+        self,
+        challenge: str,
+        credential: dict[str, object],
+    ) -> dict[str, object]:
+        assert challenge == LOGIN_CHALLENGE
+        assert credential
+        self.step_up_granted = True
+        return {"step_up_expires_at": 2_000_000_300}
+
+    async def list_sessions(self) -> dict[str, object]:
+        return {
+            "sessions": [
+                {
+                    "id": "d" * 32,
+                    "current": True,
+                    "client_ip": "127.0.0.1",
+                    "user_agent": "Chromium fixture",
+                    "created_at": 1_900_000_000,
+                    "last_seen_at": 1_900_000_100,
+                    "idle_expires_at": 2_000_000_000,
+                    "absolute_expires_at": 2_000_010_000,
+                }
+            ]
+        }
+
+    async def revoke_session(self, session_id: str) -> dict[str, object]:
+        self.revoked_session_ids.append(session_id)
+        return {"revoked": True}
 
     async def logout(self, token: str) -> None:
         assert token == SESSION_TOKEN

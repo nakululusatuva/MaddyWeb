@@ -23,6 +23,7 @@ SESSION_TOKEN = "S" * 43
 
 class BrowserGateway:
     def __init__(self) -> None:
+        self.passkeys: list[dict[str, object]] = []
         definitions = (
             (
                 "105",
@@ -118,13 +119,39 @@ class BrowserGateway:
             "role": "admin",
             "password_change_required": False,
             "enrollment_state": "active",
-            "idle_expires_at": now + 30 * 60,
-            "absolute_expires_at": now + 12 * 60 * 60,
+            "session_id": "d" * 32,
+            "step_up_until": now + 5 * 60,
+            "idle_expires_at": now + 72 * 60 * 60,
+            "absolute_expires_at": now + 30 * 24 * 60 * 60,
             "recovery_codes_remaining": 10,
         }
 
     async def peek_session(self, token: str) -> dict[str, object]:
         return await self.session(token)
+
+    async def list_passkeys(self) -> dict[str, object]:
+        return {"passkeys": [dict(item) for item in self.passkeys]}
+
+    async def list_sessions(self) -> dict[str, object]:
+        now = int(time.time())
+        return {
+            "sessions": [
+                {
+                    "id": "d" * 32,
+                    "current": True,
+                    "client_ip": "127.0.0.1",
+                    "user_agent": "Chromium fixture",
+                    "created_at": now - 60,
+                    "last_seen_at": now,
+                    "idle_expires_at": now + 72 * 60 * 60,
+                    "absolute_expires_at": now + 30 * 24 * 60 * 60,
+                }
+            ]
+        }
+
+    async def revoke_session(self, session_id: str) -> dict[str, object]:
+        assert session_id != "d" * 32
+        return {"revoked": True}
 
     async def list_accounts(self) -> list[dict[str, object]]:
         return [

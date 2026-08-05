@@ -286,11 +286,17 @@ class HelperGateway:
         code: str,
         *,
         client_ip: str,
+        user_agent: str,
     ) -> Mapping[str, Any]:
         return _mapping(
             await self._call(
                 "auth.enrollment_complete",
-                {"challenge": challenge, "code": code, "client_ip": client_ip},
+                {
+                    "challenge": challenge,
+                    "code": code,
+                    "client_ip": client_ip,
+                    "user_agent": user_agent,
+                },
                 auth_token=None,
             ),
             "auth.enrollment_complete",
@@ -302,11 +308,17 @@ class HelperGateway:
         code: str,
         *,
         client_ip: str,
+        user_agent: str,
     ) -> Mapping[str, Any]:
         return _mapping(
             await self._call(
                 "auth.totp_complete",
-                {"challenge": challenge, "code": code, "client_ip": client_ip},
+                {
+                    "challenge": challenge,
+                    "code": code,
+                    "client_ip": client_ip,
+                    "user_agent": user_agent,
+                },
                 auth_token=None,
             ),
             "auth.totp_complete",
@@ -318,6 +330,7 @@ class HelperGateway:
         recovery_code: str,
         *,
         client_ip: str,
+        user_agent: str,
     ) -> Mapping[str, Any]:
         return _mapping(
             await self._call(
@@ -326,10 +339,47 @@ class HelperGateway:
                     "challenge": challenge,
                     "recovery_code": recovery_code,
                     "client_ip": client_ip,
+                    "user_agent": user_agent,
                 },
                 auth_token=None,
             ),
             "auth.recovery_complete",
+        )
+
+    async def begin_passkey_login(
+        self,
+        *,
+        client_ip: str,
+    ) -> Mapping[str, Any]:
+        return _mapping(
+            await self._call(
+                "auth.passkey_login_begin",
+                {"client_ip": client_ip},
+                auth_token=None,
+            ),
+            "auth.passkey_login_begin",
+        )
+
+    async def complete_passkey_login(
+        self,
+        challenge: str,
+        credential: Mapping[str, Any],
+        *,
+        client_ip: str,
+        user_agent: str,
+    ) -> Mapping[str, Any]:
+        return _mapping(
+            await self._call(
+                "auth.passkey_login_complete",
+                {
+                    "challenge": challenge,
+                    "credential": dict(credential),
+                    "client_ip": client_ip,
+                    "user_agent": user_agent,
+                },
+                auth_token=None,
+            ),
+            "auth.passkey_login_complete",
         )
 
     async def session(self, token: str) -> Mapping[str, Any]:
@@ -431,13 +481,90 @@ class HelperGateway:
         *,
         client_ip: str,
     ) -> Mapping[str, Any]:
+        try:
+            return _mapping(
+                await self._call(
+                    "auth.step_up",
+                    {"password": password, "code": code, "client_ip": client_ip},
+                ),
+                "auth.step_up",
+            )
+        finally:
+            self._session_cache.clear()
+
+    async def list_passkeys(self) -> Mapping[str, Any]:
+        return _mapping(await self._call("auth.passkeys_list"), "auth.passkeys_list")
+
+    async def begin_passkey_registration(self) -> Mapping[str, Any]:
+        return _mapping(
+            await self._call("auth.passkey_register_begin"),
+            "auth.passkey_register_begin",
+        )
+
+    async def complete_passkey_registration(
+        self,
+        challenge: str,
+        credential: Mapping[str, Any],
+        *,
+        name: str,
+    ) -> Mapping[str, Any]:
         return _mapping(
             await self._call(
-                "auth.step_up",
-                {"password": password, "code": code, "client_ip": client_ip},
+                "auth.passkey_register_complete",
+                {
+                    "challenge": challenge,
+                    "credential": dict(credential),
+                    "name": name,
+                },
             ),
-            "auth.step_up",
+            "auth.passkey_register_complete",
         )
+
+    async def delete_passkey(self, passkey_id: str) -> Mapping[str, Any]:
+        return _mapping(
+            await self._call(
+                "auth.passkey_delete",
+                {"passkey_id": passkey_id, "confirm": True},
+            ),
+            "auth.passkey_delete",
+        )
+
+    async def begin_passkey_step_up(self) -> Mapping[str, Any]:
+        return _mapping(
+            await self._call("auth.passkey_step_up_begin"),
+            "auth.passkey_step_up_begin",
+        )
+
+    async def complete_passkey_step_up(
+        self,
+        challenge: str,
+        credential: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        try:
+            return _mapping(
+                await self._call(
+                    "auth.passkey_step_up_complete",
+                    {"challenge": challenge, "credential": dict(credential)},
+                ),
+                "auth.passkey_step_up_complete",
+            )
+        finally:
+            self._session_cache.clear()
+
+    async def list_sessions(self) -> Mapping[str, Any]:
+        return _mapping(await self._call("auth.sessions_list"), "auth.sessions_list")
+
+    async def revoke_session(self, session_id: str) -> Mapping[str, Any]:
+        try:
+            return _mapping(
+                await self._call(
+                    "auth.session_revoke_other",
+                    {"session_id": session_id, "confirm": True},
+                ),
+                "auth.session_revoke_other",
+            )
+        finally:
+            self._session_cache.clear()
 
     async def rotate_account_totp(self, account_id: str) -> Mapping[str, Any]:
         try:

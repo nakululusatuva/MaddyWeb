@@ -169,6 +169,10 @@ class FakeGateway:
         ]
         self.operations: list[tuple[object, ...]] = []
         self.create_account_error: Exception | None = None
+        self.change_password_error: Exception | None = None
+        self.append_limit_error: Exception | None = None
+        self.certificate_dry_run_error: Exception | None = None
+        self.delete_error: Exception | None = None
         self.certificate_automation_safe = True
         self.certificate_timer_enabled = True
         self.certificate_timer_active = True
@@ -188,6 +192,7 @@ class FakeGateway:
         self.sent: bytes | None = None
         self.delivery_error: Exception | None = None
         self.bulk_delete_error: Exception | None = None
+        self.step_up_until = 2_000_000_000
         self.spool_gate: asyncio.Event | None = None
         self.spool_active = 0
         self.spool_calls = 0
@@ -247,6 +252,7 @@ class FakeGateway:
             "enrollment_state": "active",
             "idle_expires_at": 2_000_000_000,
             "absolute_expires_at": 2_000_010_000,
+            "step_up_until": self.step_up_until,
         }
 
     async def peek_session(self, token: str) -> dict[str, object]:
@@ -263,9 +269,13 @@ class FakeGateway:
         return {"address": username}
 
     async def change_password(self, account_id: str, password: str) -> None:
+        if self.change_password_error is not None:
+            raise self.change_password_error
         self.operations.append(("change_password", account_id, password))
 
     async def set_append_limit(self, account_id: str, limit: int) -> None:
+        if self.append_limit_error is not None:
+            raise self.append_limit_error
         self.operations.append(("set_append_limit", account_id, limit))
 
     async def disable_credentials(self, account_id: str) -> None:
@@ -375,6 +385,8 @@ class FakeGateway:
         mailbox: str,
         message_id: str,
     ) -> None:
+        if self.delete_error is not None:
+            raise self.delete_error
         self.operations.append(("delete_message", account_id, mailbox, message_id))
 
     async def delete_messages_permanently(
@@ -409,6 +421,8 @@ class FakeGateway:
         self.operations.append(("certificate_timer", enabled))
 
     async def certificate_dry_run(self, certificate_name: str) -> object:
+        if self.certificate_dry_run_error is not None:
+            raise self.certificate_dry_run_error
         self.operations.append(("certificate_dry_run", certificate_name))
         return {"ok": True}
 
@@ -518,8 +532,8 @@ async def test_home_static_assets_and_strict_headers(
     page = await response.text()
     assert response.status == 200
     assert "Administration overview" in page
-    assert 'href="/static/app.css?v=22"' in page
-    assert 'src="/static/app.js?v=27"' in page
+    assert 'href="/static/app.css?v=23"' in page
+    assert 'src="/static/app.js?v=28"' in page
     assert 'id="new-mail-banner"' in page
     assert 'id="new-mail-notice"' in page
     assert 'id="new-mail-dismiss"' in page
@@ -768,6 +782,41 @@ async def test_account_creation_reports_fresh_admin_verification_requirement(
     payload = await response.json()
     assert payload["error"]["code"] == "step_up_required"
     assert not any(operation[0] == "create_account" for operation in gateway.operations)
+
+
+@pytest.mark.asyncio
+async def test_sensitive_admin_mutations_report_fresh_verification_requirement(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+    step_up_error = HelperCallError(
+        "step_up_required",
+        "Fresh authentication is required",
+    )
+    cases = (
+        (
+            "change_password_error",
+            f"/api/v1/accounts/{ADMIN_ACCOUNT_ID}/password",
+            {"password": "changed-password"},
+        ),
+        (
+            "append_limit_error",
+            f"/api/v1/accounts/{ADMIN_ACCOUNT_ID}/append-limit",
+            {"limit": 0},
+        ),
+        (
+            "certificate_dry_run_error",
+            "/api/v1/certificates/dry-run",
+            {"name": "mail.example.test"},
+        ),
+    )
+
+    for attribute, path, body in cases:
+        setattr(gateway, attribute, step_up_error)
+        response = await _post_json(client, path, await _get_token(client), body)
+        assert response.status == 403
+        assert (await response.json())["error"]["code"] == "step_up_required"
+        setattr(gateway, attribute, None)
 
 
 @pytest.mark.asyncio
@@ -1238,6 +1287,133 @@ async def _message_action_token(
     )
     assert response.status == 200
     return str(payload["freshness_token"])
+
+
+@pytest.mark.asyncio
+async def test_single_permanent_delete_preserves_proof_until_recent_verification(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+    freshness = await _message_action_token(client, "42")
+    body = {
+        "account": ADMIN_ACCOUNT_ID,
+        "mailbox": "Trash",
+        "freshness": freshness,
+        "confirmation": "PERMANENTLY DELETE",
+    }
+    initial_spools = gateway.spool_calls
+    gateway.step_up_until = int(time.time()) + 4
+
+    rejected = await _post_json(
+        client,
+        "/api/v1/admin/mail/42/delete",
+        await _get_token(client),
+        body,
+    )
+
+    assert rejected.status == 403
+    assert (await rejected.json())["error"]["code"] == "step_up_required"
+    assert gateway.spool_calls == initial_spools
+    assert not any(operation[0] == "delete_message" for operation in gateway.operations)
+
+    gateway.step_up_until = int(time.time()) + 300
+    retried = await _post_json(
+        client,
+        "/api/v1/admin/mail/42/delete",
+        await _get_token(client),
+        body,
+    )
+
+    assert retried.status == 200
+    assert ("delete_message", ADMIN_ACCOUNT_ID, "Trash", "42") in gateway.operations
+
+
+@pytest.mark.asyncio
+async def test_bulk_permanent_delete_preserves_proofs_until_recent_verification(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+    freshness = await _message_action_token(client, "42")
+    body = {
+        "account": ADMIN_ACCOUNT_ID,
+        "mailbox": "Trash",
+        "action": "permanent_delete",
+        "uids": ["42"],
+        "confirmation": "PERMANENTLY DELETE",
+        "freshness": [{"uid": "42", "token": freshness}],
+    }
+    initial_spools = gateway.spool_calls
+    gateway.step_up_until = 0
+
+    rejected = await _post_json(
+        client,
+        "/api/v1/admin/mail-actions",
+        await _get_token(client),
+        body,
+    )
+
+    assert rejected.status == 403
+    assert (await rejected.json())["error"]["code"] == "step_up_required"
+    assert gateway.spool_calls == initial_spools
+    assert not any(operation[0] == "delete_messages" for operation in gateway.operations)
+
+    gateway.step_up_until = int(time.time()) + 300
+    retried = await _post_json(
+        client,
+        "/api/v1/admin/mail-actions",
+        await _get_token(client),
+        body,
+    )
+
+    assert retried.status == 200
+    assert (
+        "delete_messages",
+        ADMIN_ACCOUNT_ID,
+        "Trash",
+        ("42",),
+    ) in gateway.operations
+
+
+@pytest.mark.asyncio
+async def test_permanent_delete_routes_surface_helper_step_up_requirement(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+    step_up_error = HelperCallError("step_up_required", "verification expired")
+
+    single_proof = await _message_action_token(client, "42")
+    gateway.delete_error = step_up_error
+    single = await _post_json(
+        client,
+        "/api/v1/admin/mail/42/delete",
+        await _get_token(client),
+        {
+            "account": ADMIN_ACCOUNT_ID,
+            "mailbox": "Trash",
+            "freshness": single_proof,
+            "confirmation": "PERMANENTLY DELETE",
+        },
+    )
+    assert single.status == 403
+    assert (await single.json())["error"]["code"] == "step_up_required"
+
+    bulk_proof = await _message_action_token(client, "43")
+    gateway.bulk_delete_error = step_up_error
+    bulk = await _post_json(
+        client,
+        "/api/v1/admin/mail-actions",
+        await _get_token(client),
+        {
+            "account": ADMIN_ACCOUNT_ID,
+            "mailbox": "Trash",
+            "action": "permanent_delete",
+            "uids": ["43"],
+            "confirmation": "PERMANENTLY DELETE",
+            "freshness": [{"uid": "43", "token": bulk_proof}],
+        },
+    )
+    assert bulk.status == 403
+    assert (await bulk.json())["error"]["code"] == "step_up_required"
 
 
 @pytest.mark.asyncio

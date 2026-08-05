@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import secrets
+import time
 from email import policy
 from email.message import EmailMessage
 from email.parser import BytesParser
@@ -205,6 +206,103 @@ async def test_normal_user_hides_administrator_ui_before_session_resolution(
     finally:
         release_session.set()
         await navigation
+
+
+async def test_required_password_change_opens_security_without_overview_flicker(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    live_application.gateway.principal["password_change_required"] = True
+    await page.add_init_script(
+        """(() => {
+            window.__overviewWasVisible = false;
+            const inspect = () => {
+                const overview = document.getElementById("overview-view");
+                if (overview && !overview.hidden) window.__overviewWasVisible = true;
+            };
+            new MutationObserver(inspect).observe(document, {
+                subtree: true,
+                attributes: true,
+                attributeFilter: ["hidden"],
+            });
+            document.addEventListener("DOMContentLoaded", inspect);
+        })();"""
+    )
+
+    await page.goto(live_application.base_url + "/")
+    await page.wait_for_url("**/security")
+    await page.get_by_role("heading", name="Security", exact=True).wait_for()
+
+    assert await page.evaluate("window.__overviewWasVisible") is False
+    assert await page.locator("#overview-view").is_hidden()
+    assert await page.locator('a[data-section="security"]').is_visible()
+    assert await page.locator('a[data-section="overview"]').is_hidden()
+
+
+async def test_unconfigured_passkeys_are_not_offered(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    requested_paths: list[str] = []
+    page.on("request", lambda request: requested_paths.append(urlsplit(request.url).path))
+
+    await page.goto(live_application.base_url + "/security")
+    await page.get_by_role("heading", name="Security", exact=True).wait_for()
+
+    assert await page.locator("#passkey-registration-form").is_hidden()
+    assert await page.locator("#security-passkey-state").inner_text() == "UNAVAILABLE"
+    assert "/api/v1/auth/passkeys" not in requested_paths
+
+
+async def test_session_timer_and_visibility_changes_do_not_extend_inactivity(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    now = int(time.time())
+    live_application.gateway.principal["idle_expires_at"] = now + 10 * 60
+    live_application.gateway.principal["absolute_expires_at"] = now + 60 * 60
+    await page.add_init_script(
+        """(() => {
+            window.__sessionTestNow = Date.now();
+            Date.now = () => window.__sessionTestNow;
+            const originalSetInterval = window.setInterval.bind(window);
+            window.setInterval = (callback, delay, ...args) => originalSetInterval(
+                callback,
+                delay === 30000 ? 25 : delay,
+                ...args,
+            );
+        })();"""
+    )
+    session_requests: list[str] = []
+    page.on(
+        "request",
+        lambda request: session_requests.append(urlsplit(request.url).path),
+    )
+
+    async def serve_login(route: Route) -> None:
+        await route.fulfill(
+            status=200,
+            content_type="text/html",
+            body="<!doctype html><title>Signed out</title>",
+        )
+
+    await page.route("**/login", serve_login)
+    await page.goto(live_application.base_url + "/security")
+    await page.get_by_role("heading", name="Security", exact=True).wait_for()
+    assert session_requests.count("/api/v1/auth/session") == 1
+
+    await page.evaluate(
+        """() => {
+            window.__sessionTestNow += 6 * 60 * 1000;
+            document.dispatchEvent(new Event("visibilitychange"));
+        }"""
+    )
+    await page.wait_for_timeout(100)
+    assert session_requests.count("/api/v1/auth/session") == 1
+
+    await page.evaluate("window.__sessionTestNow += 5 * 60 * 1000")
+    await page.wait_for_url("**/login", timeout=2_000)
+    assert session_requests.count("/api/v1/auth/session") == 1
 
 
 async def test_admin_mail_defaults_to_the_admins_own_inbox(
@@ -593,6 +691,7 @@ async def test_anonymous_browser_loads_only_login_then_completes_password_and_to
         await page.goto(base_url + "/")
         await page.wait_for_url("**/login")
         await page.get_by_role("heading", name="Sign in to MaddyWeb", exact=True).wait_for()
+        assert await page.locator("#passkey-login-panel").is_hidden()
         assert "/static/login.js" in requested_paths
         assert "/static/app.js" not in requested_paths
         unauthorized = await page.evaluate(
@@ -642,7 +741,8 @@ async def test_anonymous_browser_loads_only_login_then_completes_password_and_to
             release_totp.set()
 
         await page.wait_for_function("() => typeof window.__pendingLoginNavigation === 'function'")
-        assert "is-verifying" in (await totp_submit.get_attribute("class") or "")
+        assert "is-verified" in (await totp_submit.get_attribute("class") or "")
+        assert "is-verifying" not in (await totp_submit.get_attribute("class") or "")
         assert await totp_submit.inner_text() == "Verified. Signing in..."
         assert await totp_submit.get_attribute("aria-busy") == "true"
         assert (
@@ -712,7 +812,9 @@ async def test_account_workflows_use_json_mutations_and_typed_deletion(
     await create_form.get_by_role("button", name="Create account").click()
     step_up_dialog = page.locator("#step-up-dialog")
     await step_up_dialog.wait_for(state="visible")
-    assert await page.locator("#step-up-title").inner_text() == "Verify administrator"
+    assert await page.locator("#step-up-title").inner_text() == "Verify your identity"
+    assert await page.locator("#step-up-passkey").is_hidden()
+    assert await page.locator("#step-up-divider").is_hidden()
     await step_up_dialog.get_by_role("button", name="Cancel").click()
     await step_up_dialog.wait_for(state="hidden")
     assert live_application.gateway.created_accounts == []

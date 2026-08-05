@@ -67,14 +67,8 @@ def test_cloudflare_peer_and_login_limit_use_independent_addresses() -> None:
     assert "geo $realip_remote_addr $maddyweb_cloudflare_peer" in http
     assert "limit_req_zone $binary_remote_addr zone=maddyweb_auth_login:1m rate=5r/m;" in http
     assert "limit_req_zone $binary_remote_addr zone=maddyweb_auth_csrf:1m rate=30r/m;" in http
-    assert (
-        "limit_req_zone $binary_remote_addr zone=maddyweb_login_surface:1m rate=60r/m;"
-        in http
-    )
-    assert (
-        "limit_req_zone $binary_remote_addr zone=maddyweb_general:1m rate=300r/m;"
-        in http
-    )
+    assert "limit_req_zone $binary_remote_addr zone=maddyweb_login_surface:1m rate=60r/m;" in http
+    assert "limit_req_zone $binary_remote_addr zone=maddyweb_general:1m rate=300r/m;" in http
     assert "limit_req_zone $binary_remote_addr zone=maddyweb_send:1m rate=10r/m;" in http
     assert "limit_conn_zone $binary_remote_addr zone=maddyweb_mail_events:1m;" in http
     assert "limit_conn_status 429;" in http
@@ -103,9 +97,7 @@ def test_public_vhosts_pin_host_headers_health_rate_limit_and_tls() -> None:
         assert re.search(r"location = /healthz \{\s*return 404;\s*\}", source)
         for path in ("/login", "/static/login.css", "/static/login.js"):
             assert f"location = {path} {{" in source
-        assert source.count(
-            "limit_req zone=maddyweb_login_surface burst=20 nodelay;"
-        ) == 3
+        assert source.count("limit_req zone=maddyweb_login_surface burst=20 nodelay;") == 3
         assert re.search(
             r"location / \{\s*limit_req zone=maddyweb_general burst=100 nodelay;",
             source,
@@ -115,7 +107,18 @@ def test_public_vhosts_pin_host_headers_health_rate_limit_and_tls() -> None:
         assert "location = /api/v1/auth/recovery {" in source
         assert "location = /api/v1/auth/enrollment {" in source
         assert "location = /api/v1/auth/enrollment/confirm {" in source
-        assert source.count("limit_req zone=maddyweb_auth_login burst=5 nodelay;") == 8
+        for path in (
+            "/api/v1/auth/passkey/options",
+            "/api/v1/auth/passkey",
+            "/api/v1/auth/passkey/step-up/options",
+            "/api/v1/auth/passkey/step-up",
+        ):
+            assert re.search(
+                rf"location = {re.escape(path)} \{{\s*"
+                r"limit_req zone=maddyweb_auth_login burst=5 nodelay;",
+                source,
+            )
+        assert source.count("limit_req zone=maddyweb_auth_login burst=5 nodelay;") == 12
         for path in (
             "/api/v1/auth/password/change",
             "/api/v1/auth/recovery-codes/regenerate",

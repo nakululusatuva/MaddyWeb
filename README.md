@@ -49,19 +49,27 @@ The login shell and authenticated application use separate static bundles.
 The browser obtains a process-bound CSRF token from `/api/v1/auth/csrf`,
 serializes every mutation globally, and accepts the replacement token only
 from the response header. Mutations are never retried after an ambiguous
-failure. When the server explicitly requires fresh administrator
-verification, the browser repeats the protected operation once only after a
-successful password-and-TOTP step-up. No frontend dependency, build tool,
+failure. When the server explicitly requires fresh identity verification,
+the browser repeats the protected operation once only after a successful
+Passkey or password-and-TOTP step-up. No frontend dependency, build tool,
 CDN, remote font, or external image is required.
 
 ## Unified mailbox identity
 
 There is no separate Web password. A user signs in with the full Maddy mailbox
-address, that mailbox's current Maddy password, and a Google Authenticator
-compatible TOTP code. Before authentication, the browser can load only the
+address or its local name, that mailbox's current Maddy password, and a Google
+Authenticator compatible TOTP code. Before authentication, the browser can load only the
 login page, its small local assets, and the authentication flow. Every mail,
 account, certificate, application asset, and business API route requires an
 active session. Public Nginx never exposes `/healthz`.
+
+After the first verified sign-in, a mailbox can register a Passkey and use
+Windows Hello, macOS Touch ID, iOS Face ID, a synced platform Passkey, or a
+security key for later sign-ins. Passkeys require user verification and are
+bound to the deployment's exact HTTPS origin and relying-party ID. Passkey
+sign-in is discoverable: the browser or authenticator presents its account
+chooser, so the login page does not request an email address first. Password
+and TOTP login remains available as a recovery path.
 
 An administrator is also a real Maddy mailbox. Only the root-only
 `maddyweb auth-role` command can assign its `admin` role; the Web interface
@@ -76,6 +84,12 @@ created with the Maddy CLI is forced through TOTP enrollment after its first
 successful mailbox-password check. See
 [Authentication and identity operations](docs/authentication.md) for
 bootstrap, recovery, session, and external CLI identity rules.
+
+An active browser session expires after 72 hours without user activity and
+always expires after 30 days. The Security workspace lists active sessions
+and lets a user remotely revoke another browser. Password, TOTP, account,
+certificate, and permanent-message-deletion operations still require identity
+verification completed within the preceding five minutes.
 
 ## Supported scope
 

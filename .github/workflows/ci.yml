@@ -57,12 +57,14 @@ jobs:
             --expect-build '${{ matrix.build }}' \
             --expect-gil '${{ matrix.gil }}' \
             --require-distribution cryptography \
+            --require-distribution cbor2 \
             --require-distribution segno \
             --import maddyweb.cli \
             --import maddyweb.web \
             --import maddyweb.helper \
             --import maddyweb.docker_certificates \
-            --import aiohttp --import cryptography --import nh3 --import segno
+            --import aiohttp --import cbor2 --import cryptography --import nh3 --import segno \
+            --import webauthn
       - name: Run tests
         env:
           PYTHON_ARGS: ${{ matrix.python_args }}

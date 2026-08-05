@@ -24,7 +24,7 @@
       <div class="brand-message">
         <p class="eyebrow">Secure mail workspace</p>
         <h1>Your mailbox and server controls in one focused place.</h1>
-        <p>Sign in with your mail account. Every session is protected by a second factor and expires automatically.</p>
+        <p>Sign in with your mail account or a saved passkey. Sessions expire automatically.</p>
       </div>
       <ul class="trust-list" aria-label="Security properties">
         <li><span aria-hidden="true">1</span> Passwords are submitted only to this server.</li>
@@ -65,6 +65,13 @@
               <span aria-hidden="true">&rarr;</span>
             </button>
           </form>
+          <div id="passkey-login-panel" class="passkey-login-panel" hidden>
+            <div class="auth-divider"><span>or</span></div>
+            <button id="passkey-login" class="secondary-action passkey-action" type="button">
+              Sign in with a passkey
+            </button>
+            <p>No email address is needed. Choose a saved passkey from Windows Hello, Touch ID, Face ID, or a security key.</p>
+          </div>
         </div>
 
         <div id="totp-view" class="auth-view" data-auth-view="totp_required" hidden>
@@ -159,7 +166,7 @@
         <p id="auth-notice" class="auth-notice" role="status" aria-live="polite"></p>
       </div>
       <footer class="auth-footer">
-        <span>Protected by password and TOTP</span>
+        <span>Password, TOTP, and passkey sign-in</span>
         <span aria-hidden="true">&middot;</span>
         <span>Same-origin session</span>
       </footer>

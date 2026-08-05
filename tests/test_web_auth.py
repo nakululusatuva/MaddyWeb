@@ -22,6 +22,11 @@ USER_TOKEN = "U" * 43
 ADMIN_TOKEN = "A" * 43
 RECOVERY_TOKEN = "R" * 43
 ENROLLMENT_TOKEN = "E" * 43
+PASSKEY_TOKEN = "P" * 43
+PASSKEY_ID = "a" * 32
+CURRENT_SESSION_ID = "b" * 32
+OTHER_SESSION_ID = "c" * 32
+TEST_USER_AGENT = "MaddyWeb test browser"
 AUTHENTICATOR_KEY = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
 
 
@@ -40,6 +45,7 @@ def _principal(
         "enrollment_state": "active",
         "idle_expires_at": 2_000_000_000,
         "absolute_expires_at": 2_000_010_000,
+        "step_up_until": 2_000_000_000,
     }
 
 
@@ -53,6 +59,7 @@ class AuthGateway:
         self.password_error: HelperCallError | None = None
         self.session_error: HelperCallError | None = None
         self.logout_error: HelperCallError | None = None
+        self.change_password_error: HelperCallError | None = None
         self.latest_message_uid_value = 42
         self.enrollment_uri = (
             "otpauth://totp/MaddyWeb%3Auser%40example.test?"
@@ -126,8 +133,9 @@ class AuthGateway:
         code: str,
         *,
         client_ip: str,
+        user_agent: str,
     ) -> Mapping[str, object]:
-        self.operations.append(("enrollment_confirm", challenge, code, client_ip))
+        self.operations.append(("enrollment_confirm", challenge, code, client_ip, user_agent))
         return self._issue_session(
             token=ENROLLMENT_TOKEN,
             recovery_codes=("recovery-one", "recovery-two"),
@@ -139,8 +147,9 @@ class AuthGateway:
         code: str,
         *,
         client_ip: str,
+        user_agent: str,
     ) -> Mapping[str, object]:
-        self.operations.append(("totp", challenge, code, client_ip))
+        self.operations.append(("totp", challenge, code, client_ip, user_agent))
         return self._issue_session()
 
     async def complete_recovery_login(
@@ -149,9 +158,137 @@ class AuthGateway:
         recovery_code: str,
         *,
         client_ip: str,
+        user_agent: str,
     ) -> Mapping[str, object]:
-        self.operations.append(("recovery", challenge, recovery_code, client_ip))
+        self.operations.append(("recovery", challenge, recovery_code, client_ip, user_agent))
         return self._issue_session(token=RECOVERY_TOKEN)
+
+    @staticmethod
+    def _passkey_options() -> dict[str, object]:
+        return {
+            "challenge": "d2ViYXV0aG4tY2hhbGxlbmdl",
+            "timeout": 300_000,
+            "rpId": "example.test",
+            "userVerification": "required",
+            "allowCredentials": [{"id": "Y3JlZGVudGlhbC1pZA", "type": "public-key"}],
+        }
+
+    @staticmethod
+    def _passkey_record() -> dict[str, object]:
+        return {
+            "id": PASSKEY_ID,
+            "name": "Laptop",
+            "device_type": "multi_device",
+            "backed_up": True,
+            "transports": ["internal"],
+            "created_at": 1_900_000_000,
+            "last_used_at": 1_900_000_100,
+        }
+
+    async def begin_passkey_login(
+        self,
+        *,
+        client_ip: str,
+    ) -> Mapping[str, object]:
+        self.operations.append(("passkey_login_begin", client_ip))
+        options = self._passkey_options()
+        options.pop("allowCredentials", None)
+        return {"challenge": CHALLENGE, "options": options}
+
+    async def complete_passkey_login(
+        self,
+        challenge: str,
+        credential: Mapping[str, object],
+        *,
+        client_ip: str,
+        user_agent: str,
+    ) -> Mapping[str, object]:
+        self.operations.append(
+            ("passkey_login_complete", challenge, dict(credential), client_ip, user_agent)
+        )
+        return self._issue_session(token=PASSKEY_TOKEN)
+
+    async def list_passkeys(self) -> Mapping[str, object]:
+        self.operations.append(("passkeys_list",))
+        return {"passkeys": [self._passkey_record()]}
+
+    async def begin_passkey_registration(self) -> Mapping[str, object]:
+        self.operations.append(("passkey_register_begin",))
+        options = self._passkey_options()
+        options.update(
+            {
+                "rp": {"id": "example.test", "name": "MaddyWeb"},
+                "user": {
+                    "id": "dXNlci1pZA",
+                    "name": "user@example.test",
+                    "displayName": "user@example.test",
+                },
+                "pubKeyCredParams": [{"type": "public-key", "alg": -7}],
+            }
+        )
+        options.pop("allowCredentials", None)
+        return {"challenge": CHALLENGE, "options": options}
+
+    async def complete_passkey_registration(
+        self,
+        challenge: str,
+        credential: Mapping[str, object],
+        *,
+        name: str,
+    ) -> Mapping[str, object]:
+        self.operations.append(("passkey_register_complete", challenge, dict(credential), name))
+        return {"passkey": self._passkey_record()}
+
+    async def delete_passkey(self, passkey_id: str) -> Mapping[str, object]:
+        self.operations.append(("passkey_delete", passkey_id))
+        return {"deleted": passkey_id == PASSKEY_ID}
+
+    async def begin_passkey_step_up(self) -> Mapping[str, object]:
+        self.operations.append(("passkey_step_up_begin",))
+        return {"challenge": CHALLENGE, "options": self._passkey_options()}
+
+    async def complete_passkey_step_up(
+        self,
+        challenge: str,
+        credential: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        self.operations.append(("passkey_step_up_complete", challenge, dict(credential)))
+        return {"step_up_expires_in": 300}
+
+    async def list_sessions(self) -> Mapping[str, object]:
+        self.operations.append(("sessions_list",))
+        return {
+            "sessions": [
+                {
+                    "id": CURRENT_SESSION_ID,
+                    "created_at": 1_900_000_000,
+                    "last_seen_at": 1_900_000_100,
+                    "idle_expires_at": 1_900_259_300,
+                    "absolute_expires_at": 1_902_592_000,
+                    "step_up_until": None,
+                    "client_ip": "127.0.0.1",
+                    "user_agent": TEST_USER_AGENT,
+                    "current": True,
+                },
+                {
+                    "id": OTHER_SESSION_ID,
+                    "created_at": 1_899_000_000,
+                    "last_seen_at": 1_900_000_000,
+                    "idle_expires_at": 1_900_259_200,
+                    "absolute_expires_at": 1_901_592_000,
+                    "step_up_until": None,
+                    "client_ip": "203.0.113.8",
+                    "user_agent": "Other browser",
+                    "current": False,
+                },
+            ]
+        }
+
+    async def revoke_session(self, session_id: str) -> Mapping[str, object]:
+        self.operations.append(("session_revoke", session_id))
+        if session_id == CURRENT_SESSION_ID:
+            raise HelperCallError("forbidden")
+        return {"revoked": session_id == OTHER_SESSION_ID}
 
     async def session(self, token: str) -> Mapping[str, object]:
         self.operations.append(("session", token))
@@ -185,6 +322,8 @@ class AuthGateway:
         client_ip: str,
     ) -> Mapping[str, object]:
         self.operations.append(("change_own_password", current_password, new_password, client_ip))
+        if self.change_password_error is not None:
+            raise self.change_password_error
         self.sessions.clear()
         return {"changed": True}
 
@@ -328,6 +467,7 @@ async def _post_json(
     request_headers = {
         "Origin": _origin(client),
         "X-CSRF-Token": token,
+        "User-Agent": TEST_USER_AGENT,
     }
     if headers:
         request_headers.update(headers)
@@ -343,6 +483,22 @@ def _rotated_csrf(response: Any) -> str:
     token = response.headers.get("X-CSRF-Token")
     assert token
     return str(token)
+
+
+def _passkey_credential() -> dict[str, object]:
+    return {
+        "id": "Y3JlZGVudGlhbC1pZA",
+        "rawId": "Y3JlZGVudGlhbC1pZA",
+        "type": "public-key",
+        "authenticatorAttachment": "platform",
+        "response": {
+            "clientDataJSON": "Y2xpZW50LWRhdGE",
+            "authenticatorData": "YXV0aGVudGljYXRvci1kYXRh",
+            "signature": "c2lnbmF0dXJl",
+            "userHandle": "dXNlci1pZA",
+        },
+        "clientExtensionResults": {},
+    }
 
 
 async def _password_challenge(
@@ -558,7 +714,9 @@ async def test_unauthenticated_browser_is_confined_to_login_surface(
         assert public_asset.headers["Cache-Control"] == ("public, max-age=31536000, immutable")
     assert (await client.get("/static/login.css")).status == 404
     assert (await client.get("/static/login.js?v=incorrect")).status == 404
-    assert (await client.get("/api/v1/auth/csrf")).status == 200
+    csrf_response = await client.get("/api/v1/auth/csrf")
+    assert csrf_response.status == 200
+    assert (await csrf_response.json())["data"]["passkeys_enabled"] is False
 
     for path in ("/", "/mail", "/compose", "/accounts", "/certificates", "/security"):
         response = await client.get(path, allow_redirects=False)
@@ -659,13 +817,229 @@ async def test_password_totp_login_rotates_csrf_and_sets_session_cookie(
     assert "HttpOnly" in set_cookie
     assert "SameSite=Strict" in set_cookie
     assert "Path=/" in set_cookie
-    assert ("totp", CHALLENGE, "123456", "127.0.0.1") in gateway.operations
+    assert (
+        "totp",
+        CHALLENGE,
+        "123456",
+        "127.0.0.1",
+        TEST_USER_AGENT,
+    ) in gateway.operations
 
     session = await client.get("/api/v1/auth/session")
     assert session.status == 200
     session_payload = await session.json()
     assert session_payload["data"]["principal"]["account_id"] == USER_ID
     assert session_payload["data"]["login_domain"] == ""
+    assert session_payload["data"]["passkeys_enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_auth_bootstrap_reports_configured_passkey_support(tmp_path: Path) -> None:
+    gateway = AuthGateway()
+    client = TestClient(
+        TestServer(create_app(_config(tmp_path, public=True), gateway)),
+        cookie_jar=CookieJar(unsafe=True),
+    )
+    await client.start_server()
+    try:
+        response = await client.get("/api/v1/auth/csrf")
+        assert response.status == 200
+        assert (await response.json())["data"]["passkeys_enabled"] is True
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_passkey_login_is_anonymous_but_other_security_apis_are_protected(
+    auth_client: tuple[TestClient, AuthGateway],
+) -> None:
+    client, gateway = auth_client
+
+    for path in (
+        "/api/v1/auth/passkeys",
+        "/api/v1/auth/sessions",
+    ):
+        response = await client.get(path)
+        assert response.status == 401
+
+    csrf = await _csrf(client)
+    options = await _post_json(
+        client,
+        "/api/v1/auth/passkey/options",
+        csrf,
+        {},
+    )
+    assert options.status == 200
+    options_data = (await options.json())["data"]
+    assert options_data["challenge"] == CHALLENGE
+    assert options_data["options"]["userVerification"] == "required"
+    assert "allowCredentials" not in options_data["options"]
+    assert (
+        "passkey_login_begin",
+        "127.0.0.1",
+    ) in gateway.operations
+
+    credential = _passkey_credential()
+    completed = await _post_json(
+        client,
+        "/api/v1/auth/passkey",
+        _rotated_csrf(options),
+        {"challenge": CHALLENGE, "credential": credential},
+    )
+    assert completed.status == 200
+    assert (await completed.json())["data"]["principal"]["account_id"] == USER_ID
+    assert (
+        client.session.cookie_jar.filter_cookies(client.make_url("/"))["maddyweb-session"].value
+        == PASSKEY_TOKEN
+    )
+    assert (
+        "passkey_login_complete",
+        CHALLENGE,
+        credential,
+        "127.0.0.1",
+        TEST_USER_AGENT,
+    ) in gateway.operations
+
+
+@pytest.mark.asyncio
+async def test_passkey_login_options_reject_account_identifiers(
+    tmp_path: Path,
+) -> None:
+    gateway = AuthGateway()
+    client = TestClient(
+        TestServer(create_app(_config(tmp_path, login_domain="example.test"), gateway)),
+        cookie_jar=CookieJar(unsafe=True),
+    )
+    await client.start_server()
+    try:
+        csrf = await _csrf(client)
+        accepted = await _post_json(
+            client,
+            "/api/v1/auth/passkey/options",
+            csrf,
+            {},
+        )
+        assert accepted.status == 200
+        assert (
+            "passkey_login_begin",
+            "127.0.0.1",
+        ) in gateway.operations
+
+        operation_count = len(gateway.operations)
+        rejected = await _post_json(
+            client,
+            "/api/v1/auth/passkey/options",
+            _rotated_csrf(accepted),
+            {"email": "user.name"},
+        )
+        assert rejected.status == 400
+        assert len(gateway.operations) == operation_count
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_passkey_credential_is_bounded_before_reaching_gateway(
+    auth_client: tuple[TestClient, AuthGateway],
+) -> None:
+    client, gateway = auth_client
+    csrf = await _csrf(client)
+    options = await _post_json(
+        client,
+        "/api/v1/auth/passkey/options",
+        csrf,
+        {},
+    )
+    gateway.operations.clear()
+    oversized = await _post_json(
+        client,
+        "/api/v1/auth/passkey",
+        _rotated_csrf(options),
+        {
+            "challenge": CHALLENGE,
+            "credential": {"id": "x" * (65 * 1024)},
+        },
+    )
+    assert oversized.status == 413
+    assert not any(operation[0] == "passkey_login_complete" for operation in gateway.operations)
+
+
+@pytest.mark.asyncio
+async def test_passkey_management_and_remote_session_revocation_boundaries(
+    auth_client: tuple[TestClient, AuthGateway],
+) -> None:
+    client, gateway = auth_client
+    _login, csrf = await _login_totp(client, gateway)
+    gateway.operations.clear()
+
+    passkeys = await client.get("/api/v1/auth/passkeys")
+    assert passkeys.status == 200
+    assert (await passkeys.json())["data"]["passkeys"][0]["id"] == PASSKEY_ID
+    sessions = await client.get("/api/v1/auth/sessions")
+    assert sessions.status == 200
+    session_records = (await sessions.json())["data"]["sessions"]
+    assert [record["current"] for record in session_records] == [True, False]
+
+    missing_csrf = await client.post(
+        "/api/v1/auth/passkeys/register/options",
+        json={},
+        headers={"Origin": _origin(client)},
+    )
+    assert missing_csrf.status == 403
+    assert ("passkey_register_begin",) not in gateway.operations
+    csrf = await _csrf(client)
+
+    registration = await _post_json(
+        client,
+        "/api/v1/auth/passkeys/register/options",
+        csrf,
+        {},
+    )
+    assert registration.status == 200
+    credential = _passkey_credential()
+    registered = await _post_json(
+        client,
+        "/api/v1/auth/passkeys/register",
+        _rotated_csrf(registration),
+        {"challenge": CHALLENGE, "credential": credential, "name": "Laptop"},
+    )
+    assert registered.status == 200
+    assert (await registered.json())["data"]["passkey"]["id"] == PASSKEY_ID
+
+    stepped_up = await _post_json(
+        client,
+        "/api/v1/auth/passkey/step-up/options",
+        _rotated_csrf(registered),
+        {},
+    )
+    assert stepped_up.status == 200
+    completed_step_up = await _post_json(
+        client,
+        "/api/v1/auth/passkey/step-up",
+        _rotated_csrf(stepped_up),
+        {"challenge": CHALLENGE, "credential": credential},
+    )
+    assert completed_step_up.status == 200
+    assert (await completed_step_up.json())["data"]["step_up_expires_in"] == 300
+
+    revoked = await _post_json(
+        client,
+        f"/api/v1/auth/sessions/{OTHER_SESSION_ID}/revoke",
+        _rotated_csrf(completed_step_up),
+        {},
+    )
+    assert revoked.status == 200
+    assert (await revoked.json())["data"] == {"revoked": True}
+
+    current = await _post_json(
+        client,
+        f"/api/v1/auth/sessions/{CURRENT_SESSION_ID}/revoke",
+        _rotated_csrf(revoked),
+        {},
+    )
+    assert current.status == 403
+    assert (await current.json())["error"]["code"] == "forbidden"
+    assert ("session_revoke", CURRENT_SESSION_ID) in gateway.operations
 
 
 @pytest.mark.asyncio
@@ -742,6 +1116,7 @@ async def test_first_login_enrollment_and_recovery_login_flows(
         CHALLENGE,
         "654321",
         "127.0.0.1",
+        TEST_USER_AGENT,
     ) in gateway.operations
 
     gateway.sessions.clear()
@@ -759,6 +1134,7 @@ async def test_first_login_enrollment_and_recovery_login_flows(
         CHALLENGE,
         "recovery-one",
         "127.0.0.1",
+        TEST_USER_AGENT,
     ) in gateway.operations
     cookies = client.session.cookie_jar.filter_cookies(client.make_url("/"))
     assert cookies["maddyweb-session"].value == RECOVERY_TOKEN
@@ -1025,6 +1401,43 @@ async def test_admin_uses_opaque_target_and_unknown_target_is_rejected(
 
 
 @pytest.mark.asyncio
+async def test_own_password_change_preserves_authentication_error_mapping(
+    auth_client: tuple[TestClient, AuthGateway],
+) -> None:
+    client, gateway = auth_client
+    _response, csrf = await _login_totp(client, gateway)
+    body = {
+        "current_password": "wrong-mailbox-password",
+        "new_password": "new-mailbox-password",
+    }
+
+    gateway.change_password_error = HelperCallError("invalid_credentials", "private detail")
+    invalid = await _post_json(
+        client,
+        "/api/v1/auth/password/change",
+        csrf,
+        body,
+    )
+    assert invalid.status == 401
+    invalid_payload = await invalid.json()
+    assert invalid_payload["error"]["code"] == "invalid_credentials"
+    assert "private detail" not in await invalid.text()
+
+    gateway.change_password_error = HelperCallError(
+        "step_up_required",
+        "verification expired",
+    )
+    stale = await _post_json(
+        client,
+        "/api/v1/auth/password/change",
+        _rotated_csrf(invalid),
+        body,
+    )
+    assert stale.status == 403
+    assert (await stale.json())["error"]["code"] == "step_up_required"
+
+
+@pytest.mark.asyncio
 async def test_forced_password_change_gate_only_allows_security_flow(
     auth_client: tuple[TestClient, AuthGateway],
 ) -> None:
@@ -1044,11 +1457,28 @@ async def test_forced_password_change_gate_only_allows_security_flow(
     assert (await mail.json())["error"]["code"] == "password_change_required"
     assert (await client.get("/api/v1/auth/session")).status == 200
     assert (await client.get("/security")).status == 200
+    assert (await client.get("/api/v1/auth/passkeys")).status == 200
+    assert (await client.get("/api/v1/auth/sessions")).status == 200
+    passkey_step_up = await _post_json(
+        client,
+        "/api/v1/auth/passkey/step-up/options",
+        csrf,
+        {},
+    )
+    assert passkey_step_up.status == 200
+    blocked_registration = await _post_json(
+        client,
+        "/api/v1/auth/passkeys/register/options",
+        _rotated_csrf(passkey_step_up),
+        {},
+    )
+    assert blocked_registration.status == 403
+    assert (await blocked_registration.json())["error"]["code"] == ("password_change_required")
 
     changed = await _post_json(
         client,
         "/api/v1/auth/password/change",
-        csrf,
+        _rotated_csrf(passkey_step_up),
         {
             "current_password": "old-mailbox-password",
             "new_password": "new-mailbox-password",

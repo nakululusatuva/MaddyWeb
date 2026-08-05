@@ -93,10 +93,13 @@
     principal: {},
     role: "mailbox",
     loginDomain: "",
+    passkeysEnabled: false,
     capabilities: new Set(),
     sessionExpiresAt: 0,
     idleExpiresAt: 0,
     sessionTimer: 0,
+    sessionRefreshAt: 0,
+    sessionRefreshPromise: null,
     mailEventSource: null,
     mailEventAccount: "",
     newMailNotices: [],
@@ -108,6 +111,8 @@
     mail: null,
     message: null,
     certificates: null,
+    passkeys: [],
+    sessions: [],
     selectedAccount: null,
     accountOpener: null,
     confirmAction: null,
@@ -184,6 +189,84 @@
     if (url.origin !== window.location.origin) return null;
     if (requiredPrefix && !url.pathname.startsWith(requiredPrefix)) return null;
     return url;
+  };
+
+  const passkeysSupported = () => (
+    window.isSecureContext
+    && typeof window.PublicKeyCredential === "function"
+    && navigator.credentials
+    && typeof navigator.credentials.create === "function"
+    && typeof navigator.credentials.get === "function"
+  );
+
+  const passkeysAvailable = () => state.passkeysEnabled && passkeysSupported();
+
+  const decodeBase64url = (value) => {
+    const encoded = stringValue(value).replace(/-/g, "+").replace(/_/g, "/");
+    const padded = encoded + "=".repeat((4 - (encoded.length % 4)) % 4);
+    const binary = window.atob(padded);
+    return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  };
+
+  const encodeBase64url = (value) => {
+    const bytes = value instanceof ArrayBuffer
+      ? new Uint8Array(value)
+      : new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+    let binary = "";
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    return window.btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/u, "");
+  };
+
+  const passkeyRequestOptions = (value) => {
+    const options = {...objectValue(value)};
+    options.challenge = decodeBase64url(options.challenge);
+    options.allowCredentials = arrayValue(options.allowCredentials).map((credential) => ({
+      ...objectValue(credential),
+      id: decodeBase64url(objectValue(credential).id),
+    }));
+    return options;
+  };
+
+  const passkeyCreationOptions = (value) => {
+    const options = {...objectValue(value)};
+    options.challenge = decodeBase64url(options.challenge);
+    options.user = {
+      ...objectValue(options.user),
+      id: decodeBase64url(objectValue(options.user).id),
+    };
+    options.excludeCredentials = arrayValue(options.excludeCredentials).map((credential) => ({
+      ...objectValue(credential),
+      id: decodeBase64url(objectValue(credential).id),
+    }));
+    return options;
+  };
+
+  const passkeyCredentialJson = (credential) => {
+    if (typeof credential.toJSON === "function") return credential.toJSON();
+    const response = credential.response;
+    const result = {
+      id: credential.id,
+      rawId: encodeBase64url(credential.rawId),
+      type: credential.type,
+      authenticatorAttachment: credential.authenticatorAttachment || undefined,
+      clientExtensionResults: credential.getClientExtensionResults(),
+      response: {
+        clientDataJSON: encodeBase64url(response.clientDataJSON),
+      },
+    };
+    if (response.attestationObject) {
+      result.response.attestationObject = encodeBase64url(response.attestationObject);
+      result.response.transports = typeof response.getTransports === "function"
+        ? response.getTransports()
+        : [];
+    } else {
+      result.response.authenticatorData = encodeBase64url(response.authenticatorData);
+      result.response.signature = encodeBase64url(response.signature);
+      result.response.userHandle = response.userHandle
+        ? encodeBase64url(response.userHandle)
+        : null;
+    }
+    return result;
   };
 
   const scopedAccount = () => (
@@ -387,7 +470,12 @@
       createAccountButton.disabled = !loginDomain;
     }
     const passwordChangeRequired = principal.password_change_required === true;
+    document.documentElement.dataset.passwordChangeRequired = String(passwordChangeRequired);
     byId("password-change-required").hidden = !passwordChangeRequired;
+    byId("passkey-registration-form").hidden = !state.passkeysEnabled;
+    byId("passkey-registration-button").disabled = (
+      passwordChangeRequired || !passkeysAvailable()
+    );
     const recoveryForm = byId("regenerate-recovery-form");
     for (const control of recoveryForm.elements) {
       if (
@@ -412,15 +500,19 @@
       }
       const remaining = expires - Date.now();
       if (remaining <= 0) {
+        label.textContent = "Session expired";
+        state.authState = "anonymous";
         window.clearInterval(state.sessionTimer);
+        state.sessionTimer = null;
+        closeMailEvents();
         window.location.replace("/login");
         return;
       }
       const minutes = Math.max(1, Math.ceil(remaining / 60000));
       label.textContent = `Session expires in ${minutes} min`;
     };
-    update();
     state.sessionTimer = window.setInterval(update, 30000);
+    update();
   };
 
   const applySessionData = (data) => {
@@ -430,6 +522,7 @@
     state.principal = principal;
     state.role = role;
     state.loginDomain = stringValue(data.login_domain).trim().toLowerCase();
+    state.passkeysEnabled = data.passkeys_enabled === true;
     state.capabilities = new Set(
       arrayValue(data.capabilities).map((value) => stringValue(value)).filter(Boolean),
     );
@@ -442,6 +535,14 @@
     state.idleExpiresAt = Number.isSafeInteger(principal.idle_expires_at)
       ? principal.idle_expires_at
       : 0;
+    if (
+      state.authState === "active"
+      && principal.password_change_required === true
+      && window.location.pathname !== "/security"
+    ) {
+      window.history.replaceState(null, "", "/security");
+    }
+    state.sessionRefreshAt = Date.now();
     const token = stringValue(data.csrf_token);
     if (token) state.csrfToken = token;
     applySessionUi();
@@ -481,6 +582,20 @@
     applySessionData(data);
     if (!state.csrfToken) throw new ApiError("The server did not provide a CSRF token.");
     return state.csrfToken;
+  };
+
+  const refreshSessionAfterActivity = () => {
+    if (
+      state.authState !== "active"
+      || document.visibilityState !== "visible"
+      || Date.now() - state.sessionRefreshAt < 5 * 60 * 1000
+    ) return;
+    if (state.sessionRefreshPromise instanceof Promise) return;
+    state.sessionRefreshPromise = refreshSession().catch((error) => {
+      handleError(error, "The secure session could not be refreshed.");
+    }).finally(() => {
+      state.sessionRefreshPromise = null;
+    });
   };
 
   const refreshCsrfToken = async (signal = undefined) => {
@@ -586,23 +701,25 @@
     return objectValue(payload);
   };
 
-  const requestAdministratorStepUp = (options = {}) => {
+  const requestStepUp = (options = {}) => {
     if (typeof state.stepUpResolve === "function") {
       return Promise.reject(new ApiError(
-        "Administrator verification is already in progress.",
+        "Security verification is already in progress.",
         {code: "step_up_in_progress", status: 409},
       ));
     }
     const values = objectValue(options);
     byId("step-up-title").textContent = stringValue(
       values.title,
-      "Verify administrator",
+      "Verify your identity",
     );
-    byId("step-up-account").textContent = stringValue(values.account);
+    byId("step-up-account").textContent = stringValue(
+      values.account,
+      stringValue(objectValue(state.principal).email),
+    );
     byId("step-up-copy").textContent = stringValue(
       values.copy,
-      "Verify your administrator password and current authenticator code "
-        + "to continue this protected operation.",
+      "Confirm your identity to continue this protected operation.",
     );
     byId("step-up-submit").textContent = stringValue(
       values.submitLabel,
@@ -611,6 +728,10 @@
     byId("step-up-error").hidden = true;
     byId("step-up-error").textContent = "";
     byId("step-up-form").reset();
+    const passkeyAvailable = passkeysAvailable();
+    byId("step-up-passkey").hidden = !passkeyAvailable;
+    byId("step-up-passkey").disabled = !passkeyAvailable;
+    byId("step-up-divider").hidden = !passkeyAvailable;
     state.stepUpOpener = values.opener instanceof HTMLElement
       ? values.opener
       : document.activeElement instanceof HTMLElement
@@ -636,7 +757,7 @@
           && options.stepUp !== false
           && path !== "/auth/step-up"
         ) {
-          await requestAdministratorStepUp();
+          await requestStepUp();
           return executeMutation(path, {...options, stepUp: false});
         }
         throw error;
@@ -3441,6 +3562,138 @@
     renderCertificates(data);
   };
 
+  const renderPasskeys = (records) => {
+    state.passkeys = arrayValue(records).map(objectValue);
+    const fragment = document.createDocumentFragment();
+    for (const passkey of state.passkeys) {
+      const publicId = stringValue(passkey.id || passkey.credential_id);
+      const item = element("article", {className: "security-item"});
+      const details = element("div");
+      details.append(
+        element("h3", {text: stringValue(passkey.name, "Passkey")}),
+        element("p", {
+          text: [
+            passkey.backed_up === true ? "Synced passkey" : "Device-bound passkey",
+            `Added ${formatSessionTime(passkey.created_at)}`,
+            passkey.last_used_at ? `Last used ${formatSessionTime(passkey.last_used_at)}` : "Not used yet",
+          ].join(" | "),
+        }),
+      );
+      const actions = element("div", {className: "security-item-actions"});
+      const remove = element("button", {
+        className: "button button-secondary",
+        text: "Remove",
+        type: "button",
+      });
+      remove.disabled = !publicId;
+      remove.addEventListener("click", () => {
+        openConfirm({
+          title: "Remove passkey?",
+          message: `Remove ${stringValue(passkey.name, "this passkey")}? Other sign-in methods remain available.`,
+          label: "Remove passkey",
+          danger: true,
+          opener: remove,
+          action: async () => {
+            await mutate(`/auth/passkeys/${encodeURIComponent(publicId)}/delete`, {json: {}});
+            showToast("Passkey removed.");
+            await loadSecurity();
+          },
+        });
+      });
+      actions.append(remove);
+      item.append(details, actions);
+      fragment.append(item);
+    }
+    byId("passkeys-list").replaceChildren(fragment);
+    byId("passkeys-empty").hidden = state.passkeys.length !== 0;
+    const badge = byId("security-passkey-state");
+    badge.textContent = state.passkeys.length ? `${state.passkeys.length} registered` : "Not configured";
+    badge.className = `status-pill ${state.passkeys.length ? "status-positive" : "status-neutral"}`;
+  };
+
+  const renderSessions = (records) => {
+    state.sessions = arrayValue(records).map(objectValue);
+    const fragment = document.createDocumentFragment();
+    for (const session of state.sessions) {
+      const publicId = stringValue(session.id || session.session_id);
+      const current = session.current === true;
+      const item = element("article", {className: "security-item"});
+      const details = element("div");
+      const title = element("h3", {
+        text: stringValue(session.user_agent, "Unknown browser"),
+      });
+      const description = [
+        stringValue(session.client_ip, "Unknown address"),
+        `Last active ${formatSessionTime(session.last_seen_at)}`,
+        `Expires after inactivity ${formatSessionTime(session.idle_expires_at)}`,
+      ].join(" | ");
+      details.append(title, element("p", {text: description}));
+      const actions = element("div", {className: "security-item-actions"});
+      if (current) {
+        actions.append(element("span", {
+          className: "status-pill status-positive",
+          text: "This session",
+        }));
+      } else {
+        const revoke = element("button", {
+          className: "button button-secondary",
+          text: "Revoke",
+          type: "button",
+        });
+        revoke.disabled = !publicId;
+        revoke.addEventListener("click", () => {
+          openConfirm({
+            title: "Revoke browser session?",
+            message: "That browser will immediately lose access to this mailbox.",
+            label: "Revoke session",
+            danger: true,
+            opener: revoke,
+            action: async () => {
+              await mutate(`/auth/sessions/${encodeURIComponent(publicId)}/revoke`, {json: {}});
+              showToast("Session revoked.");
+              await loadSecurity();
+            },
+          });
+        });
+        actions.append(revoke);
+      }
+      item.append(details, actions);
+      fragment.append(item);
+    }
+    byId("security-sessions-list").replaceChildren(fragment);
+    byId("security-sessions-empty").hidden = state.sessions.length !== 0;
+  };
+
+  const loadSecurity = async (signal = undefined) => {
+    setLoading("Loading account security.");
+    const [passkeyData, sessionDataValue] = await Promise.all([
+      state.passkeysEnabled
+        ? apiData("/auth/passkeys", {signal})
+        : Promise.resolve({passkeys: []}),
+      apiData("/auth/sessions", {signal}),
+    ]);
+    renderPasskeys(passkeyData.passkeys);
+    renderSessions(sessionDataValue.sessions);
+    const form = byId("passkey-registration-form");
+    const list = byId("passkeys-list");
+    form.hidden = !state.passkeysEnabled;
+    list.hidden = !state.passkeysEnabled;
+    if (!state.passkeysEnabled) {
+      byId("passkeys-empty").hidden = true;
+      byId("security-passkey-state").textContent = "Unavailable";
+      byId("security-passkey-state").className = "status-pill status-neutral";
+      return;
+    }
+    const supported = passkeysAvailable();
+    byId("passkey-registration-button").disabled = (
+      !supported || objectValue(state.principal).password_change_required === true
+    );
+    if (!supported) {
+      byId("security-passkey-state").textContent = "Browser unsupported";
+      byId("security-passkey-state").className = "status-pill status-warning";
+    }
+  };
+
   const closeDialog = (dialog) => {
     if (dialog instanceof HTMLDialogElement && dialog.open) dialog.close();
   };
@@ -3638,6 +3891,7 @@
       else if (route.name === "compose") await loadCompose(signal);
       else if (route.name === "accounts") await loadAccounts(signal);
       else if (route.name === "certificates") await loadCertificates(signal);
+      else if (route.name === "security") await loadSecurity(signal);
     } catch (error) {
       if (route.name === "message" && !signal.aborted) {
         setMessagePlaceholder("error");
@@ -3676,6 +3930,11 @@
   window.addEventListener("pageshow", (event) => {
     if (event.persisted && state.authState === "active") startMailEvents();
   });
+  for (const eventName of ["pointerdown", "keydown", "touchstart"]) {
+    document.addEventListener(eventName, (event) => {
+      if (event.isTrusted) refreshSessionAfterActivity();
+    }, {passive: true});
+  }
 
   const logout = async () => {
     const buttons = [
@@ -4223,6 +4482,57 @@
     }
   });
 
+  byId("passkey-registration-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    if (
+      !(form instanceof HTMLFormElement)
+      || !form.reportValidity()
+      || !passkeysAvailable()
+    ) return;
+    const nameInput = form.elements.namedItem("name");
+    const button = form.querySelector('button[type="submit"]');
+    if (!(nameInput instanceof HTMLInputElement) || !(button instanceof HTMLButtonElement)) return;
+    const name = nameInput.value.trim();
+    button.disabled = true;
+    clearAlert();
+    try {
+      const beginPayload = await mutate("/auth/passkeys/register/options", {json: {}});
+      const begin = objectValue(beginPayload.data);
+      const challenge = stringValue(begin.challenge);
+      if (!challenge) throw new ApiError("The server returned an invalid passkey request.");
+      const credential = await navigator.credentials.create({
+        publicKey: passkeyCreationOptions(begin.options),
+      });
+      if (!(credential instanceof PublicKeyCredential)) {
+        throw new ApiError("The browser did not return a passkey credential.");
+      }
+      await mutate("/auth/passkeys/register", {
+        json: {challenge, name, credential: passkeyCredentialJson(credential)},
+        stepUp: false,
+      });
+      showToast("Passkey added.");
+      await loadSecurity();
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "NotAllowedError") {
+        showAlert("Passkey registration was cancelled or timed out.");
+      } else {
+        handleError(error, "The passkey could not be added.");
+      }
+    } finally {
+      button.disabled = (
+        !passkeysAvailable()
+        || objectValue(state.principal).password_change_required === true
+      );
+    }
+  });
+
+  byId("refresh-security-sessions").addEventListener("click", () => {
+    void loadSecurity().catch((error) => {
+      handleError(error, "Account security could not be refreshed.");
+    });
+  });
+
   const accountLocalPartIsValid = (value) => (
     /^[A-Za-z0-9!#$%&'*+=?^_`{|}~.-]+$/.test(value)
     && value.length <= 64
@@ -4381,7 +4691,7 @@
       : event.currentTarget;
     closeDialog(accountDialog);
     try {
-      await requestAdministratorStepUp({
+      await requestStepUp({
         title: "Reset account TOTP",
         account: address,
         copy: "Verify your administrator password and current authenticator code. "
@@ -4412,6 +4722,48 @@
       finishAction(payload, "Account TOTP reset.");
     } catch (error) {
       handleError(error, "Account TOTP could not be reset.");
+    }
+  });
+
+  byId("step-up-passkey").addEventListener("click", async (event) => {
+    if (typeof state.stepUpResolve !== "function" || !passkeysAvailable()) return;
+    const button = event.currentTarget;
+    if (!(button instanceof HTMLButtonElement)) return;
+    button.disabled = true;
+    byId("step-up-error").hidden = true;
+    byId("step-up-error").textContent = "";
+    try {
+      const beginPayload = await executeMutation(
+        "/auth/passkey/step-up/options",
+        {json: {}, stepUp: false},
+      );
+      const begin = objectValue(beginPayload.data);
+      const challenge = stringValue(begin.challenge);
+      if (!challenge) throw new ApiError("The server returned an invalid passkey request.");
+      const credential = await navigator.credentials.get({
+        publicKey: passkeyRequestOptions(begin.options),
+      });
+      if (!(credential instanceof PublicKeyCredential)) {
+        throw new ApiError("The browser did not return a passkey credential.");
+      }
+      await executeMutation("/auth/passkey/step-up", {
+        json: {challenge, credential: passkeyCredentialJson(credential)},
+        stepUp: false,
+      });
+      const resolve = state.stepUpResolve;
+      state.stepUpResolve = null;
+      state.stepUpReject = null;
+      closeDialog(stepUpDialog);
+      resolve();
+    } catch (error) {
+      const message = error instanceof DOMException && error.name === "NotAllowedError"
+        ? "Passkey verification was cancelled or timed out."
+        : error instanceof ApiError
+          ? error.message
+          : "Passkey verification failed.";
+      byId("step-up-error").textContent = message;
+      byId("step-up-error").hidden = false;
+      button.disabled = false;
     }
   });
 
@@ -4449,7 +4801,7 @@
     } catch (error) {
       const message = error instanceof ApiError
         ? error.message
-        : "Administrator verification failed.";
+        : "Security verification failed.";
       byId("step-up-error").textContent = message;
       byId("step-up-error").hidden = false;
       button.disabled = false;
@@ -4715,7 +5067,7 @@
     state.stepUpReject = null;
     if (typeof reject === "function") {
       reject(new ApiError(
-        "Administrator verification was cancelled.",
+        "Security verification was cancelled.",
         {code: "step_up_cancelled", status: 403},
       ));
     }

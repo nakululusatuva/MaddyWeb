@@ -20,6 +20,7 @@
     qrObjectUrl: null,
     recoveryCodes: [],
     recoveryDownloadUrl: null,
+    passkeysEnabled: false,
     busy: false,
   };
 
@@ -31,6 +32,67 @@
     typeof value === "string" ? value : fallback
   );
   const arrayValue = (value) => (Array.isArray(value) ? value : []);
+
+  const passkeysSupported = () => (
+    window.isSecureContext
+    && typeof window.PublicKeyCredential === "function"
+    && navigator.credentials
+    && typeof navigator.credentials.get === "function"
+  );
+
+  const passkeysAvailable = () => state.passkeysEnabled && passkeysSupported();
+
+  const updatePasskeyAvailability = () => {
+    const panel = byId("passkey-login-panel");
+    const button = byId("passkey-login");
+    const available = passkeysAvailable();
+    panel.hidden = !available;
+    button.disabled = state.busy || !available;
+  };
+
+  const decodeBase64url = (value) => {
+    const encoded = stringValue(value).replace(/-/g, "+").replace(/_/g, "/");
+    const padded = encoded + "=".repeat((4 - (encoded.length % 4)) % 4);
+    const binary = window.atob(padded);
+    return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  };
+
+  const encodeBase64url = (value) => {
+    const bytes = value instanceof ArrayBuffer
+      ? new Uint8Array(value)
+      : new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+    let binary = "";
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    return window.btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/u, "");
+  };
+
+  const passkeyRequestOptions = (value) => {
+    const options = {...objectValue(value)};
+    options.challenge = decodeBase64url(options.challenge);
+    options.allowCredentials = arrayValue(options.allowCredentials).map((credential) => ({
+      ...objectValue(credential),
+      id: decodeBase64url(objectValue(credential).id),
+    }));
+    return options;
+  };
+
+  const passkeyCredentialJson = (credential) => {
+    if (typeof credential.toJSON === "function") return credential.toJSON();
+    const response = credential.response;
+    return {
+      id: credential.id,
+      rawId: encodeBase64url(credential.rawId),
+      type: credential.type,
+      authenticatorAttachment: credential.authenticatorAttachment || undefined,
+      clientExtensionResults: credential.getClientExtensionResults(),
+      response: {
+        clientDataJSON: encodeBase64url(response.clientDataJSON),
+        authenticatorData: encodeBase64url(response.authenticatorData),
+        signature: encodeBase64url(response.signature),
+        userHandle: response.userHandle ? encodeBase64url(response.userHandle) : null,
+      },
+    };
+  };
 
   class AuthError extends Error {
     constructor(message, options = {}) {
@@ -53,13 +115,16 @@
 
   const setBusy = (busy, message = "") => {
     state.busy = busy;
-    document.querySelectorAll("button[type=\"submit\"], #recovery-continue").forEach((button) => {
+    document.querySelectorAll(
+      "button[type=\"submit\"], #recovery-continue, #passkey-login",
+    ).forEach((button) => {
       if (button instanceof HTMLButtonElement) {
         button.disabled = busy || (
           button.id === "recovery-continue" && !byId("recovery-acknowledged").checked
         );
       }
     });
+    updatePasskeyAvailability();
     if (message) setNotice(message);
   };
 
@@ -132,6 +197,10 @@
     const headerToken = response.headers.get("X-CSRF-Token");
     const token = headerToken || stringValue(data.csrf_token);
     if (token) state.csrfToken = token;
+    if (typeof data.passkeys_enabled === "boolean") {
+      state.passkeysEnabled = data.passkeys_enabled;
+      updatePasskeyAvailability();
+    }
     const principal = objectValue(data.principal);
     if (stringValue(principal.email)) state.principal = principal;
   };
@@ -177,9 +246,20 @@
     return unwrapPayload(payload);
   };
 
-  const activeDestination = (principal) => (
-    stringValue(objectValue(principal).role) === "admin" ? "/" : "/mail"
-  );
+  const activeDestination = (principal) => {
+    const identity = objectValue(principal);
+    if (identity.password_change_required === true) return "/security";
+    return stringValue(identity.role) === "admin" ? "/" : "/mail";
+  };
+
+  const showVerifiedButton = (button, label = "Verified. Signing in...") => {
+    if (!(button instanceof HTMLButtonElement)) return;
+    button.classList.remove("is-verifying");
+    button.classList.add("is-verified");
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+    button.textContent = label;
+  };
 
   const finishAuthentication = (response, beforeRedirect = null) => {
     const principal = objectValue(response.principal);
@@ -401,6 +481,44 @@
     }
   });
 
+  byId("passkey-login").addEventListener("click", async () => {
+    if (state.busy || !passkeysAvailable()) return;
+    setBusy(true, "Waiting for your passkey...");
+    let redirecting = false;
+    try {
+      const ceremony = await authRequest("/passkey/options", {
+        method: "POST",
+        body: {},
+      });
+      const challenge = stringValue(ceremony.challenge);
+      if (!challenge) throw new AuthError("The server returned an invalid passkey request.");
+      const credential = await navigator.credentials.get({
+        publicKey: passkeyRequestOptions(ceremony.options),
+      });
+      if (!(credential instanceof PublicKeyCredential)) {
+        throw new AuthError("The browser did not return a passkey credential.");
+      }
+      redirecting = finishAuthentication(
+        await authRequest("/passkey", {
+          method: "POST",
+          body: {challenge, credential: passkeyCredentialJson(credential)},
+        }),
+        () => {
+          showVerifiedButton(byId("passkey-login"));
+          setNotice("Authentication complete. Opening MaddyWeb...", "success");
+        },
+      );
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "NotAllowedError") {
+        setNotice("Passkey sign-in was cancelled or timed out.", "error");
+      } else {
+        handleError(error);
+      }
+    } finally {
+      if (!redirecting) setBusy(false);
+    }
+  });
+
   byId("totp-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     if (state.busy || !state.challenge) return;
@@ -420,7 +538,7 @@
           body: {challenge: state.challenge, code},
         }),
         () => {
-          submit.textContent = "Verified. Signing in...";
+          showVerifiedButton(submit);
           setNotice("Authentication complete. Opening MaddyWeb...", "success");
         },
       );
@@ -547,6 +665,8 @@
 
   byId("retry-session").addEventListener("click", () => void restoreSession());
   window.addEventListener("pagehide", () => clearSensitiveState());
+
+  updatePasskeyAvailability();
 
   void restoreSession();
 })();

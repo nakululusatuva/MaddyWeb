@@ -15,10 +15,12 @@ import pytest
 
 import maddyweb.helper as helper_module
 from maddyweb.auth import (
+    MAX_SESSIONS_PER_ACCOUNT,
     AuthStore,
     InvalidSessionError,
     LoginRateLimitedError,
     Role,
+    VerifiedPasskeyIdentity,
     totp_code,
 )
 from maddyweb.config import AppConfig
@@ -607,6 +609,30 @@ def test_password_change_gate_and_dangerous_operation_step_up(tmp_path: Path) ->
     assert dangerous.response.error.code == "step_up_required"
 
 
+def test_sensitive_mutations_require_helper_enforced_recent_authentication() -> None:
+    protected = {
+        "auth.change_password",
+        "auth.passkey_register_begin",
+        "auth.passkey_register_complete",
+        "auth.passkey_delete",
+        "auth.session_revoke_other",
+        "auth.admin_rotate_totp",
+        "accounts.create",
+        "accounts.change_password",
+        "accounts.disable_credentials",
+        "accounts.delete_imap_account",
+        "accounts.set_append_limit",
+        "certificates.timer_enable",
+        "certificates.timer_disable",
+        "certificates.renew_dry_run",
+        "certificates.renew",
+        "messages.delete",
+        "messages.delete_many",
+    }
+    assert all(ALLOWED_OPERATIONS[operation].step_up for operation in protected)
+    assert ALLOWED_OPERATIONS["auth.recovery_regenerate"].step_up is False
+
+
 def test_password_login_rejection_is_generic_and_never_audits_secret(
     tmp_path: Path,
 ) -> None:
@@ -708,6 +734,7 @@ def test_successful_password_totp_and_recovery_audits_are_attributed(
                     "challenge": challenge,
                     "code": totp_code(enrollment.secret, timestamp=_AUTH_CLOCK),
                     "client_ip": "203.0.113.8",
+                    "user_agent": "Test Browser/1.0",
                 },
             )
         )
@@ -715,6 +742,15 @@ def test_successful_password_totp_and_recovery_audits_are_attributed(
         totp_audit = audit_records[-1]
         assert totp_audit[2]["actor"] == account.email
         assert totp_audit[2]["authentication_method"] == "totp"
+        totp_token = totp_result.response.result["session_token"]
+        sessions = store.list_sessions(
+            account.account_id,
+            current_session_token=totp_token,
+        )
+        assert len(sessions) == 1
+        assert sessions[0].client_ip == "203.0.113.8"
+        assert sessions[0].user_agent == "Test Browser/1.0"
+        assert sessions[0].current is True
 
         recovery_begin = dispatcher.dispatch(
             Request.create(
@@ -733,6 +769,7 @@ def test_successful_password_totp_and_recovery_audits_are_attributed(
                     "challenge": recovery_begin.response.result["challenge"],
                     "recovery_code": recovery_codes[0],
                     "client_ip": "203.0.113.8",
+                    "user_agent": "Test Browser/1.0",
                 },
             )
         )
@@ -779,6 +816,7 @@ def test_successful_enrollment_completion_audit_is_attributed(
                     "challenge": challenge,
                     "code": totp_code(secret, timestamp=_AUTH_CLOCK),
                     "client_ip": "198.51.100.9",
+                    "user_agent": "Test Browser/1.0",
                 },
             )
         )
@@ -792,6 +830,204 @@ def test_successful_enrollment_completion_audit_is_attributed(
     assert record[2]["client_ip"] == "198.51.100.9"
     assert challenge not in repr(record)
     assert secret not in repr(record)
+
+
+def test_session_management_uses_public_ids_and_refuses_current_revocation(
+    tmp_path: Path,
+) -> None:
+    with make_auth_store(tmp_path) as store:
+        account, token = provision_session(store, "sender@example.test")
+        store.mark_step_up(token)
+        dispatcher = make_dispatcher(
+            tmp_path,
+            FakeMaddy(),
+            auth_store=store,
+        )
+
+        listed = dispatcher.dispatch(Request.create("auth.sessions_list", auth_token=token))
+        assert listed.response.ok is True
+        sessions = listed.response.result["sessions"]
+        assert len(sessions) == 1
+        assert sessions[0]["current"] is True
+        assert sessions[0]["id"] == store.authenticate_session(token).session_id
+        assert token not in repr(listed.response.result)
+        assert account.account_id not in repr(listed.response.result)
+
+        current = dispatcher.dispatch(
+            Request.create(
+                "auth.session_revoke_other",
+                {"session_id": sessions[0]["id"], "confirm": True},
+                auth_token=token,
+            )
+        )
+        assert current.response.error is not None
+        assert current.response.error.code == "forbidden"
+        assert store.authenticate_session(token).account_id == account.account_id
+
+        missing = dispatcher.dispatch(
+            Request.create(
+                "auth.session_revoke_other",
+                {"session_id": "f" * 32, "confirm": True},
+                auth_token=token,
+            )
+        )
+        assert missing.response.result == {"revoked": False}
+
+
+def test_passkey_inventory_exposes_only_public_management_identifiers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with make_auth_store(tmp_path) as store:
+        _account, token = provision_session(store, "sender@example.test")
+        passkey = SimpleNamespace(
+            public_id="a" * 32,
+            account_id="b" * 32,
+            credential_id=b"raw-webauthn-credential-id",
+            name="Laptop",
+            device_type="multi_device",
+            backed_up=True,
+            transports=("internal",),
+            created_at=_AUTH_CLOCK,
+            last_used_at=None,
+        )
+        monkeypatch.setattr(store, "list_passkeys", lambda _account_id: (passkey,))
+        listed = make_dispatcher(
+            tmp_path,
+            FakeMaddy(),
+            auth_store=store,
+        ).dispatch(Request.create("auth.passkeys_list", auth_token=token))
+
+    assert listed.response.ok is True
+    assert listed.response.result == {
+        "passkeys": [
+            {
+                "id": "a" * 32,
+                "name": "Laptop",
+                "device_type": "multi_device",
+                "backed_up": True,
+                "transports": ["internal"],
+                "created_at": _AUTH_CLOCK,
+                "last_used_at": None,
+            }
+        ]
+    }
+    assert "raw-webauthn-credential-id" not in repr(listed.response.result)
+    assert "b" * 32 not in repr(listed.response.result)
+
+
+def test_passkey_login_revalidates_maddy_account_before_returning_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audit_records: list[tuple[str, str, dict[str, Any]]] = []
+
+    def audit(action: str, *, outcome: str, fields: dict[str, Any]) -> None:
+        audit_records.append((action, outcome, fields))
+
+    with make_auth_store(tmp_path) as store:
+        account, enrollment, _recovery_codes = store.provision_active_account("sender@example.test")
+        tokens: list[str] = []
+        for index in range(MAX_SESSIONS_PER_ACCOUNT):
+            timestamp = _AUTH_CLOCK + (index * 30)
+            store._clock = lambda timestamp=timestamp: timestamp
+            challenge = store.create_pending_challenge(account.email)
+            tokens.append(
+                store.complete_totp_challenge(
+                    challenge,
+                    totp_code(enrollment.secret, timestamp=timestamp),
+                ).token
+            )
+        session_ids_before = {
+            store.authenticate_session(token, touch=False).session_id for token in tokens
+        }
+        issue_calls: list[VerifiedPasskeyIdentity] = []
+        monkeypatch.setattr(
+            store,
+            "verify_passkey_login",
+            lambda *_args, **_kwargs: VerifiedPasskeyIdentity(
+                account_id=account.account_id,
+                email=account.email,
+            ),
+        )
+        issue_session = store.issue_verified_passkey_session
+
+        def record_issue(identity: VerifiedPasskeyIdentity, **kwargs: Any) -> Any:
+            issue_calls.append(identity)
+            return issue_session(identity, **kwargs)
+
+        monkeypatch.setattr(store, "issue_verified_passkey_session", record_issue)
+        dispatcher = make_dispatcher(
+            tmp_path,
+            FakeMaddy(
+                accounts=[
+                    {
+                        "username": "sender@example.test",
+                        "has_credentials": False,
+                        "has_mailbox": True,
+                    }
+                ]
+            ),
+            auth_store=store,
+            audit=audit,
+        )
+        raw_response_marker = "browser-passkey-response-marker"
+        result = dispatcher.dispatch(
+            Request.create(
+                "auth.passkey_login_complete",
+                {
+                    "challenge": "C" * 43,
+                    "credential": {"id": raw_response_marker},
+                    "client_ip": "203.0.113.80",
+                    "user_agent": "Test Browser/1.0",
+                },
+            )
+        )
+        session_ids_after = {
+            store.authenticate_session(token, touch=False).session_id for token in tokens
+        }
+
+    assert result.response.error is not None
+    assert result.response.error.code == "invalid_credentials"
+    assert issue_calls == []
+    assert session_ids_after == session_ids_before
+    assert raw_response_marker not in repr(audit_records)
+
+
+def test_passkey_login_begin_is_account_unbound_and_does_not_query_maddy(
+    tmp_path: Path,
+) -> None:
+    maddy = FakeMaddy(accounts=[])
+    with AuthStore(
+        (tmp_path / "discoverable-auth.db").resolve(),
+        b"K" * 32,
+        "MaddyWeb Test",
+        clock=lambda: _AUTH_CLOCK,
+        webauthn_rp_id="example.test",
+        webauthn_origin="https://example.test",
+    ) as store:
+        dispatcher = make_dispatcher(tmp_path, maddy, auth_store=store)
+        begun = dispatcher.dispatch(
+            Request.create(
+                "auth.passkey_login_begin",
+                {"client_ip": "203.0.113.80"},
+            )
+        )
+        rejected_identity = dispatcher.dispatch(
+            Request.create(
+                "auth.passkey_login_begin",
+                {
+                    "client_ip": "203.0.113.80",
+                    "email": "user@example.test",
+                },
+            )
+        )
+
+    assert begun.response.ok is True
+    assert begun.response.result["options"]["allowCredentials"] == []
+    assert maddy.account_list_modes == []
+    assert rejected_identity.response.error is not None
+    assert rejected_identity.response.error.code == "invalid_request"
 
 
 def test_password_login_rejects_identity_without_mailbox(
@@ -852,6 +1088,7 @@ def test_self_password_change_revokes_sessions_before_maddy_write(
 
     with make_auth_store(tmp_path) as store:
         account, token = provision_session(store, "sender@example.test")
+        store.mark_step_up(token)
 
         class OrderingMaddy(FakeMaddy):
             def change_password(self, username: str, password: str) -> None:
@@ -899,6 +1136,7 @@ def test_password_change_stops_before_maddy_if_session_revocation_fails(
     maddy = FakeMaddy()
     with make_auth_store(tmp_path) as store:
         _account, token = provision_session(store, "sender@example.test")
+        store.mark_step_up(token)
 
         def fail_revocation(_account_id: str) -> None:
             raise OSError("simulated authentication database failure")
@@ -975,6 +1213,8 @@ def test_authenticated_reverification_honors_helper_rate_limit(
             "sender@example.test",
             role=Role.ADMIN,
         )
+        if operation == "auth.change_password":
+            store.mark_step_up(token)
 
         def reject_rate(_email: str, _client_ip: str) -> None:
             raise LoginRateLimitedError(60)
@@ -1427,6 +1667,8 @@ def test_bulk_permanent_delete_derives_identity_and_enforces_helper_account_scop
             password_change_required=False,
         )
         dispatcher = make_dispatcher(tmp_path, maddy, auth_store=store)
+        store.mark_step_up(user_token)
+        store.mark_step_up(admin_token)
 
         derived_self = dispatcher.dispatch(
             Request.create(

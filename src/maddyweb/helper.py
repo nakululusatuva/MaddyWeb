@@ -74,6 +74,7 @@ _SENSITIVE_KEYS = frozenset(
         "authorization",
         "challenge",
         "code",
+        "credential",
     }
 )
 _EMAIL_RE = re.compile(r"\A[^\s<>@]+@[^\s<>@]+\Z")
@@ -948,6 +949,16 @@ ALLOWED_OPERATIONS: Mapping[str, _Operation] = {
         mutating=True,
         permission="public",
     ),
+    "auth.passkey_login_begin": _Operation(
+        "_auth_passkey_login_begin",
+        mutating=True,
+        permission="public",
+    ),
+    "auth.passkey_login_complete": _Operation(
+        "_auth_passkey_login_complete",
+        mutating=True,
+        permission="public",
+    ),
     "auth.session": _Operation("_auth_session", permission="session"),
     "auth.session_peek": _Operation(
         "_auth_session",
@@ -960,13 +971,50 @@ ALLOWED_OPERATIONS: Mapping[str, _Operation] = {
         "_auth_change_password",
         mutating=True,
         permission="session",
+        step_up=True,
     ),
     "auth.recovery_regenerate": _Operation(
         "_auth_recovery_regenerate",
         mutating=True,
         permission="session",
     ),
-    "auth.step_up": _Operation("_auth_step_up", mutating=True, permission="admin"),
+    "auth.step_up": _Operation("_auth_step_up", mutating=True, permission="session"),
+    "auth.passkeys_list": _Operation("_auth_passkeys_list", permission="session"),
+    "auth.passkey_register_begin": _Operation(
+        "_auth_passkey_register_begin",
+        mutating=True,
+        permission="session",
+        step_up=True,
+    ),
+    "auth.passkey_register_complete": _Operation(
+        "_auth_passkey_register_complete",
+        mutating=True,
+        permission="session",
+        step_up=True,
+    ),
+    "auth.passkey_delete": _Operation(
+        "_auth_passkey_delete",
+        mutating=True,
+        permission="session",
+        step_up=True,
+    ),
+    "auth.passkey_step_up_begin": _Operation(
+        "_auth_passkey_step_up_begin",
+        mutating=True,
+        permission="session",
+    ),
+    "auth.passkey_step_up_complete": _Operation(
+        "_auth_passkey_step_up_complete",
+        mutating=True,
+        permission="session",
+    ),
+    "auth.sessions_list": _Operation("_auth_sessions_list", permission="session"),
+    "auth.session_revoke_other": _Operation(
+        "_auth_session_revoke_other",
+        mutating=True,
+        permission="session",
+        step_up=True,
+    ),
     "auth.admin_rotate_totp": _Operation(
         "_auth_admin_rotate_totp",
         mutating=True,
@@ -1001,6 +1049,7 @@ ALLOWED_OPERATIONS: Mapping[str, _Operation] = {
         "_append_limit_set",
         mutating=True,
         permission="admin_account",
+        step_up=True,
     ),
     "mailboxes.list": _Operation("_mailboxes_list", permission="account"),
     "mailboxes.create": _Operation("_mailboxes_create", mutating=True, permission="account"),
@@ -1020,11 +1069,17 @@ ALLOWED_OPERATIONS: Mapping[str, _Operation] = {
         stream_in=True,
         permission="account",
     ),
-    "messages.delete": _Operation("_messages_delete", mutating=True, permission="account"),
+    "messages.delete": _Operation(
+        "_messages_delete",
+        mutating=True,
+        permission="account",
+        step_up=True,
+    ),
     "messages.delete_many": _Operation(
         "_messages_delete_many",
         mutating=True,
         permission="account",
+        step_up=True,
     ),
     "messages.copy": _Operation("_messages_copy", mutating=True, permission="account"),
     "messages.move": _Operation("_messages_move", mutating=True, permission="account"),
@@ -1062,7 +1117,11 @@ ALLOWED_OPERATIONS: Mapping[str, _Operation] = {
         mutating=True,
         step_up=True,
     ),
-    "certificates.renew_dry_run": _Operation("_certificates_dry_run", mutating=True),
+    "certificates.renew_dry_run": _Operation(
+        "_certificates_dry_run",
+        mutating=True,
+        step_up=True,
+    ),
     "certificates.renew": _Operation("_certificates_renew", mutating=True, step_up=True),
 }
 
@@ -1209,6 +1268,11 @@ class PrivilegedDispatcher:
             "auth.session_peek",
             "auth.logout",
             "auth.change_password",
+            "auth.step_up",
+            "auth.passkeys_list",
+            "auth.passkey_step_up_begin",
+            "auth.passkey_step_up_complete",
+            "auth.sessions_list",
         }:
             raise PasswordChangeRequired("mailbox password change is required")
         if (
@@ -1402,6 +1466,10 @@ class PrivilegedDispatcher:
             return "invalid_challenge", "Authentication challenge is invalid or expired"
         if auth_error in {"InvalidSecondFactorError"}:
             return "invalid_second_factor", "The authentication code is invalid"
+        if auth_error in {"InvalidPasskeyError"}:
+            return "invalid_credentials", "The authentication request was rejected"
+        if auth_error in {"PasskeyLimitError"}:
+            return "limit_exceeded", "The passkey limit has been reached"
         if auth_error in {"AccountNotFoundError", "EnrollmentStateError"}:
             return "invalid_credentials", "Email address or password is invalid"
         if isinstance(exc, InvalidCredentials):
@@ -1409,7 +1477,7 @@ class PrivilegedDispatcher:
         if isinstance(exc, PasswordChangeRequired):
             return "password_change_required", "Mailbox password change is required"
         if isinstance(exc, StepUpRequired):
-            return "step_up_required", "Fresh administrator authentication is required"
+            return "step_up_required", "Recent authentication is required"
         if isinstance(exc, AuthorizationDenied):
             return (
                 "forbidden",
@@ -1478,6 +1546,58 @@ class PrivilegedDispatcher:
         except ValueError as exc:
             raise ValueError("client IP is invalid") from exc
 
+    @staticmethod
+    def _client_user_agent(value: Any) -> str | None:
+        if not isinstance(value, str):
+            raise ValueError("user agent is invalid")
+        normalized = value.strip()
+        if not normalized:
+            return None
+        if len(normalized) > 512 or any(
+            ord(character) < 0x20 or ord(character) == 0x7F for character in normalized
+        ):
+            raise ValueError("user agent is invalid")
+        return normalized
+
+    @staticmethod
+    def _passkey_credential(value: Any) -> dict[str, Any]:
+        if not isinstance(value, Mapping):
+            raise ValueError("passkey credential must be an object")
+        credential = dict(value)
+        try:
+            encoded = json.dumps(
+                credential,
+                ensure_ascii=True,
+                allow_nan=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise ValueError("passkey credential must be valid JSON") from exc
+        if not 1 <= len(encoded) <= 64 * 1024:
+            raise ValueError("passkey credential exceeds the safety limit")
+        return credential
+
+    @staticmethod
+    def _passkey_name(value: Any) -> str:
+        if not isinstance(value, str):
+            raise ValueError("passkey name must be text")
+        normalized = value.strip()
+        if not 1 <= len(normalized) <= 100 or any(
+            ord(character) < 0x20 or ord(character) == 0x7F for character in normalized
+        ):
+            raise ValueError("passkey name is invalid")
+        return normalized
+
+    @staticmethod
+    def _public_auth_id(value: Any, label: str) -> str:
+        if (
+            not isinstance(value, str)
+            or len(value) != 32
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ValueError(f"{label} is invalid")
+        return value
+
     def _principal_payload(self, principal: Any) -> dict[str, Any]:
         if self.auth_store is None:
             raise RuntimeError("authentication service is unavailable")
@@ -1492,6 +1612,8 @@ class PrivilegedDispatcher:
             "recovery_codes_remaining": self.auth_store.recovery_code_count(principal.account_id),
             "idle_expires_at": principal.idle_expires_at,
             "absolute_expires_at": principal.absolute_expires_at,
+            "step_up_until": principal.step_up_until,
+            "session_id": principal.session_id,
         }
 
     def _issued_session_payload(
@@ -1564,12 +1686,17 @@ class PrivilegedDispatcher:
     ) -> Any:
         if self.auth_store is None:
             raise RuntimeError("authentication service is unavailable")
-        values = _params(request, required={"challenge", "code", "client_ip"})
+        values = _params(
+            request,
+            required={"challenge", "code", "client_ip", "user_agent"},
+        )
+        client_ip = self._client_ip(values["client_ip"])
         result = self.auth_store.confirm_totp_enrollment(
             values["challenge"],
             values["code"],
+            client_ip=client_ip,
+            user_agent=self._client_user_agent(values["user_agent"]),
         )
-        client_ip = self._client_ip(values["client_ip"])
         self.auth_store.record_login_result(
             result.session.principal.email,
             client_ip,
@@ -1588,12 +1715,17 @@ class PrivilegedDispatcher:
     def _auth_totp_complete(self, request: Request, _spool: TrustedSpool | None) -> Any:
         if self.auth_store is None:
             raise RuntimeError("authentication service is unavailable")
-        values = _params(request, required={"challenge", "code", "client_ip"})
+        values = _params(
+            request,
+            required={"challenge", "code", "client_ip", "user_agent"},
+        )
+        client_ip = self._client_ip(values["client_ip"])
         issued = self.auth_store.complete_totp_challenge(
             values["challenge"],
             values["code"],
+            client_ip=client_ip,
+            user_agent=self._client_user_agent(values["user_agent"]),
         )
-        client_ip = self._client_ip(values["client_ip"])
         self.auth_store.record_login_result(issued.principal.email, client_ip, success=True)
         self._set_auth_audit(issued.principal, method="totp", client_ip=client_ip)
         return self._issued_session_payload(issued)
@@ -1607,13 +1739,15 @@ class PrivilegedDispatcher:
             raise RuntimeError("authentication service is unavailable")
         values = _params(
             request,
-            required={"challenge", "recovery_code", "client_ip"},
+            required={"challenge", "recovery_code", "client_ip", "user_agent"},
         )
+        client_ip = self._client_ip(values["client_ip"])
         issued = self.auth_store.complete_recovery_challenge(
             values["challenge"],
             values["recovery_code"],
+            client_ip=client_ip,
+            user_agent=self._client_user_agent(values["user_agent"]),
         )
-        client_ip = self._client_ip(values["client_ip"])
         self.auth_store.record_login_result(issued.principal.email, client_ip, success=True)
         self._set_auth_audit(
             issued.principal,
@@ -1621,6 +1755,207 @@ class PrivilegedDispatcher:
             client_ip=client_ip,
         )
         return self._issued_session_payload(issued)
+
+    @staticmethod
+    def _passkey_payload(passkey: Any) -> dict[str, Any]:
+        return {
+            "id": passkey.public_id,
+            "name": passkey.name,
+            "device_type": passkey.device_type,
+            "backed_up": passkey.backed_up,
+            "transports": list(passkey.transports),
+            "created_at": passkey.created_at,
+            "last_used_at": passkey.last_used_at,
+        }
+
+    @staticmethod
+    def _passkey_ceremony_payload(ceremony: Any) -> dict[str, Any]:
+        return {
+            "challenge": ceremony.challenge_token,
+            "options": ceremony.options,
+        }
+
+    def _auth_passkey_login_begin(
+        self,
+        request: Request,
+        _spool: TrustedSpool | None,
+    ) -> Any:
+        if self.auth_store is None:
+            raise RuntimeError("authentication service is unavailable")
+        values = _params(request, required={"client_ip"})
+        client_ip = self._client_ip(values["client_ip"])
+        self.auth_store.check_passkey_login_rate(client_ip)
+        ceremony = self.auth_store.begin_passkey_login()
+        return self._passkey_ceremony_payload(ceremony)
+
+    def _auth_passkey_login_complete(
+        self,
+        request: Request,
+        _spool: TrustedSpool | None,
+    ) -> Any:
+        if self.auth_store is None:
+            raise RuntimeError("authentication service is unavailable")
+        values = _params(
+            request,
+            required={"challenge", "credential", "client_ip", "user_agent"},
+        )
+        client_ip = self._client_ip(values["client_ip"])
+        try:
+            identity = self.auth_store.verify_passkey_login(
+                values["challenge"],
+                self._passkey_credential(values["credential"]),
+            )
+        except Exception as exc:
+            if type(exc).__name__ in {
+                "AccountNotFoundError",
+                "InvalidChallengeError",
+                "InvalidPasskeyError",
+            }:
+                raise InvalidCredentials("authentication request was rejected") from exc
+            raise
+        account_record = self._maddy_account(identity.email)
+        if (
+            account_record is None
+            or account_record.get("has_credentials") is not True
+            or account_record.get("has_mailbox") is not True
+        ):
+            raise InvalidCredentials("authentication request was rejected")
+        self.auth_store.record_passkey_login_result(client_ip, success=True)
+        try:
+            issued = self.auth_store.issue_verified_passkey_session(
+                identity,
+                client_ip=client_ip,
+                user_agent=self._client_user_agent(values["user_agent"]),
+            )
+        except Exception as exc:
+            if type(exc).__name__ == "AccountNotFoundError":
+                raise InvalidCredentials("authentication request was rejected") from exc
+            raise
+        self._set_auth_audit(issued.principal, method="passkey", client_ip=client_ip)
+        return self._issued_session_payload(issued)
+
+    def _auth_passkeys_list(self, request: Request, _spool: TrustedSpool | None) -> Any:
+        _params(request)
+        if self.auth_store is None:
+            raise RuntimeError("authentication service is unavailable")
+        principal = self._current_principal()
+        return {
+            "passkeys": [
+                self._passkey_payload(passkey)
+                for passkey in self.auth_store.list_passkeys(principal.account_id)
+            ]
+        }
+
+    def _auth_passkey_register_begin(
+        self,
+        request: Request,
+        _spool: TrustedSpool | None,
+    ) -> Any:
+        _params(request)
+        if self.auth_store is None or request.auth_token is None:
+            raise RuntimeError("authentication service is unavailable")
+        ceremony = self.auth_store.begin_passkey_registration(request.auth_token)
+        return self._passkey_ceremony_payload(ceremony)
+
+    def _auth_passkey_register_complete(
+        self,
+        request: Request,
+        _spool: TrustedSpool | None,
+    ) -> Any:
+        if self.auth_store is None or request.auth_token is None:
+            raise RuntimeError("authentication service is unavailable")
+        values = _params(request, required={"challenge", "credential", "name"})
+        passkey = self.auth_store.complete_passkey_registration(
+            request.auth_token,
+            values["challenge"],
+            self._passkey_credential(values["credential"]),
+            name=self._passkey_name(values["name"]),
+        )
+        return {"passkey": self._passkey_payload(passkey)}
+
+    def _auth_passkey_delete(self, request: Request, _spool: TrustedSpool | None) -> Any:
+        if self.auth_store is None:
+            raise RuntimeError("authentication service is unavailable")
+        values = _params(request, required={"passkey_id", "confirm"})
+        _confirmed(values)
+        principal = self._current_principal()
+        passkey_id = self._public_auth_id(values["passkey_id"], "passkey identifier")
+        return {"deleted": self.auth_store.delete_passkey(principal.account_id, passkey_id)}
+
+    def _auth_passkey_step_up_begin(
+        self,
+        request: Request,
+        _spool: TrustedSpool | None,
+    ) -> Any:
+        _params(request)
+        if self.auth_store is None or request.auth_token is None:
+            raise RuntimeError("authentication service is unavailable")
+        ceremony = self.auth_store.begin_passkey_step_up(request.auth_token)
+        return self._passkey_ceremony_payload(ceremony)
+
+    def _auth_passkey_step_up_complete(
+        self,
+        request: Request,
+        _spool: TrustedSpool | None,
+    ) -> Any:
+        if self.auth_store is None or request.auth_token is None:
+            raise RuntimeError("authentication service is unavailable")
+        values = _params(request, required={"challenge", "credential"})
+        principal = self.auth_store.complete_passkey_step_up(
+            request.auth_token,
+            values["challenge"],
+            self._passkey_credential(values["credential"]),
+        )
+        return {
+            "step_up_expires_in": 300,
+            "step_up_until": principal.step_up_until,
+        }
+
+    def _auth_sessions_list(self, request: Request, _spool: TrustedSpool | None) -> Any:
+        _params(request)
+        if self.auth_store is None or request.auth_token is None:
+            raise RuntimeError("authentication service is unavailable")
+        principal = self._current_principal()
+        sessions = self.auth_store.list_sessions(
+            principal.account_id,
+            current_session_token=request.auth_token,
+        )
+        return {
+            "sessions": [
+                {
+                    "id": session.session_id,
+                    "created_at": session.created_at,
+                    "last_seen_at": session.last_seen_at,
+                    "idle_expires_at": session.idle_expires_at,
+                    "absolute_expires_at": session.absolute_expires_at,
+                    "step_up_until": session.step_up_until,
+                    "client_ip": session.client_ip,
+                    "user_agent": session.user_agent,
+                    "current": session.current,
+                }
+                for session in sessions
+            ]
+        }
+
+    def _auth_session_revoke_other(
+        self,
+        request: Request,
+        _spool: TrustedSpool | None,
+    ) -> Any:
+        if self.auth_store is None:
+            raise RuntimeError("authentication service is unavailable")
+        values = _params(request, required={"session_id", "confirm"})
+        _confirmed(values)
+        principal = self._current_principal()
+        session_id = self._public_auth_id(values["session_id"], "session identifier")
+        if principal.session_id is None or session_id == principal.session_id:
+            raise AuthorizationDenied("the current session cannot be remotely revoked")
+        return {
+            "revoked": self.auth_store.revoke_session_by_id(
+                principal.account_id,
+                session_id,
+            )
+        }
 
     def _auth_session(self, request: Request, _spool: TrustedSpool | None) -> Any:
         _params(request)

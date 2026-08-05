@@ -115,7 +115,7 @@ manifest or retain the one-time JSON after a successful import.
 Password changes, role changes, factor resets, recovery-code regeneration,
 credential disable, and account deletion revoke affected authentication
 state. An administrator TOTP reset and other danger operations require a
-fresh password-and-TOTP step-up. Treat the one-time replacement disclosure as
+fresh Passkey or password-and-TOTP step-up. Treat the one-time replacement disclosure as
 a secret incident handoff; do not email both factors together. Recovery-code
 login consumes one code and revokes other sessions. A user who loses both
 TOTP and all recovery codes must use the administrator reset workflow after
@@ -385,6 +385,10 @@ archive with a key from another.
 Rollback changes only the application release and, when explicitly requested,
 the exact predecessor application configuration. It does not downgrade Maddy
 or restore Maddy data.
+When rolling back across the session-lifetime upgrade, also restore the matching
+authentication-state backup while Web and helper are stopped, or revoke every
+session created after the upgrade before starting the predecessor. The older
+release must not inherit sessions issued with the newer absolute lifetime.
 An installation that used `--replace-config` already restores the previous
 configuration before it restarts the previous release if that installation
 fails. Do not pre-edit the live configuration to work around a closed-schema
@@ -418,6 +422,10 @@ The combined release-rollback-and-remove entry point accepts only native or Dock
 For a Docker named volume, first use the separate `configure-submission.sh --action remove` transaction above
 with `submission-remove` approval and verify it, then run release rollback separately.
 Never pass an internal daemon volume path to the rollback command as though it were a host configuration path.
+
+Pre-upgrade sessions that remain valid during the forward migration retain
+their original, shorter absolute expiration. Users receive the new 30-day
+absolute lifetime after their next complete sign-in.
 Every release rollback first loads the effective configuration with the target
 release. The default is the unchanged live `/etc/maddyweb/config.toml`. For a
 closed-schema predecessor, add `--restore-previous-config` to both the root-run

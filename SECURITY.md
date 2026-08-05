@@ -99,10 +99,24 @@ once.
 Sessions use random 256-bit opaque tokens in Secure, HttpOnly,
 SameSite=Strict, path-rooted `__Host-` cookies. The browser does not store
 identity secrets in URLs, `localStorage`, or `sessionStorage`. The idle limit
-is 30 minutes, the absolute limit is 12 hours, and each account may have at
-most five sessions. Role, password, TOTP, recovery, disable, and delete
-transitions revoke affected sessions and pending challenges. Administrator
-danger operations require a password-and-TOTP step-up valid for five minutes.
+is 72 hours, the absolute limit is 30 days, and each account may have at most
+five sessions. Users can review active sessions and revoke any other browser
+session. Role, password, TOTP, recovery, disable, and delete transitions
+revoke affected sessions and pending challenges. Password, TOTP, account,
+certificate, and permanent-message-deletion operations require a Passkey or
+password-and-TOTP step-up valid for five minutes.
+
+Passkeys use WebAuthn with discoverable credentials and required user
+verification. The helper validates the exact configured HTTPS origin and
+relying-party ID, consumes short-lived single-use challenges, and verifies the
+signature and authenticator counter. The Web process transiently relays each
+browser assertion, including its protocol credential identifier, but management
+APIs expose only a separate random public identifier. Stored credential mappings
+and public keys remain root-helper state.
+Passkey sign-in does not request an email address before the browser presents
+its discoverable credential chooser. Attestation is not requested. This allows
+Windows Hello, macOS Touch ID, iOS Face ID, synced Passkeys, and security keys
+without weakening the password-and-TOTP fallback.
 
 Unauthenticated clients can load only the login shell, its local assets, and
 the authentication flow. All application pages redirect to `/login`; all

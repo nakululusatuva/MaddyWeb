@@ -1027,6 +1027,110 @@ async def test_reauthentication_operations_send_the_validated_client_ip() -> Non
 
 
 @pytest.mark.asyncio
+async def test_passkey_and_session_operations_use_public_helper_contracts() -> None:
+    token = "T" * 43
+    credential = {
+        "id": "credential-response",
+        "rawId": "credential-response",
+        "type": "public-key",
+        "response": {"clientDataJSON": "AA", "authenticatorData": "AA", "signature": "AA"},
+    }
+    client = FakeClient(
+        {
+            "auth.passkey_login_begin": Response.success(
+                "template", {"challenge": "C" * 43, "options": {}}
+            ),
+            "auth.passkey_login_complete": Response.success(
+                "template", {"session_token": "S" * 43, "principal": {}}
+            ),
+            "auth.passkeys_list": Response.success("template", {"passkeys": []}),
+            "auth.passkey_register_begin": Response.success(
+                "template", {"challenge": "C" * 43, "options": {}}
+            ),
+            "auth.passkey_register_complete": Response.success(
+                "template", {"passkey": {"id": "a" * 32}}
+            ),
+            "auth.passkey_delete": Response.success("template", {"deleted": True}),
+            "auth.passkey_step_up_begin": Response.success(
+                "template", {"challenge": "C" * 43, "options": {}}
+            ),
+            "auth.passkey_step_up_complete": Response.success(
+                "template", {"step_up_expires_in": 300}
+            ),
+            "auth.sessions_list": Response.success("template", {"sessions": []}),
+            "auth.session_revoke_other": Response.success("template", {"revoked": True}),
+        }
+    )
+    gateway = gateway_with(client)
+
+    await gateway.begin_passkey_login(client_ip="203.0.113.70")
+    await gateway.complete_passkey_login(
+        "C" * 43,
+        credential,
+        client_ip="203.0.113.70",
+        user_agent="Test Browser/1.0",
+    )
+    with bind_helper_identity(token):
+        await gateway.list_passkeys()
+        await gateway.begin_passkey_registration()
+        await gateway.complete_passkey_registration("C" * 43, credential, name="Laptop")
+        await gateway.delete_passkey("a" * 32)
+        await gateway.begin_passkey_step_up()
+        await gateway.complete_passkey_step_up("C" * 43, credential)
+        await gateway.list_sessions()
+        await gateway.revoke_session("b" * 32)
+
+    assert [request.auth_token for request in client.requests[:2]] == [None, None]
+    assert all(request.auth_token == token for request in client.requests[2:])
+    assert client.requests[0].params == {
+        "client_ip": "203.0.113.70",
+    }
+    assert client.requests[1].params["user_agent"] == "Test Browser/1.0"
+    assert client.requests[4].params["name"] == "Laptop"
+    assert client.requests[5].params == {"passkey_id": "a" * 32, "confirm": True}
+    assert client.requests[-1].params == {"session_id": "b" * 32, "confirm": True}
+
+
+@pytest.mark.asyncio
+async def test_second_factor_completion_forwards_bounded_session_metadata() -> None:
+    result = {"session_token": "S" * 43, "principal": {}}
+    client = FakeClient(
+        {
+            "auth.enrollment_complete": Response.success("template", result),
+            "auth.totp_complete": Response.success("template", result),
+            "auth.recovery_complete": Response.success("template", result),
+        }
+    )
+    gateway = gateway_with(client)
+
+    await gateway.complete_totp_enrollment(
+        "C" * 43,
+        "123456",
+        client_ip="203.0.113.90",
+        user_agent="Test Browser/1.0",
+    )
+    await gateway.complete_totp_login(
+        "D" * 43,
+        "234567",
+        client_ip="203.0.113.91",
+        user_agent="Test Browser/2.0",
+    )
+    await gateway.complete_recovery_login(
+        "E" * 43,
+        "recovery-code",
+        client_ip="203.0.113.92",
+        user_agent="Test Browser/3.0",
+    )
+
+    assert all(request.auth_token is None for request in client.requests)
+    assert [request.params["user_agent"] for request in client.requests] == [
+        "Test Browser/1.0",
+        "Test Browser/2.0",
+        "Test Browser/3.0",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_archive_move_uses_the_existing_special_mailbox_operation() -> None:
     account_id = "a" * 32
     client = FakeClient(

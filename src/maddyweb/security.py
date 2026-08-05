@@ -392,7 +392,11 @@ def _apply_security_headers(response: web.StreamResponse) -> None:
     response.headers.setdefault("Content-Security-Policy", DEFAULT_CSP)
     response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
     response.headers.setdefault("Cross-Origin-Resource-Policy", "same-origin")
-    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    response.headers.setdefault(
+        "Permissions-Policy",
+        "camera=(), microphone=(), geolocation=(), "
+        "publickey-credentials-create=(self), publickey-credentials-get=(self)",
+    )
     # Chromium serializes a same-origin HTML form POST with an opaque
     # ``Origin: null`` under a global ``no-referrer`` policy.  That makes the
     # fail-closed Origin gate reject every ordinary form.  ``same-origin``

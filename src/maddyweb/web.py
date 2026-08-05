@@ -87,6 +87,10 @@ PARSED_MESSAGE_CACHE_MAX_BYTES = 32 * 1024 * 1024
 MAX_BULK_MESSAGE_UIDS = 50
 BULK_FRESHNESS_CONCURRENCY = 2
 MAX_TOTP_QR_SVG_CHARS = 256 * 1024
+MAX_PASSKEY_CREDENTIAL_JSON_BYTES = MAX_API_JSON_BYTES
+MAX_PASSKEY_OPTIONS_JSON_BYTES = 64 * 1024
+MAX_SECURITY_RECORD_JSON_BYTES = 16 * 1024
+MAX_SECURITY_RECORDS = 100
 DEFAULT_MAIL_EVENT_POLL_SECONDS = 30.0
 MAIL_EVENT_KEEPALIVE_SECONDS = 15.0
 _MAIL_EVENT_PATHS = frozenset(
@@ -123,6 +127,8 @@ _IMAGE_TYPES = {
     "image/webp",
 }
 _MISSING = object()
+_SESSION_COOKIE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
+_STEP_UP_EXPIRY_SAFETY_SECONDS = 5
 
 
 @runtime_checkable
@@ -147,6 +153,7 @@ class Gateway(MailGateway, Protocol):
         code: str,
         *,
         client_ip: str,
+        user_agent: str,
     ) -> Mapping[str, object]: ...
 
     async def complete_totp_login(
@@ -155,6 +162,7 @@ class Gateway(MailGateway, Protocol):
         code: str,
         *,
         client_ip: str,
+        user_agent: str,
     ) -> Mapping[str, object]: ...
 
     async def complete_recovery_login(
@@ -163,7 +171,49 @@ class Gateway(MailGateway, Protocol):
         recovery_code: str,
         *,
         client_ip: str,
+        user_agent: str,
     ) -> Mapping[str, object]: ...
+
+    async def begin_passkey_login(
+        self,
+        *,
+        client_ip: str,
+    ) -> Mapping[str, object]: ...
+
+    async def complete_passkey_login(
+        self,
+        challenge: str,
+        credential: Mapping[str, object],
+        *,
+        client_ip: str,
+        user_agent: str,
+    ) -> Mapping[str, object]: ...
+
+    async def list_passkeys(self) -> Mapping[str, object]: ...
+
+    async def begin_passkey_registration(self) -> Mapping[str, object]: ...
+
+    async def complete_passkey_registration(
+        self,
+        challenge: str,
+        credential: Mapping[str, object],
+        *,
+        name: str,
+    ) -> Mapping[str, object]: ...
+
+    async def delete_passkey(self, passkey_id: str) -> Mapping[str, object]: ...
+
+    async def begin_passkey_step_up(self) -> Mapping[str, object]: ...
+
+    async def complete_passkey_step_up(
+        self,
+        challenge: str,
+        credential: Mapping[str, object],
+    ) -> Mapping[str, object]: ...
+
+    async def list_sessions(self) -> Mapping[str, object]: ...
+
+    async def revoke_session(self, session_id: str) -> Mapping[str, object]: ...
 
     async def session(self, token: str) -> Mapping[str, object]: ...
 
@@ -458,9 +508,7 @@ class _MailEventHub:
     async def close(self) -> None:
         async with self._lock:
             tasks = [
-                watcher.task
-                for watcher in self._watchers.values()
-                if watcher.task is not None
+                watcher.task for watcher in self._watchers.values() if watcher.task is not None
             ]
             self._watchers.clear()
             for task in tasks:
@@ -1138,6 +1186,8 @@ _ANONYMOUS_PATHS = frozenset(
         "/api/v1/auth/enrollment/confirm",
         "/api/v1/auth/totp",
         "/api/v1/auth/recovery",
+        "/api/v1/auth/passkey/options",
+        "/api/v1/auth/passkey",
     }
 )
 _PASSWORD_CHANGE_PATHS = frozenset(
@@ -1146,6 +1196,11 @@ _PASSWORD_CHANGE_PATHS = frozenset(
         "/api/v1/auth/session",
         "/api/v1/auth/logout",
         "/api/v1/auth/password/change",
+        "/api/v1/auth/step-up",
+        "/api/v1/auth/passkeys",
+        "/api/v1/auth/passkey/step-up/options",
+        "/api/v1/auth/passkey/step-up",
+        "/api/v1/auth/sessions",
         "/static/app.css",
         "/static/app.js",
         "/static/preview.css",
@@ -1185,6 +1240,19 @@ def _require_admin(request: web.Request) -> Mapping[str, object]:
     return principal
 
 
+def _recent_step_up_error(request: web.Request) -> web.Response | None:
+    """Fail before local one-time proofs are consumed when step-up is stale."""
+
+    step_up_until = _principal(request).get("step_up_until")
+    if type(step_up_until) is int and step_up_until > time.time() + _STEP_UP_EXPIRY_SAFETY_SECONDS:
+        return None
+    return _api_error(
+        "step_up_required",
+        "Fresh authentication is required.",
+        status=403,
+    )
+
+
 def _clear_session_cookie(request: web.Request, response: web.StreamResponse) -> None:
     response.del_cookie(
         _session_cookie_name(request),
@@ -1208,7 +1276,7 @@ def _set_session_cookie(
         httponly=True,
         samesite="Strict",
         path="/",
-        max_age=12 * 60 * 60,
+        max_age=_SESSION_COOKIE_MAX_AGE_SECONDS,
     )
 
 
@@ -1249,6 +1317,21 @@ def _request_client_ip(request: web.Request) -> str:
     ):
         raise web.HTTPBadRequest(text="Forwarding headers are not accepted on this host.")
     return remote_ip
+
+
+def _request_user_agent(request: web.Request) -> str:
+    """Return a bounded, display-only browser label for the session inventory."""
+
+    value = request.headers.get("User-Agent", "").strip()
+    if not value:
+        return "Unknown browser"
+    cleaned = "".join(
+        " " if ord(character) < 0x20 or ord(character) == 0x7F else character for character in value
+    )
+    cleaned = " ".join(cleaned.split())
+    if not cleaned:
+        return "Unknown browser"
+    return cleaned[:256]
 
 
 def _authentication_middleware() -> web.middleware:
@@ -1638,10 +1721,10 @@ async def _mutation_gateway_error(
     exc: Exception,
 ) -> web.Response:
     if isinstance(exc, HelperCallError) and exc.code == "step_up_required":
-        LOGGER.info("gateway operation requires fresh administrator verification: %s", title)
+        LOGGER.info("gateway operation requires fresh verification: %s", title)
         return _api_error(
             "step_up_required",
-            "Fresh administrator authentication is required.",
+            "Fresh authentication is required.",
             status=403,
         )
     return await _gateway_error(request, title)
@@ -1685,6 +1768,27 @@ def _auth_failure(exc: Exception) -> web.Response:
     )
 
 
+def _security_auth_failure(exc: Exception) -> web.Response:
+    code = exc.code if isinstance(exc, HelperCallError) else "backend_failure"
+    if code == "step_up_required":
+        return _api_error(
+            "step_up_required",
+            "Fresh authentication is required.",
+            status=403,
+        )
+    if code == "forbidden":
+        return _api_error("forbidden", "The operation is not allowed.", status=403)
+    if code == "invalid_request":
+        return _api_error("invalid_request", "The request was rejected.", status=400)
+    if code == "limit_exceeded":
+        return _api_error(
+            "limit_exceeded",
+            "The account has reached its passkey limit.",
+            status=409,
+        )
+    return _auth_failure(exc)
+
+
 def _bounded_auth_text(
     values: Mapping[str, object],
     name: str,
@@ -1696,6 +1800,154 @@ def _bounded_auth_text(
     if not minimum <= len(value) <= maximum or any(char in "\r\n\0" for char in value):
         raise web.HTTPBadRequest(text=f"Field {name} has an invalid length or character.")
     return value
+
+
+def _bounded_json_mapping(
+    value: object,
+    *,
+    label: str,
+    maximum_bytes: int,
+) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise web.HTTPBadRequest(text=f"Field {label} must be a JSON object.")
+
+    nodes = 0
+    active: set[int] = set()
+
+    def validate(current: object, depth: int) -> None:
+        nonlocal nodes
+        nodes += 1
+        if nodes > 1024 or depth > 10:
+            raise web.HTTPBadRequest(text=f"Field {label} is too complex.")
+        if isinstance(current, Mapping):
+            identity = id(current)
+            if identity in active or len(current) > 128:
+                raise web.HTTPBadRequest(text=f"Field {label} is too complex.")
+            active.add(identity)
+            try:
+                for key, nested in current.items():
+                    if (
+                        not isinstance(key, str)
+                        or not key
+                        or len(key) > 128
+                        or any(ord(character) < 0x20 for character in key)
+                    ):
+                        raise web.HTTPBadRequest(text=f"Field {label} is invalid.")
+                    validate(nested, depth + 1)
+            finally:
+                active.remove(identity)
+            return
+        if isinstance(current, list | tuple):
+            identity = id(current)
+            if identity in active or len(current) > 256:
+                raise web.HTTPBadRequest(text=f"Field {label} is too complex.")
+            active.add(identity)
+            try:
+                for nested in current:
+                    validate(nested, depth + 1)
+            finally:
+                active.remove(identity)
+            return
+        if isinstance(current, str):
+            if len(current) > maximum_bytes:
+                raise web.HTTPRequestEntityTooLarge(
+                    max_size=maximum_bytes,
+                    actual_size=len(current),
+                )
+            return
+        if current is None or isinstance(current, bool | int | float):
+            return
+        raise web.HTTPBadRequest(text=f"Field {label} contains an invalid value.")
+
+    validate(value, 0)
+    try:
+        encoded = _json_dumps(value).encode("ascii", "strict")
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise web.HTTPBadRequest(text=f"Field {label} is invalid.") from exc
+    if len(encoded) > maximum_bytes:
+        raise web.HTTPRequestEntityTooLarge(
+            max_size=maximum_bytes,
+            actual_size=len(encoded),
+        )
+    return dict(value)
+
+
+def _passkey_credential(values: Mapping[str, object]) -> dict[str, object]:
+    return _bounded_json_mapping(
+        values.get("credential"),
+        label="credential",
+        maximum_bytes=MAX_PASSKEY_CREDENTIAL_JSON_BYTES,
+    )
+
+
+def _passkey_name(values: Mapping[str, object]) -> str:
+    name = _bounded_auth_text(values, "name", minimum=1, maximum=64).strip()
+    if not name or any(ord(character) < 0x20 or ord(character) == 0x7F for character in name):
+        raise web.HTTPBadRequest(text="Field name contains an invalid character.")
+    return name
+
+
+def _public_security_id(value: str, label: str) -> str:
+    if re.fullmatch(r"[0-9a-f]{32}", value) is None:
+        raise web.HTTPBadRequest(text=f"Invalid {label} identifier.")
+    return value
+
+
+def _passkey_ceremony_payload(result: object) -> dict[str, object]:
+    if not isinstance(result, Mapping):
+        raise web.HTTPBadGateway(text="Authentication service returned an invalid response.")
+    challenge = result.get("challenge")
+    if not isinstance(challenge, str) or re.fullmatch(r"[A-Za-z0-9_-]{43}", challenge) is None:
+        raise web.HTTPBadGateway(text="Authentication service returned an invalid response.")
+    try:
+        options = _bounded_json_mapping(
+            result.get("options"),
+            label="options",
+            maximum_bytes=MAX_PASSKEY_OPTIONS_JSON_BYTES,
+        )
+    except web.HTTPException as exc:
+        raise web.HTTPBadGateway(
+            text="Authentication service returned an invalid response."
+        ) from exc
+    return {"challenge": challenge, "options": options}
+
+
+def _security_records_payload(result: object, name: str) -> dict[str, object]:
+    if not isinstance(result, Mapping):
+        raise web.HTTPBadGateway(text="Authentication service returned an invalid response.")
+    records = result.get(name)
+    if not isinstance(records, list) or len(records) > MAX_SECURITY_RECORDS:
+        raise web.HTTPBadGateway(text="Authentication service returned an invalid response.")
+    rendered: list[dict[str, object]] = []
+    try:
+        for record in records:
+            rendered.append(
+                _bounded_json_mapping(
+                    record,
+                    label=name,
+                    maximum_bytes=MAX_SECURITY_RECORD_JSON_BYTES,
+                )
+            )
+    except web.HTTPException as exc:
+        raise web.HTTPBadGateway(
+            text="Authentication service returned an invalid response."
+        ) from exc
+    return {name: rendered}
+
+
+def _security_result_payload(result: object) -> dict[str, object]:
+    if not isinstance(result, Mapping):
+        raise web.HTTPBadGateway(text="Authentication service returned an invalid response.")
+    try:
+        return _bounded_json_mapping(
+            result,
+            label="result",
+            maximum_bytes=MAX_SECURITY_RECORD_JSON_BYTES,
+        )
+    except web.HTTPException as exc:
+        raise web.HTTPBadGateway(
+            text="Authentication service returned an invalid response."
+        ) from exc
 
 
 def _totp_qr_svg(provisioning_uri: str) -> str:
@@ -1779,7 +2031,12 @@ def _login_response(
 
 async def api_auth_csrf(request: web.Request) -> web.Response:
     _read_query(request, allowed_fields=frozenset())
-    return _api_response(data={"csrf_token": csrf_token_for_request(request)})
+    return _api_response(
+        data={
+            "csrf_token": csrf_token_for_request(request),
+            "passkeys_enabled": bool(request.app[_PUBLIC_ORIGIN_KEY]),
+        }
+    )
 
 
 def _valid_login_local_part(value: str) -> bool:
@@ -1901,6 +2158,7 @@ async def api_auth_enrollment_confirm(request: web.Request) -> web.Response:
             challenge,
             code,
             client_ip=_request_client_ip(request),
+            user_agent=_request_user_agent(request),
         )
     except Exception as exc:
         return _auth_failure(exc)
@@ -1919,6 +2177,7 @@ async def api_auth_totp(request: web.Request) -> web.Response:
             challenge,
             code,
             client_ip=_request_client_ip(request),
+            user_agent=_request_user_agent(request),
         )
     except Exception as exc:
         return _auth_failure(exc)
@@ -1942,10 +2201,163 @@ async def api_auth_recovery(request: web.Request) -> web.Response:
             challenge,
             recovery_code,
             client_ip=_request_client_ip(request),
+            user_agent=_request_user_agent(request),
         )
     except Exception as exc:
         return _auth_failure(exc)
     return _login_response(request, result)
+
+
+async def api_auth_passkey_options(request: web.Request) -> web.Response:
+    await _read_json_object(request, allowed_fields=frozenset())
+    try:
+        result = await _gateway(request).begin_passkey_login(
+            client_ip=_request_client_ip(request),
+        )
+        payload = _passkey_ceremony_payload(result)
+    except web.HTTPException:
+        raise
+    except Exception as exc:
+        return _auth_failure(exc)
+    return _api_response(data=payload)
+
+
+async def api_auth_passkey(request: web.Request) -> web.Response:
+    values = await _read_json_object(
+        request,
+        allowed_fields=frozenset({"challenge", "credential"}),
+    )
+    challenge = _bounded_auth_text(values, "challenge", minimum=43, maximum=43)
+    if re.fullmatch(r"[A-Za-z0-9_-]{43}", challenge) is None:
+        raise web.HTTPBadRequest(text="Field challenge is invalid.")
+    credential = _passkey_credential(values)
+    try:
+        result = await _gateway(request).complete_passkey_login(
+            challenge,
+            credential,
+            client_ip=_request_client_ip(request),
+            user_agent=_request_user_agent(request),
+        )
+    except Exception as exc:
+        return _auth_failure(exc)
+    return _login_response(request, result)
+
+
+async def api_auth_passkeys(request: web.Request) -> web.Response:
+    _read_query(request, allowed_fields=frozenset())
+    try:
+        result = await _gateway(request).list_passkeys()
+        payload = _security_records_payload(result, "passkeys")
+    except web.HTTPException:
+        raise
+    except Exception as exc:
+        return _security_auth_failure(exc)
+    return _api_response(data=payload)
+
+
+async def api_auth_passkey_register_options(request: web.Request) -> web.Response:
+    await _read_json_object(request, allowed_fields=frozenset())
+    try:
+        result = await _gateway(request).begin_passkey_registration()
+        payload = _passkey_ceremony_payload(result)
+    except web.HTTPException:
+        raise
+    except Exception as exc:
+        return _security_auth_failure(exc)
+    return _api_response(data=payload)
+
+
+async def api_auth_passkey_register(request: web.Request) -> web.Response:
+    values = await _read_json_object(
+        request,
+        allowed_fields=frozenset({"challenge", "credential", "name"}),
+    )
+    challenge = _bounded_auth_text(values, "challenge", minimum=43, maximum=43)
+    if re.fullmatch(r"[A-Za-z0-9_-]{43}", challenge) is None:
+        raise web.HTTPBadRequest(text="Field challenge is invalid.")
+    name = _passkey_name(values)
+    credential = _passkey_credential(values)
+    try:
+        result = await _gateway(request).complete_passkey_registration(
+            challenge,
+            credential,
+            name=name,
+        )
+        payload = _security_result_payload(result)
+    except web.HTTPException:
+        raise
+    except Exception as exc:
+        return _security_auth_failure(exc)
+    return _api_response(data=payload)
+
+
+async def api_auth_passkey_delete(request: web.Request) -> web.Response:
+    await _read_json_object(request, allowed_fields=frozenset())
+    passkey_id = _public_security_id(request.match_info["passkey_id"], "passkey")
+    try:
+        result = await _gateway(request).delete_passkey(passkey_id)
+        payload = _security_result_payload(result)
+    except web.HTTPException:
+        raise
+    except Exception as exc:
+        return _security_auth_failure(exc)
+    return _api_response(data=payload)
+
+
+async def api_auth_passkey_step_up_options(request: web.Request) -> web.Response:
+    await _read_json_object(request, allowed_fields=frozenset())
+    try:
+        result = await _gateway(request).begin_passkey_step_up()
+        payload = _passkey_ceremony_payload(result)
+    except web.HTTPException:
+        raise
+    except Exception as exc:
+        return _security_auth_failure(exc)
+    return _api_response(data=payload)
+
+
+async def api_auth_passkey_step_up(request: web.Request) -> web.Response:
+    values = await _read_json_object(
+        request,
+        allowed_fields=frozenset({"challenge", "credential"}),
+    )
+    challenge = _bounded_auth_text(values, "challenge", minimum=43, maximum=43)
+    if re.fullmatch(r"[A-Za-z0-9_-]{43}", challenge) is None:
+        raise web.HTTPBadRequest(text="Field challenge is invalid.")
+    credential = _passkey_credential(values)
+    try:
+        result = await _gateway(request).complete_passkey_step_up(challenge, credential)
+        payload = _security_result_payload(result)
+    except web.HTTPException:
+        raise
+    except Exception as exc:
+        return _security_auth_failure(exc)
+    return _api_response(data=payload)
+
+
+async def api_auth_sessions(request: web.Request) -> web.Response:
+    _read_query(request, allowed_fields=frozenset())
+    try:
+        result = await _gateway(request).list_sessions()
+        payload = _security_records_payload(result, "sessions")
+    except web.HTTPException:
+        raise
+    except Exception as exc:
+        return _security_auth_failure(exc)
+    return _api_response(data=payload)
+
+
+async def api_auth_session_revoke(request: web.Request) -> web.Response:
+    await _read_json_object(request, allowed_fields=frozenset())
+    session_id = _public_security_id(request.match_info["session_id"], "session")
+    try:
+        result = await _gateway(request).revoke_session(session_id)
+        payload = _security_result_payload(result)
+    except web.HTTPException:
+        raise
+    except Exception as exc:
+        return _security_auth_failure(exc)
+    return _api_response(data=payload)
 
 
 async def api_auth_session(request: web.Request) -> web.Response:
@@ -1958,6 +2370,7 @@ async def api_auth_session(request: web.Request) -> web.Response:
             "principal": dict(principal),
             "csrf_token": csrf_token_for_request(request),
             "login_domain": request.app[_LOGIN_DOMAIN_KEY],
+            "passkeys_enabled": bool(request.app[_PUBLIC_ORIGIN_KEY]),
         }
     )
 
@@ -2007,7 +2420,7 @@ async def api_auth_change_password(request: web.Request) -> web.Response:
             client_ip=_request_client_ip(request),
         )
     except Exception as exc:
-        return _auth_failure(exc)
+        return _security_auth_failure(exc)
     finally:
         current_password = ""
         new_password = ""
@@ -2201,8 +2614,8 @@ async def set_append_limit(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(text="APPENDLIMIT must be between 0 and 4 GiB.")
     try:
         await _gateway(request).set_append_limit(account_id, limit)
-    except Exception:
-        return await _gateway_error(request, "Failed to set APPENDLIMIT")
+    except Exception as exc:
+        return await _mutation_gateway_error(request, "Failed to set APPENDLIMIT", exc)
     return _api_response(message="APPENDLIMIT updated.")
 
 
@@ -2521,9 +2934,7 @@ async def mail_events(request: web.Request) -> web.StreamResponse:
                 # written.  This preserves both first-connect and reconnect
                 # delivery across a disconnect between the two events.
                 event_id=(
-                    None
-                    if resume_from is not None and latest_uid > resume_from
-                    else latest_uid
+                    None if resume_from is not None and latest_uid > resume_from else latest_uid
                 ),
             )
         )
@@ -2563,7 +2974,7 @@ async def mail_events(request: web.Request) -> web.StreamResponse:
             baseline = current_uid
     except asyncio.CancelledError:
         raise
-    except (BrokenPipeError, ConnectionResetError):
+    except BrokenPipeError, ConnectionResetError:
         pass
     finally:
         await _mail_event_hub(request).unsubscribe(watcher_key, events)
@@ -2952,9 +3363,7 @@ def _message_iframe_document(message: ParsedMessage) -> str:
 def _iframe_document(message_html: str, cid_urls: Mapping[str, str]) -> str:
     rewritten = rewrite_cid_images(message_html, cid_urls)
     if not html_to_text(rewritten) and "<img" not in rewritten.lower():
-        rewritten = (
-            '<p class="empty">No safe visible HTML content remained after sanitization.</p>'
-        )
+        rewritten = '<p class="empty">No safe visible HTML content remained after sanitization.</p>'
     return sandboxed_html_document(rewritten, already_sanitized=True)
 
 
@@ -3141,6 +3550,9 @@ async def delete_message_permanently(request: web.Request) -> web.Response:
     account, mailbox_name = _mail_context(request, values)
     if _json_text(values, "confirmation") != "PERMANENTLY DELETE":
         raise web.HTTPBadRequest(text="Confirmation text mismatch; message not deleted.")
+    step_up_error = _recent_step_up_error(request)
+    if step_up_error is not None:
+        return step_up_error
     await _verify_message_freshness(
         request,
         account=account,
@@ -3150,8 +3562,12 @@ async def delete_message_permanently(request: web.Request) -> web.Response:
     )
     try:
         await _gateway(request).delete_message_permanently(account, mailbox_name, message_id)
-    except Exception:
-        return await _gateway_error(request, "Permanent message deletion failed")
+    except Exception as exc:
+        return await _mutation_gateway_error(
+            request,
+            "Permanent message deletion failed",
+            exc,
+        )
     _parsed_message_cache(request).invalidate(account, mailbox_name, (message_id,))
     return _api_response(message="Message permanently deleted.")
 
@@ -3373,6 +3789,9 @@ async def bulk_message_action(request: web.Request) -> web.Response:
             )
         if selected is None:
             raise RuntimeError("Message selection is unexpectedly unavailable.")
+        step_up_error = _recent_step_up_error(request)
+        if step_up_error is not None:
+            return step_up_error
         freshness_tokens = _bulk_freshness_tokens(values, selected)
         async with _mail_work_slot(request):
             await _verify_bulk_message_freshness(
@@ -3438,8 +3857,8 @@ async def bulk_message_action(request: web.Request) -> web.Response:
                 # retry, and do not retain previews for an unknowable outcome.
                 _parsed_message_cache(request).invalidate(account, mailbox_name, selected)
             message = f"{affected} message{'s' if affected != 1 else ''} permanently deleted."
-    except Exception:
-        return await _gateway_error(request, "Bulk message action failed")
+    except Exception as exc:
+        return await _mutation_gateway_error(request, "Bulk message action failed", exc)
     if action in {"archive", "trash", "permanent_delete"} and selected is not None:
         _parsed_message_cache(request).invalidate(account, mailbox_name, selected)
     return _api_response(
@@ -4055,8 +4474,12 @@ async def certificate_dry_run(request: web.Request) -> web.Response:
     certificate_name = await _allowed_certificate_name(request)
     try:
         await _gateway(request).certificate_dry_run(certificate_name)
-    except Exception:
-        return await _gateway_error(request, "Certificate renewal dry-run failed")
+    except Exception as exc:
+        return await _mutation_gateway_error(
+            request,
+            "Certificate renewal dry-run failed",
+            exc,
+        )
     return _api_response(message="Certificate renewal dry-run succeeded.")
 
 
@@ -4330,6 +4753,8 @@ def create_app(config: object, gateway: Gateway) -> web.Application:
             ),
             web.post("/api/v1/auth/totp", api_auth_totp),
             web.post("/api/v1/auth/recovery", api_auth_recovery),
+            web.post("/api/v1/auth/passkey/options", api_auth_passkey_options),
+            web.post("/api/v1/auth/passkey", api_auth_passkey),
             web.get("/api/v1/auth/session", api_auth_session),
             web.post("/api/v1/auth/logout", api_auth_logout),
             web.post(
@@ -4341,6 +4766,32 @@ def create_app(config: object, gateway: Gateway) -> web.Application:
                 api_auth_recovery_regenerate,
             ),
             web.post("/api/v1/auth/step-up", api_auth_step_up),
+            web.get("/api/v1/auth/passkeys", api_auth_passkeys),
+            web.post(
+                "/api/v1/auth/passkeys/register/options",
+                api_auth_passkey_register_options,
+            ),
+            web.post(
+                "/api/v1/auth/passkeys/register",
+                api_auth_passkey_register,
+            ),
+            web.post(
+                "/api/v1/auth/passkeys/{passkey_id}/delete",
+                api_auth_passkey_delete,
+            ),
+            web.post(
+                "/api/v1/auth/passkey/step-up/options",
+                api_auth_passkey_step_up_options,
+            ),
+            web.post(
+                "/api/v1/auth/passkey/step-up",
+                api_auth_passkey_step_up,
+            ),
+            web.get("/api/v1/auth/sessions", api_auth_sessions),
+            web.post(
+                "/api/v1/auth/sessions/{session_id}/revoke",
+                api_auth_session_revoke,
+            ),
             web.get("/api/v1/accounts", api_accounts),
             web.post("/api/v1/accounts", create_account),
             web.post("/api/v1/accounts/{account_id}/password", change_password),

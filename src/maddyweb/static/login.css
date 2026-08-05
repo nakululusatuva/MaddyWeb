@@ -341,7 +341,9 @@ input:focus {
   opacity: 0.52;
 }
 
-.primary-action.is-verifying {
+.primary-action.is-verifying,
+.primary-action.is-verified,
+.passkey-action.is-verified {
   color: #ffffff;
   background: #16845b;
   box-shadow: 0 8px 20px rgb(22 132 91 / 28%);
@@ -356,6 +358,13 @@ input:focus {
   border-radius: 50%;
   content: "";
   animation: auth-button-spin 680ms linear infinite;
+}
+
+.primary-action.is-verified::before,
+.passkey-action.is-verified::before {
+  content: "\2713";
+  font-size: 16px;
+  font-weight: 900;
 }
 
 @keyframes auth-button-spin {
@@ -376,6 +385,47 @@ input:focus {
 .secondary-action:hover,
 .copy-button:hover {
   border-color: var(--primary);
+}
+
+.passkey-login-panel {
+  display: grid;
+  gap: 10px;
+  margin-top: 18px;
+  text-align: center;
+}
+
+.passkey-login-panel[hidden] {
+  display: none;
+}
+
+.passkey-login-panel p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.passkey-action {
+  width: 100%;
+  min-height: 48px;
+  color: var(--primary);
+  background: var(--surface);
+}
+
+.auth-divider {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  gap: 12px;
+  align-items: center;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.auth-divider::before,
+.auth-divider::after {
+  height: 1px;
+  background: var(--line);
+  content: "";
 }
 
 .text-action,
