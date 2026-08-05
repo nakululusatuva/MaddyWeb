@@ -532,6 +532,7 @@ def test_docker_helper_gets_only_the_fixed_socket_and_no_native_host_paths(
         "/var/backups/maddyweb",
         "/run/maddyweb",
         "/var/lib/maddyweb-auth",
+        "/var/lib/maddyweb-filter/snapshots",
     }
     assert helper_drop_in.count("InaccessiblePaths=\n") == 1
     assert "BindReadOnlyPaths=-/run/docker.sock" in helper_drop_in
@@ -748,6 +749,7 @@ def test_systemd_privilege_boundary() -> None:
         "/var/backups/maddyweb",
         "/run/maddyweb",
         "/var/lib/maddyweb-auth",
+        "/var/lib/maddyweb-filter/snapshots",
     }
     assert "InaccessiblePaths=-/run/docker.sock -/var/run/docker.sock" in helper
     assert "ListenStream=/run/maddyweb/helper.sock" in socket
@@ -1170,7 +1172,12 @@ esac
         encoding="utf-8",
     )
     systemctl.chmod(0o755)
-    units = ("maddyweb.service", "maddyweb-helper.socket", "maddyweb-helper.service")
+    units = (
+        "maddyweb.service",
+        "maddyweb-helper.socket",
+        "maddyweb-helper.service",
+        "maddyweb-filter.service",
+    )
     for unit in units:
         (state_dir / f"{unit}.load").write_text("not-found\n", encoding="utf-8")
         (state_dir / f"{unit}.active").write_text("inactive\n", encoding="utf-8")

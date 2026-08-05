@@ -58,3 +58,25 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw 'Host-network Submission integration failed.'
           }
+      - name: Run digest-locked delivery filter integrations
+        if: ${{ inputs.allow_image_pull }}
+        shell: pwsh
+        env:
+          WSL_DISTRO: ${{ inputs.distro }}
+        run: |
+          $Repository = (Resolve-Path -LiteralPath '.').Path
+          $WslPathOutput = & wsl.exe -d $env:WSL_DISTRO --exec wslpath -a -- $Repository 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            throw "wslpath failed: $WslPathOutput"
+          }
+          $WslRepository = ($WslPathOutput | Select-Object -Last 1).Trim()
+          foreach ($Script in @(
+            'tests/integration/test-filter-docker-client.sh',
+            'tests/integration/test-filter-maddy-delivery.sh'
+          )) {
+            & wsl.exe -d $env:WSL_DISTRO --user root --exec env `
+              PYTHON_BINARY=python3.14 bash "$WslRepository/$Script"
+            if ($LASTEXITCODE -ne 0) {
+              throw "Delivery filter integration failed: $Script"
+            }
+          }

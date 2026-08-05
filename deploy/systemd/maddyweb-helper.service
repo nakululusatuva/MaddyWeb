@@ -43,7 +43,7 @@ MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
-ReadWritePaths=/var/backups/maddyweb /run/maddyweb /var/lib/maddyweb-auth
+ReadWritePaths=/var/backups/maddyweb /run/maddyweb /var/lib/maddyweb-auth /var/lib/maddyweb-filter/snapshots
 InaccessiblePaths=-/run/docker.sock -/var/run/docker.sock
 
 [Install]

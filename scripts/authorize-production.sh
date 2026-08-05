@@ -9,7 +9,7 @@ source "$SCRIPT_DIR/lib/common.sh"
 
 usage() {
     cat <<'EOF'
-Usage: authorize-production.sh --action install|backup|rollback|submission-add|submission-remove
+Usage: authorize-production.sh --action install|backup|rollback|submission-add|submission-remove|filter-add|filter-remove
 
 Creates a root-owned, host-bound approval in /run/maddyweb-approval. The approval
 expires after ten minutes and is consumed by exactly one operational command.
@@ -28,7 +28,7 @@ while (($#)); do
 done
 
 case "$action" in
-    install|backup|rollback|submission-add|submission-remove) ;;
+    install|backup|rollback|submission-add|submission-remove|filter-add|filter-remove) ;;
     *) die "unsupported production action" ;;
 esac
 

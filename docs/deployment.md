@@ -18,9 +18,11 @@ paths must be absolute Linux paths. Complete a full rehearsal on a non-productio
 
 The installer does not access the network, download Python, Maddy, images, or dependencies, or modify Nginx.
 
-After unified authentication has been initialized, every routine backup must
-include `auth-state.tar` and `auth-state.status` from `backup.sh`. A Maddy-only
-snapshot is no longer a complete MaddyWeb recovery point.
+After unified authentication or delivery rules have been initialized, every
+routine backup must include `auth-state.tar`, `auth-state.status`,
+`filter-snapshots.tar`, and `filter-snapshots.status` from `backup.sh`. The
+backup transaction quiesces the helper and bridge before capturing both state
+sets. A Maddy-only snapshot is no longer a complete MaddyWeb recovery point.
 
 Public HTTPS exposure is a separate, explicitly reviewed operation. It is not
 performed by the application installer. See the
@@ -480,7 +482,80 @@ An administrator is always a real Maddy mailbox. There is no separate Web
 administrator password. A bootstrap-created administrator must change its
 random initial Maddy password at first login.
 
-## 9. Verification and access
+## 9. Delivery-time mailbox rules
+
+Mailbox rules require an explicit second deployment transaction after the
+application release is installed. The bridge always uses TCP port `18787`.
+Native mode binds `127.0.0.1:18787`; Docker mode inspects the selected running
+container and binds only its host-side private bridge gateway (or loopback for
+an explicitly host-networked container). Wildcard and public addresses are
+rejected by both the application and the systemd sandbox.
+
+The transaction creates one random bridge token and two separate copies:
+
+- `/var/lib/maddyweb-filter/bridge.token` is `root:maddyweb-filter 0640` and
+  is read only by the unprivileged bridge service.
+- Native Maddy receives a same-value `root:maddyweb-filter-client 0640` copy at
+  `/etc/maddyweb-filter/client.token`. That dedicated supplementary group is
+  required to contain only the configured Maddy service identity and must not
+  be its primary group. Docker Maddy receives a root-only `0400` copy inside
+  `/data/maddyweb-filter`. Neither Maddy identity is added to the
+  snapshot-reading group.
+
+The endpoint is a non-secret fixed-path file. The native Python client and the
+official-image BusyBox `nc` wrapper accept the Maddy-expanded
+`{account_name}` only as one separately quoted argument. They never evaluate
+it as shell input. If the optional bridge is unavailable or rejects a frame,
+the client exits successfully without output, which leaves delivery in INBOX.
+
+Review the add plan first, then use a fresh production approval whose purpose
+is `filter-add`:
+
+```console
+sudo bash scripts/configure-filter.sh \
+  --action add --environment production --host "$(hostname)" \
+  --app-config /etc/maddyweb/config.toml
+
+sudo bash scripts/configure-filter.sh \
+  --action add --environment production --host "$(hostname)" \
+  --app-config /etc/maddyweb/config.toml \
+  --approval-file /run/maddyweb-approval/<reviewed-file> --apply
+```
+
+The editor accepts exactly one top-level
+`storage.imapsql local_mailboxes` block and refuses an existing unmanaged
+`imap_filter`. It inserts one versioned marker block with either the native
+Python command or `/data/maddyweb-filter/maddyweb-filter-client`; the account
+placeholder remains a separate command argument. Configuration is backed up,
+rendered, verified where the Maddy version supports `verify-config`, atomically
+replaced, read back, reloaded, and restored on failure. The lifecycle checks
+the unchanged Maddy version, process or container identity, configuration and
+listener set after every reload. Native activation uses a controlled restart
+so the Maddy process acquires its dedicated client-reader group. Maddy 0.8.2
+also requires this path because it has no `verify-config` or hot-reload
+contract.
+
+Before rolling back to a release that does not contain
+`maddyweb.filter_client`, remove the managed block as its own reviewed
+transaction using purpose `filter-remove`:
+
+```console
+sudo bash scripts/configure-filter.sh \
+  --action remove --environment production --host "$(hostname)" \
+  --app-config /etc/maddyweb/config.toml
+
+sudo bash scripts/configure-filter.sh \
+  --action remove --environment production --host "$(hostname)" \
+  --app-config /etc/maddyweb/config.toml \
+  --approval-file /run/maddyweb-approval/<reviewed-file> --apply
+```
+
+Removal verifies and deletes only the exact managed marker block, reloads
+Maddy, stops the bridge, and then removes the client token copies and wrapper.
+It never edits an unrelated filter block. Snapshots remain private so a later
+re-enable can republish or reuse rule state.
+
+## 10. Verification and access
 
 Run the strict smoke gate on the server:
 

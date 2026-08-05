@@ -4,3 +4,5 @@ d /run/maddyweb-approval 0700 root     root     -
 d /var/lib/maddyweb     0750 maddyweb maddyweb -
 d /var/backups/maddyweb 0700 root     root     -
 d /var/tmp/maddyweb     0700 maddyweb maddyweb -
+d /var/lib/maddyweb-filter 0750 root maddyweb-filter -
+d /var/lib/maddyweb-filter/snapshots 0750 root maddyweb-filter -

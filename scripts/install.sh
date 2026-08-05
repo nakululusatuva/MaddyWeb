@@ -201,6 +201,9 @@ require_regular_file "$artifact_manifest" "artifact manifest"
 require_regular_file "$DEPENDENCY_LOCK" "dependency lock"
 require_regular_file "$CLI_WRAPPER" "release-local CLI wrapper"
 require_regular_file "$REPO_ROOT/deploy/systemd/maddyweb.tmpfiles" "tmpfiles policy"
+require_regular_file "$REPO_ROOT/deploy/systemd/maddyweb-filter.service" "filter systemd unit"
+require_regular_file "$REPO_ROOT/deploy/maddyweb-filter-docker" "Docker filter client"
+require_regular_file "$SCRIPT_DIR/manage-imap-filter.py" "managed IMAP filter editor"
 require_directory "$wheelhouse" "offline wheelhouse"
 require_path_below "$artifact" "$wheelhouse"
 require_absolute_path "$python_binary" "Python binary"
@@ -447,6 +450,10 @@ install -o root -g root -m 0444 -- \
     "$SCRIPT_DIR/certbot-deploy-hook.py" "$staging/libexec/certbot-deploy-hook.py"
 install -o root -g root -m 0555 -- \
     "$SCRIPT_DIR/certbot-deploy-hook.sh" "$staging/CERTBOT-DEPLOY-HOOK"
+install -o root -g root -m 0555 -- \
+    "$REPO_ROOT/deploy/maddyweb-filter-docker" "$staging/libexec/maddyweb-filter-docker"
+install -o root -g root -m 0444 -- \
+    "$SCRIPT_DIR/manage-imap-filter.py" "$staging/libexec/manage-imap-filter.py"
 install -d -o root -g root -m 0755 -- \
     "$staging/public-edge" "$staging/public-edge/nginx" \
     "$staging/public-edge/systemd"
@@ -508,6 +515,7 @@ cleanup_pretransaction() {
             "$unit_backup/maddyweb-helper.socket" \
             "$unit_backup/maddyweb-helper.service" \
             "$unit_backup/maddyweb.service" \
+            "$unit_backup/maddyweb-filter.service" \
             "$unit_backup/DROPIN-web-paths.conf" \
             "$unit_backup/DROPIN-helper-paths.conf" \
             "$unit_backup/CERTBOT-DEPLOY-HOOK" \
@@ -571,7 +579,7 @@ if [[ "$replace_config" == true ]]; then
         || die "configuration rollback history staging path already exists"
 fi
 
-unit_names=(maddyweb-helper.socket maddyweb-helper.service maddyweb.service)
+unit_names=(maddyweb-helper.socket maddyweb-helper.service maddyweb-filter.service maddyweb.service)
 declare -A unit_existed=()
 declare -A unit_enabled=()
 declare -A unit_active=()
@@ -1047,7 +1055,7 @@ if [[ "$replace_config" == true ]]; then
 fi
 
 if [[ "$replace_config" == true ]]; then
-    for unit in maddyweb.service maddyweb-helper.socket maddyweb-helper.service; do
+    for unit in "${unit_names[@]}"; do
         if [[ "${unit_existed[$unit]}" == true ]] \
             || systemctl is-active --quiet "$unit"; then
             systemctl stop "$unit" \
@@ -1078,6 +1086,8 @@ if ! install -o root -g root -m 0644 -- \
     "$REPO_ROOT/deploy/systemd/maddyweb-helper.service" "$SYSTEMD_ROOT/maddyweb-helper.service" \
     || ! install -o root -g root -m 0644 -- \
     "$REPO_ROOT/deploy/systemd/maddyweb-helper.socket" "$SYSTEMD_ROOT/maddyweb-helper.socket" \
+    || ! install -o root -g root -m 0644 -- \
+    "$REPO_ROOT/deploy/systemd/maddyweb-filter.service" "$SYSTEMD_ROOT/maddyweb-filter.service" \
     || ! install -d -o root -g root -m 0755 -- \
     "$(dirname -- "${dropin_target[web-paths]}")" \
     || ! install -d -o root -g root -m 0755 -- \
@@ -1162,6 +1172,12 @@ if [[ "$activate" == true ]]; then
         || ! systemctl is-active --quiet maddyweb-helper.socket maddyweb.service \
         || ! "$release_path/bin/python" "$SCRIPT_DIR/smoke-test.py"; then
         abort_install_transaction "installation activation or smoke gate failed"
+    fi
+    if [[ "${unit_active[maddyweb-filter.service]}" == true ]]; then
+        systemctl restart maddyweb-filter.service \
+            || abort_install_transaction "delivery filter restart failed"
+        systemctl is-active --quiet maddyweb-filter.service \
+            || abort_install_transaction "delivery filter did not become active"
     fi
 fi
 

@@ -10,6 +10,7 @@ source "$SCRIPT_DIR/lib/common.sh"
 source "$SCRIPT_DIR/lib/backup-unit-state.sh"
 
 readonly AUTH_STATE_DIR="/var/lib/maddyweb-auth"
+readonly FILTER_SNAPSHOT_DIR="/var/lib/maddyweb-filter/snapshots"
 
 usage() {
     cat <<'EOF'
@@ -112,6 +113,7 @@ require_command find
 require_command realpath
 require_command systemctl
 require_command tar
+require_command sort
 install -d -o root -g root -m 0700 -- "$destination"
 require_directory "$destination" "backup destination"
 destination_mode=$(stat -c '%a' -- "$destination")
@@ -124,6 +126,7 @@ maddy_was_active=false
 source_quiesced=false
 snapshot_helper=""
 auth_state_status=absent
+filter_snapshot_status=absent
 
 assert_auth_state_file() {
     local path=${1:?authentication state file is required}
@@ -200,9 +203,83 @@ snapshot_auth_state() {
     printf 'status=%s\n' "$auth_state_status" > "$staging/auth-state.status"
 }
 
+snapshot_filter_state() {
+    local entries_file="$staging/.filter-snapshot-entries-before"
+    local entries_after_file="$staging/.filter-snapshot-entries-after"
+    local hashes_before="$staging/.filter-snapshot-hashes-before"
+    local hashes_after="$staging/.filter-snapshot-hashes-after"
+    local filter_gid entry name snapshot_size
+    local -a entries=()
+
+    if [[ ! -e "$FILTER_SNAPSHOT_DIR" && ! -L "$FILTER_SNAPSHOT_DIR" ]]; then
+        tar --create --file "$staging/filter-snapshots.tar" --files-from /dev/null
+        printf 'status=absent\n' > "$staging/filter-snapshots.status"
+        filter_snapshot_status=absent
+        return
+    fi
+    filter_gid=$(id -g maddyweb-filter) \
+        || die "cannot resolve delivery filter group"
+    [[ -d "$FILTER_SNAPSHOT_DIR" && ! -L "$FILTER_SNAPSHOT_DIR" ]] \
+        || die "delivery filter snapshot path must be a real directory"
+    [[ "$(realpath -e -- "$FILTER_SNAPSHOT_DIR")" == "$FILTER_SNAPSHOT_DIR" ]] \
+        || die "delivery filter snapshot directory must be canonical"
+    [[ "$(stat -c '%u:%g:%a' -- "$FILTER_SNAPSHOT_DIR")" \
+        == "0:${filter_gid}:750" ]] \
+        || die "delivery filter snapshot directory metadata is unsafe"
+
+    find "$FILTER_SNAPSHOT_DIR" -xdev -mindepth 1 -maxdepth 1 -print0 \
+        | LC_ALL=C sort -z > "$entries_file" \
+        || die "cannot enumerate delivery filter snapshots"
+    mapfile -d '' -t entries < "$entries_file"
+    : > "$hashes_before"
+    for entry in "${entries[@]}"; do
+        name=$(basename -- "$entry")
+        [[ "$name" =~ ^[0-9a-f]{64}\.json$ ]] \
+            || die "delivery filter snapshot has an unexpected name"
+        [[ -f "$entry" && ! -L "$entry" ]] \
+            || die "delivery filter snapshot must be a regular non-symlink file"
+        [[ "$(stat -c '%u:%g:%a:%h' -- "$entry")" \
+            == "0:${filter_gid}:640:1" ]] \
+            || die "delivery filter snapshot metadata is unsafe"
+        snapshot_size=$(stat -c '%s' -- "$entry")
+        (( snapshot_size >= 2 && snapshot_size <= 262144 )) \
+            || die "delivery filter snapshot size is invalid"
+        printf '%s  %s\n' "$(sha256_file "$entry")" "$name" >> "$hashes_before"
+    done
+    LC_ALL=C sort -o "$hashes_before" "$hashes_before"
+    if (( ${#entries[@]} == 0 )); then
+        filter_snapshot_status=empty
+    else
+        filter_snapshot_status=active
+    fi
+    tar --create --file "$staging/filter-snapshots.tar" \
+        --acls --xattrs --numeric-owner --one-file-system \
+        --directory "$(dirname -- "$FILTER_SNAPSHOT_DIR")" \
+        "$(basename -- "$FILTER_SNAPSHOT_DIR")"
+
+    find "$FILTER_SNAPSHOT_DIR" -xdev -mindepth 1 -maxdepth 1 -print0 \
+        | LC_ALL=C sort -z > "$entries_after_file" \
+        || die "cannot re-enumerate delivery filter snapshots"
+    cmp -s -- "$entries_file" "$entries_after_file" \
+        || die "delivery filter snapshot set changed during backup"
+    : > "$hashes_after"
+    for entry in "${entries[@]}"; do
+        [[ -f "$entry" && ! -L "$entry" ]] \
+            || die "delivery filter snapshot changed during backup"
+        printf '%s  %s\n' "$(sha256_file "$entry")" \
+            "$(basename -- "$entry")" >> "$hashes_after"
+    done
+    LC_ALL=C sort -o "$hashes_after" "$hashes_after"
+    cmp -s -- "$hashes_before" "$hashes_after" \
+        || die "delivery filter snapshots changed during backup"
+    rm -f -- "$entries_file" "$entries_after_file" "$hashes_before" "$hashes_after"
+    printf 'status=%s\n' "$filter_snapshot_status" \
+        > "$staging/filter-snapshots.status"
+}
+
 quiesce_all_maddyweb_units_for_snapshot() {
     local unit active_state
-    for unit in maddyweb.service maddyweb-helper.socket maddyweb-helper.service; do
+    for unit in maddyweb.service maddyweb-filter.service maddyweb-helper.socket maddyweb-helper.service; do
         if [[ "${MADDYWEB_BACKUP_UNIT_PRESENT[$unit]}" == true ]]; then
             systemctl stop "$unit" || return 1
             active_state=$(systemd_unit_property "$unit" ActiveState) || return 1
@@ -283,6 +360,7 @@ quiesce_all_maddyweb_units_for_snapshot \
     || die "cannot normalize every MaddyWeb unit to inactive for the snapshot"
 
 snapshot_auth_state
+snapshot_filter_state
 
 if [[ "$mode" == native ]]; then
     systemctl is-active --quiet maddy.service && maddy_was_active=true
@@ -330,13 +408,16 @@ raise SystemExit(any(before.get(key) != after.get(key) for key in keys))' \
 fi
 
 install -o root -g root -m 0600 -- "$app_config" "$staging/maddyweb.toml"
-printf 'format=maddyweb-backup-v2\nhost=%s\ncreated=%s\nmode=%s\ncontainer=%s\nauth_state=%s\n' \
+printf 'format=maddyweb-backup-v2\nhost=%s\ncreated=%s\nmode=%s\ncontainer=%s\nauth_state=%s\nfilter_snapshots=%s\n' \
     "$target_host" "$timestamp" "$mode" "$container" "$auth_state_status" \
+    "$filter_snapshot_status" \
     > "$staging/MANIFEST"
 (
     cd -- "$staging"
     sha256_file auth-state.tar > auth-state.tar.sha256
     sha256_file auth-state.status > auth-state.status.sha256
+    sha256_file filter-snapshots.tar > filter-snapshots.tar.sha256
+    sha256_file filter-snapshots.status > filter-snapshots.status.sha256
     sha256_file maddy-state.tar > maddy-state.tar.sha256
     sha256_file maddy.conf > maddy.conf.sha256
     sha256_file maddyweb.toml > maddyweb.toml.sha256

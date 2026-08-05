@@ -54,6 +54,14 @@ the browser repeats the protected operation once only after a successful
 Passkey or password-and-TOTP step-up. No frontend dependency, build tool,
 CDN, remote font, or external image is required.
 
+The Mail workspace also provides a merged All Mail view, user-created IMAP
+folders, single and bounded bulk moves, and ordered filing rules with nested
+AND, OR, and NOT conditions. New-mail filing uses Maddy's `imap_filter`
+command through a separate private service; an unavailable rule bridge leaves
+normal INBOX delivery intact. See
+[Mail organization and filing rules](docs/mail-organization.md) for behavior,
+bounds, and deployment details.
+
 ## Unified mailbox identity
 
 There is no separate Web password. A user signs in with the full Maddy mailbox
@@ -111,6 +119,7 @@ because the old release sends unknown subcommands through the implicit server-ru
 | --- | --- | --- |
 | Web | `maddyweb` user, `127.0.0.1:8787` | UI, sessions, and validation; cannot see the Docker socket |
 | helper | root, Unix socket `0660 root:maddyweb` | Fixed allow-listed Maddy, SMTP, certificate, and systemd operations |
+| delivery filter | `maddyweb-filter` user, private TCP `18787` | Reads immutable rule snapshots; cannot read authentication or mail storage |
 | Maddy | Native service or existing Docker container | Mail data, credentials, mailboxes, messages, and TLS files |
 
 Passwords pass briefly only through stdin for a required invocation or through the local Unix socket; they never enter command lines,
@@ -207,6 +216,8 @@ the [operations runbook](docs/runbook.md) for routine work. Read
 [Authentication and identity operations](docs/authentication.md) before
 creating or importing accounts, use the
 [Cloudflare public-edge runbook](docs/public-edge.md) for public HTTPS, see
+[mail organization and filing rules](docs/mail-organization.md) for folders and
+delivery-time filtering, see
 the [compatibility matrix](docs/compatibility.md) for version differences, and
 read [SECURITY.md](SECURITY.md) for the security model.
 

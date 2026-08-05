@@ -1,0 +1,64 @@
+#!/bin/sh
+# Fixed fail-open delivery filter client for the official Maddy Docker image.
+set -eu
+
+export LC_ALL=C
+readonly state_dir=/data/maddyweb-filter
+readonly endpoint_file=$state_dir/client.endpoint
+readonly token_file=$state_dir/client.token
+
+# Maddy replaces {account_name} in this single positional argument.  The value
+# is never evaluated as code or appended to a shell command.
+[ "$#" -eq 1 ] || exit 0
+account=$1
+[ -n "$account" ] && [ "${#account}" -le 254 ] || exit 0
+case "$account" in
+    *[![:graph:]]*|*@*@*|@*|*@) exit 0 ;;
+    *'@'*) ;;
+    *) exit 0 ;;
+esac
+
+for private_file in "$endpoint_file" "$token_file"; do
+    [ -f "$private_file" ] && [ ! -L "$private_file" ] || exit 0
+    [ "$(/bin/busybox stat -c '%u:%g:%a:%h' "$private_file" 2>/dev/null)" = "0:0:400:1" ] \
+        || exit 0
+    [ "$(/bin/busybox wc -l < "$private_file")" -eq 1 ] || exit 0
+done
+
+IFS= read -r endpoint < "$endpoint_file" || exit 0
+IFS= read -r token < "$token_file" || exit 0
+[ "${#token}" -eq 64 ] || exit 0
+case "$token" in *[!0-9a-f]*) exit 0 ;; esac
+
+case "$endpoint" in
+    *:18787) host=${endpoint%:18787} ;;
+    *) exit 0 ;;
+esac
+case "$host" in
+    10.*|192.168.*|127.*) ;;
+    172.*)
+        second=${host#172.}
+        second=${second%%.*}
+        case "$second" in
+            ''|*[!0-9]*) exit 0 ;;
+        esac
+        [ "$second" -ge 16 ] && [ "$second" -le 31 ] || exit 0
+        ;;
+    *) exit 0 ;;
+esac
+case "$host" in *[!0-9.]*|*..*|.*|*.) exit 0 ;; esac
+
+response=$(
+    {
+        /bin/busybox printf '%s %s %s\n' 'MADDYWEB-FILTER/1' "$token" "$account"
+        /bin/busybox cat
+    } | /usr/bin/nc -w 5 "$host" 18787 2>/dev/null
+) || exit 0
+
+[ -n "$response" ] && [ "${#response}" -le 1024 ] || exit 0
+newline='
+'
+carriage_return=$(/bin/busybox printf '\r')
+case "$response" in *"$newline"*|*"$carriage_return"*) exit 0 ;; esac
+/bin/busybox printf '%s\n' "$response"
+exit 0

@@ -17,6 +17,8 @@ bash -n -- "$ROOT/deploy/public-edge/check-public-edge.sh" \
     || fail "syntax error: deploy/public-edge/check-public-edge.sh"
 bash -n -- "$ROOT/deploy/maddyweb-cli" \
     || fail "syntax error: deploy/maddyweb-cli"
+bash -n -- "$ROOT/deploy/maddyweb-filter-docker" \
+    || fail "syntax error: deploy/maddyweb-filter-docker"
 
 grep -Fq 'ListenStream=/run/maddyweb/helper.sock' "$ROOT/deploy/systemd/maddyweb-helper.socket" || fail "helper socket path changed"
 grep -Fq 'SocketMode=0660' "$ROOT/deploy/systemd/maddyweb-helper.socket" || fail "helper socket mode changed"
@@ -30,7 +32,7 @@ if grep -Fq 'ReadWritePaths=/var/tmp/maddyweb' "$ROOT/deploy/systemd/maddyweb.se
     fail "web private temp directory must not be a host path allow-list"
 fi
 helper_write_paths=$(sed -n 's/^ReadWritePaths=//p' "$ROOT/deploy/systemd/maddyweb-helper.service")
-expected_helper_write_paths='/var/backups/maddyweb /run/maddyweb /var/lib/maddyweb-auth'
+expected_helper_write_paths='/var/backups/maddyweb /run/maddyweb /var/lib/maddyweb-auth /var/lib/maddyweb-filter/snapshots'
 [[ "$helper_write_paths" == "$expected_helper_write_paths" ]] \
     || fail "base helper write allow-list changed or gained native Maddy paths"
 grep -Fq 'd /run/maddyweb         0750 root     maddyweb -' "$ROOT/deploy/systemd/maddyweb.tmpfiles" || fail "helper socket parent ownership changed"
@@ -39,6 +41,11 @@ grep -Fq 'readonly TMPFILES_CONFIG="$TMPFILES_ROOT/maddyweb.conf"' "$ROOT/script
 grep -Fq '"$REPO_ROOT/deploy/systemd/maddyweb.tmpfiles" "$TMPFILES_CONFIG"' "$ROOT/scripts/install.sh" || fail "tmpfiles policy is not installed persistently"
 grep -Fq 'systemd-tmpfiles --create "$TMPFILES_CONFIG"' "$ROOT/scripts/install.sh" || fail "installed tmpfiles policy is not applied"
 grep -Fq 'MADDYWEB_APPROVAL_ROOT="/run/maddyweb-approval"' "$ROOT/scripts/lib/common.sh" || fail "approval root is not isolated"
+grep -Fq 'filter-add|filter-remove' "$ROOT/scripts/authorize-production.sh" \
+    || fail "delivery filter production approval scopes are missing"
+if grep -Eq 'MADDYWEB_CONFIG|--config' "$ROOT/deploy/systemd/maddyweb-filter.service"; then
+    fail "delivery filter service must not read the web application config"
+fi
 grep -Fq 'unexpectedly advertises verify-config' "$ROOT/scripts/lib/common.sh" || fail "0.8.2 verify-config guard is missing"
 grep -Fq 'exec "$script_dir/python" -I -m maddyweb "$@"' "$ROOT/deploy/maddyweb-cli" \
     || fail "release-local CLI wrapper no longer invokes its own interpreter"

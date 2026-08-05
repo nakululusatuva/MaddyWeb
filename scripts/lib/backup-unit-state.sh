@@ -7,10 +7,12 @@ readonly -a MADDYWEB_BACKUP_UNITS=(
     maddyweb.service
     maddyweb-helper.socket
     maddyweb-helper.service
+    maddyweb-filter.service
 )
 readonly -a MADDYWEB_BACKUP_RESTORE_ORDER=(
     maddyweb-helper.socket
     maddyweb-helper.service
+    maddyweb-filter.service
     maddyweb.service
 )
 declare -A MADDYWEB_BACKUP_UNIT_PRESENT=()

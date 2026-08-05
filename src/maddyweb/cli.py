@@ -252,18 +252,22 @@ def _certificate_manager(
 def _dispatcher(config: AppConfig) -> Any:
     from .helper import PrivilegedDispatcher, SMTPSubmissionClient
     from .maddy import MaddyService, SubprocessRunner
+    from .rule_snapshots import DEFAULT_FILTER_SNAPSHOT_DIR
 
     spool_dir = _private_helper_spool_directory()
     runner = SubprocessRunner()
     maddy = MaddyService.from_config(config.maddy, runner=runner)
     certificates = _certificate_manager(config, runner, maddy, spool_dir)
     smtp = SMTPSubmissionClient.from_config(config.maddy)
+    filter_account = _service_account("maddyweb-filter")
     return PrivilegedDispatcher(
         maddy,
         certificates,
         spool_dir=spool_dir,
         smtp=smtp,
         auth_store=_auth_store(config),
+        rule_snapshot_dir=DEFAULT_FILTER_SNAPSHOT_DIR,
+        rule_snapshot_group_id=filter_account.pw_gid,
     )
 
 
@@ -594,6 +598,14 @@ def _run_web(config: AppConfig, *, allow_root_development: bool) -> None:
     )
 
 
+def _run_filter_bridge(listen: str, token_file: Path) -> None:
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        raise RuntimeError("the delivery-time filter bridge refuses to run as root")
+    from .filter_bridge import serve_filter_bridge
+
+    serve_filter_bridge(listen, token_file)
+
+
 def _load(path: Path) -> AppConfig:
     config = load_config(path)
     _configure_logging(config.logging.level)
@@ -625,6 +637,13 @@ def _parser() -> argparse.ArgumentParser:
     helper = subparsers.add_parser("helper", help="serve the systemd-activated root helper")
     helper.add_argument("--config", type=Path, required=True)
 
+    filter_bridge = subparsers.add_parser(
+        "filter-bridge",
+        help="serve the private Maddy delivery-time rule bridge",
+    )
+    filter_bridge.add_argument("--listen", required=True)
+    filter_bridge.add_argument("--token-file", type=Path, required=True)
+
     auth_bootstrap = subparsers.add_parser(
         "auth-bootstrap",
         help="import root-only authentication metadata from standard input",
@@ -653,6 +672,15 @@ def main(argv: Sequence[str] | None = None) -> None:
     try:
         _validate_python_runtime()
         arguments = _parser().parse_args(argv)
+        if arguments.command == "filter-bridge":
+            # The isolated filter identity intentionally cannot read the main
+            # root:maddyweb application configuration. Its complete runtime
+            # contract is the fixed private endpoint, token file, and snapshot
+            # tree, so do not widen filesystem access merely to load settings
+            # that this process does not use.
+            _configure_logging("INFO")
+            _run_filter_bridge(arguments.listen, arguments.token_file)
+            return
         config = _load(arguments.config)
         if arguments.command == "validate-config":
             print("config=ok")

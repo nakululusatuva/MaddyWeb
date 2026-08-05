@@ -317,6 +317,69 @@ case "$target_authentication" in
     *) die "rollback target returned an invalid authentication capability" ;;
 esac
 
+target_filter_capability=unsupported
+if "$release/bin/python" -I -c \
+    'import maddyweb.filter_bridge, maddyweb.filter_client' >/dev/null 2>&1; then
+    target_filter_help=$(
+        "$release/bin/python" -I -m maddyweb filter-bridge --help 2>/dev/null
+    ) || target_filter_help=""
+    if [[ "$target_filter_help" == *--listen* \
+        && "$target_filter_help" == *--token-file* \
+        && "$target_filter_help" != *--config* ]]; then
+        target_filter_capability=supported
+    fi
+fi
+current_filter_profile=$(
+    "$current/bin/python" -I - "$app_config" <<'PY'
+from __future__ import annotations
+
+import json
+import sys
+from maddyweb.config import load_config
+
+config = load_config(sys.argv[1])
+print(json.dumps({
+    "mode": config.maddy.mode,
+    "config": str(config.maddy.config_path),
+    "container": config.maddy.container or "",
+}, sort_keys=True, separators=(",", ":")))
+PY
+) || die "cannot inspect the current filter deployment profile"
+current_filter_mode=$("$current/bin/python" -c \
+    'import json,sys; print(json.loads(sys.argv[1])["mode"])' "$current_filter_profile")
+current_filter_config=$("$current/bin/python" -c \
+    'import json,sys; print(json.loads(sys.argv[1])["config"])' "$current_filter_profile")
+current_filter_container=$("$current/bin/python" -c \
+    'import json,sys; print(json.loads(sys.argv[1])["container"])' "$current_filter_profile")
+
+managed_filter_marker_present() {
+    if [[ "$current_filter_mode" == native ]]; then
+        [[ -f "$current_filter_config" && ! -L "$current_filter_config" ]] \
+            || die "current native Maddy config is missing or unsafe"
+        grep -Fq '# BEGIN MADDYWEB MANAGED IMAP FILTER v1' "$current_filter_config"
+    else
+        [[ -n "$docker_binary" && -x "$docker_binary" ]] \
+            || die "Docker is required to inspect the current managed filter"
+        [[ "$current_filter_container" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] \
+            || die "current Maddy container name is invalid"
+        [[ "$current_filter_config" == /data/maddy.conf ]] \
+            || die "current Docker Maddy config path is unsupported"
+        "$docker_binary" exec "$current_filter_container" /bin/busybox grep -Fq \
+            '# BEGIN MADDYWEB MANAGED IMAP FILTER v1' /data/maddy.conf
+    fi
+}
+
+if [[ "$target_filter_capability" == unsupported ]]; then
+    if managed_filter_marker_present; then
+        die "rollback target lacks the managed delivery filter; run configure-filter.sh --action remove first"
+    fi
+    if command -v systemctl >/dev/null 2>&1 \
+        && { systemctl is-active --quiet maddyweb-filter.service \
+            || systemctl is-enabled --quiet maddyweb-filter.service; }; then
+        die "rollback target lacks the managed delivery filter; disable it through configure-filter.sh --action remove first"
+    fi
+fi
+
 effective_app_config="$app_config"
 installed_config_sha256=$(sha256_file "$app_config")
 previous_config_sha256=""
@@ -446,9 +509,10 @@ elif [[ -n "$maddy_mode$maddy_config$maddy_binary$container" \
     die "managed Maddy options require --remove-managed-submission"
 fi
 
-printf 'environment=%s\nhost=%s\nfrom=%s\nto=%s\ncommit=%s\nartifact_sha256=%s\ntarget_authentication=%s\nrestore_previous_config=%s\ninstalled_config_sha256=%s\nprevious_config_sha256=%s\npublic_withdrawal=%s\nremove_managed_submission=%s\ndocker_submission_scope=%s\nnetwork_mode=%s\n' \
+printf 'environment=%s\nhost=%s\nfrom=%s\nto=%s\ncommit=%s\nartifact_sha256=%s\ntarget_authentication=%s\ntarget_filter=%s\nrestore_previous_config=%s\ninstalled_config_sha256=%s\nprevious_config_sha256=%s\npublic_withdrawal=%s\nremove_managed_submission=%s\ndocker_submission_scope=%s\nnetwork_mode=%s\n' \
     "$environment" "$target_host" "$current" "$release" "$release_commit" \
-    "$expected_sha256" "$target_authentication" "$restore_previous_config" \
+    "$expected_sha256" "$target_authentication" "$target_filter_capability" \
+    "$restore_previous_config" \
     "$installed_config_sha256" "${previous_config_sha256:-none}" \
     "${public_domain:-none}" "$remove_submission" "$docker_submission_scope" \
     "${network_mode:-native}"
@@ -468,6 +532,18 @@ require_command systemctl
 require_command sync
 require_command flock
 require_command install
+
+filter_was_active=false
+if systemctl is-active --quiet maddyweb-filter.service; then
+    filter_was_active=true
+fi
+if [[ "$target_filter_capability" == unsupported ]]; then
+    if managed_filter_marker_present \
+        || [[ "$filter_was_active" == true ]] \
+        || systemctl is-enabled --quiet maddyweb-filter.service; then
+        die "managed delivery filter state changed or was not removed before incompatible rollback"
+    fi
+fi
 
 [[ "$(stat -c '%u:%g:%a' -- "$MADDYWEB_APPROVAL_ROOT")" == "0:0:700" ]] \
     || die "approval runtime directory must be root:root 0700"
@@ -513,10 +589,14 @@ assert_live_config() {
 
 quiesce_maddyweb_units() {
     local unit status=0
-    for unit in maddyweb.service maddyweb-helper.socket maddyweb-helper.service; do
+    local -a units=(maddyweb.service maddyweb-helper.socket maddyweb-helper.service)
+    if [[ "$filter_was_active" == true ]]; then
+        units=(maddyweb-filter.service "${units[@]}")
+    fi
+    for unit in "${units[@]}"; do
         systemctl stop "$unit" || status=1
     done
-    for unit in maddyweb.service maddyweb-helper.socket maddyweb-helper.service; do
+    for unit in "${units[@]}"; do
         if systemctl is-active --quiet "$unit"; then status=1; fi
     done
     return "$status"
@@ -734,6 +814,10 @@ restore_previous_release_state() {
     if [[ "$remove_submission" == true ]]; then restore_submission || status=1; fi
     if (( status == 0 )) && [[ "$quiesced" == true \
         && "$restored_link" == true && "$restored_config" == true ]]; then
+        if [[ "$filter_was_active" == true ]]; then
+            systemctl restart maddyweb-filter.service || status=1
+            systemctl is-active --quiet maddyweb-filter.service || status=1
+        fi
         systemctl restart maddyweb-helper.socket maddyweb.service || status=1
         systemctl try-restart maddyweb-helper.service || status=1
         restored_current=$(readlink -f -- "$CURRENT_LINK" 2>/dev/null) || status=1
@@ -830,6 +914,11 @@ if [[ "$restore_previous_config" == true ]]; then
 fi
 
 switch_link "$release" || abort_rollback_transaction "rollback release switch failed"
+if [[ "$filter_was_active" == true ]] \
+    && { ! systemctl restart maddyweb-filter.service \
+        || ! systemctl is-active --quiet maddyweb-filter.service; }; then
+    abort_rollback_transaction "rollback delivery filter activation failed"
+fi
 if ! systemctl restart maddyweb-helper.socket maddyweb.service \
     || ! systemctl try-restart maddyweb-helper.service \
     || ! systemctl is-active --quiet maddyweb-helper.socket maddyweb.service \

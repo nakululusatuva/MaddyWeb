@@ -364,6 +364,8 @@ Each archive contains:
 
 - `auth-state.tar`, its internal SHA-256, and `auth-state.status` recording
   `absent`, `empty`, or `active`;
+- `filter-snapshots.tar`, its internal SHA-256, and `filter-snapshots.status`
+  recording `absent`, `empty`, or `active`;
 - `maddy-state.tar` and its internal SHA-256;
 - `maddy.conf` and its SHA-256;
 - `maddyweb.toml` and its SHA-256;

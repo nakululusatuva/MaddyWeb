@@ -45,6 +45,53 @@ def test_disabled_certificate_manager_fails_closed() -> None:
         manager.renew("mx.example.test")
 
 
+def test_filter_bridge_has_no_application_config_argument() -> None:
+    parser = cli._parser()
+    arguments = parser.parse_args(
+        [
+            "filter-bridge",
+            "--listen",
+            "127.0.0.1:18787",
+            "--token-file",
+            "/var/lib/maddyweb-filter/bridge.token",
+        ]
+    )
+
+    assert arguments.command == "filter-bridge"
+    assert not hasattr(arguments, "config")
+
+
+def test_filter_bridge_main_does_not_load_application_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called: list[tuple[str, Path]] = []
+    monkeypatch.setattr(cli, "_validate_python_runtime", lambda: None)
+    monkeypatch.setattr(
+        cli,
+        "_load",
+        lambda _path: (_ for _ in ()).throw(AssertionError("config must not be loaded")),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_run_filter_bridge",
+        lambda listen, token_file: called.append((listen, token_file)),
+    )
+
+    cli.main(
+        [
+            "filter-bridge",
+            "--listen",
+            "127.0.0.1:18787",
+            "--token-file",
+            "/var/lib/maddyweb-filter/bridge.token",
+        ]
+    )
+
+    assert called == [
+        ("127.0.0.1:18787", Path("/var/lib/maddyweb-filter/bridge.token"))
+    ]
+
+
 @pytest.mark.asyncio
 async def test_diagnose_shape_is_serializable_without_paths(
     monkeypatch: pytest.MonkeyPatch,

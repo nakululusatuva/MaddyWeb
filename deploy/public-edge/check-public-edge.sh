@@ -132,6 +132,148 @@ require_root_executable() {
     (( (8#$mode & 8#022) == 0 )) || die "executable is group or world writable: $path"
 }
 
+normalize_nginx_path_argument() {
+    local value=${1:?Nginx path argument is required}
+    case "$value" in
+        \"*\")
+            value=${value#\"}
+            value=${value%\"}
+            ;;
+        \'*\')
+            value=${value#\'}
+            value=${value%\'}
+            ;;
+    esac
+    [[ "$value" =~ ^[A-Za-z0-9._/+:-]+$ ]] \
+        || die "Nginx reported an unsafe or unsupported path argument"
+    printf '%s\n' "$value"
+}
+
+resolve_nginx_proxy_temp_path() {
+    local config_dump build_output explicit_values build_values prefix_values
+    local proxy_path nginx_prefix
+    config_dump=$("$nginx_binary" -T -c "$nginx_config" 2>&1) \
+        || die "cannot dump the active Nginx configuration"
+    explicit_values=$(
+        printf '%s\n' "$config_dump" \
+            | awk '$1 == "proxy_temp_path" { value = $2; sub(/;.*/, "", value); print value }'
+    ) || die "cannot inspect explicit Nginx proxy temp paths"
+    if [[ -n "$explicit_values" && "$explicit_values" == *$'\n'* ]]; then
+        die "active Nginx configuration contains multiple proxy temp paths"
+    fi
+
+    build_output=$("$nginx_binary" -V 2>&1) \
+        || die "cannot inspect the Nginx build configuration"
+    build_values=$(
+        printf '%s\n' "$build_output" \
+            | grep -oE -- '--http-proxy-temp-path=[^[:space:]]+' \
+            | sed -E 's/^--http-proxy-temp-path=//' \
+            || true
+    )
+    if [[ -n "$build_values" && "$build_values" == *$'\n'* ]]; then
+        die "Nginx build configuration contains multiple proxy temp paths"
+    fi
+    prefix_values=$(
+        printf '%s\n' "$build_output" \
+            | grep -oE -- '--prefix=[^[:space:]]+' \
+            | sed -E 's/^--prefix=//' \
+            || true
+    )
+    if [[ -n "$prefix_values" && "$prefix_values" == *$'\n'* ]]; then
+        die "Nginx build configuration contains multiple prefixes"
+    fi
+    if [[ -n "$prefix_values" ]]; then
+        nginx_prefix=$(normalize_nginx_path_argument "$prefix_values")
+    else
+        nginx_prefix="/usr/local/nginx"
+    fi
+
+    if [[ -n "$explicit_values" ]]; then
+        proxy_path=$(normalize_nginx_path_argument "$explicit_values")
+    elif [[ -n "$build_values" ]]; then
+        proxy_path=$(normalize_nginx_path_argument "$build_values")
+    else
+        proxy_path="proxy_temp"
+    fi
+    if [[ "$proxy_path" != /* ]]; then
+        proxy_path="${nginx_prefix%/}/$proxy_path"
+    fi
+    realpath -e -- "$proxy_path" \
+        || die "cannot resolve the effective Nginx proxy temp path: $proxy_path"
+}
+
+find_live_nginx_worker() {
+    local master_pid children child child_command child_executable expected_executable
+    master_pid=$(systemctl show "$nginx_service" --property=MainPID --value) \
+        || die "cannot inspect the Nginx service main process"
+    [[ "$master_pid" =~ ^[1-9][0-9]*$ && -d "/proc/$master_pid" ]] \
+        || die "the Nginx service main process is not running"
+    expected_executable=$(realpath -e -- "$nginx_binary") \
+        || die "cannot resolve the expected Nginx executable"
+    [[ -r "/proc/$master_pid/task/$master_pid/children" ]] \
+        || die "cannot inspect Nginx child processes"
+    children=$(<"/proc/$master_pid/task/$master_pid/children")
+    local IFS=' '
+    for child in $children; do
+        [[ "$child" =~ ^[1-9][0-9]*$ && -d "/proc/$child" ]] || continue
+        child_command=$(tr '\0' ' ' <"/proc/$child/cmdline" 2>/dev/null || true)
+        [[ "$child_command" == *"nginx: worker process"* ]] || continue
+        child_executable=$(realpath -e -- "/proc/$child/exe" 2>/dev/null || true)
+        [[ "$child_executable" == "$expected_executable" ]] || continue
+        printf '%s\n' "$child"
+        return 0
+    done
+    die "cannot identify a live Nginx worker process"
+}
+
+validate_proxy_temp_path_access() {
+    local proxy_temp_path worker_pid worker_status worker_uid worker_gid worker_groups
+    proxy_temp_path=$(resolve_nginx_proxy_temp_path)
+    [[ -d "$proxy_temp_path" && ! -L "$proxy_temp_path" ]] \
+        || die "effective Nginx proxy temp path is not a real directory: $proxy_temp_path"
+    worker_pid=$(find_live_nginx_worker)
+    worker_status="/proc/$worker_pid/status"
+    worker_uid=$(awk '$1 == "Uid:" { print $2; exit }' "$worker_status") \
+        || die "cannot inspect the Nginx worker UID"
+    worker_gid=$(awk '$1 == "Gid:" { print $2; exit }' "$worker_status") \
+        || die "cannot inspect the Nginx worker GID"
+    worker_groups=$(awk '
+        $1 == "Groups:" {
+            for (index = 2; index <= NF; index += 1) {
+                printf "%s%s", separator, $index
+                separator = ","
+            }
+            print ""
+            exit
+        }
+    ' "$worker_status") || die "cannot inspect the Nginx worker groups"
+    [[ "$worker_uid" =~ ^[0-9]+$ && "$worker_gid" =~ ^[0-9]+$ ]] \
+        || die "Nginx worker identity is invalid"
+    [[ "$worker_uid" != "0" ]] || die "Nginx worker must not run as root"
+    [[ -n "$worker_groups" ]] || worker_groups=$worker_gid
+
+    "$installed_python" -I - \
+        "$proxy_temp_path" "$worker_uid" "$worker_gid" "$worker_groups" <<'PY' \
+        || die "Nginx worker cannot traverse and write its proxy temp path: $proxy_temp_path"
+from __future__ import annotations
+
+import os
+import sys
+
+path, uid_text, gid_text, groups_text = sys.argv[1:]
+uid = int(uid_text)
+gid = int(gid_text)
+groups = [int(value) for value in groups_text.split(",") if value]
+os.setgroups(groups)
+os.setgid(gid)
+os.setuid(uid)
+if not os.access(path, os.W_OK | os.X_OK, effective_ids=True):
+    raise SystemExit(1)
+PY
+    [[ -r "/proc/$worker_pid/status" ]] \
+        || die "Nginx worker changed during proxy temp path validation"
+}
+
 resolve_live_lineage_file() {
     local kind=${1:?lineage file kind is required}
     local live_path="$certificate_live/$kind.pem"
@@ -314,6 +456,7 @@ fi
 "${nginx_test[@]}" >/dev/null 2>&1 || die "nginx configuration test failed"
 if [[ "$profile" == "custom" ]]; then
     systemctl is-active --quiet "$nginx_service" || die "$nginx_service is not active"
+    validate_proxy_temp_path_access
 fi
 systemctl is-active --quiet maddyweb.service || die "maddyweb.service is not active"
 systemctl is-enabled --quiet "$timer_unit" || die "$timer_unit is not enabled"

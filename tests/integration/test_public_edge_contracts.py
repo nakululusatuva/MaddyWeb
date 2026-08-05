@@ -426,6 +426,45 @@ def test_custom_checker_validates_actual_service_owner_and_hup_reload() -> None:
     assert "-s[[:space:]]+HUP|-HUP" in checker
 
 
+def test_custom_checker_validates_live_worker_proxy_temp_access() -> None:
+    checker = _read(EDGE / "check-public-edge.sh")
+
+    resolver = checker.split("resolve_nginx_proxy_temp_path() {", maxsplit=1)[1].split(
+        "\n}\n\nfind_live_nginx_worker()", maxsplit=1
+    )[0]
+    assert '"$nginx_binary" -T -c "$nginx_config"' in resolver
+    assert '$1 == "proxy_temp_path"' in resolver
+    assert '"$nginx_binary" -V' in resolver
+    assert "--http-proxy-temp-path=" in resolver
+    assert "--prefix=" in resolver
+    assert 'nginx_prefix="/usr/local/nginx"' in resolver
+    assert 'proxy_path="proxy_temp"' in resolver
+    assert 'realpath -e -- "$proxy_path"' in resolver
+
+    worker_check = checker.split("validate_proxy_temp_path_access() {", maxsplit=1)[1].split(
+        "\n}\n\nresolve_live_lineage_file()", maxsplit=1
+    )[0]
+    assert "find_live_nginx_worker" in worker_check
+    assert '"/proc/$worker_pid/status"' in worker_check
+    assert '$1 == "Uid:"' in worker_check
+    assert '$1 == "Gid:"' in worker_check
+    assert '$1 == "Groups:"' in worker_check
+    assert "os.setgroups(groups)" in worker_check
+    assert "os.setgid(gid)" in worker_check
+    assert "os.setuid(uid)" in worker_check
+    assert "os.access(path, os.W_OK | os.X_OK, effective_ids=True)" in worker_check
+    assert "Nginx worker cannot traverse and write its proxy temp path" in worker_check
+    assert "touch " not in worker_check
+    assert "open(" not in worker_check
+
+    custom_active_block = checker.split(
+        'if [[ "$profile" == "custom" ]]; then\n'
+        '    systemctl is-active --quiet "$nginx_service"',
+        maxsplit=1,
+    )[1].split("\nfi", maxsplit=1)[0]
+    assert "validate_proxy_temp_path_access" in custom_active_block
+
+
 def test_public_edge_documentation_preserves_mail_automation() -> None:
     guide = _read(ROOT / "docs/public-edge.md")
     compact_guide = " ".join(guide.split())
