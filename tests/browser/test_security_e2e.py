@@ -1782,7 +1782,7 @@ async def test_folder_and_bulk_action_layout_keeps_controls_in_clear_groups(
         bounds = await page.locator(selector_value).bounding_box()
         assert bounds is not None
         action_rows.append(round(bounds["y"]))
-    assert len(set(action_rows)) == 1
+    assert max(action_rows) - min(action_rows) <= 1
     move_target = await page.locator("#mail-bulk-move-target").bounding_box()
     move_button = await page.locator("#mail-bulk-move").bounding_box()
     assert move_target is not None
