@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -28,6 +29,16 @@ CURRENT_SESSION_ID = "b" * 32
 OTHER_SESSION_ID = "c" * 32
 TEST_USER_AGENT = "MaddyWeb test browser"
 AUTHENTICATOR_KEY = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
+
+
+def _expected_application_asset_version() -> str:
+    static = Path(__file__).parents[1] / "src" / "maddyweb" / "static"
+    digest = hashlib.sha256()
+    for name in ("app.css", "app.js"):
+        digest.update(name.encode("ascii"))
+        digest.update(b"\0")
+        digest.update((static / name).read_bytes())
+    return digest.hexdigest()[:16]
 
 
 def _principal(
@@ -732,6 +743,7 @@ async def test_unauthenticated_browser_is_confined_to_login_surface(
         f"/api/v1/admin/mail-events?account={TARGET_ID}",
         "/static/app.css",
         "/static/app.js",
+        "/static/workspace.js",
     ):
         response = await client.get(path, allow_redirects=False)
         assert response.status == 401
@@ -1043,13 +1055,32 @@ async def test_passkey_management_and_remote_session_revocation_boundaries(
 
 
 @pytest.mark.asyncio
-async def test_authenticated_application_bundle_is_never_publicly_cacheable(
+async def test_authenticated_application_bundle_is_content_addressed_and_private(
     auth_client: tuple[TestClient, AuthGateway],
 ) -> None:
     client, gateway = auth_client
     await _login_totp(client, gateway)
 
-    for path in ("/static/app.css", "/static/app.js", "/static/preview.css"):
+    expected_version = _expected_application_asset_version()
+    shell_response = await client.get("/")
+    assert shell_response.status == 200
+    shell = await shell_response.text()
+    assert re.findall(
+        r'(?:href|src)="(/static/(?:app\.css|workspace\.js)\?v=([0-9a-f]{16}))"',
+        shell,
+    ) == [
+        (f"/static/app.css?v={expected_version}", expected_version),
+        (f"/static/workspace.js?v={expected_version}", expected_version),
+    ]
+    assert "/static/app.js?v=" not in shell
+    assert "__MADDYWEB_APP_ASSET_VERSION__" not in shell
+
+    for path in (
+        "/static/app.css",
+        "/static/app.js",
+        "/static/workspace.js",
+        "/static/preview.css",
+    ):
         response = await client.get(path)
         assert response.status == 200
         directives = {
@@ -1059,7 +1090,10 @@ async def test_authenticated_application_bundle_is_never_publicly_cacheable(
         assert "no-store" in directives
         assert "public" not in directives
 
-    for path in ("/static/app.css?v=21", "/static/app.js?v=26"):
+    for path in (
+        f"/static/app.css?v={expected_version}",
+        f"/static/workspace.js?v={expected_version}",
+    ):
         versioned = await client.get(path)
         assert versioned.status == 200
         directives = {
@@ -1068,6 +1102,25 @@ async def test_authenticated_application_bundle_is_never_publicly_cacheable(
         }
         assert "private" in directives
         assert "immutable" in directives
+        assert "public" not in directives
+
+    workspace = await client.get(f"/static/workspace.js?v={expected_version}")
+    app_source = Path(__file__).parents[1] / "src" / "maddyweb" / "static" / "app.js"
+    assert await workspace.read() == app_source.read_bytes()
+
+    for path in (
+        "/static/app.css?v=incorrect",
+        "/static/workspace.js?v=incorrect",
+        f"/static/workspace.js?v={expected_version}&v={expected_version}",
+    ):
+        mismatched = await client.get(path)
+        assert mismatched.status == 200
+        directives = {
+            directive.strip().casefold()
+            for directive in mismatched.headers["Cache-Control"].split(",")
+        }
+        assert "no-store" in directives
+        assert "immutable" not in directives
         assert "public" not in directives
 
 

@@ -59,6 +59,7 @@ def test_anonymous_surface_is_an_explicit_minimal_allowlist() -> None:
         "/api/v1/auth/sessions",
         "/static/app.css",
         "/static/app.js",
+        "/static/workspace.js",
         "/static/preview.css",
     }
     assert expected_anonymous == _ANONYMOUS_PATHS
@@ -72,6 +73,7 @@ def test_anonymous_surface_is_an_explicit_minimal_allowlist() -> None:
         "/security",
         "/static/app.css",
         "/static/app.js",
+        "/static/workspace.js",
         "/static/preview.css",
         "/api/v1/health",
         "/api/v1/me/mail",

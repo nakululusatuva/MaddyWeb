@@ -532,8 +532,10 @@ async def test_home_static_assets_and_strict_headers(
     page = await response.text()
     assert response.status == 200
     assert "Administration overview" in page
-    assert 'href="/static/app.css?v=23"' in page
-    assert 'src="/static/app.js?v=28"' in page
+    assert 'href="/static/app.css?v=' in page
+    assert 'src="/static/workspace.js?v=' in page
+    assert 'src="/static/app.js?v=' not in page
+    assert "__MADDYWEB_APP_ASSET_VERSION__" not in page
     assert 'id="new-mail-banner"' in page
     assert 'id="new-mail-notice"' in page
     assert 'id="new-mail-dismiss"' in page

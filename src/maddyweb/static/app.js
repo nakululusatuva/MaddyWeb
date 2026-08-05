@@ -2,6 +2,7 @@
 
 (() => {
   const API_ROOT = "/api/v1";
+  const SESSION_BOOTSTRAP_TIMEOUT_MS = 12_000;
   const DELETE_MESSAGE_CONFIRMATION = "PERMANENTLY DELETE";
   const FORWARD_FORM_RESERVE_BYTES = 128 * 1024;
   const ALLOWED_PREVIEW_TAGS = new Set([
@@ -567,6 +568,28 @@
         code: "auth_required",
         status: 401,
       });
+    }
+  };
+
+  const bootstrapSessionWithinDeadline = async () => {
+    const controller = new AbortController();
+    let timedOut = false;
+    const timeout = window.setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, SESSION_BOOTSTRAP_TIMEOUT_MS);
+    try {
+      await bootstrapSession(controller.signal);
+    } catch (error) {
+      if (timedOut) {
+        throw new ApiError(
+          "The secure session request timed out. Reload the page to retry.",
+          {code: "session_timeout"},
+        );
+      }
+      throw error;
+    } finally {
+      window.clearTimeout(timeout);
     }
   };
 
@@ -5086,21 +5109,37 @@
   });
 
   const initialize = async () => {
-    initializeTheme();
-    setBodyMode("write");
-    renderSourceInWrite();
-    renderAttachmentTray();
-    renderInlineImageTray();
-    updateFormattingButtons();
     try {
-      await bootstrapSession();
+      initializeTheme();
+      setBodyMode("write");
+      renderSourceInWrite();
+      renderAttachmentTray();
+      renderInlineImageTray();
+      updateFormattingButtons();
+      await bootstrapSessionWithinDeadline();
+      await renderRoute(false);
+      startMailEvents();
     } catch (error) {
-      handleError(error, "The secure session could not be initialized.");
-      if (state.authState !== "active") return;
+      if (state.authState === "checking") {
+        state.authState = "error";
+        document.documentElement.dataset.authState = "error";
+        const badge = byId("runtime-badge");
+        if (badge) {
+          badge.textContent = "Connection failed";
+          badge.className = "status-pill status-warning";
+        }
+      }
+      handleError(
+        error,
+        "The application could not be initialized. Reload the page to retry.",
+      );
     }
-    await renderRoute(false);
-    startMailEvents();
   };
 
-  void initialize();
+  void initialize().catch((error) => {
+    handleError(
+      error,
+      "The application could not be initialized. Reload the page to retry.",
+    );
+  });
 })();

@@ -208,6 +208,40 @@ async def test_normal_user_hides_administrator_ui_before_session_resolution(
         await navigation
 
 
+async def test_session_bootstrap_timeout_exits_connecting_with_retryable_error(
+    page: Page,
+    normal_user_application: LiveApplication,
+) -> None:
+    await _install_session(page, normal_user_application)
+    session_requested = asyncio.Event()
+    release_session = asyncio.Event()
+
+    async def pause_session(route: Route) -> None:
+        session_requested.set()
+        await release_session.wait()
+        await route.continue_()
+
+    await page.clock.install()
+    await page.route("**/api/v1/auth/session", pause_session)
+    await page.goto(normal_user_application.base_url + "/mail", wait_until="domcontentloaded")
+    try:
+        await asyncio.wait_for(session_requested.wait(), timeout=2)
+        assert await page.locator("html").get_attribute("data-auth-state") == "checking"
+        assert await page.locator("#runtime-badge").inner_text() == "CONNECTING"
+
+        await page.clock.fast_forward(12_001)
+
+        alert = page.locator("#global-alert")
+        await alert.wait_for(state="visible", timeout=2_000)
+        assert await page.locator("html").get_attribute("data-auth-state") == "error"
+        assert await page.locator("#runtime-badge").inner_text() == "CONNECTION FAILED"
+        assert await alert.inner_text() == (
+            "The secure session request timed out. Reload the page to retry."
+        )
+    finally:
+        release_session.set()
+
+
 async def test_required_password_change_opens_security_without_overview_flicker(
     page: Page,
     live_application: LiveApplication,

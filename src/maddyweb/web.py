@@ -1203,6 +1203,7 @@ _PASSWORD_CHANGE_PATHS = frozenset(
         "/api/v1/auth/sessions",
         "/static/app.css",
         "/static/app.js",
+        "/static/workspace.js",
         "/static/preview.css",
     }
 )
@@ -4544,6 +4545,25 @@ def _login_asset_version() -> str:
 
 
 @cache
+def _application_asset_version() -> str:
+    digest = hashlib.sha256()
+    for name in ("app.css", "app.js"):
+        digest.update(name.encode("ascii"))
+        digest.update(b"\0")
+        digest.update(_static_body(name))
+    return digest.hexdigest()[:16]
+
+
+@cache
+def _app_shell_body() -> bytes:
+    placeholder = b"__MADDYWEB_APP_ASSET_VERSION__"
+    body = _static_body("index.html")
+    if body.count(placeholder) != 2:
+        raise RuntimeError("application shell asset version placeholders are invalid")
+    return body.replace(placeholder, _application_asset_version().encode("ascii"))
+
+
+@cache
 def _login_shell_body() -> bytes:
     placeholder = b"__MADDYWEB_LOGIN_ASSET_VERSION__"
     body = _static_body("login.html")
@@ -4554,7 +4574,7 @@ def _login_shell_body() -> bytes:
 
 async def app_shell(_request: web.Request) -> web.Response:
     return web.Response(
-        body=_static_body("index.html"),
+        body=_app_shell_body(),
         content_type="text/html",
         charset="utf-8",
         headers={"Cache-Control": "no-store"},
@@ -4572,36 +4592,40 @@ async def login_shell(_request: web.Request) -> web.Response:
 
 async def static_asset(request: web.Request) -> web.Response:
     name = request.match_info["name"]
-    content_types = {
-        "app.css": "text/css",
-        "app.js": "application/javascript",
-        "preview.css": "text/css",
-        "login.css": "text/css",
-        "login.js": "application/javascript",
+    assets = {
+        "app.css": ("app.css", "text/css"),
+        # Keep the legacy URL available for already-open pages, while the
+        # application shell uses a distinct URL to invalidate failed or stale
+        # script loads from earlier releases.
+        "app.js": ("app.js", "application/javascript"),
+        "workspace.js": ("app.js", "application/javascript"),
+        "preview.css": ("preview.css", "text/css"),
+        "login.css": ("login.css", "text/css"),
+        "login.js": ("login.js", "application/javascript"),
     }
-    content_type = content_types.get(name)
-    if content_type is None:
+    asset = assets.get(name)
+    if asset is None:
         raise web.HTTPNotFound()
+    source_name, content_type = asset
     cache_control = "private, no-store"
     if name in {"login.css", "login.js"}:
         versions = request.query.getall("v", [])
         if len(request.query) != 1 or versions != [_login_asset_version()]:
             raise web.HTTPNotFound()
         cache_control = "public, max-age=31536000, immutable"
-    else:
-        application_versions = {
-            "app.css": "21",
-            "app.js": "26",
-            "preview.css": "1",
-        }
+    elif name in {"app.css", "app.js", "workspace.js"}:
         versions = request.query.getall("v", [])
-        if len(request.query) == 1 and versions == [application_versions[name]]:
+        if len(request.query) == 1 and versions == [_application_asset_version()]:
             # These assets still require an authenticated request on a cold
             # browser. Once received, their versioned URLs can be reused
             # without spending bandwidth on every authenticated page load.
             cache_control = "private, max-age=31536000, immutable"
+    elif name == "preview.css":
+        versions = request.query.getall("v", [])
+        if len(request.query) == 1 and versions == ["1"]:
+            cache_control = "private, max-age=31536000, immutable"
     return web.Response(
-        body=_static_body(name),
+        body=_static_body(source_name),
         content_type=content_type,
         charset="utf-8",
         headers={
