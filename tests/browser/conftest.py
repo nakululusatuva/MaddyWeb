@@ -157,6 +157,7 @@ class BrowserSecurityGateway:
             "role": "admin",
             "password_change_required": False,
             "enrollment_state": "active",
+            "step_up_until": 2_000_000_300,
             "idle_expires_at": 2_000_000_000,
             "absolute_expires_at": 2_000_010_000,
             "recovery_codes_remaining": 10,
