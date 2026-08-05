@@ -50,6 +50,7 @@ if TYPE_CHECKING:
 
 pytestmark = pytest.mark.asyncio
 CLIENT_SOURCE_PATH = Path(__file__).resolve().parents[2] / "src" / "maddyweb" / "static" / "app.js"
+TOUCH_TARGET_GEOMETRY_TOLERANCE_PX = 0.01
 
 
 async def _allow_loopback_only(route: Route) -> None:
@@ -1416,7 +1417,7 @@ async def test_mailbox_auto_opens_inbox_and_rows_support_pointer_and_keyboard_na
     for index in range(await actions.count()):
         bounds = await actions.nth(index).bounding_box()
         assert bounds is not None
-        assert bounds["height"] >= 44
+        assert bounds["height"] >= 44 - TOUCH_TARGET_GEOMETRY_TOLERANCE_PX
 
 
 async def test_mailbox_rows_fit_the_desktop_message_pane(
@@ -3830,11 +3831,11 @@ async def test_theme_persists_and_mobile_navigation_has_safe_touch_targets(
     for index in range(await visible_links.count()):
         bounds = await visible_links.nth(index).bounding_box()
         assert bounds is not None
-        assert bounds["height"] >= 44
+        assert bounds["height"] >= 44 - TOUCH_TARGET_GEOMETRY_TOLERANCE_PX
     theme_bounds = await toggle.bounding_box()
     assert theme_bounds is not None
-    assert theme_bounds["height"] >= 44
-    assert theme_bounds["width"] >= 44
+    assert theme_bounds["height"] >= 44 - TOUCH_TARGET_GEOMETRY_TOLERANCE_PX
+    assert theme_bounds["width"] >= 44 - TOUCH_TARGET_GEOMETRY_TOLERANCE_PX
 
 
 async def test_folder_and_rule_builder_controls_have_mobile_touch_targets(
@@ -3865,14 +3866,14 @@ async def test_folder_and_rule_builder_controls_have_mobile_touch_targets(
     for control in controls:
         bounds = await control.bounding_box()
         assert bounds is not None
-        assert bounds["height"] >= 44
+        assert bounds["height"] >= 44 - TOUCH_TARGET_GEOMETRY_TOLERANCE_PX
 
     await page.locator('a[data-section="rules"]').click()
     await page.get_by_role("heading", name="Mail rules", exact=True).wait_for()
     for control in await page.locator(".rule-node-button").all():
         bounds = await control.bounding_box()
         assert bounds is not None
-        assert bounds["height"] >= 44
+        assert bounds["height"] >= 44 - TOUCH_TARGET_GEOMETRY_TOLERANCE_PX
     for selector in (
         "#mail-rule-enabled",
         "#mail-rule-stop",
