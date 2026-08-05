@@ -24,7 +24,12 @@ jobs:
           python -m pip install --disable-pip-version-check \
             'pip-audit==2.10.1' 'bandit==1.9.4' -e '.[test]'
       - name: Audit hash-locked production dependencies
-        run: python -m pip_audit -r requirements.lock --no-deps --disable-pip
+        run: |
+          for attempt in 1 2; do
+            python -m pip_audit -r requirements.lock --no-deps --disable-pip && exit 0
+            test "$attempt" -eq 1
+            sleep 5
+          done
       - name: Reject high-severity Python findings
         run: python -m bandit -q -lll -r src scripts
       - name: Run extended deterministic parser fuzzing
