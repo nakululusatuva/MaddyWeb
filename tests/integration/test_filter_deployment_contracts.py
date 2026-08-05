@@ -144,6 +144,16 @@ def test_filter_lifecycle_preflights_tokens_and_restarts_bridge() -> None:
     assert 're.fullmatch(rb"[0-9a-f]{64}\\n", payload)' in lifecycle
     assert "systemctl restart maddyweb-filter.service" in lifecycle
     assert "systemctl enable --now maddyweb-filter.service" not in lifecycle
+    listener_wait = lifecycle.index("wait_for_filter_listener() {")
+    listener_restart = lifecycle.index("systemctl restart maddyweb-filter.service")
+    listener_gate = lifecycle.index("wait_for_filter_listener", listener_restart)
+    config_replace = lifecycle.index('replace_config "$candidate_config"', listener_gate)
+    assert "for _ in {1..50}" in lifecycle[listener_wait:listener_restart]
+    assert "systemctl is-active --quiet maddyweb-filter.service || return 1" in lifecycle[
+        listener_wait:listener_restart
+    ]
+    assert "sleep 0.1" in lifecycle[listener_wait:listener_restart]
+    assert listener_restart < listener_gate < config_replace
     assert "maddyweb-filter-client" in lifecycle
     assert '"$(id -gn "$service_user")" != maddyweb-filter-client' in lifecycle
     assert '"$refreshed_members" == "$service_user"' in lifecycle

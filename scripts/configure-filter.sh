@@ -579,6 +579,23 @@ PY
     return 1
 }
 
+wait_for_filter_listener() {
+    local listeners
+    for _ in {1..50}; do
+        systemctl is-active --quiet maddyweb-filter.service || return 1
+        listeners=$(
+            ss -H -ltn 'sport = :18787' \
+                | awk '{print $4}' \
+                | LC_ALL=C sort -u
+        )
+        if [[ "$listeners" == "$filter_host:18787" ]]; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    return 1
+}
+
 install_native_config() {
     local source=$1 temporary
     temporary="$(dirname -- "$maddy_config")/.maddy.conf.filter-$$"
@@ -705,8 +722,7 @@ PY
     if [[ "$filter_was_active" == false ]]; then service_started=true; fi
     systemctl restart maddyweb-filter.service
     systemctl is-active --quiet maddyweb-filter.service
-    listeners=$(ss -H -ltn 'sport = :18787' | awk '{print $4}')
-    [[ "$listeners" == "$filter_host:18787" ]] \
+    wait_for_filter_listener \
         || die "delivery filter is not listening on exactly its reviewed private endpoint"
     replace_config "$candidate_config"
     reload_maddy
