@@ -195,6 +195,12 @@ async def test_bulk_message_operations_build_only_valid_uid_sets() -> None:
         "INBOX",
         ("42", "44"),
     )
+    generic_target = await gateway.move_messages(
+        "account-id",
+        "INBOX",
+        ("41", "43"),
+        "Projects/2026",
+    )
     await gateway.delete_messages_permanently(
         "account-id",
         "Custom Trash",
@@ -202,13 +208,21 @@ async def test_bulk_message_operations_build_only_valid_uid_sets() -> None:
     )
 
     assert target == "Custom Archive"
+    assert generic_target == "Custom Archive"
     assert [request.params["uid_set"] for request in client.requests] == [
         "42,44",
         "1:*",
         "42,44",
+        "41,43",
         "44,42",
     ]
-    assert client.requests[-2].params["target_special"] == "archive"
+    assert client.requests[-3].params["target_special"] == "archive"
+    assert client.requests[-2].params == {
+        "target_account_id": "account-id",
+        "source": "INBOX",
+        "uid_set": "41,43",
+        "target": "Projects/2026",
+    }
     assert client.requests[-1].operation == "messages.delete_many"
     assert client.requests[-1].params == {
         "target_account_id": "account-id",
@@ -1386,3 +1400,138 @@ async def test_certificate_status_preserves_active_timer_when_disabled() -> None
     assert result["timer_enabled"] is False
     assert result["timer_active"] is True
     assert result["timer_state"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_mail_rule_gateway_uses_strict_helper_operation_contract() -> None:
+    rule_id = "a" * 32
+    run_id = "b" * 32
+    rule = {
+        "rule_id": rule_id,
+        "name": "Receipts",
+        "match": {"field": "subject", "operator": "contains", "value": "receipt"},
+        "target_mailbox": "Receipts",
+    }
+    run = {"run_id": run_id, "status": "queued", "processed": 0}
+    client = FakeClient(
+        {
+            "rules.list": Response.success(
+                "template",
+                {"rules": [rule], "active_run": run},
+            ),
+            "rules.create": Response.success("template", {"rule": rule, "run": run}),
+            "rules.update": Response.success("template", {"rule": rule}),
+            "rules.delete": Response.success("template", {"deleted": True}),
+            "rules.reorder": Response.success("template", {"rules": [rule]}),
+            "rules.run_create": Response.success("template", {"run": run}),
+            "rules.run_status": Response.success("template", {"run": run}),
+            "rules.run_step": Response.success(
+                "template",
+                {"run": {**run, "status": "completed", "processed": 2}},
+            ),
+            "rules.run_cancel": Response.success(
+                "template",
+                {"run": {**run, "status": "cancelled"}},
+            ),
+        }
+    )
+    gateway = gateway_with(client)
+    condition = {"field": "subject", "operator": "contains", "value": "receipt"}
+
+    assert (await gateway.list_mail_rules("account-id"))["active_run"] == run
+    await gateway.create_mail_rule(
+        "account-id",
+        name="Receipts",
+        enabled=True,
+        match_condition=condition,
+        target_mailbox="Receipts",
+        stop_processing=True,
+        apply_existing=True,
+    )
+    await gateway.update_mail_rule(
+        "account-id",
+        rule_id,
+        name="Receipts",
+        enabled=True,
+        match_condition=condition,
+        target_mailbox="Receipts",
+        stop_processing=True,
+        expected_revision=1,
+    )
+    await gateway.reorder_mail_rules("account-id", [rule_id])
+    await gateway.create_mail_rule_run("account-id", rule_id)
+    await gateway.get_mail_rule_run("account-id", run_id)
+    await gateway.step_mail_rule_run("account-id", run_id)
+    await gateway.cancel_mail_rule_run("account-id", run_id)
+    await gateway.delete_mail_rule("account-id", rule_id)
+
+    assert [request.operation for request in client.requests] == [
+        "rules.list",
+        "rules.create",
+        "rules.update",
+        "rules.reorder",
+        "rules.run_create",
+        "rules.run_status",
+        "rules.run_step",
+        "rules.run_cancel",
+        "rules.delete",
+    ]
+    created = client.requests[1]
+    assert created.params == {
+        "target_account_id": "account-id",
+        "name": "Receipts",
+        "enabled": True,
+        "match": condition,
+        "target_mailbox": "Receipts",
+        "stop_processing": True,
+        "apply_existing": True,
+    }
+    assert client.requests[2].params["expected_revision"] == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_mail_rule_step_finishes_and_invalidates_message_cache() -> None:
+    step_started = threading.Event()
+    finish_step = threading.Event()
+    state: dict[str, object] = {"items": [{"uid": 42}], "list_calls": 0}
+
+    class CancellationClient(FakeClient):
+        def call(self, request: Request) -> Response:
+            self.requests.append(request)
+            if request.operation == "messages.list":
+                state["list_calls"] = int(state["list_calls"]) + 1
+                return Response.success(
+                    request.request_id,
+                    {"items": list(state["items"]), "has_next": False},
+                )
+            if request.operation == "rules.run_step":
+                step_started.set()
+                assert finish_step.wait(timeout=2.0)
+                state["items"] = []
+                return Response.success(
+                    request.request_id,
+                    {"run": {"run_id": "b" * 32, "status": "completed"}},
+                )
+            raise AssertionError(f"unexpected operation: {request.operation}")
+
+    gateway = gateway_with(CancellationClient({}))
+    try:
+        first = await gateway.list_messages("account-id", "INBOX", limit=20, offset=0)
+        assert first["items"] == [{"uid": 42}]
+        step = asyncio.create_task(gateway.step_mail_rule_run("account-id", "b" * 32))
+        assert await asyncio.to_thread(step_started.wait, 1.0)
+        step.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await step
+
+        finish_step.set()
+        for _attempt in range(100):
+            if not gateway._mail_rule_step_tasks:  # type: ignore[attr-defined]
+                break
+            await asyncio.sleep(0.01)
+        assert not gateway._mail_rule_step_tasks  # type: ignore[attr-defined]
+        fresh = await gateway.list_messages("account-id", "INBOX", limit=20, offset=0)
+        assert fresh["items"] == []
+        assert state["list_calls"] == 2
+    finally:
+        finish_step.set()

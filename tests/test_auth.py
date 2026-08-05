@@ -43,6 +43,9 @@ from maddyweb.auth import (
     InvalidSecondFactorError,
     InvalidSessionError,
     LoginRateLimitedError,
+    MailRuleConflictError,
+    MailRuleLimitError,
+    MailRuleNotFoundError,
     MasterKeyError,
     PasskeyLimitError,
     Role,
@@ -896,7 +899,7 @@ def test_step_up_column_migrates_from_schema_version_one(
             connection.execute(
                 "SELECT value FROM auth_metadata WHERE key = 'schema_version'"
             ).fetchone()[0]
-            == b"4"
+            == b"5"
         )
 
 
@@ -928,7 +931,7 @@ def test_schema_version_three_pending_enrollment_migrates_to_required(
             connection.execute(
                 "SELECT value FROM auth_metadata WHERE key = 'schema_version'"
             ).fetchone()[0]
-            == b"4"
+            == b"5"
         )
 
     challenge = store.create_pending_challenge(account.email)
@@ -982,6 +985,8 @@ def test_passkey_session_extension_migrates_additively_from_schema_v4(
     path = store_factory.tmp_path / "legacy-v4.db"
 
     with sqlite3.connect(path) as connection:
+        connection.execute("DROP TABLE mail_rule_runs")
+        connection.execute("DROP TABLE mail_rules")
         connection.execute("DROP TABLE auth_passkey_challenges")
         connection.execute("DROP TABLE auth_passkey_credentials")
         connection.execute("DROP INDEX auth_sessions_public_id_idx")
@@ -990,6 +995,10 @@ def test_passkey_session_extension_migrates_additively_from_schema_v4(
         connection.execute("ALTER TABLE auth_sessions DROP COLUMN session_id")
         connection.execute(
             "DELETE FROM auth_metadata WHERE key = 'passkey_session_extension_version'"
+        )
+        connection.execute(
+            "UPDATE auth_metadata SET value = ? WHERE key = 'schema_version'",
+            (b"4",),
         )
         assert (
             connection.execute(
@@ -1006,7 +1015,7 @@ def test_passkey_session_extension_migrates_additively_from_schema_v4(
             connection.execute(
                 "SELECT value FROM auth_metadata WHERE key = 'schema_version'"
             ).fetchone()[0]
-            == b"4"
+            == b"5"
         )
         assert (
             connection.execute(
@@ -1025,6 +1034,7 @@ def test_passkey_session_extension_migrates_additively_from_schema_v4(
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
         assert {"auth_passkey_credentials", "auth_passkey_challenges"} <= tables
+        assert {"mail_rules", "mail_rule_runs"} <= tables
         challenge_columns = {
             row[1]: row for row in connection.execute("PRAGMA table_info(auth_passkey_challenges)")
         }
@@ -1633,3 +1643,284 @@ def test_store_rejects_bad_inputs_and_use_after_close(
     store.close()
     with pytest.raises(RuntimeError, match="closed"):
         store.list_accounts()
+
+
+def test_mail_rule_crud_reorder_and_revision_conflicts(
+    store_factory: StoreFactory,
+) -> None:
+    store = store_factory()
+    account = store.create_account("user@example.test")
+    first = store.create_mail_rule(
+        account.account_id,
+        name="Invoices",
+        enabled=True,
+        expression={"field": "subject", "test": "contains", "value": "invoice"},
+        target_mailbox="Finance/Invoices",
+        stop_processing=True,
+    )
+    second = store.create_mail_rule(
+        account.account_id,
+        name="Newsletters",
+        enabled=False,
+        expression={"field": "list_id", "test": "exists"},
+        target_mailbox="Reading",
+        stop_processing=False,
+    )
+
+    assert [rule.rule_id for rule in store.list_mail_rules(account.account_id)] == [
+        first.rule_id,
+        second.rule_id,
+    ]
+    changed = store.update_mail_rule(
+        account.account_id,
+        first.rule_id,
+        expected_revision=1,
+        name="Invoices and receipts",
+        enabled=True,
+        expression={"op": "or", "children": []},
+        target_mailbox="Finance",
+        stop_processing=True,
+    )
+    assert changed.revision == 2
+    assert changed.target_mailbox == "Finance"
+    with pytest.raises(MailRuleConflictError):
+        store.update_mail_rule(
+            account.account_id,
+            first.rule_id,
+            expected_revision=1,
+            name="Stale",
+            enabled=True,
+            expression={"op": "and", "children": []},
+            target_mailbox="Finance",
+            stop_processing=True,
+        )
+
+    store.reorder_mail_rules(account.account_id, [second.rule_id, first.rule_id])
+    assert [rule.position for rule in store.list_mail_rules(account.account_id)] == [0, 1]
+    assert store.list_mail_rules(account.account_id)[0].rule_id == second.rule_id
+    assert store.mailbox_rule_reference_count(account.account_id, "Finance") == 1
+
+    store.delete_mail_rule(account.account_id, second.rule_id)
+    assert store.list_mail_rules(account.account_id)[0].position == 0
+    with pytest.raises(MailRuleNotFoundError):
+        store.get_mail_rule(account.account_id, second.rule_id)
+
+
+def test_mail_rule_records_are_account_scoped_and_cascade(
+    store_factory: StoreFactory,
+) -> None:
+    store = store_factory()
+    first_account = store.create_account("first@example.test")
+    second_account = store.create_account("second@example.test")
+    rule = store.create_mail_rule(
+        first_account.account_id,
+        name="Private",
+        enabled=True,
+        expression={"field": "from", "test": "contains", "value": "private.example"},
+        target_mailbox="Private",
+        stop_processing=True,
+    )
+    with pytest.raises(MailRuleNotFoundError):
+        store.get_mail_rule(second_account.account_id, rule.rule_id)
+
+    store.delete_account(first_account.account_id)
+    with sqlite3.connect(store_factory.tmp_path / "auth.db") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM mail_rules").fetchone()[0] == 0
+
+
+def test_mail_rule_run_state_is_bounded_and_final(
+    store_factory: StoreFactory,
+) -> None:
+    store = store_factory()
+    account = store.create_account("user@example.test")
+    rule = store.create_mail_rule(
+        account.account_id,
+        name="Receipts",
+        enabled=True,
+        expression={"field": "subject", "test": "contains", "value": "receipt"},
+        target_mailbox="Receipts",
+        stop_processing=True,
+    )
+    run = store.create_mail_rule_run(
+        account.account_id,
+        rule.rule_id,
+        rule_snapshot={"rule_id": rule.rule_id, "revision": rule.revision},
+        state={"mailbox_index": 0, "cursor": 0},
+    )
+    assert run.status == "queued"
+    assert store.get_active_mail_rule_run(account.account_id) == run
+    with pytest.raises(MailRuleConflictError):
+        store.create_mail_rule_run(
+            account.account_id,
+            rule.rule_id,
+            rule_snapshot={"rule_id": rule.rule_id, "revision": rule.revision},
+            state={"mailbox_index": 0, "cursor": 0},
+        )
+    running = store.update_mail_rule_run(
+        account.account_id,
+        run.run_id,
+        state={"mailbox_index": 1, "cursor": 42},
+        status="running",
+        scanned=10,
+        matched=2,
+        moved=2,
+        failed=0,
+    )
+    assert running.started_at is not None
+    completed = store.update_mail_rule_run(
+        account.account_id,
+        run.run_id,
+        state={"mailbox_index": 2, "cursor": 0},
+        status="completed",
+        scanned=20,
+        matched=3,
+        moved=3,
+        failed=0,
+    )
+    assert completed.finished_at is not None
+    assert store.get_active_mail_rule_run(account.account_id) is None
+    with pytest.raises(MailRuleConflictError):
+        store.cancel_mail_rule_run(account.account_id, run.run_id)
+
+
+def test_mail_rule_and_initial_run_commit_or_roll_back_together(
+    store_factory: StoreFactory,
+) -> None:
+    store = store_factory()
+    account = store.create_account("user@example.test")
+    state = {
+        "mailboxes": [{"mailbox": "INBOX", "cursor": 42, "done": False}],
+        "mailbox_index": 0,
+    }
+    rule, run = store.create_mail_rule_with_run(
+        account.account_id,
+        name="Receipts",
+        enabled=True,
+        expression={"field": "subject", "operator": "contains", "value": "receipt"},
+        target_mailbox="Receipts",
+        stop_processing=True,
+        run_state=state,
+    )
+
+    assert run.rule_id == rule.rule_id
+    assert run.rule_revision == rule.revision
+    assert run.rule_snapshot == {
+        "rule_id": rule.rule_id,
+        "rule_name": rule.name,
+        "condition": rule.expression,
+        "target_mailbox": rule.target_mailbox,
+        "revision": rule.revision,
+    }
+    assert run.state == state
+    before = store.list_mail_rules(account.account_id)
+
+    with pytest.raises(MailRuleConflictError):
+        store.create_mail_rule_with_run(
+            account.account_id,
+            name="Must roll back",
+            enabled=True,
+            expression={"field": "from", "operator": "exists"},
+            target_mailbox="Receipts",
+            stop_processing=True,
+            run_state=state,
+        )
+
+    assert store.list_mail_rules(account.account_id) == before
+    assert store.get_active_mail_rule_run(account.account_id) == run
+
+
+def test_atomic_mail_rule_run_can_start_completed(
+    store_factory: StoreFactory,
+) -> None:
+    store = store_factory()
+    account = store.create_account("empty@example.test")
+    state = {"mailboxes": [], "mailbox_index": 0}
+
+    rule, run = store.create_mail_rule_with_run(
+        account.account_id,
+        name="Nothing to file",
+        enabled=True,
+        expression={"field": "subject", "operator": "exists"},
+        target_mailbox="Receipts",
+        stop_processing=True,
+        run_state=state,
+        run_completed=True,
+    )
+
+    assert run.rule_id == rule.rule_id
+    assert run.status == "completed"
+    assert run.finished_at == START_TIME
+    assert store.get_active_mail_rule_run(account.account_id) is None
+
+
+def test_terminal_mail_rule_run_history_is_bounded(
+    store_factory: StoreFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = store_factory()
+    account = store.create_account("user@example.test")
+    rule = store.create_mail_rule(
+        account.account_id,
+        name="Receipts",
+        enabled=True,
+        expression={"field": "subject", "operator": "contains", "value": "receipt"},
+        target_mailbox="Receipts",
+        stop_processing=True,
+    )
+    monkeypatch.setattr(auth_module, "_MAX_MAIL_RULE_RUNS_PER_ACCOUNT", 2)
+    for index in range(3):
+        run = store.create_mail_rule_run(
+            account.account_id,
+            rule.rule_id,
+            rule_snapshot={"rule_id": rule.rule_id, "revision": rule.revision},
+            state={"index": index},
+        )
+        store.update_mail_rule_run(
+            account.account_id,
+            run.run_id,
+            state={"index": index + 1},
+            status="completed",
+            scanned=1,
+            matched=0,
+            moved=0,
+            failed=0,
+        )
+
+    with sqlite3.connect(store_factory.tmp_path / "auth.db") as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM mail_rule_runs WHERE account_id = ?",
+            (account.account_id,),
+        ).fetchone()[0] == 2
+
+
+def test_mail_rule_limits_and_json_bounds(
+    store_factory: StoreFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = store_factory()
+    account = store.create_account("user@example.test")
+    monkeypatch.setattr(auth_module, "_MAX_MAIL_RULES_PER_ACCOUNT", 1)
+    store.create_mail_rule(
+        account.account_id,
+        name="One",
+        enabled=True,
+        expression={"op": "and", "children": []},
+        target_mailbox="One",
+        stop_processing=True,
+    )
+    with pytest.raises(MailRuleLimitError):
+        store.create_mail_rule(
+            account.account_id,
+            name="Two",
+            enabled=True,
+            expression={"op": "and", "children": []},
+            target_mailbox="Two",
+            stop_processing=True,
+        )
+    with pytest.raises(ValueError, match="size limit"):
+        store.create_mail_rule_run(
+            account.account_id,
+            store.list_mail_rules(account.account_id)[0].rule_id,
+            rule_snapshot={"value": "x" * 70_000},
+            state={},
+        )

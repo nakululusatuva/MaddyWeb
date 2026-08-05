@@ -46,6 +46,7 @@ from maddyweb.protocol import (
     send_frame,
     send_stream_frame,
 )
+from maddyweb.rule_snapshots import load_snapshot, publish_snapshot
 
 _PROC_HEADER = b"  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt\n"
 _PROC6_HEADER = (
@@ -180,6 +181,92 @@ class FakeMaddy:
         return len(self.dump_data)
 
 
+class FakeRuleMaddy(FakeMaddy):
+    def __init__(self) -> None:
+        super().__init__()
+        self.mailboxes = [
+            {"name": "INBOX", "attributes": []},
+            {"name": "Receipts", "attributes": []},
+            {"name": "Deleted Items", "attributes": ["\\Trash"]},
+            {"name": "Stored", "attributes": ["\\Archive"]},
+        ]
+        self.mailbox_messages: dict[str, list[dict[str, Any]]] = {
+            "INBOX": [
+                {
+                    "uid": 2,
+                    "raw": b"From: shop@example.test\r\nSubject: Receipt 2\r\n\r\nbody",
+                },
+                {
+                    "uid": 1,
+                    "raw": b"From: friend@example.test\r\nSubject: Hello\r\n\r\nbody",
+                },
+            ],
+            "Receipts": [],
+            "Deleted Items": [],
+            "Stored": [],
+        }
+
+    def list_mailboxes(
+        self,
+        _username: str,
+        *,
+        subscribed_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        assert subscribed_only is False
+        return [dict(record) for record in self.mailboxes]
+
+    def latest_message_uid(self, username: str, mailbox: str) -> int:
+        self.latest_message_uid_calls.append((username, mailbox))
+        return max(
+            (int(record["uid"]) for record in self.mailbox_messages[mailbox]),
+            default=0,
+        )
+
+    def list_message_window(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        username, mailbox = args
+        self.message_list_args.append((username, mailbox))
+        self.message_list_kwargs.append(kwargs)
+        ordered = sorted(
+            self.mailbox_messages[mailbox],
+            key=lambda item: int(item["uid"]),
+            reverse=True,
+        )
+        cursor = int(kwargs.get("cursor_uid", 0))
+        if cursor:
+            try:
+                start = next(
+                    index for index, record in enumerate(ordered) if int(record["uid"]) == cursor
+                )
+            except StopIteration as exc:
+                raise StaleMessageCursor("fixture cursor is stale") from exc
+        else:
+            start = 0
+        return [
+            {key: value for key, value in record.items() if key != "raw"}
+            for record in ordered[start : start + int(kwargs["limit"]) + 1]
+        ]
+
+    def dump_message(self, _username: str, mailbox: str, uid: int) -> bytes:
+        return next(
+            bytes(record["raw"])
+            for record in self.mailbox_messages[mailbox]
+            if int(record["uid"]) == uid
+        )
+
+    def move_messages(self, username: str, source: str, uid_set: str, target: str) -> None:
+        super().move_messages(username, source, uid_set, target)
+        selected = {int(value) for value in uid_set.split(",")}
+        moved = [
+            record for record in self.mailbox_messages[source] if int(record["uid"]) in selected
+        ]
+        self.mailbox_messages[source] = [
+            record
+            for record in self.mailbox_messages[source]
+            if int(record["uid"]) not in selected
+        ]
+        self.mailbox_messages[target].extend(moved)
+
+
 class RecordingSMTP:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
@@ -198,6 +285,8 @@ def make_dispatcher(
     smtp: Any = None,
     auth_store: Any = None,
     audit: Any = None,
+    rule_snapshot_dir: Path | None = None,
+    rule_snapshot_group_id: int | None = None,
 ) -> PrivilegedDispatcher:
     dispatcher_type = PrivilegedDispatcher
     if auth_store is None:
@@ -220,6 +309,8 @@ def make_dispatcher(
         spool_dir=tmp_path,
         smtp=smtp,
         auth_store=auth_store,
+        rule_snapshot_dir=rule_snapshot_dir,
+        rule_snapshot_group_id=rule_snapshot_group_id,
         audit=audit or (lambda *_args, **_kwargs: None),
     )
 
@@ -628,6 +719,12 @@ def test_sensitive_mutations_require_helper_enforced_recent_authentication() -> 
         "certificates.renew",
         "messages.delete",
         "messages.delete_many",
+        "rules.create",
+        "rules.update",
+        "rules.delete",
+        "rules.reorder",
+        "rules.run_create",
+        "rules.run_step",
     }
     assert all(ALLOWED_OPERATIONS[operation].step_up for operation in protected)
     assert ALLOWED_OPERATIONS["auth.recovery_regenerate"].step_up is False
@@ -2462,3 +2559,438 @@ def test_so_peercred_rejects_wrong_uid(tmp_path: Path) -> None:
     finally:
         client_socket.close()
         server_socket.close()
+
+
+def test_mail_rule_crud_publishes_snapshot_and_protects_target_folder(
+    tmp_path: Path,
+) -> None:
+    snapshots = (tmp_path / "rule-snapshots").resolve()
+    snapshots.mkdir(mode=0o700)
+    maddy = FakeRuleMaddy()
+    with make_auth_store(tmp_path) as store:
+        account, token = provision_session(store, "sender@example.test")
+        store.mark_step_up(token)
+        dispatcher = make_dispatcher(
+            tmp_path,
+            maddy,
+            auth_store=store,
+            rule_snapshot_dir=snapshots,
+        )
+        created = dispatcher.dispatch(
+            Request.create(
+                "rules.create",
+                {
+                    "target_account_id": account.account_id,
+                    "name": "Receipts",
+                    "enabled": True,
+                    "match": {
+                        "op": "or",
+                        "conditions": [
+                            {
+                                "field": "subject",
+                                "operator": "contains",
+                                "value": "receipt",
+                            },
+                            {
+                                "field": "from",
+                                "operator": "ends_with",
+                                "value": "@billing.example",
+                            },
+                        ],
+                    },
+                    "target_mailbox": "Receipts",
+                    "stop_processing": True,
+                    "apply_existing": False,
+                },
+                auth_token=token,
+            )
+        )
+        assert created.response.ok is True
+        created_rule = created.response.result["rule"]
+        rule_id = created_rule["rule_id"]
+        assert created_rule["revision"] == 1
+        assert created_rule["match"]["op"] == "or"
+
+        published = load_snapshot(snapshots, account.email)
+        assert published is not None
+        assert published["rules"][0]["condition"] == created_rule["match"]
+
+        updated = dispatcher.dispatch(
+            Request.create(
+                "rules.update",
+                {
+                    "target_account_id": account.account_id,
+                    "rule_id": rule_id,
+                    "expected_revision": 1,
+                    "name": "Receipts and invoices",
+                    "enabled": True,
+                    "condition": {
+                        "field": "subject",
+                        "operator": "contains",
+                        "value": "invoice",
+                    },
+                    "target_mailbox": "Receipts",
+                    "stop_processing": False,
+                },
+                auth_token=token,
+            )
+        )
+        assert updated.response.result["rule"]["revision"] == 2
+
+        protected = dispatcher.dispatch(
+            Request.create(
+                "mailboxes.rename",
+                {
+                    "target_account_id": account.account_id,
+                    "old_name": "Receipts",
+                    "new_name": "Filed",
+                },
+                auth_token=token,
+            )
+        )
+        assert protected.response.error is not None
+        assert protected.response.error.code == "conflict"
+
+        protected_delete = dispatcher.dispatch(
+            Request.create(
+                "mailboxes.delete",
+                {
+                    "target_account_id": account.account_id,
+                    "mailbox": "Receipts",
+                    "confirm": True,
+                },
+                auth_token=token,
+            )
+        )
+        assert protected_delete.response.error is not None
+        assert protected_delete.response.error.code == "conflict"
+
+        deleted = dispatcher.dispatch(
+            Request.create(
+                "rules.delete",
+                {"target_account_id": account.account_id, "rule_id": rule_id},
+                auth_token=token,
+            )
+        )
+        assert deleted.response.ok is True
+        published = load_snapshot(snapshots, account.email)
+        assert published is not None
+        assert published["rules"] == []
+
+
+def test_existing_mail_rule_run_is_bounded_unique_and_reports_progress(
+    tmp_path: Path,
+) -> None:
+    maddy = FakeRuleMaddy()
+    with make_auth_store(tmp_path) as store:
+        account, token = provision_session(store, "sender@example.test")
+        store.mark_step_up(token)
+        dispatcher = make_dispatcher(tmp_path, maddy, auth_store=store)
+        created = dispatcher.dispatch(
+            Request.create(
+                "rules.create",
+                {
+                    "target_account_id": account.account_id,
+                    "name": "Receipts",
+                    "enabled": True,
+                    "match": {
+                        "field": "subject",
+                        "operator": "contains",
+                        "value": "receipt",
+                    },
+                    "target_mailbox": "Receipts",
+                    "stop_processing": True,
+                    "apply_existing": True,
+                },
+                auth_token=token,
+            )
+        )
+        rule_id = created.response.result["rule"]["rule_id"]
+        run = created.response.result["run"]
+        assert run["status"] == "queued"
+        assert run["rule_name"] == "Receipts"
+
+        duplicate = dispatcher.dispatch(
+            Request.create(
+                "rules.run_create",
+                {"target_account_id": account.account_id, "rule_id": rule_id},
+                auth_token=token,
+            )
+        )
+        assert duplicate.response.error is not None
+        assert duplicate.response.error.code == "conflict"
+
+        rejected_create = dispatcher.dispatch(
+            Request.create(
+                "rules.create",
+                {
+                    "target_account_id": account.account_id,
+                    "name": "Second active run",
+                    "enabled": True,
+                    "match": {"field": "subject", "operator": "exists"},
+                    "target_mailbox": "Receipts",
+                    "stop_processing": True,
+                    "apply_existing": True,
+                },
+                auth_token=token,
+            )
+        )
+        assert rejected_create.response.error is not None
+        assert rejected_create.response.error.code == "conflict"
+        assert len(store.list_mail_rules(account.account_id)) == 1
+
+        stepped = dispatcher.dispatch(
+            Request.create(
+                "rules.run_step",
+                {
+                    "target_account_id": account.account_id,
+                    "run_id": run["run_id"],
+                },
+                auth_token=token,
+            )
+        )
+        progress = stepped.response.result["run"]
+        assert progress["status"] == "completed"
+        assert progress["processed"] == 2
+        assert progress["matched"] == 1
+        assert progress["moved"] == 1
+        assert progress["failed"] == 0
+        assert maddy.moved_many == [
+            ("sender@example.test", "INBOX", "2", "Receipts")
+        ]
+
+        listed = dispatcher.dispatch(
+            Request.create(
+                "rules.list",
+                {"target_account_id": account.account_id},
+                auth_token=token,
+            )
+        )
+        assert listed.response.result["active_run"] is None
+
+
+def test_every_allowlisted_operation_has_a_dispatcher_handler() -> None:
+    assert all(
+        callable(getattr(PrivilegedDispatcher, operation.method, None))
+        for operation in ALLOWED_OPERATIONS.values()
+    )
+
+
+def test_mail_rule_collection_frame_budget_fails_before_storage_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(helper_module, "_MAX_RULE_RESPONSE_BYTES", 256)
+    with make_auth_store(tmp_path) as store:
+        account, token = provision_session(store, "sender@example.test")
+        store.mark_step_up(token)
+        result = make_dispatcher(tmp_path, FakeRuleMaddy(), auth_store=store).dispatch(
+            Request.create(
+                "rules.create",
+                {
+                    "target_account_id": account.account_id,
+                    "name": "Oversized response record",
+                    "enabled": True,
+                    "match": {
+                        "field": "subject",
+                        "operator": "contains",
+                        "value": "x" * 100,
+                    },
+                    "target_mailbox": "Receipts",
+                    "stop_processing": True,
+                },
+                auth_token=token,
+            )
+        )
+        assert result.response.error is not None
+        assert result.response.error.code == "limit_exceeded"
+        assert store.list_mail_rules(account.account_id) == ()
+
+
+def test_mail_rule_reorder_frame_budget_fails_before_storage_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshots = (tmp_path / "rule-snapshots").resolve()
+    snapshots.mkdir(mode=0o700)
+    with make_auth_store(tmp_path) as store:
+        account, token = provision_session(store, "sender@example.test")
+        store.mark_step_up(token)
+        dispatcher = make_dispatcher(
+            tmp_path,
+            FakeRuleMaddy(),
+            auth_store=store,
+            rule_snapshot_dir=snapshots,
+        )
+        rule_ids: list[str] = []
+        for name in ("First", "Second"):
+            created = dispatcher.dispatch(
+                Request.create(
+                    "rules.create",
+                    {
+                        "target_account_id": account.account_id,
+                        "name": name,
+                        "enabled": True,
+                        "match": {"field": "subject", "operator": "exists"},
+                        "target_mailbox": "Receipts",
+                        "stop_processing": True,
+                    },
+                    auth_token=token,
+                )
+            )
+            assert created.response.ok is True
+            rule_ids.append(created.response.result["rule"]["rule_id"])
+        before = load_snapshot(snapshots, account.email)
+        monkeypatch.setattr(helper_module, "_MAX_RULE_RESPONSE_BYTES", 256)
+
+        reordered = dispatcher.dispatch(
+            Request.create(
+                "rules.reorder",
+                {
+                    "target_account_id": account.account_id,
+                    "rule_ids": list(reversed(rule_ids)),
+                },
+                auth_token=token,
+            )
+        )
+
+        assert reordered.response.error is not None
+        assert reordered.response.error.code == "limit_exceeded"
+        assert [
+            rule.rule_id for rule in store.list_mail_rules(account.account_id)
+        ] == rule_ids
+        assert load_snapshot(snapshots, account.email) == before
+
+
+def test_mail_rule_reads_remain_read_only_and_do_not_require_step_up() -> None:
+    for operation_name in ("rules.list", "rules.run_status"):
+        operation = ALLOWED_OPERATIONS[operation_name]
+        assert operation.mutating is False
+        assert operation.step_up is False
+    assert ALLOWED_OPERATIONS["rules.run_cancel"].step_up is False
+
+
+def test_mail_rule_mutation_rejects_an_active_session_without_recent_verification(
+    tmp_path: Path,
+) -> None:
+    with make_auth_store(tmp_path) as store:
+        account, token = provision_session(store, "sender@example.test")
+        dispatcher = make_dispatcher(tmp_path, FakeRuleMaddy(), auth_store=store)
+
+        result = dispatcher.dispatch(
+            Request.create(
+                "rules.create",
+                {
+                    "target_account_id": account.account_id,
+                    "name": "Receipts",
+                    "enabled": True,
+                    "match": {"field": "subject", "operator": "exists"},
+                    "target_mailbox": "Receipts",
+                    "stop_processing": True,
+                    "apply_existing": False,
+                },
+                auth_token=token,
+            )
+        )
+
+        assert result.response.error is not None
+        assert result.response.error.code == "step_up_required"
+        assert store.list_mail_rules(account.account_id) == ()
+
+        listed = dispatcher.dispatch(
+            Request.create(
+                "rules.list",
+                {"target_account_id": account.account_id},
+                auth_token=token,
+            )
+        )
+        assert listed.response.ok is True
+
+
+def test_mail_rule_snapshot_startup_reconciliation_fails_before_storage_mutation(
+    tmp_path: Path,
+) -> None:
+    missing_snapshots = (tmp_path / "missing-snapshots").resolve()
+    with make_auth_store(tmp_path) as store:
+        account, _token = provision_session(store, "sender@example.test")
+        with pytest.raises(FileNotFoundError):
+            make_dispatcher(
+                tmp_path,
+                FakeRuleMaddy(),
+                auth_store=store,
+                rule_snapshot_dir=missing_snapshots,
+            )
+        assert store.list_mail_rules(account.account_id) == ()
+
+
+def test_mail_rule_post_commit_snapshot_failure_leaves_delivery_paused_and_recovers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshots = (tmp_path / "rule-snapshots").resolve()
+    snapshots.mkdir(mode=0o700)
+    with make_auth_store(tmp_path) as store:
+        account, token = provision_session(store, "sender@example.test")
+        store.mark_step_up(token)
+        dispatcher = make_dispatcher(
+            tmp_path,
+            FakeRuleMaddy(),
+            auth_store=store,
+            rule_snapshot_dir=snapshots,
+        )
+        real_publish = helper_module.publish_snapshot
+        calls = 0
+
+        def fail_second_publish(*args: Any, **kwargs: Any) -> Path:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("simulated storage failure")
+            return real_publish(*args, **kwargs)
+
+        monkeypatch.setattr(helper_module, "publish_snapshot", fail_second_publish)
+        result = dispatcher.dispatch(
+            Request.create(
+                "rules.create",
+                {
+                    "target_account_id": account.account_id,
+                    "name": "Receipts",
+                    "enabled": True,
+                    "match": {"field": "subject", "operator": "exists"},
+                    "target_mailbox": "Receipts",
+                    "stop_processing": True,
+                },
+                auth_token=token,
+            )
+        )
+
+        assert result.response.ok is True
+        assert result.response.result["delivery_ready"] is False
+        assert len(store.list_mail_rules(account.account_id)) == 1
+        paused = load_snapshot(snapshots, account.email)
+        assert paused is not None
+        assert paused["rules"] == []
+
+        monkeypatch.setattr(helper_module, "publish_snapshot", real_publish)
+        listed = dispatcher.dispatch(
+            Request.create(
+                "rules.list",
+                {"target_account_id": account.account_id},
+                auth_token=token,
+            )
+        )
+        assert listed.response.ok is True
+        still_paused = load_snapshot(snapshots, account.email)
+        assert still_paused is not None
+        assert still_paused["rules"] == []
+
+        publish_snapshot(snapshots, account.email, [])
+        make_dispatcher(
+            tmp_path,
+            FakeRuleMaddy(),
+            auth_store=store,
+            rule_snapshot_dir=snapshots,
+        )
+        startup_recovered = load_snapshot(snapshots, account.email)
+        assert startup_recovered is not None
+        assert len(startup_recovered["rules"]) == 1

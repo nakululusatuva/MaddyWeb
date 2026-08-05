@@ -86,6 +86,9 @@ PARSED_MESSAGE_CACHE_CAPACITY = 32
 PARSED_MESSAGE_CACHE_MAX_BYTES = 32 * 1024 * 1024
 MAX_BULK_MESSAGE_UIDS = 50
 BULK_FRESHNESS_CONCURRENCY = 2
+MAX_ALL_MAIL_MAILBOXES = 64
+MAX_ALL_MAIL_CANDIDATES = 400
+ALL_MAIL_FANOUT_CONCURRENCY = 4
 MAX_TOTP_QR_SVG_CHARS = 256 * 1024
 MAX_PASSKEY_CREDENTIAL_JSON_BYTES = MAX_API_JSON_BYTES
 MAX_PASSKEY_OPTIONS_JSON_BYTES = 64 * 1024
@@ -99,7 +102,9 @@ _MAIL_EVENT_PATHS = frozenset(
         "/api/v1/admin/mail-events",
     }
 )
-_SPA_PATHS = frozenset({"/", "/accounts", "/certificates", "/compose", "/mail", "/security"})
+_SPA_PATHS = frozenset(
+    {"/", "/accounts", "/certificates", "/compose", "/mail", "/rules", "/security"}
+)
 _SPA_MAIL_PATH_RE = re.compile(r"\A/mail/([1-9][0-9]{0,9})\Z")
 
 _GATEWAY_KEY = web.AppKey("gateway", object)
@@ -272,6 +277,65 @@ class Gateway(MailGateway, Protocol):
 
     async def delete_named_mailbox(self, account_id: str, mailbox: str) -> None: ...
 
+    async def list_mail_rules(self, account_id: str) -> Mapping[str, object]: ...
+
+    async def create_mail_rule(
+        self,
+        account_id: str,
+        *,
+        name: str,
+        enabled: bool,
+        match_condition: Mapping[str, object],
+        target_mailbox: str,
+        stop_processing: bool,
+        apply_existing: bool,
+    ) -> Mapping[str, object]: ...
+
+    async def update_mail_rule(
+        self,
+        account_id: str,
+        rule_id: str,
+        *,
+        name: str,
+        enabled: bool,
+        match_condition: Mapping[str, object],
+        target_mailbox: str,
+        stop_processing: bool,
+        expected_revision: int,
+    ) -> Mapping[str, object]: ...
+
+    async def delete_mail_rule(self, account_id: str, rule_id: str) -> None: ...
+
+    async def reorder_mail_rules(
+        self,
+        account_id: str,
+        rule_ids: Sequence[str],
+    ) -> Mapping[str, object]: ...
+
+    async def create_mail_rule_run(
+        self,
+        account_id: str,
+        rule_id: str,
+    ) -> Mapping[str, object]: ...
+
+    async def get_mail_rule_run(
+        self,
+        account_id: str,
+        run_id: str,
+    ) -> Mapping[str, object]: ...
+
+    async def step_mail_rule_run(
+        self,
+        account_id: str,
+        run_id: str,
+    ) -> Mapping[str, object]: ...
+
+    async def cancel_mail_rule_run(
+        self,
+        account_id: str,
+        run_id: str,
+    ) -> Mapping[str, object]: ...
+
     async def list_messages(
         self,
         account_id: str,
@@ -345,6 +409,14 @@ class Gateway(MailGateway, Protocol):
         account_id: str,
         mailbox: str,
         message_ids: Sequence[str],
+    ) -> str: ...
+
+    async def move_messages(
+        self,
+        account_id: str,
+        mailbox: str,
+        message_ids: Sequence[str],
+        target: str,
     ) -> str: ...
 
     async def delete_message_permanently(
@@ -538,6 +610,16 @@ class _MailboxCursorState:
     expires_at: float
 
 
+@dataclass(frozen=True, slots=True)
+class _AllMailCursorState:
+    account: str
+    mailboxes: tuple[str, ...]
+    offsets: tuple[tuple[str, int], ...]
+    page: int
+    previous: str | None
+    expires_at: float
+
+
 class _MailboxCursorError(ValueError):
     pass
 
@@ -550,7 +632,7 @@ class _MailboxCursorStore:
             raise ValueError("mailbox cursor limits must be positive")
         self._ttl_seconds = ttl_seconds
         self._capacity = capacity
-        self._states: OrderedDict[str, _MailboxCursorState] = OrderedDict()
+        self._states: OrderedDict[str, _MailboxCursorState | _AllMailCursorState] = OrderedDict()
 
     def _prune(self, now: float) -> None:
         while self._states:
@@ -566,10 +648,31 @@ class _MailboxCursorStore:
         self._prune(now)
         state = self._states.get(token)
         if (
-            state is None
+            not isinstance(state, _MailboxCursorState)
             or state.expires_at <= now
             or state.account != account
             or state.mailbox != mailbox
+        ):
+            raise _MailboxCursorError("expired or mismatched mailbox cursor")
+        return state
+
+    def resolve_all(
+        self,
+        token: str,
+        *,
+        account: str,
+        mailboxes: Sequence[str],
+    ) -> _AllMailCursorState:
+        if re.fullmatch(r"[A-Za-z0-9_-]{32}", token) is None:
+            raise _MailboxCursorError("invalid mailbox cursor")
+        now = time.monotonic()
+        self._prune(now)
+        state = self._states.get(token)
+        if (
+            not isinstance(state, _AllMailCursorState)
+            or state.expires_at <= now
+            or state.account != account
+            or state.mailboxes != tuple(mailboxes)
         ):
             raise _MailboxCursorError("expired or mismatched mailbox cursor")
         return state
@@ -594,6 +697,53 @@ class _MailboxCursorStore:
             account=account,
             mailbox=mailbox,
             offset=offset,
+            page=page,
+            previous=previous,
+            expires_at=now + self._ttl_seconds,
+        )
+        while len(self._states) > self._capacity:
+            self._states.popitem(last=False)
+        return token
+
+    def create_all(
+        self,
+        *,
+        account: str,
+        mailboxes: Sequence[str],
+        offsets: Sequence[tuple[str, int]],
+        page: int,
+        previous: str | None,
+    ) -> str:
+        mailbox_values = tuple(mailboxes)
+        offset_values = tuple(offsets)
+        if (
+            not 1 <= len(mailbox_values) <= MAX_ALL_MAIL_MAILBOXES
+            or len(set(mailbox_values)) != len(mailbox_values)
+            or not 1 <= page <= MAX_MAILBOX_PAGE
+        ):
+            raise ValueError("all-mail cursor state is out of bounds")
+        allowed = set(mailbox_values)
+        seen: set[str] = set()
+        for mailbox, offset in offset_values:
+            if (
+                mailbox not in allowed
+                or mailbox in seen
+                or type(offset) is not int
+                or not 0 <= offset <= MAX_MESSAGE_CURSOR
+            ):
+                raise ValueError("all-mail cursor continuation is invalid")
+            seen.add(mailbox)
+        if not offset_values:
+            raise ValueError("all-mail cursor has no active mailbox")
+        now = time.monotonic()
+        self._prune(now)
+        token = secrets.token_urlsafe(24)
+        while token in self._states:
+            token = secrets.token_urlsafe(24)
+        self._states[token] = _AllMailCursorState(
+            account=account,
+            mailboxes=mailbox_values,
+            offsets=offset_values,
             page=page,
             previous=previous,
             expires_at=now + self._ttl_seconds,
@@ -842,6 +992,127 @@ def _message_page(value: MessagePage | Mapping[str, object]) -> MessagePage:
         next_offset=next_offset_value,
         offset=offset_value,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class _AllMailPage:
+    items: tuple[tuple[str, object], ...]
+    next_offsets: tuple[tuple[str, int], ...]
+
+
+def _all_mail_head_key(mailbox: str, record: object) -> tuple[int, str, str]:
+    timestamp = _record_value(record, "internal_date_unix", "date_unix", default=0)
+    if type(timestamp) is not int:
+        timestamp = 0
+    return (-timestamp, mailbox.casefold(), mailbox)
+
+
+def _all_mail_resume_offset(record: object) -> int:
+    try:
+        return int(_normalized_message_uid(str(_record_value(record, "uid", "id"))))
+    except ValueError as exc:
+        raise TypeError("messages.list returned an invalid all-mail UID") from exc
+
+
+async def _list_all_mail_page(
+    gateway: Gateway,
+    account: str,
+    mailboxes: Sequence[str],
+    offsets: Sequence[tuple[str, int]],
+    *,
+    limit: int,
+) -> _AllMailPage:
+    """Merge bounded per-mailbox UID streams without losing their continuations."""
+
+    if not mailboxes or not offsets:
+        return _AllMailPage((), ())
+    if len(mailboxes) > MAX_ALL_MAIL_MAILBOXES:
+        raise ValueError("all-mail mailbox fan-out exceeds the supported limit")
+    mailbox_set = set(mailboxes)
+    offset_map = dict(offsets)
+    if len(offset_map) != len(offsets) or not set(offset_map).issubset(mailbox_set):
+        raise ValueError("all-mail mailbox continuation is invalid")
+
+    active = [(mailbox, offset_map[mailbox]) for mailbox in mailboxes if mailbox in offset_map]
+    per_mailbox_limit = max(
+        1,
+        min(limit, MAX_ALL_MAIL_CANDIDATES // max(1, len(active))),
+    )
+    semaphore = asyncio.Semaphore(ALL_MAIL_FANOUT_CONCURRENCY)
+
+    async def fetch(
+        mailbox: str,
+        offset: int,
+        fetch_limit: int,
+    ) -> tuple[str, MessagePage]:
+        async with semaphore:
+            page = _message_page(
+                await gateway.list_messages(
+                    account,
+                    mailbox,
+                    limit=fetch_limit,
+                    offset=offset,
+                )
+            )
+        if len(page.items) > fetch_limit:
+            raise TypeError("messages.list exceeded the requested all-mail window")
+        if not page.items and page.next_offset is not None:
+            raise TypeError("messages.list returned an empty page with a continuation")
+        return mailbox, page
+
+    pages = dict(
+        await asyncio.gather(
+            *(
+                fetch(mailbox, offset, per_mailbox_limit)
+                for mailbox, offset in active
+            )
+        )
+    )
+    positions = {mailbox: 0 for mailbox, _offset in active}
+    selected: list[tuple[str, object]] = []
+    while len(selected) < limit:
+        heads = [
+            (mailbox, pages[mailbox].items[position])
+            for mailbox, position in positions.items()
+            if position < len(pages[mailbox].items)
+        ]
+        if not heads:
+            break
+        mailbox, record = min(heads, key=lambda item: _all_mail_head_key(*item))
+        selected.append((mailbox, record))
+        positions[mailbox] += 1
+        page = pages[mailbox]
+        if (
+            positions[mailbox] == len(page.items)
+            and page.next_offset is not None
+            and len(selected) < limit
+        ):
+            buffered = sum(
+                len(candidate_page.items) - positions[candidate_mailbox]
+                for candidate_mailbox, candidate_page in pages.items()
+            )
+            refill_limit = min(
+                limit - len(selected),
+                MAX_ALL_MAIL_CANDIDATES - buffered,
+            )
+            if refill_limit <= 0:
+                break
+            _mailbox, pages[mailbox] = await fetch(
+                mailbox,
+                page.next_offset,
+                refill_limit,
+            )
+            positions[mailbox] = 0
+
+    next_offsets: list[tuple[str, int]] = []
+    for mailbox, _offset in active:
+        page = pages[mailbox]
+        position = positions[mailbox]
+        if position < len(page.items):
+            next_offsets.append((mailbox, _all_mail_resume_offset(page.items[position])))
+        elif page.next_offset is not None:
+            next_offsets.append((mailbox, page.next_offset))
+    return _AllMailPage(tuple(selected), tuple(next_offsets))
 
 
 @dataclass(frozen=True, slots=True)
@@ -1657,7 +1928,11 @@ def _resolved_mailbox_payloads(
     return normalized, trash_target is not None, archive_target is not None
 
 
-def _message_summary_payload(record: object) -> dict[str, object]:
+def _message_summary_payload(
+    record: object,
+    *,
+    mailbox: str | None = None,
+) -> dict[str, object]:
     try:
         identifier = _normalized_message_uid(str(_record_value(record, "uid", "id")))
     except ValueError as exc:
@@ -1673,7 +1948,7 @@ def _message_summary_payload(record: object) -> dict[str, object]:
         unread = unread_value
     if type(unread) is not bool:
         raise TypeError("message summary unread flag must be a boolean")
-    return {
+    payload: dict[str, object] = {
         "uid": identifier,
         "sender": safe_display_header(_record_value(record, "sender", "from_", "from", default="")),
         "subject": safe_display_header(_record_value(record, "subject", default="(No subject)"))
@@ -1681,6 +1956,9 @@ def _message_summary_payload(record: object) -> dict[str, object]:
         "date": safe_display_header(_record_value(record, "date", "received_at", default="")),
         "unread": unread,
     }
+    if mailbox is not None:
+        payload["mailbox"] = mailbox
+    return payload
 
 
 def _account_identifiers(records: Sequence[object]) -> set[str]:
@@ -2684,10 +2962,14 @@ async def api_mailbox(request: web.Request) -> web.Response:
         _require_admin(request)
     query = _read_query(
         request,
-        allowed_fields=frozenset({"account", "mailbox", "cursor", "page", "phase"}),
+        allowed_fields=frozenset({"account", "mailbox", "cursor", "page", "phase", "view"}),
     )
     if personal_scope and "account" in query:
         raise web.HTTPBadRequest(text="Personal mailbox APIs do not accept an account field.")
+    selected_view = query.get("view", "mailbox")
+    if selected_view not in {"mailbox", "all"}:
+        raise web.HTTPBadRequest(text="Invalid mail view.")
+    all_mail_view = selected_view == "all"
     context_only = query.get("phase", "") == "context"
     if "phase" in query and not context_only:
         raise web.HTTPBadRequest(text="Invalid mailbox loading phase.")
@@ -2697,6 +2979,8 @@ async def api_mailbox(request: web.Request) -> web.Response:
         else (query.get("account", "") or _principal_account_id(request))
     )
     mailbox_name = query.get("mailbox", "")
+    if all_mail_view and mailbox_name:
+        raise web.HTTPBadRequest(text="All Mail does not accept a mailbox field.")
     if account:
         account = _account_id(account)
     if mailbox_name:
@@ -2706,7 +2990,9 @@ async def api_mailbox(request: web.Request) -> web.Response:
     cursor_token = query.get("cursor")
     if context_only and cursor_token is not None:
         raise web.HTTPBadRequest(text="Mailbox context does not accept a pagination cursor.")
-    if cursor_token is not None and (not account or not mailbox_name):
+    if cursor_token is not None and (
+        not account or (not all_mail_view and not mailbox_name)
+    ):
         raise web.HTTPBadRequest(text="Pagination cursor lacks account or mailbox context.")
     page_size = _settings(request).page_size
     if personal_scope:
@@ -2757,7 +3043,7 @@ async def api_mailbox(request: web.Request) -> web.Response:
     mailbox_names = _mailbox_names(mailbox_values)
     if mailbox_name and mailbox_name not in mailbox_names:
         raise web.HTTPBadRequest(text="Mailbox is not in the allowed list.")
-    if account and not mailbox_name:
+    if account and not mailbox_name and not all_mail_view:
         mailbox_name = next(
             (
                 mailbox["name"]
@@ -2767,71 +3053,165 @@ async def api_mailbox(request: web.Request) -> web.Response:
             "",
         )
 
-    cursor_state: _MailboxCursorState | None = None
     page = 1
-    offset = 0
-    if cursor_token is not None:
-        try:
-            cursor_state = _mail_cursor_store(request).resolve(
-                cursor_token,
-                account=account,
-                mailbox=mailbox_name,
-            )
-        except _MailboxCursorError as exc:
-            raise web.HTTPConflict(text="Pagination expired; refresh.") from exc
-        page = cursor_state.page
-        offset = cursor_state.offset
-    try:
-        message_page = (
-            _message_page(
-                await _gateway(request).list_messages(
-                    account,
-                    mailbox_name,
-                    limit=page_size,
-                    offset=offset,
-                )
-            )
-            if account and mailbox_name and not context_only
-            else MessagePage((), False)
-        )
-    except Exception as exc:
-        if getattr(exc, "code", None) == "stale_cursor":
-            raise web.HTTPConflict(text="Mailbox changed; refresh before continuing.") from exc
-        return await _gateway_error(request, "Could not read messages")
-
-    previous_cursor = cursor_state.previous if cursor_state is not None else None
+    previous_cursor: str | None = None
     next_cursor: str | None = None
-    if (
-        account
-        and mailbox_name
-        and message_page.next_offset is not None
-        and page < MAX_MAILBOX_PAGE
-    ):
-        current_cursor = cursor_token
-        if current_cursor is None:
-            current_cursor = _mail_cursor_store(request).create(
+    message_payloads: list[dict[str, object]] = []
+    if all_mail_view:
+        raw_mailbox_payloads = tuple(_mailbox_payload(record) for record in mailbox_values)
+        all_mailboxes = tuple(
+            sorted(
+                (
+                    str(resolved["name"])
+                    for raw, resolved in zip(
+                        raw_mailbox_payloads,
+                        mailbox_payloads,
+                        strict=True,
+                    )
+                    if raw["is_trash"] is not True
+                    and raw["is_archive"] is not True
+                    and resolved["is_trash"] is not True
+                    and resolved["is_archive"] is not True
+                ),
+                key=lambda name: (name.casefold(), name),
+            )
+        )
+        if not context_only and len(all_mailboxes) > MAX_ALL_MAIL_MAILBOXES:
+            raise web.HTTPBadRequest(
+                text=f"All Mail supports at most {MAX_ALL_MAIL_MAILBOXES} folders."
+            )
+        all_cursor_state: _AllMailCursorState | None = None
+        current_offsets = tuple((mailbox, 0) for mailbox in all_mailboxes)
+        if cursor_token is not None:
+            try:
+                all_cursor_state = _mail_cursor_store(request).resolve_all(
+                    cursor_token,
+                    account=account,
+                    mailboxes=all_mailboxes,
+                )
+            except _MailboxCursorError as exc:
+                raise web.HTTPConflict(text="Pagination expired; refresh.") from exc
+            page = all_cursor_state.page
+            previous_cursor = all_cursor_state.previous
+            current_offsets = all_cursor_state.offsets
+        try:
+            all_page = (
+                await _list_all_mail_page(
+                    _gateway(request),
+                    account,
+                    all_mailboxes,
+                    current_offsets,
+                    limit=page_size,
+                )
+                if account and all_mailboxes and not context_only
+                else _AllMailPage((), ())
+            )
+        except Exception as exc:
+            if getattr(exc, "code", None) == "stale_cursor":
+                raise web.HTTPConflict(text="Mailbox changed; refresh before continuing.") from exc
+            return await _gateway_error(request, "Could not read messages")
+        try:
+            message_payloads = [
+                _message_summary_payload(record, mailbox=source_mailbox)
+                for source_mailbox, record in all_page.items
+            ]
+        except TypeError, ValueError:
+            LOGGER.error("mail backend returned an invalid payload", exc_info=True)
+            return _api_error(
+                "invalid_backend_response",
+                "Backend returned an invalid mailbox response.",
+                status=502,
+            )
+        if account and all_page.next_offsets and page < MAX_MAILBOX_PAGE:
+            current_cursor = cursor_token
+            if current_cursor is None:
+                current_cursor = _mail_cursor_store(request).create_all(
+                    account=account,
+                    mailboxes=all_mailboxes,
+                    offsets=current_offsets,
+                    page=page,
+                    previous=None,
+                )
+            next_cursor = _mail_cursor_store(request).create_all(
+                account=account,
+                mailboxes=all_mailboxes,
+                offsets=all_page.next_offsets,
+                page=page + 1,
+                previous=current_cursor,
+            )
+    else:
+        cursor_state: _MailboxCursorState | None = None
+        offset = 0
+        if cursor_token is not None:
+            try:
+                cursor_state = _mail_cursor_store(request).resolve(
+                    cursor_token,
+                    account=account,
+                    mailbox=mailbox_name,
+                )
+            except _MailboxCursorError as exc:
+                raise web.HTTPConflict(text="Pagination expired; refresh.") from exc
+            page = cursor_state.page
+            offset = cursor_state.offset
+            previous_cursor = cursor_state.previous
+        try:
+            message_page = (
+                _message_page(
+                    await _gateway(request).list_messages(
+                        account,
+                        mailbox_name,
+                        limit=page_size,
+                        offset=offset,
+                    )
+                )
+                if account and mailbox_name and not context_only
+                else MessagePage((), False)
+            )
+        except Exception as exc:
+            if getattr(exc, "code", None) == "stale_cursor":
+                raise web.HTTPConflict(text="Mailbox changed; refresh before continuing.") from exc
+            return await _gateway_error(request, "Could not read messages")
+        try:
+            message_payloads = [_message_summary_payload(value) for value in message_page.items]
+        except TypeError, ValueError:
+            LOGGER.error("mail backend returned an invalid payload", exc_info=True)
+            return _api_error(
+                "invalid_backend_response",
+                "Backend returned an invalid mailbox response.",
+                status=502,
+            )
+        if (
+            account
+            and mailbox_name
+            and message_page.next_offset is not None
+            and page < MAX_MAILBOX_PAGE
+        ):
+            current_cursor = cursor_token
+            if current_cursor is None:
+                current_cursor = _mail_cursor_store(request).create(
+                    account=account,
+                    mailbox=mailbox_name,
+                    offset=message_page.offset,
+                    page=page,
+                    previous=None,
+                )
+            next_cursor = _mail_cursor_store(request).create(
                 account=account,
                 mailbox=mailbox_name,
-                offset=message_page.offset,
-                page=page,
-                previous=None,
+                offset=message_page.next_offset,
+                page=page + 1,
+                previous=current_cursor,
             )
-        next_cursor = _mail_cursor_store(request).create(
-            account=account,
-            mailbox=mailbox_name,
-            offset=message_page.next_offset,
-            page=page + 1,
-            previous=current_cursor,
-        )
     try:
         payload = {
             "accounts": account_payloads,
             "mailboxes": mailbox_payloads,
             "trash_available": trash_available,
             "archive_available": archive_available,
-            "messages": [_message_summary_payload(value) for value in message_page.items],
+            "messages": message_payloads,
             "selected_account": account,
             "selected_mailbox": mailbox_name,
+            "selected_view": selected_view,
             "page": page,
             "previous_cursor": previous_cursor,
             "next_cursor": next_cursor,
@@ -3227,6 +3607,77 @@ async def api_message_action_snapshot(request: web.Request) -> web.Response:
             "mailbox": mailbox_name,
             "size": size,
             "freshness_token": freshness,
+        }
+    )
+
+
+async def api_message_action_snapshots(request: web.Request) -> web.Response:
+    values = await _read_json_object(
+        request,
+        allowed_fields=frozenset({"account", "mailbox", "uids"}),
+    )
+    account, mailbox_name = _mail_context(request, values)
+    selected = _selected_message_uids(values)
+    await _authorize_mail_context(request, account, mailbox_name)
+
+    results: list[str | None] = [None] * len(selected)
+    next_index = 0
+    failure: Exception | None = None
+
+    async def snapshot_worker() -> None:
+        nonlocal failure, next_index
+        while failure is None and next_index < len(selected):
+            index = next_index
+            next_index += 1
+            uid = selected[index]
+            try:
+                async with _mail_work_slot(request):
+                    spool = await _spool_raw_message(
+                        request,
+                        account,
+                        mailbox_name,
+                        authorized=True,
+                        message_id=uid,
+                    )
+                    try:
+                        results[index] = await asyncio.to_thread(_file_sha256, spool.path)
+                    finally:
+                        await asyncio.to_thread(spool.cleanup)
+            except Exception as exc:
+                if failure is None:
+                    failure = exc
+
+    await asyncio.gather(
+        *(snapshot_worker() for _index in range(min(BULK_FRESHNESS_CONCURRENCY, len(selected))))
+    )
+    if failure is not None:
+        if isinstance(failure, web.HTTPException):
+            raise failure
+        LOGGER.exception("failed to snapshot a message batch", exc_info=failure)
+        raise web.HTTPBadGateway(text="Could not read the selected messages.") from failure
+
+    owner = _freshness_owner(request)
+    freshness: list[dict[str, str]] = []
+    for uid, result in zip(selected, results, strict=True):
+        if result is None:
+            raise RuntimeError("message batch snapshot did not complete")
+        freshness.append(
+            {
+                "uid": uid,
+                "token": _freshness_store(request).issue(
+                    owner,
+                    account,
+                    mailbox_name,
+                    uid,
+                    result,
+                ),
+            }
+        )
+    return _api_response(
+        data={
+            "account": account,
+            "mailbox": mailbox_name,
+            "freshness": freshness,
         }
     )
 
@@ -3752,7 +4203,15 @@ async def bulk_message_action(request: web.Request) -> web.Response:
     values = await _read_json_object(
         request,
         allowed_fields=frozenset(
-            {"account", "mailbox", "action", "uids", "confirmation", "freshness"}
+            {
+                "account",
+                "mailbox",
+                "action",
+                "uids",
+                "target_mailbox",
+                "confirmation",
+                "freshness",
+            }
         ),
     )
     account, mailbox_name = _mail_context(request, values)
@@ -3763,12 +4222,26 @@ async def bulk_message_action(request: web.Request) -> web.Response:
         "mark_all_read",
         "archive",
         "trash",
+        "move",
         "permanent_delete",
     }:
         raise web.HTTPBadRequest(text="Bulk message action is invalid.")
-    if action != "permanent_delete" and ({"confirmation", "freshness"} & set(values)):
+    relocation_actions = {"archive", "trash", "move"}
+    if action in relocation_actions:
+        if "confirmation" in values:
+            raise web.HTTPBadRequest(text="Bulk message action contains disallowed fields.")
+    elif action != "permanent_delete" and ({"confirmation", "freshness"} & set(values)):
         raise web.HTTPBadRequest(text="Bulk message action contains disallowed fields.")
     mailbox_payloads = await _authorize_mail_context(request, account, mailbox_name)
+    target_mailbox: str | None = None
+    if action == "move":
+        target_mailbox = _mailbox_name(_json_text(values, "target_mailbox"))
+        if target_mailbox not in {str(mailbox["name"]) for mailbox in mailbox_payloads}:
+            raise web.HTTPBadRequest(text="Target mailbox is not in the allowed list.")
+        if target_mailbox.casefold() == mailbox_name.casefold():
+            raise web.HTTPBadRequest(text="Source and target mailbox must differ.")
+    elif "target_mailbox" in values:
+        raise web.HTTPBadRequest(text="Bulk message action contains disallowed fields.")
     if action == "mark_all_read":
         if "uids" in values:
             raise web.HTTPBadRequest(text="Mark all as read does not accept a message selection.")
@@ -3802,6 +4275,19 @@ async def bulk_message_action(request: web.Request) -> web.Response:
                 selected=selected,
                 tokens=freshness_tokens,
             )
+    elif action in relocation_actions:
+        if selected is None:
+            raise RuntimeError("Message selection is unexpectedly unavailable.")
+        freshness_tokens = _bulk_freshness_tokens(values, selected)
+        async with _mail_work_slot(request):
+            await _verify_bulk_message_freshness(
+                request,
+                account=account,
+                mailbox=mailbox_name,
+                selected=selected,
+                tokens=freshness_tokens,
+            )
+    moved_target: str | None = None
     try:
         if action == "mark_all_read":
             await _gateway(request).set_messages_seen(
@@ -3843,6 +4329,16 @@ async def bulk_message_action(request: web.Request) -> web.Response:
                 selected,
             )
             message = f"{affected} message{'s' if affected != 1 else ''} moved to Trash."
+        elif action == "move":
+            if selected is None or target_mailbox is None:
+                raise RuntimeError("Message move context is unexpectedly unavailable.")
+            moved_target = await _gateway(request).move_messages(
+                account,
+                mailbox_name,
+                selected,
+                target_mailbox,
+            )
+            message = f"{affected} message{'s' if affected != 1 else ''} moved."
         else:
             if selected is None:
                 raise RuntimeError("Message selection is unexpectedly unavailable.")
@@ -3860,10 +4356,17 @@ async def bulk_message_action(request: web.Request) -> web.Response:
             message = f"{affected} message{'s' if affected != 1 else ''} permanently deleted."
     except Exception as exc:
         return await _mutation_gateway_error(request, "Bulk message action failed", exc)
-    if action in {"archive", "trash", "permanent_delete"} and selected is not None:
+    if action in {"archive", "trash", "move", "permanent_delete"} and selected is not None:
         _parsed_message_cache(request).invalidate(account, mailbox_name, selected)
+    data: dict[str, object] = {
+        "account": account,
+        "mailbox": mailbox_name,
+        "affected": affected,
+    }
+    if moved_target is not None:
+        data["target_mailbox"] = moved_target
     return _api_response(
-        data={"account": account, "mailbox": mailbox_name, "affected": affected},
+        data=data,
         message=message,
     )
 
@@ -3931,8 +4434,8 @@ async def rename_mailbox(request: web.Request) -> web.Response:
     new_name = _mailbox_name(_json_text(values, "new_name"))
     try:
         await _gateway(request).rename_mailbox(account, old_name, new_name)
-    except Exception:
-        return await _gateway_error(request, "Could not rename mailbox")
+    except Exception as exc:
+        return await _folder_rule_reference_error(request, "Could not rename mailbox", exc)
     _parsed_message_cache(request).invalidate(account, old_name)
     return _api_response(data={"name": new_name}, message="Folder renamed.")
 
@@ -3948,10 +4451,264 @@ async def delete_named_mailbox(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(text="Folder confirmation does not match.")
     try:
         await _gateway(request).delete_named_mailbox(account, name)
-    except Exception:
-        return await _gateway_error(request, "Could not delete empty mailbox")
+    except Exception as exc:
+        return await _folder_rule_reference_error(
+            request,
+            "Could not delete empty mailbox",
+            exc,
+        )
     _parsed_message_cache(request).invalidate(account, name)
     return _api_response(message="Empty folder deleted.")
+
+
+def _mail_rule_public_id(value: str, label: str) -> str:
+    if _ACCOUNT_ID_RE.fullmatch(value) is None:
+        raise web.HTTPBadRequest(text=f"Invalid {label}.")
+    return value
+
+
+def _mail_rule_boolean(
+    values: Mapping[str, object],
+    name: str,
+    *,
+    default: bool | None = None,
+) -> bool:
+    value = values.get(name, default)
+    if type(value) is not bool:
+        raise web.HTTPBadRequest(text=f"Field {name} must be a boolean.")
+    return value
+
+
+def _mail_rule_match(values: Mapping[str, object]) -> Mapping[str, object]:
+    value = values.get("match")
+    if not isinstance(value, Mapping) or any(not isinstance(key, str) for key in value):
+        raise web.HTTPBadRequest(text="Field match must be an object.")
+    return value
+
+
+def _mail_rule_query_account(request: web.Request) -> str:
+    values = _read_query(request, allowed_fields=frozenset({"account"}))
+    return _account_context(request, values)
+
+
+async def _folder_rule_reference_error(
+    request: web.Request,
+    title: str,
+    exc: Exception,
+) -> web.Response:
+    if isinstance(exc, HelperCallError) and exc.code == "conflict":
+        return _api_error(
+            "conflict",
+            "The folder is used by a mail rule and cannot be changed.",
+            status=409,
+        )
+    return await _gateway_error(request, title)
+
+
+async def _mail_rule_gateway_error(
+    request: web.Request,
+    title: str,
+    exc: Exception,
+) -> web.Response:
+    if isinstance(exc, HelperCallError):
+        public = {
+            "invalid_request": (400, "The mail rule request is invalid."),
+            "not_found": (404, "The mail rule or run does not exist."),
+            "conflict": (409, "The mail rule state conflicts with this operation."),
+            "limit_exceeded": (409, "The mail rule limit has been reached."),
+            "step_up_required": (403, "Fresh authentication is required."),
+        }.get(exc.code)
+        if public is not None:
+            LOGGER.info("mail rule operation rejected: %s (%s)", title, exc.code)
+            status, message = public
+            return _api_error(exc.code, message, status=status)
+    return await _gateway_error(request, title)
+
+
+async def api_mail_rules(request: web.Request) -> web.Response:
+    account = _mail_rule_query_account(request)
+    try:
+        result = await _gateway(request).list_mail_rules(account)
+    except Exception as exc:
+        return await _mail_rule_gateway_error(request, "Could not list mail rules", exc)
+    return _api_response(data=dict(result))
+
+
+async def create_mail_rule(request: web.Request) -> web.Response:
+    values = await _read_json_object(
+        request,
+        allowed_fields=frozenset(
+            {
+                "account",
+                "name",
+                "enabled",
+                "match",
+                "target_mailbox",
+                "stop_processing",
+                "apply_existing",
+            }
+        ),
+    )
+    account = _account_context(request, values)
+    apply_existing = _mail_rule_boolean(values, "apply_existing", default=False)
+    step_up_error = _recent_step_up_error(request)
+    if step_up_error is not None:
+        return step_up_error
+    try:
+        result = await _gateway(request).create_mail_rule(
+            account,
+            name=_json_text(values, "name"),
+            enabled=_mail_rule_boolean(values, "enabled"),
+            match_condition=_mail_rule_match(values),
+            target_mailbox=_mailbox_name(_json_text(values, "target_mailbox")),
+            stop_processing=_mail_rule_boolean(values, "stop_processing"),
+            apply_existing=apply_existing,
+        )
+    except web.HTTPException:
+        raise
+    except Exception as exc:
+        return await _mail_rule_gateway_error(request, "Could not create mail rule", exc)
+    return _api_response(data=dict(result), message="Rule created.", status=201)
+
+
+async def update_mail_rule(request: web.Request) -> web.Response:
+    rule_id = _mail_rule_public_id(request.match_info["rule_id"], "mail rule identifier")
+    values = await _read_json_object(
+        request,
+        allowed_fields=frozenset(
+            {
+                "account",
+                "name",
+                "enabled",
+                "match",
+                "target_mailbox",
+                "stop_processing",
+                "expected_revision",
+                "revision",
+            }
+        ),
+    )
+    account = _account_context(request, values)
+    revision_fields = {"expected_revision", "revision"} & set(values)
+    if len(revision_fields) != 1:
+        raise web.HTTPBadRequest(text="Mail rule revision must be supplied exactly once.")
+    revision = values.get("expected_revision", values.get("revision"))
+    if revision is not None and (type(revision) is not int or revision < 1):
+        raise web.HTTPBadRequest(text="Field revision must be a positive integer.")
+    step_up_error = _recent_step_up_error(request)
+    if step_up_error is not None:
+        return step_up_error
+    try:
+        result = await _gateway(request).update_mail_rule(
+            account,
+            rule_id,
+            name=_json_text(values, "name"),
+            enabled=_mail_rule_boolean(values, "enabled"),
+            match_condition=_mail_rule_match(values),
+            target_mailbox=_mailbox_name(_json_text(values, "target_mailbox")),
+            stop_processing=_mail_rule_boolean(values, "stop_processing"),
+            expected_revision=revision,
+        )
+    except web.HTTPException:
+        raise
+    except Exception as exc:
+        return await _mail_rule_gateway_error(request, "Could not update mail rule", exc)
+    return _api_response(data=dict(result), message="Rule updated.")
+
+
+async def delete_mail_rule(request: web.Request) -> web.Response:
+    rule_id = _mail_rule_public_id(request.match_info["rule_id"], "mail rule identifier")
+    values = await _read_json_object(request, allowed_fields=frozenset({"account"}))
+    account = _account_context(request, values)
+    step_up_error = _recent_step_up_error(request)
+    if step_up_error is not None:
+        return step_up_error
+    try:
+        await _gateway(request).delete_mail_rule(account, rule_id)
+    except Exception as exc:
+        return await _mail_rule_gateway_error(request, "Could not delete mail rule", exc)
+    return _api_response(message="Rule deleted.")
+
+
+async def reorder_mail_rules(request: web.Request) -> web.Response:
+    values = await _read_json_object(
+        request,
+        allowed_fields=frozenset({"account", "rule_ids"}),
+    )
+    account = _account_context(request, values)
+    raw_ids = values.get("rule_ids")
+    if not isinstance(raw_ids, list) or len(raw_ids) > 100:
+        raise web.HTTPBadRequest(text="Field rule_ids must be a bounded array.")
+    rule_ids: list[str] = []
+    for value in raw_ids:
+        if not isinstance(value, str):
+            raise web.HTTPBadRequest(text="Mail rule identifiers must be text.")
+        rule_ids.append(_mail_rule_public_id(value, "mail rule identifier"))
+    if len(rule_ids) != len(set(rule_ids)):
+        raise web.HTTPBadRequest(text="Mail rule identifiers must not be repeated.")
+    step_up_error = _recent_step_up_error(request)
+    if step_up_error is not None:
+        return step_up_error
+    try:
+        result = await _gateway(request).reorder_mail_rules(account, rule_ids)
+    except Exception as exc:
+        return await _mail_rule_gateway_error(request, "Could not reorder mail rules", exc)
+    return _api_response(data=dict(result), message="Rule order updated.")
+
+
+async def create_mail_rule_run(request: web.Request) -> web.Response:
+    values = await _read_json_object(
+        request,
+        allowed_fields=frozenset({"account", "rule_id"}),
+    )
+    account = _account_context(request, values)
+    rule_id = _mail_rule_public_id(
+        _json_text(values, "rule_id"),
+        "mail rule identifier",
+    )
+    step_up_error = _recent_step_up_error(request)
+    if step_up_error is not None:
+        return step_up_error
+    try:
+        result = await _gateway(request).create_mail_rule_run(account, rule_id)
+    except Exception as exc:
+        return await _mail_rule_gateway_error(request, "Could not start mail rule run", exc)
+    return _api_response(data=dict(result), message="Existing-mail run started.", status=201)
+
+
+async def api_mail_rule_run(request: web.Request) -> web.Response:
+    run_id = _mail_rule_public_id(request.match_info["run_id"], "mail rule run identifier")
+    account = _mail_rule_query_account(request)
+    try:
+        result = await _gateway(request).get_mail_rule_run(account, run_id)
+    except Exception as exc:
+        return await _mail_rule_gateway_error(request, "Could not read mail rule run", exc)
+    return _api_response(data=dict(result))
+
+
+async def step_mail_rule_run(request: web.Request) -> web.Response:
+    run_id = _mail_rule_public_id(request.match_info["run_id"], "mail rule run identifier")
+    values = await _read_json_object(request, allowed_fields=frozenset({"account"}))
+    account = _account_context(request, values)
+    step_up_error = _recent_step_up_error(request)
+    if step_up_error is not None:
+        return step_up_error
+    try:
+        result = await _gateway(request).step_mail_rule_run(account, run_id)
+    except Exception as exc:
+        return await _mail_rule_gateway_error(request, "Could not process mail rule run", exc)
+    return _api_response(data=dict(result), message="Rule batch processed.")
+
+
+async def cancel_mail_rule_run(request: web.Request) -> web.Response:
+    run_id = _mail_rule_public_id(request.match_info["run_id"], "mail rule run identifier")
+    values = await _read_json_object(request, allowed_fields=frozenset({"account"}))
+    account = _account_context(request, values)
+    try:
+        result = await _gateway(request).cancel_mail_rule_run(account, run_id)
+    except Exception as exc:
+        return await _mail_rule_gateway_error(request, "Could not cancel mail rule run", exc)
+    return _api_response(data=dict(result), message="Rule run cancelled.")
 
 
 async def api_compose(request: web.Request) -> web.Response:
@@ -4853,6 +5610,10 @@ def create_app(config: object, gateway: Gateway) -> web.Application:
             web.get("/api/v1/me/mail", api_mailbox),
             web.get("/api/v1/me/mail-events", mail_events, allow_head=False),
             web.post("/api/v1/me/mail-actions", bulk_message_action),
+            web.post(
+                "/api/v1/me/mail/action-snapshots",
+                api_message_action_snapshots,
+            ),
             web.get("/api/v1/me/mail/{message_id}/html", message_html),
             web.get(
                 "/api/v1/me/mail/{message_id}/inline/{attachment_id}",
@@ -4880,6 +5641,15 @@ def create_app(config: object, gateway: Gateway) -> web.Application:
             web.post("/api/v1/me/mailboxes", create_mailbox),
             web.post("/api/v1/me/mailboxes/rename", rename_mailbox),
             web.post("/api/v1/me/mailboxes/delete", delete_named_mailbox),
+            web.get("/api/v1/me/mail-rules", api_mail_rules),
+            web.post("/api/v1/me/mail-rules", create_mail_rule),
+            web.post("/api/v1/me/mail-rules/reorder", reorder_mail_rules),
+            web.post("/api/v1/me/mail-rules/{rule_id}/update", update_mail_rule),
+            web.post("/api/v1/me/mail-rules/{rule_id}/delete", delete_mail_rule),
+            web.post("/api/v1/me/mail-rule-runs", create_mail_rule_run),
+            web.get("/api/v1/me/mail-rule-runs/{run_id}", api_mail_rule_run),
+            web.post("/api/v1/me/mail-rule-runs/{run_id}/step", step_mail_rule_run),
+            web.post("/api/v1/me/mail-rule-runs/{run_id}/cancel", cancel_mail_rule_run),
             web.get("/api/v1/me/compose", api_compose),
             web.post("/api/v1/me/send", send_message),
             web.get("/api/v1/admin/accounts", api_accounts),
@@ -4907,6 +5677,10 @@ def create_app(config: object, gateway: Gateway) -> web.Application:
             web.get("/api/v1/admin/mail", api_mailbox),
             web.get("/api/v1/admin/mail-events", mail_events, allow_head=False),
             web.post("/api/v1/admin/mail-actions", bulk_message_action),
+            web.post(
+                "/api/v1/admin/mail/action-snapshots",
+                api_message_action_snapshots,
+            ),
             web.get("/api/v1/admin/mail/{message_id}/html", message_html),
             web.get(
                 "/api/v1/admin/mail/{message_id}/inline/{attachment_id}",
@@ -4946,6 +5720,27 @@ def create_app(config: object, gateway: Gateway) -> web.Application:
             web.post("/api/v1/admin/mailboxes", create_mailbox),
             web.post("/api/v1/admin/mailboxes/rename", rename_mailbox),
             web.post("/api/v1/admin/mailboxes/delete", delete_named_mailbox),
+            web.get("/api/v1/admin/mail-rules", api_mail_rules),
+            web.post("/api/v1/admin/mail-rules", create_mail_rule),
+            web.post("/api/v1/admin/mail-rules/reorder", reorder_mail_rules),
+            web.post(
+                "/api/v1/admin/mail-rules/{rule_id}/update",
+                update_mail_rule,
+            ),
+            web.post(
+                "/api/v1/admin/mail-rules/{rule_id}/delete",
+                delete_mail_rule,
+            ),
+            web.post("/api/v1/admin/mail-rule-runs", create_mail_rule_run),
+            web.get("/api/v1/admin/mail-rule-runs/{run_id}", api_mail_rule_run),
+            web.post(
+                "/api/v1/admin/mail-rule-runs/{run_id}/step",
+                step_mail_rule_run,
+            ),
+            web.post(
+                "/api/v1/admin/mail-rule-runs/{run_id}/cancel",
+                cancel_mail_rule_run,
+            ),
             web.get("/api/v1/admin/compose", api_compose),
             web.post("/api/v1/admin/send", send_message),
             web.get("/api/v1/admin/certificates", api_certificates),

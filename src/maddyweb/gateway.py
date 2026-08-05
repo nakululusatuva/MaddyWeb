@@ -217,6 +217,7 @@ class HelperGateway:
             set[asyncio.Task[Any]],
         ] = {}
         self._message_cache_quarantined: set[tuple[str, str]] = set()
+        self._mail_rule_step_tasks: set[asyncio.Task[Any]] = set()
         self._session_cache: dict[bytes, _SessionCacheEntry] = {}
         self._session_flights: dict[bytes, asyncio.Task[Mapping[str, Any]]] = {}
 
@@ -1063,6 +1064,182 @@ class HelperGateway:
             },
         )
 
+    @staticmethod
+    def _mail_rules_result(value: Any, operation: str) -> Mapping[str, Any]:
+        result = _mapping(value, operation)
+        rules = result.get("rules")
+        if rules is not None:
+            for rule in _sequence(rules, f"{operation}.rules"):
+                _mapping(rule, f"{operation}.rule")
+        active = result.get("active_run")
+        if active is not None:
+            _mapping(active, f"{operation}.active_run")
+        rule = result.get("rule")
+        if rule is not None:
+            _mapping(rule, f"{operation}.rule")
+        run = result.get("run")
+        if run is not None:
+            _mapping(run, f"{operation}.run")
+        delivery_ready = result.get("delivery_ready")
+        if delivery_ready is not None and type(delivery_ready) is not bool:
+            raise HelperCallError(
+                "invalid_response",
+                f"{operation}.delivery_ready is not a boolean",
+            )
+        return result
+
+    async def list_mail_rules(self, account_id: str) -> Mapping[str, object]:
+        return self._mail_rules_result(
+            await self._call("rules.list", {"target_account_id": account_id}),
+            "rules.list",
+        )
+
+    async def create_mail_rule(
+        self,
+        account_id: str,
+        *,
+        name: str,
+        enabled: bool,
+        match_condition: Mapping[str, object],
+        target_mailbox: str,
+        stop_processing: bool,
+        apply_existing: bool,
+    ) -> Mapping[str, object]:
+        return self._mail_rules_result(
+            await self._call(
+                "rules.create",
+                {
+                    "target_account_id": account_id,
+                    "name": name,
+                    "enabled": enabled,
+                    "match": dict(match_condition),
+                    "target_mailbox": target_mailbox,
+                    "stop_processing": stop_processing,
+                    "apply_existing": apply_existing,
+                },
+            ),
+            "rules.create",
+        )
+
+    async def update_mail_rule(
+        self,
+        account_id: str,
+        rule_id: str,
+        *,
+        name: str,
+        enabled: bool,
+        match_condition: Mapping[str, object],
+        target_mailbox: str,
+        stop_processing: bool,
+        expected_revision: int,
+    ) -> Mapping[str, object]:
+        params: dict[str, object] = {
+            "target_account_id": account_id,
+            "rule_id": rule_id,
+            "name": name,
+            "enabled": enabled,
+            "match": dict(match_condition),
+            "target_mailbox": target_mailbox,
+            "stop_processing": stop_processing,
+            "expected_revision": expected_revision,
+        }
+        return self._mail_rules_result(
+            await self._call("rules.update", params),
+            "rules.update",
+        )
+
+    async def delete_mail_rule(self, account_id: str, rule_id: str) -> None:
+        self._mail_rules_result(
+            await self._call(
+                "rules.delete",
+                {"target_account_id": account_id, "rule_id": rule_id},
+            ),
+            "rules.delete",
+        )
+
+    async def reorder_mail_rules(
+        self,
+        account_id: str,
+        rule_ids: Sequence[str],
+    ) -> Mapping[str, object]:
+        return self._mail_rules_result(
+            await self._call(
+                "rules.reorder",
+                {"target_account_id": account_id, "rule_ids": list(rule_ids)},
+            ),
+            "rules.reorder",
+        )
+
+    async def create_mail_rule_run(
+        self,
+        account_id: str,
+        rule_id: str,
+    ) -> Mapping[str, object]:
+        return self._mail_rules_result(
+            await self._call(
+                "rules.run_create",
+                {"target_account_id": account_id, "rule_id": rule_id},
+            ),
+            "rules.run_create",
+        )
+
+    async def get_mail_rule_run(
+        self,
+        account_id: str,
+        run_id: str,
+    ) -> Mapping[str, object]:
+        return self._mail_rules_result(
+            await self._call(
+                "rules.run_status",
+                {"target_account_id": account_id, "run_id": run_id},
+            ),
+            "rules.run_status",
+        )
+
+    async def step_mail_rule_run(
+        self,
+        account_id: str,
+        run_id: str,
+    ) -> Mapping[str, object]:
+        self._invalidate_message_lists(account_id)
+        task = asyncio.create_task(self._run_mail_rule_step(account_id, run_id))
+        self._mail_rule_step_tasks.add(task)
+        task.add_done_callback(self._release_mail_rule_step_task)
+        return await asyncio.shield(task)
+
+    def _release_mail_rule_step_task(self, task: asyncio.Task[Any]) -> None:
+        self._mail_rule_step_tasks.discard(task)
+        self._consume_task_exception(task)
+
+    async def _run_mail_rule_step(
+        self,
+        account_id: str,
+        run_id: str,
+    ) -> Mapping[str, object]:
+        try:
+            return self._mail_rules_result(
+                await self._call(
+                    "rules.run_step",
+                    {"target_account_id": account_id, "run_id": run_id},
+                ),
+                "rules.run_step",
+            )
+        finally:
+            self._invalidate_message_lists(account_id)
+
+    async def cancel_mail_rule_run(
+        self,
+        account_id: str,
+        run_id: str,
+    ) -> Mapping[str, object]:
+        return self._mail_rules_result(
+            await self._call(
+                "rules.run_cancel",
+                {"target_account_id": account_id, "run_id": run_id},
+            ),
+            "rules.run_cancel",
+        )
+
     async def list_messages(
         self,
         account_id: str,
@@ -1335,6 +1512,36 @@ class HelperGateway:
         message_ids: Sequence[str],
     ) -> str:
         return await self._move_messages(account_id, mailbox, message_ids, "archive")
+
+    async def move_messages(
+        self,
+        account_id: str,
+        mailbox: str,
+        message_ids: Sequence[str],
+        target: str,
+    ) -> str:
+        self._invalidate_message_lists(account_id, mailbox)
+        self._invalidate_message_lists(account_id, target)
+        try:
+            result = _mapping(
+                await self._call(
+                    "messages.move",
+                    {
+                        "target_account_id": account_id,
+                        "source": mailbox,
+                        "uid_set": _uid_set(message_ids),
+                        "target": target,
+                    },
+                ),
+                "messages.move",
+            )
+        finally:
+            self._invalidate_message_lists(account_id, mailbox)
+            self._invalidate_message_lists(account_id, target)
+        moved_to = result.get("target")
+        if not isinstance(moved_to, str) or not moved_to:
+            raise HelperCallError("invalid_response", "messages.move returned no target mailbox")
+        return moved_to
 
     async def _move_messages(
         self,

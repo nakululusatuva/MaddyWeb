@@ -57,6 +57,9 @@ from webauthn.helpers.structs import (
 )
 from webauthn.registration.verify_registration_response import VerifiedRegistration
 
+from .identity import DOMAIN_LABEL_PATTERN as _DOMAIN_LABEL_PATTERN
+from .identity import canonicalize_email
+
 TOTP_PERIOD_SECONDS: Final[int] = 30
 TOTP_WINDOW: Final[int] = 1
 TOTP_SECRET_BYTES: Final[int] = 20
@@ -74,7 +77,7 @@ _TOKEN_BYTES: Final[int] = 32
 _ACCOUNT_ID_BYTES: Final[int] = 16
 _SESSION_ID_BYTES: Final[int] = 16
 _AES_GCM_NONCE_BYTES: Final[int] = 12
-_SCHEMA_VERSION: Final[int] = 4
+_SCHEMA_VERSION: Final[int] = 5
 _PASSKEY_SESSION_EXTENSION_VERSION: Final[int] = 1
 _PASSKEY_SESSION_EXTENSION_KEY: Final[str] = "passkey_session_extension_version"
 _MAX_CHALLENGES_PER_ACCOUNT: Final[int] = 5
@@ -84,12 +87,16 @@ _MAX_RATE_LIMIT_ROWS: Final[int] = 1024
 _MAX_CREDENTIAL_ID_BYTES: Final[int] = 1024
 _MAX_PASSKEY_NAME_LENGTH: Final[int] = 100
 _MAX_USER_AGENT_LENGTH: Final[int] = 512
-_EMAIL_PATTERN: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~.-]+")
-_DOMAIN_LABEL_PATTERN: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9-]+")
 _ACCOUNT_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"[0-9a-f]{32}")
 _OPAQUE_TOKEN_PATTERN: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9_-]{43}")
 _RECOVERY_CODE_PATTERN: Final[re.Pattern[str]] = re.compile(r"[0-9a-f]{32}")
 _SESSION_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"[0-9a-f]{32}")
+_MAIL_RULE_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"[0-9a-f]{32}")
+_MAIL_RULE_RUN_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"[0-9a-f]{32}")
+_MAX_MAIL_RULES_PER_ACCOUNT: Final[int] = 100
+_MAX_MAIL_RULE_RUNS_PER_ACCOUNT: Final[int] = 100
+_MAX_MAIL_RULE_EXPRESSION_BYTES: Final[int] = 32 * 1024
+_MAX_MAIL_RULE_STATE_BYTES: Final[int] = 64 * 1024
 _RATE_POLICIES: Final[tuple[tuple[str, int, int], ...]] = (
     ("global", 120, 5 * 60),
     ("ip", 30, 5 * 60),
@@ -270,6 +277,56 @@ CREATE INDEX IF NOT EXISTS auth_passkey_challenges_expiry_idx
     ON auth_passkey_challenges(expires_at);
 """
 
+_MAIL_RULE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS mail_rules (
+    rule_id TEXT PRIMARY KEY CHECK(length(rule_id) = 32),
+    account_id TEXT NOT NULL
+        REFERENCES auth_accounts(account_id) ON DELETE CASCADE,
+    name TEXT NOT NULL CHECK(length(name) BETWEEN 1 AND 128),
+    enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+    position INTEGER NOT NULL CHECK(position >= 0),
+    expression_json TEXT NOT NULL CHECK(length(expression_json) BETWEEN 2 AND 32768),
+    target_mailbox TEXT NOT NULL CHECK(length(target_mailbox) BETWEEN 1 AND 255),
+    stop_processing INTEGER NOT NULL CHECK(stop_processing IN (0, 1)),
+    revision INTEGER NOT NULL CHECK(revision >= 1),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(account_id, position)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS mail_rules_account_idx
+    ON mail_rules(account_id, position, rule_id);
+
+CREATE TABLE IF NOT EXISTS mail_rule_runs (
+    run_id TEXT PRIMARY KEY CHECK(length(run_id) = 32),
+    account_id TEXT NOT NULL
+        REFERENCES auth_accounts(account_id) ON DELETE CASCADE,
+    rule_id TEXT REFERENCES mail_rules(rule_id) ON DELETE SET NULL,
+    rule_revision INTEGER NOT NULL CHECK(rule_revision >= 1),
+    rule_snapshot_json TEXT NOT NULL
+        CHECK(length(rule_snapshot_json) BETWEEN 2 AND 65536),
+    state_json TEXT NOT NULL CHECK(length(state_json) BETWEEN 2 AND 65536),
+    status TEXT NOT NULL
+        CHECK(status IN ('queued', 'running', 'completed', 'failed', 'cancelled')),
+    scanned INTEGER NOT NULL DEFAULT 0 CHECK(scanned >= 0),
+    matched INTEGER NOT NULL DEFAULT 0 CHECK(matched >= 0),
+    moved INTEGER NOT NULL DEFAULT 0 CHECK(moved >= 0),
+    failed INTEGER NOT NULL DEFAULT 0 CHECK(failed >= 0),
+    created_at INTEGER NOT NULL,
+    started_at INTEGER,
+    updated_at INTEGER NOT NULL,
+    finished_at INTEGER,
+    error_code TEXT CHECK(error_code IS NULL OR length(error_code) BETWEEN 1 AND 64)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS mail_rule_runs_account_idx
+    ON mail_rule_runs(account_id, created_at DESC, run_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS mail_rule_runs_one_active_idx
+    ON mail_rule_runs(account_id)
+    WHERE status IN ('queued', 'running');
+"""
+
 
 class Role(StrEnum):
     ADMIN = "admin"
@@ -375,6 +432,41 @@ class PasskeyCeremony:
     options: dict[str, object]
 
 
+@dataclass(frozen=True, slots=True)
+class MailRuleRecord:
+    rule_id: str
+    account_id: str
+    name: str
+    enabled: bool
+    position: int
+    expression: dict[str, object]
+    target_mailbox: str
+    stop_processing: bool
+    revision: int
+    created_at: int
+    updated_at: int
+
+
+@dataclass(frozen=True, slots=True)
+class MailRuleRun:
+    run_id: str
+    account_id: str
+    rule_id: str | None
+    rule_revision: int
+    rule_snapshot: dict[str, object]
+    state: dict[str, object]
+    status: str
+    scanned: int
+    matched: int
+    moved: int
+    failed: int
+    created_at: int
+    started_at: int | None
+    updated_at: int
+    finished_at: int | None
+    error_code: str | None
+
+
 class AuthenticationError(RuntimeError):
     """Base class for authentication-store failures."""
 
@@ -433,39 +525,16 @@ class PasskeyLimitError(AuthenticationError):
     pass
 
 
-def canonicalize_email(value: str) -> str:
-    """Return the canonical ASCII mailbox identity used by the metadata store."""
+class MailRuleLimitError(AuthenticationError):
+    pass
 
-    if not isinstance(value, str):
-        raise ValueError("email identity must be text")
-    normalized = value.strip()
-    if not normalized or len(normalized) > 254 or not normalized.isascii():
-        raise ValueError("email identity must be a valid ASCII address")
-    if normalized.count("@") != 1:
-        raise ValueError("email identity must contain one at sign")
-    local, domain = normalized.rsplit("@", 1)
-    if (
-        not local
-        or len(local) > 64
-        or local.startswith(".")
-        or local.endswith(".")
-        or ".." in local
-        or _EMAIL_PATTERN.fullmatch(local) is None
-    ):
-        raise ValueError("email identity has an invalid local part")
-    if not domain or len(domain) > 253 or domain.startswith(".") or domain.endswith("."):
-        raise ValueError("email identity has an invalid domain")
-    labels = domain.split(".")
-    if any(
-        not label
-        or len(label) > 63
-        or label.startswith("-")
-        or label.endswith("-")
-        or _DOMAIN_LABEL_PATTERN.fullmatch(label) is None
-        for label in labels
-    ):
-        raise ValueError("email identity has an invalid domain")
-    return f"{local.lower()}@{domain.lower()}"
+
+class MailRuleNotFoundError(AuthenticationError):
+    pass
+
+
+class MailRuleConflictError(AuthenticationError):
+    pass
 
 
 def decode_totp_secret(value: str) -> bytes:
@@ -2164,6 +2233,550 @@ class AuthStore:
                 (digest,),
             )
 
+    def list_mail_rules(self, account_id: str) -> tuple[MailRuleRecord, ...]:
+        """Return one account's ordered mail-filing rules."""
+
+        normalized_id = _validate_account_id(account_id)
+        with self._lock:
+            self._require_open()
+            self._require_account_by_id_locked(normalized_id)
+            rows = self._connection.execute(
+                """
+                SELECT * FROM mail_rules
+                WHERE account_id = ?
+                ORDER BY position, rule_id
+                """,
+                (normalized_id,),
+            ).fetchall()
+        return tuple(_mail_rule_from_row(row) for row in rows)
+
+    def get_mail_rule(self, account_id: str, rule_id: str) -> MailRuleRecord:
+        normalized_id = _validate_account_id(account_id)
+        normalized_rule = _validate_mail_rule_id(rule_id)
+        with self._lock:
+            self._require_open()
+            row = self._connection.execute(
+                "SELECT * FROM mail_rules WHERE account_id = ? AND rule_id = ?",
+                (normalized_id, normalized_rule),
+            ).fetchone()
+        if row is None:
+            raise MailRuleNotFoundError("mail rule does not exist")
+        return _mail_rule_from_row(row)
+
+    def create_mail_rule(
+        self,
+        account_id: str,
+        *,
+        name: str,
+        enabled: bool,
+        expression: dict[str, object],
+        target_mailbox: str,
+        stop_processing: bool,
+    ) -> MailRuleRecord:
+        normalized_id = _validate_account_id(account_id)
+        normalized_name = _normalize_mail_rule_name(name)
+        normalized_enabled = _coerce_bool(enabled, "enabled")
+        normalized_expression = _canonical_json_object(
+            expression,
+            "mail rule expression",
+            maximum_bytes=_MAX_MAIL_RULE_EXPRESSION_BYTES,
+        )
+        normalized_target = _normalize_mailbox_metadata(target_mailbox)
+        normalized_stop = _coerce_bool(stop_processing, "stop_processing")
+        now = self._now()
+        with self._transaction():
+            self._require_account_by_id_locked(normalized_id)
+            count_row = self._connection.execute(
+                "SELECT COUNT(*) AS count FROM mail_rules WHERE account_id = ?",
+                (normalized_id,),
+            ).fetchone()
+            if count_row is None or int(count_row["count"]) >= _MAX_MAIL_RULES_PER_ACCOUNT:
+                raise MailRuleLimitError("mail rule limit reached")
+            position_row = self._connection.execute(
+                "SELECT COALESCE(MAX(position), -1) + 1 AS position "
+                "FROM mail_rules WHERE account_id = ?",
+                (normalized_id,),
+            ).fetchone()
+            position = int(_required_row(position_row)["position"])
+            rule_id = self._new_mail_rule_id_locked()
+            self._connection.execute(
+                """
+                INSERT INTO mail_rules(
+                    rule_id, account_id, name, enabled, position,
+                    expression_json, target_mailbox, stop_processing,
+                    revision, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                """,
+                (
+                    rule_id,
+                    normalized_id,
+                    normalized_name,
+                    int(normalized_enabled),
+                    position,
+                    normalized_expression,
+                    normalized_target,
+                    int(normalized_stop),
+                    now,
+                    now,
+                ),
+            )
+            row = self._connection.execute(
+                "SELECT * FROM mail_rules WHERE rule_id = ?",
+                (rule_id,),
+            ).fetchone()
+        return _mail_rule_from_row(_required_row(row))
+
+    def create_mail_rule_with_run(
+        self,
+        account_id: str,
+        *,
+        name: str,
+        enabled: bool,
+        expression: dict[str, object],
+        target_mailbox: str,
+        stop_processing: bool,
+        run_state: dict[str, object],
+        run_completed: bool = False,
+    ) -> tuple[MailRuleRecord, MailRuleRun]:
+        """Atomically create a filing rule and its initial existing-mail run."""
+
+        normalized_id = _validate_account_id(account_id)
+        normalized_name = _normalize_mail_rule_name(name)
+        normalized_enabled = _coerce_bool(enabled, "enabled")
+        normalized_expression = _canonical_json_object(
+            expression,
+            "mail rule expression",
+            maximum_bytes=_MAX_MAIL_RULE_EXPRESSION_BYTES,
+        )
+        normalized_target = _normalize_mailbox_metadata(target_mailbox)
+        normalized_stop = _coerce_bool(stop_processing, "stop_processing")
+        normalized_completed = _coerce_bool(run_completed, "run_completed")
+        state_json = _canonical_json_object(
+            run_state,
+            "mail rule run state",
+            maximum_bytes=_MAX_MAIL_RULE_STATE_BYTES,
+        )
+        now = self._now()
+        with self._transaction():
+            self._require_account_by_id_locked(normalized_id)
+            count_row = self._connection.execute(
+                "SELECT COUNT(*) AS count FROM mail_rules WHERE account_id = ?",
+                (normalized_id,),
+            ).fetchone()
+            if count_row is None or int(count_row["count"]) >= _MAX_MAIL_RULES_PER_ACCOUNT:
+                raise MailRuleLimitError("mail rule limit reached")
+            position_row = self._connection.execute(
+                "SELECT COALESCE(MAX(position), -1) + 1 AS position "
+                "FROM mail_rules WHERE account_id = ?",
+                (normalized_id,),
+            ).fetchone()
+            position = int(_required_row(position_row)["position"])
+            rule_id = self._new_mail_rule_id_locked()
+            self._connection.execute(
+                """
+                INSERT INTO mail_rules(
+                    rule_id, account_id, name, enabled, position,
+                    expression_json, target_mailbox, stop_processing,
+                    revision, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                """,
+                (
+                    rule_id,
+                    normalized_id,
+                    normalized_name,
+                    int(normalized_enabled),
+                    position,
+                    normalized_expression,
+                    normalized_target,
+                    int(normalized_stop),
+                    now,
+                    now,
+                ),
+            )
+            rule_row = self._connection.execute(
+                "SELECT * FROM mail_rules WHERE rule_id = ?",
+                (rule_id,),
+            ).fetchone()
+            rule = _mail_rule_from_row(_required_row(rule_row))
+            snapshot_json = _canonical_json_object(
+                {
+                    "rule_id": rule.rule_id,
+                    "rule_name": rule.name,
+                    "condition": rule.expression,
+                    "target_mailbox": rule.target_mailbox,
+                    "revision": rule.revision,
+                },
+                "mail rule run snapshot",
+                maximum_bytes=_MAX_MAIL_RULE_STATE_BYTES,
+            )
+            active = self._connection.execute(
+                """
+                SELECT 1 FROM mail_rule_runs
+                WHERE account_id = ? AND status IN ('queued', 'running')
+                LIMIT 1
+                """,
+                (normalized_id,),
+            ).fetchone()
+            if active is not None:
+                raise MailRuleConflictError("an existing-mail rule run is already active")
+            self._connection.execute(
+                """
+                DELETE FROM mail_rule_runs
+                WHERE run_id IN (
+                    SELECT run_id FROM mail_rule_runs
+                    WHERE account_id = ?
+                      AND status IN ('completed', 'failed', 'cancelled')
+                    ORDER BY created_at DESC, run_id DESC
+                    LIMIT -1 OFFSET ?
+                )
+                """,
+                (normalized_id, _MAX_MAIL_RULE_RUNS_PER_ACCOUNT - 1),
+            )
+            run_id = self._new_mail_rule_run_id_locked()
+            status = "completed" if normalized_completed else "queued"
+            finished_at = now if normalized_completed else None
+            self._connection.execute(
+                """
+                INSERT INTO mail_rule_runs(
+                    run_id, account_id, rule_id, rule_revision,
+                    rule_snapshot_json, state_json, status,
+                    created_at, updated_at, finished_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    normalized_id,
+                    rule.rule_id,
+                    rule.revision,
+                    snapshot_json,
+                    state_json,
+                    status,
+                    now,
+                    now,
+                    finished_at,
+                ),
+            )
+            run_row = self._connection.execute(
+                "SELECT * FROM mail_rule_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            run = _mail_rule_run_from_row(_required_row(run_row))
+        return rule, run
+
+    def update_mail_rule(
+        self,
+        account_id: str,
+        rule_id: str,
+        *,
+        expected_revision: int,
+        name: str,
+        enabled: bool,
+        expression: dict[str, object],
+        target_mailbox: str,
+        stop_processing: bool,
+    ) -> MailRuleRecord:
+        normalized_id = _validate_account_id(account_id)
+        normalized_rule = _validate_mail_rule_id(rule_id)
+        if type(expected_revision) is not int or expected_revision < 1:
+            raise ValueError("mail rule revision must be a positive integer")
+        normalized_name = _normalize_mail_rule_name(name)
+        normalized_enabled = _coerce_bool(enabled, "enabled")
+        normalized_expression = _canonical_json_object(
+            expression,
+            "mail rule expression",
+            maximum_bytes=_MAX_MAIL_RULE_EXPRESSION_BYTES,
+        )
+        normalized_target = _normalize_mailbox_metadata(target_mailbox)
+        normalized_stop = _coerce_bool(stop_processing, "stop_processing")
+        now = self._now()
+        with self._transaction():
+            changed = self._connection.execute(
+                """
+                UPDATE mail_rules
+                SET name = ?, enabled = ?, expression_json = ?,
+                    target_mailbox = ?, stop_processing = ?,
+                    revision = revision + 1, updated_at = ?
+                WHERE account_id = ? AND rule_id = ? AND revision = ?
+                """,
+                (
+                    normalized_name,
+                    int(normalized_enabled),
+                    normalized_expression,
+                    normalized_target,
+                    int(normalized_stop),
+                    now,
+                    normalized_id,
+                    normalized_rule,
+                    expected_revision,
+                ),
+            )
+            if changed.rowcount != 1:
+                exists = self._connection.execute(
+                    "SELECT 1 FROM mail_rules WHERE account_id = ? AND rule_id = ?",
+                    (normalized_id, normalized_rule),
+                ).fetchone()
+                if exists is None:
+                    raise MailRuleNotFoundError("mail rule does not exist")
+                raise MailRuleConflictError("mail rule was changed by another request")
+            row = self._connection.execute(
+                "SELECT * FROM mail_rules WHERE rule_id = ?",
+                (normalized_rule,),
+            ).fetchone()
+        return _mail_rule_from_row(_required_row(row))
+
+    def delete_mail_rule(self, account_id: str, rule_id: str) -> None:
+        normalized_id = _validate_account_id(account_id)
+        normalized_rule = _validate_mail_rule_id(rule_id)
+        with self._transaction():
+            deleted = self._connection.execute(
+                "DELETE FROM mail_rules WHERE account_id = ? AND rule_id = ?",
+                (normalized_id, normalized_rule),
+            )
+            if deleted.rowcount != 1:
+                raise MailRuleNotFoundError("mail rule does not exist")
+            self._compact_mail_rule_positions_locked(normalized_id)
+
+    def reorder_mail_rules(self, account_id: str, rule_ids: Sequence[str]) -> None:
+        normalized_id = _validate_account_id(account_id)
+        if not isinstance(rule_ids, list | tuple):
+            raise ValueError("mail rule order must be a list")
+        normalized_rules = tuple(_validate_mail_rule_id(value) for value in rule_ids)
+        if len(normalized_rules) != len(set(normalized_rules)):
+            raise ValueError("mail rule order contains duplicates")
+        with self._transaction():
+            rows = self._connection.execute(
+                "SELECT rule_id FROM mail_rules WHERE account_id = ? ORDER BY position",
+                (normalized_id,),
+            ).fetchall()
+            current = {str(row["rule_id"]) for row in rows}
+            if set(normalized_rules) != current:
+                raise ValueError("mail rule order must contain every account rule exactly once")
+            self._connection.execute(
+                "UPDATE mail_rules SET position = position + 1000 WHERE account_id = ?",
+                (normalized_id,),
+            )
+            now = self._now()
+            for position, normalized_rule in enumerate(normalized_rules):
+                self._connection.execute(
+                    """
+                    UPDATE mail_rules
+                    SET position = ?, updated_at = ?
+                    WHERE account_id = ? AND rule_id = ?
+                    """,
+                    (position, now, normalized_id, normalized_rule),
+                )
+
+    def mailbox_rule_reference_count(self, account_id: str, mailbox: str) -> int:
+        normalized_id = _validate_account_id(account_id)
+        normalized_mailbox = _normalize_mailbox_metadata(mailbox)
+        with self._lock:
+            self._require_open()
+            row = self._connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM mail_rules
+                WHERE account_id = ? AND target_mailbox = ?
+                """,
+                (normalized_id, normalized_mailbox),
+            ).fetchone()
+        return int(_required_row(row)["count"])
+
+    def create_mail_rule_run(
+        self,
+        account_id: str,
+        rule_id: str,
+        *,
+        rule_snapshot: dict[str, object],
+        state: dict[str, object],
+    ) -> MailRuleRun:
+        normalized_id = _validate_account_id(account_id)
+        normalized_rule = _validate_mail_rule_id(rule_id)
+        snapshot_json = _canonical_json_object(
+            rule_snapshot,
+            "mail rule run snapshot",
+            maximum_bytes=_MAX_MAIL_RULE_STATE_BYTES,
+        )
+        state_json = _canonical_json_object(
+            state,
+            "mail rule run state",
+            maximum_bytes=_MAX_MAIL_RULE_STATE_BYTES,
+        )
+        now = self._now()
+        with self._transaction():
+            rule_row = self._connection.execute(
+                "SELECT revision FROM mail_rules WHERE account_id = ? AND rule_id = ?",
+                (normalized_id, normalized_rule),
+            ).fetchone()
+            if rule_row is None:
+                raise MailRuleNotFoundError("mail rule does not exist")
+            active = self._connection.execute(
+                """
+                SELECT 1 FROM mail_rule_runs
+                WHERE account_id = ? AND status IN ('queued', 'running')
+                LIMIT 1
+                """,
+                (normalized_id,),
+            ).fetchone()
+            if active is not None:
+                raise MailRuleConflictError("an existing-mail rule run is already active")
+            self._connection.execute(
+                """
+                DELETE FROM mail_rule_runs
+                WHERE run_id IN (
+                    SELECT run_id FROM mail_rule_runs
+                    WHERE account_id = ?
+                      AND status IN ('completed', 'failed', 'cancelled')
+                    ORDER BY created_at DESC, run_id DESC
+                    LIMIT -1 OFFSET ?
+                )
+                """,
+                (normalized_id, _MAX_MAIL_RULE_RUNS_PER_ACCOUNT - 1),
+            )
+            run_id = self._new_mail_rule_run_id_locked()
+            self._connection.execute(
+                """
+                INSERT INTO mail_rule_runs(
+                    run_id, account_id, rule_id, rule_revision,
+                    rule_snapshot_json, state_json, status,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+                """,
+                (
+                    run_id,
+                    normalized_id,
+                    normalized_rule,
+                    int(rule_row["revision"]),
+                    snapshot_json,
+                    state_json,
+                    now,
+                    now,
+                ),
+            )
+            row = self._connection.execute(
+                "SELECT * FROM mail_rule_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return _mail_rule_run_from_row(_required_row(row))
+
+    def get_active_mail_rule_run(self, account_id: str) -> MailRuleRun | None:
+        """Return the account's one queued/running rule job, if present."""
+
+        normalized_id = _validate_account_id(account_id)
+        with self._lock:
+            self._require_open()
+            self._require_account_by_id_locked(normalized_id)
+            row = self._connection.execute(
+                """
+                SELECT * FROM mail_rule_runs
+                WHERE account_id = ? AND status IN ('queued', 'running')
+                ORDER BY created_at DESC, run_id DESC
+                LIMIT 1
+                """,
+                (normalized_id,),
+            ).fetchone()
+        return None if row is None else _mail_rule_run_from_row(row)
+
+    def get_mail_rule_run(self, account_id: str, run_id: str) -> MailRuleRun:
+        normalized_id = _validate_account_id(account_id)
+        normalized_run = _validate_mail_rule_run_id(run_id)
+        with self._lock:
+            self._require_open()
+            row = self._connection.execute(
+                "SELECT * FROM mail_rule_runs WHERE account_id = ? AND run_id = ?",
+                (normalized_id, normalized_run),
+            ).fetchone()
+        if row is None:
+            raise MailRuleNotFoundError("mail rule run does not exist")
+        return _mail_rule_run_from_row(row)
+
+    def update_mail_rule_run(
+        self,
+        account_id: str,
+        run_id: str,
+        *,
+        state: dict[str, object],
+        status: str,
+        scanned: int,
+        matched: int,
+        moved: int,
+        failed: int,
+        error_code: str | None = None,
+    ) -> MailRuleRun:
+        normalized_id = _validate_account_id(account_id)
+        normalized_run = _validate_mail_rule_run_id(run_id)
+        if status not in {"queued", "running", "completed", "failed", "cancelled"}:
+            raise ValueError("mail rule run status is invalid")
+        counters = (scanned, matched, moved, failed)
+        if any(type(value) is not int or value < 0 for value in counters):
+            raise ValueError("mail rule run counters must be non-negative integers")
+        if error_code is not None and (
+            not isinstance(error_code, str)
+            or not 1 <= len(error_code) <= 64
+            or not error_code.replace("_", "").isalnum()
+        ):
+            raise ValueError("mail rule run error code is invalid")
+        state_json = _canonical_json_object(
+            state,
+            "mail rule run state",
+            maximum_bytes=_MAX_MAIL_RULE_STATE_BYTES,
+        )
+        now = self._now()
+        with self._transaction():
+            current = self._connection.execute(
+                "SELECT status, started_at FROM mail_rule_runs "
+                "WHERE account_id = ? AND run_id = ?",
+                (normalized_id, normalized_run),
+            ).fetchone()
+            if current is None:
+                raise MailRuleNotFoundError("mail rule run does not exist")
+            current_status = str(current["status"])
+            if current_status in {"completed", "failed", "cancelled"}:
+                raise MailRuleConflictError("mail rule run is already final")
+            started_at = current["started_at"]
+            if status == "running" and started_at is None:
+                started_at = now
+            finished_at = now if status in {"completed", "failed", "cancelled"} else None
+            self._connection.execute(
+                """
+                UPDATE mail_rule_runs
+                SET state_json = ?, status = ?, scanned = ?, matched = ?,
+                    moved = ?, failed = ?, started_at = ?, updated_at = ?,
+                    finished_at = ?, error_code = ?
+                WHERE account_id = ? AND run_id = ?
+                """,
+                (
+                    state_json,
+                    status,
+                    scanned,
+                    matched,
+                    moved,
+                    failed,
+                    started_at,
+                    now,
+                    finished_at,
+                    error_code,
+                    normalized_id,
+                    normalized_run,
+                ),
+            )
+            row = self._connection.execute(
+                "SELECT * FROM mail_rule_runs WHERE run_id = ?",
+                (normalized_run,),
+            ).fetchone()
+        return _mail_rule_run_from_row(_required_row(row))
+
+    def cancel_mail_rule_run(self, account_id: str, run_id: str) -> MailRuleRun:
+        current = self.get_mail_rule_run(account_id, run_id)
+        return self.update_mail_rule_run(
+            account_id,
+            run_id,
+            state=current.state,
+            status="cancelled",
+            scanned=current.scanned,
+            matched=current.matched,
+            moved=current.moved,
+            failed=current.failed,
+        )
+
     def _configure_connection(self) -> None:
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._connection.execute("PRAGMA trusted_schema = OFF")
@@ -2253,6 +2866,7 @@ class AuthStore:
                     """
                 )
             self._connection.executescript(_PASSKEY_SCHEMA)
+            self._connection.executescript(_MAIL_RULE_SCHEMA)
         with self._transaction():
             version = self._connection.execute(
                 "SELECT value FROM auth_metadata WHERE key = 'schema_version'"
@@ -2458,6 +3072,43 @@ class AuthStore:
             if exists is None:
                 return public_id
         raise AuthenticationError("unable to allocate a unique passkey identifier")
+
+    def _new_mail_rule_id_locked(self) -> str:
+        for _ in range(8):
+            rule_id = self._random_bytes(_ACCOUNT_ID_BYTES).hex()
+            exists = self._connection.execute(
+                "SELECT 1 FROM mail_rules WHERE rule_id = ?",
+                (rule_id,),
+            ).fetchone()
+            if exists is None:
+                return rule_id
+        raise AuthenticationError("unable to allocate a unique mail rule identifier")
+
+    def _new_mail_rule_run_id_locked(self) -> str:
+        for _ in range(8):
+            run_id = self._random_bytes(_ACCOUNT_ID_BYTES).hex()
+            exists = self._connection.execute(
+                "SELECT 1 FROM mail_rule_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if exists is None:
+                return run_id
+        raise AuthenticationError("unable to allocate a unique mail rule run identifier")
+
+    def _compact_mail_rule_positions_locked(self, account_id: str) -> None:
+        rows = self._connection.execute(
+            "SELECT rule_id FROM mail_rules WHERE account_id = ? ORDER BY position, rule_id",
+            (account_id,),
+        ).fetchall()
+        self._connection.execute(
+            "UPDATE mail_rules SET position = position + 1000 WHERE account_id = ?",
+            (account_id,),
+        )
+        for position, row in enumerate(rows):
+            self._connection.execute(
+                "UPDATE mail_rules SET position = ? WHERE rule_id = ?",
+                (position, str(row["rule_id"])),
+            )
 
     def _require_passkey_configuration(self) -> tuple[str, str]:
         if self.webauthn_rp_id is None or self.webauthn_origin is None:
@@ -3441,6 +4092,126 @@ def _prepare_private_database(path: Path) -> None:
         )
 
 
+def _validate_mail_rule_id(value: str) -> str:
+    if not isinstance(value, str) or _MAIL_RULE_ID_PATTERN.fullmatch(value) is None:
+        raise ValueError("mail rule identifier is invalid")
+    return value
+
+
+def _validate_mail_rule_run_id(value: str) -> str:
+    if not isinstance(value, str) or _MAIL_RULE_RUN_ID_PATTERN.fullmatch(value) is None:
+        raise ValueError("mail rule run identifier is invalid")
+    return value
+
+
+def _normalize_mail_rule_name(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("mail rule name must be text")
+    normalized = value.strip()
+    if (
+        not 1 <= len(normalized) <= 128
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in normalized)
+    ):
+        raise ValueError("mail rule name is invalid")
+    return normalized
+
+
+def _normalize_mailbox_metadata(value: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not 1 <= len(value) <= 255
+        or value != value.strip()
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
+    ):
+        raise ValueError("mailbox name is invalid")
+    return value
+
+
+def _canonical_json_object(
+    value: dict[str, object],
+    name: str,
+    *,
+    maximum_bytes: int,
+) -> str:
+    if not isinstance(value, dict):
+        raise ValueError(f"{name} must be an object")
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} is not valid JSON") from exc
+    if not 2 <= len(encoded.encode("utf-8")) <= maximum_bytes:
+        raise ValueError(f"{name} exceeds its size limit")
+    return encoded
+
+
+def _json_object_from_database(value: object, name: str) -> dict[str, object]:
+    if not isinstance(value, str):
+        raise AuthenticationDataError(f"{name} is invalid")
+    try:
+        parsed = json.loads(value, object_pairs_hook=_reject_duplicate_json_pairs)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise AuthenticationDataError(f"{name} is invalid") from exc
+    if not isinstance(parsed, dict):
+        raise AuthenticationDataError(f"{name} is invalid")
+    return parsed
+
+
+def _reject_duplicate_json_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object key")
+        result[key] = value
+    return result
+
+
+def _mail_rule_from_row(row: sqlite3.Row) -> MailRuleRecord:
+    return MailRuleRecord(
+        rule_id=_validate_mail_rule_id(str(row["rule_id"])),
+        account_id=_validate_account_id(str(row["account_id"])),
+        name=_normalize_mail_rule_name(str(row["name"])),
+        enabled=bool(row["enabled"]),
+        position=int(row["position"]),
+        expression=_json_object_from_database(row["expression_json"], "mail rule expression"),
+        target_mailbox=_normalize_mailbox_metadata(str(row["target_mailbox"])),
+        stop_processing=bool(row["stop_processing"]),
+        revision=int(row["revision"]),
+        created_at=int(row["created_at"]),
+        updated_at=int(row["updated_at"]),
+    )
+
+
+def _mail_rule_run_from_row(row: sqlite3.Row) -> MailRuleRun:
+    raw_rule_id = row["rule_id"]
+    return MailRuleRun(
+        run_id=_validate_mail_rule_run_id(str(row["run_id"])),
+        account_id=_validate_account_id(str(row["account_id"])),
+        rule_id=(None if raw_rule_id is None else _validate_mail_rule_id(str(raw_rule_id))),
+        rule_revision=int(row["rule_revision"]),
+        rule_snapshot=_json_object_from_database(
+            row["rule_snapshot_json"],
+            "mail rule run snapshot",
+        ),
+        state=_json_object_from_database(row["state_json"], "mail rule run state"),
+        status=str(row["status"]),
+        scanned=int(row["scanned"]),
+        matched=int(row["matched"]),
+        moved=int(row["moved"]),
+        failed=int(row["failed"]),
+        created_at=int(row["created_at"]),
+        started_at=(None if row["started_at"] is None else int(row["started_at"])),
+        updated_at=int(row["updated_at"]),
+        finished_at=(None if row["finished_at"] is None else int(row["finished_at"])),
+        error_code=(None if row["error_code"] is None else str(row["error_code"])),
+    )
+
+
 def _account_from_row(row: sqlite3.Row) -> Account:
     return Account(
         account_id=str(row["account_id"]),
@@ -3568,6 +4339,11 @@ __all__ = [
     "InvalidSessionError",
     "IssuedSession",
     "LoginRateLimitedError",
+    "MailRuleConflictError",
+    "MailRuleLimitError",
+    "MailRuleNotFoundError",
+    "MailRuleRecord",
+    "MailRuleRun",
     "MasterKeyError",
     "PasskeyCeremony",
     "PasskeyCredential",

@@ -28,6 +28,7 @@ from maddyweb.mail import (
     PreparedMessage,
 )
 from maddyweb.web import (
+    _FRESHNESS_KEY,
     MessagePage,
     _eligible_inline_attachments,
     _FreshnessStore,
@@ -192,6 +193,9 @@ class FakeGateway:
         self.sent: bytes | None = None
         self.delivery_error: Exception | None = None
         self.bulk_delete_error: Exception | None = None
+        self.mail_rule_error: Exception | None = None
+        self.mail_rules: list[dict[str, object]] = []
+        self.mail_rule_run: dict[str, object] | None = None
         self.step_up_until = 2_000_000_000
         self.spool_gate: asyncio.Event | None = None
         self.spool_active = 0
@@ -288,6 +292,160 @@ class FakeGateway:
         self.operations.append(("list_mailboxes", account_id))
         return [{"name": "INBOX"}, {"name": "Sent"}, {"name": "Trash"}]
 
+    async def create_mailbox(self, account_id: str, mailbox: str) -> None:
+        self.operations.append(("create_mailbox", account_id, mailbox))
+
+    async def rename_mailbox(
+        self,
+        account_id: str,
+        old_name: str,
+        new_name: str,
+    ) -> None:
+        self.operations.append(("rename_mailbox", account_id, old_name, new_name))
+
+    async def delete_named_mailbox(self, account_id: str, mailbox: str) -> None:
+        self.operations.append(("delete_named_mailbox", account_id, mailbox))
+
+    async def list_mail_rules(self, account_id: str) -> dict[str, object]:
+        if self.mail_rule_error is not None:
+            raise self.mail_rule_error
+        self.operations.append(("list_mail_rules", account_id))
+        return {"rules": list(self.mail_rules), "active_run": self.mail_rule_run}
+
+    async def create_mail_rule(
+        self,
+        account_id: str,
+        *,
+        name: str,
+        enabled: bool,
+        match_condition: dict[str, object],
+        target_mailbox: str,
+        stop_processing: bool,
+        apply_existing: bool,
+    ) -> dict[str, object]:
+        if self.mail_rule_error is not None:
+            raise self.mail_rule_error
+        self.operations.append(
+            (
+                "create_mail_rule",
+                account_id,
+                name,
+                enabled,
+                match_condition,
+                target_mailbox,
+                stop_processing,
+                apply_existing,
+            )
+        )
+        rule = {
+            "rule_id": "b" * 32,
+            "name": name,
+            "enabled": enabled,
+            "match": match_condition,
+            "target_mailbox": target_mailbox,
+            "stop_processing": stop_processing,
+            "revision": 1,
+        }
+        self.mail_rules.append(rule)
+        result: dict[str, object] = {"rule": rule}
+        if apply_existing:
+            self.mail_rule_run = {
+                "run_id": "c" * 32,
+                "rule_id": rule["rule_id"],
+                "rule_name": name,
+                "status": "queued",
+                "processed": 0,
+            }
+            result["run"] = self.mail_rule_run
+        return result
+
+    async def update_mail_rule(
+        self,
+        account_id: str,
+        rule_id: str,
+        *,
+        name: str,
+        enabled: bool,
+        match_condition: dict[str, object],
+        target_mailbox: str,
+        stop_processing: bool,
+        expected_revision: int | None = None,
+    ) -> dict[str, object]:
+        if self.mail_rule_error is not None:
+            raise self.mail_rule_error
+        self.operations.append(
+            (
+                "update_mail_rule",
+                account_id,
+                rule_id,
+                name,
+                enabled,
+                match_condition,
+                target_mailbox,
+                stop_processing,
+                expected_revision,
+            )
+        )
+        rule = {
+            "rule_id": rule_id,
+            "name": name,
+            "enabled": enabled,
+            "match": match_condition,
+            "target_mailbox": target_mailbox,
+            "stop_processing": stop_processing,
+            "revision": (expected_revision or 1) + 1,
+        }
+        self.mail_rules = [rule]
+        return {"rule": rule}
+
+    async def delete_mail_rule(self, account_id: str, rule_id: str) -> None:
+        if self.mail_rule_error is not None:
+            raise self.mail_rule_error
+        self.operations.append(("delete_mail_rule", account_id, rule_id))
+        self.mail_rules = [rule for rule in self.mail_rules if rule["rule_id"] != rule_id]
+
+    async def reorder_mail_rules(
+        self,
+        account_id: str,
+        rule_ids: Sequence[str],
+    ) -> dict[str, object]:
+        if self.mail_rule_error is not None:
+            raise self.mail_rule_error
+        self.operations.append(("reorder_mail_rules", account_id, tuple(rule_ids)))
+        return {"rules": list(self.mail_rules)}
+
+    async def create_mail_rule_run(self, account_id: str, rule_id: str) -> dict[str, object]:
+        if self.mail_rule_error is not None:
+            raise self.mail_rule_error
+        self.operations.append(("create_mail_rule_run", account_id, rule_id))
+        self.mail_rule_run = {
+            "run_id": "c" * 32,
+            "rule_id": rule_id,
+            "status": "queued",
+            "processed": 0,
+        }
+        return {"run": self.mail_rule_run}
+
+    async def get_mail_rule_run(self, account_id: str, run_id: str) -> dict[str, object]:
+        if self.mail_rule_error is not None:
+            raise self.mail_rule_error
+        self.operations.append(("get_mail_rule_run", account_id, run_id))
+        return {"run": self.mail_rule_run or {"run_id": run_id, "status": "completed"}}
+
+    async def step_mail_rule_run(self, account_id: str, run_id: str) -> dict[str, object]:
+        if self.mail_rule_error is not None:
+            raise self.mail_rule_error
+        self.operations.append(("step_mail_rule_run", account_id, run_id))
+        self.mail_rule_run = {"run_id": run_id, "status": "completed", "processed": 2}
+        return {"run": self.mail_rule_run}
+
+    async def cancel_mail_rule_run(self, account_id: str, run_id: str) -> dict[str, object]:
+        if self.mail_rule_error is not None:
+            raise self.mail_rule_error
+        self.operations.append(("cancel_mail_rule_run", account_id, run_id))
+        self.mail_rule_run = {"run_id": run_id, "status": "cancelled", "processed": 0}
+        return {"run": self.mail_rule_run}
+
     async def list_messages(
         self,
         account_id: str,
@@ -351,6 +509,16 @@ class FakeGateway:
         self.operations.append(("archive", account_id, mailbox, message_id))
         return "Archive"
 
+    async def move_message(
+        self,
+        account_id: str,
+        mailbox: str,
+        message_id: str,
+        target: str,
+    ) -> str:
+        self.operations.append(("move", account_id, mailbox, message_id, target))
+        return target
+
     async def set_messages_seen(
         self,
         account_id: str,
@@ -378,6 +546,16 @@ class FakeGateway:
     ) -> str:
         self.operations.append(("archive_many", account_id, mailbox, tuple(message_ids)))
         return "Archive"
+
+    async def move_messages(
+        self,
+        account_id: str,
+        mailbox: str,
+        message_ids: Sequence[str],
+        target: str,
+    ) -> str:
+        self.operations.append(("move_many", account_id, mailbox, tuple(message_ids), target))
+        return target
 
     async def delete_message_permanently(
         self,
@@ -1054,6 +1232,7 @@ async def test_mail_defaults_to_admin_inbox_and_has_two_delete_levels(
     assert response.status == 200
     assert data["selected_account"] == ADMIN_ACCOUNT_ID
     assert data["selected_mailbox"] == "INBOX"
+    assert data["selected_view"] == "mailbox"
     assert data["messages"][0]["uid"] == "42"
     assert ("list_messages", ADMIN_ACCOUNT_ID, "INBOX", 20, 0) in gateway.operations
 
@@ -1214,6 +1393,658 @@ async def test_mailbox_payload_exposes_validated_special_use_flags(
 
 
 @pytest.mark.asyncio
+async def test_all_mail_excludes_resolved_special_folders_and_keeps_source_identity(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+
+    async def special_use_mailboxes(account_id: str) -> list[object]:
+        gateway.operations.append(("list_mailboxes", account_id))
+        return [
+            {"name": "INBOX"},
+            {"name": "Receipts"},
+            {"name": "Deleted Items", "attributes": [r"\Trash"]},
+            {"name": "Old Deleted Items", "attributes": [r"\Trash"]},
+            {"name": "Stored Mail", "attributes": [r"\Archive"]},
+            {"name": "Old Stored Mail", "attributes": [r"\Archive"]},
+        ]
+
+    rows = {
+        "INBOX": [
+            {
+                "uid": 42,
+                "from": "inbox@example.test",
+                "subject": "Inbox message",
+                "internal_date_unix": 100,
+            }
+        ],
+        "Receipts": [
+            {
+                "uid": 42,
+                "from": "billing@example.test",
+                "subject": "Receipt",
+                "internal_date_unix": 200,
+            }
+        ],
+    }
+
+    async def mailbox_messages(
+        account_id: str,
+        mailbox: str,
+        *,
+        limit: int,
+        offset: int,
+    ) -> MessagePage:
+        gateway.operations.append(("list_messages", account_id, mailbox, limit, offset))
+        values = rows.get(mailbox, [])
+        initial_offset = int(values[0]["uid"]) if values else 0
+        return MessagePage(values, False, None, offset or initial_offset)
+
+    gateway.list_mailboxes = special_use_mailboxes  # type: ignore[method-assign]
+    gateway.list_messages = mailbox_messages  # type: ignore[method-assign]
+    response, data = await _api_data(
+        client,
+        f"/api/v1/admin/mail?account={ADMIN_ACCOUNT_ID}&view=all",
+    )
+
+    assert response.status == 200
+    assert data["selected_view"] == "all"
+    assert data["selected_mailbox"] == ""
+    assert [(item["mailbox"], item["uid"]) for item in data["messages"]] == [
+        ("Receipts", "42"),
+        ("INBOX", "42"),
+    ]
+    listed = {
+        operation[2]
+        for operation in gateway.operations
+        if operation[0] == "list_messages"
+    }
+    assert listed == {"INBOX", "Receipts"}
+    assert all(
+        operation[3] <= 20
+        for operation in gateway.operations
+        if operation[0] == "list_messages"
+    )
+
+    mixed_context = await client.get(
+        f"/api/v1/admin/mail?account={ADMIN_ACCOUNT_ID}&view=all&mailbox=INBOX"
+    )
+    assert mixed_context.status == 400
+
+
+@pytest.mark.asyncio
+async def test_all_mail_cursor_resumes_each_source_without_uid_collisions(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+    mailbox_names = ["INBOX", "Sent", "Trash"]
+    rows = {
+        "INBOX": [
+            {"uid": uid, "subject": f"Inbox {uid}", "internal_date_unix": uid + 200}
+            for uid in range(100, 0, -1)
+        ],
+        "Sent": [
+            {"uid": uid, "subject": f"Sent {uid}", "internal_date_unix": uid + 90}
+            for uid in range(200, 100, -1)
+        ],
+    }
+
+    async def listed_mailboxes(account_id: str) -> list[dict[str, str]]:
+        gateway.operations.append(("list_mailboxes", account_id))
+        return [{"name": mailbox} for mailbox in mailbox_names]
+
+    async def mailbox_messages(
+        account_id: str,
+        mailbox: str,
+        *,
+        limit: int,
+        offset: int,
+    ) -> MessagePage:
+        gateway.operations.append(("list_messages", account_id, mailbox, limit, offset))
+        mailbox_rows = rows[mailbox]
+        start = 0
+        if offset:
+            start = next(index for index, row in enumerate(mailbox_rows) if row["uid"] == offset)
+        items = mailbox_rows[start : start + limit]
+        next_offset = (
+            int(mailbox_rows[start + limit]["uid"])
+            if start + limit < len(mailbox_rows)
+            else None
+        )
+        return MessagePage(
+            items,
+            next_offset is not None,
+            next_offset,
+            offset or int(items[0]["uid"]),
+        )
+
+    gateway.list_mailboxes = listed_mailboxes  # type: ignore[method-assign]
+    gateway.list_messages = mailbox_messages  # type: ignore[method-assign]
+    base = f"/api/v1/admin/mail?account={ADMIN_ACCOUNT_ID}&view=all"
+    _response, first = await _api_data(client, base)
+    next_cursor = str(first["next_cursor"])
+    first_identities = {
+        (str(item["mailbox"]), str(item["uid"])) for item in first["messages"]
+    }
+
+    assert len(first_identities) == 20
+    assert next_cursor
+    gateway.operations.clear()
+    _response, second = await _api_data(client, f"{base}&cursor={next_cursor}")
+    second_identities = {
+        (str(item["mailbox"]), str(item["uid"])) for item in second["messages"]
+    }
+    assert len(second_identities) == 20
+    assert first_identities.isdisjoint(second_identities)
+    assert second["previous_cursor"]
+    resumed_offsets = {
+        operation[2]: operation[4]
+        for operation in gateway.operations
+        if operation[0] == "list_messages"
+    }
+    assert resumed_offsets.keys() == {"INBOX", "Sent"}
+    assert all(offset > 0 for offset in resumed_offsets.values())
+
+    mailbox_names.insert(2, "Drafts")
+    changed = await client.get(f"{base}&cursor={next_cursor}")
+    assert changed.status == 409
+
+
+@pytest.mark.asyncio
+async def test_all_mail_fills_a_page_from_one_busy_folder_with_bounded_fanout(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+    mailbox_names = ["INBOX", *(f"Empty {index:02d}" for index in range(63))]
+    rows = [
+        {"uid": uid, "subject": f"Inbox {uid}", "internal_date_unix": uid}
+        for uid in range(50, 0, -1)
+    ]
+
+    async def listed_mailboxes(account_id: str) -> list[dict[str, str]]:
+        gateway.operations.append(("list_mailboxes", account_id))
+        return [{"name": mailbox} for mailbox in mailbox_names]
+
+    async def mailbox_messages(
+        account_id: str,
+        mailbox: str,
+        *,
+        limit: int,
+        offset: int,
+    ) -> MessagePage:
+        gateway.operations.append(("list_messages", account_id, mailbox, limit, offset))
+        if mailbox != "INBOX":
+            return MessagePage((), False, None, 0)
+        start = 0
+        if offset:
+            start = next(index for index, row in enumerate(rows) if row["uid"] == offset)
+        items = rows[start : start + limit]
+        next_offset = (
+            int(rows[start + limit]["uid"]) if start + limit < len(rows) else None
+        )
+        return MessagePage(
+            items,
+            next_offset is not None,
+            next_offset,
+            offset or int(items[0]["uid"]),
+        )
+
+    gateway.list_mailboxes = listed_mailboxes  # type: ignore[method-assign]
+    gateway.list_messages = mailbox_messages  # type: ignore[method-assign]
+    base = f"/api/v1/admin/mail?account={ADMIN_ACCOUNT_ID}&view=all"
+    _response, first = await _api_data(client, base)
+
+    assert len(first["messages"]) == 20
+    assert {item["mailbox"] for item in first["messages"]} == {"INBOX"}
+    list_calls = [
+        operation for operation in gateway.operations if operation[0] == "list_messages"
+    ]
+    assert len(list_calls) <= 65
+    assert all(1 <= int(operation[3]) <= 20 for operation in list_calls)
+
+    gateway.operations.clear()
+    mailbox_names.reverse()
+    _response, second = await _api_data(
+        client,
+        f"{base}&cursor={first['next_cursor']}",
+    )
+    assert len(second["messages"]) == 20
+    assert {
+        (str(item["mailbox"]), str(item["uid"])) for item in first["messages"]
+    }.isdisjoint(
+        (str(item["mailbox"]), str(item["uid"])) for item in second["messages"]
+    )
+    _response, previous = await _api_data(
+        client,
+        f"{base}&cursor={second['previous_cursor']}",
+    )
+    assert [
+        (str(item["mailbox"]), str(item["uid"])) for item in previous["messages"]
+    ] == [
+        (str(item["mailbox"]), str(item["uid"])) for item in first["messages"]
+    ]
+
+    wrong_account = await client.get(
+        "/api/v1/admin/mail?"
+        + urlencode(
+            {
+                "account": DISABLED_ACCOUNT_ID,
+                "view": "all",
+                "cursor": str(first["next_cursor"]),
+            }
+        )
+    )
+    assert wrong_account.status == 409
+
+    personal_override = await client.get(
+        "/api/v1/me/mail?"
+        + urlencode({"account": DISABLED_ACCOUNT_ID, "view": "all"})
+    )
+    assert personal_override.status == 400
+
+
+@pytest.mark.asyncio
+async def test_folder_mutation_endpoints_are_account_scoped_and_confirm_delete(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+
+    created = await _post_json(
+        client,
+        "/api/v1/admin/mailboxes",
+        await _get_token(client),
+        {"account": ADMIN_ACCOUNT_ID, "name": "Projects/2026"},
+    )
+    assert created.status == 201
+    assert ("create_mailbox", ADMIN_ACCOUNT_ID, "Projects/2026") in gateway.operations
+
+    renamed = await _post_json(
+        client,
+        "/api/v1/admin/mailboxes/rename",
+        await _get_token(client),
+        {
+            "account": ADMIN_ACCOUNT_ID,
+            "old_name": "Projects/2026",
+            "new_name": "Projects/Current",
+        },
+    )
+    assert renamed.status == 200
+    assert (
+        "rename_mailbox",
+        ADMIN_ACCOUNT_ID,
+        "Projects/2026",
+        "Projects/Current",
+    ) in gateway.operations
+
+    rejected = await _post_json(
+        client,
+        "/api/v1/admin/mailboxes/delete",
+        await _get_token(client),
+        {
+            "account": ADMIN_ACCOUNT_ID,
+            "name": "Projects/Current",
+            "confirmation": "Projects",
+        },
+    )
+    assert rejected.status == 400
+    assert not any(operation[0] == "delete_named_mailbox" for operation in gateway.operations)
+
+    deleted = await _post_json(
+        client,
+        "/api/v1/admin/mailboxes/delete",
+        await _get_token(client),
+        {
+            "account": ADMIN_ACCOUNT_ID,
+            "name": "Projects/Current",
+            "confirmation": "Projects/Current",
+        },
+    )
+    assert deleted.status == 200
+    assert ("delete_named_mailbox", ADMIN_ACCOUNT_ID, "Projects/Current") in gateway.operations
+
+    personal_cross_account = await _post_json(
+        client,
+        "/api/v1/me/mailboxes",
+        await _get_token(client),
+        {"account": ADMIN_ACCOUNT_ID, "name": "Should not exist"},
+    )
+    assert personal_cross_account.status == 400
+    assert not any(
+        operation[:2] == ("create_mailbox", ADMIN_ACCOUNT_ID)
+        and operation[-1] == "Should not exist"
+        for operation in gateway.operations
+    )
+
+    async def referenced_folder(*_args: object) -> None:
+        raise HelperCallError("conflict", "internal rule reference")
+
+    gateway.rename_mailbox = referenced_folder  # type: ignore[method-assign]
+    referenced = await _post_json(
+        client,
+        "/api/v1/admin/mailboxes/rename",
+        await _get_token(client),
+        {
+            "account": ADMIN_ACCOUNT_ID,
+            "old_name": "Receipts",
+            "new_name": "Filed",
+        },
+    )
+    assert referenced.status == 409
+    assert (await referenced.json())["error"]["message"] == (
+        "The folder is used by a mail rule and cannot be changed."
+    )
+
+
+@pytest.mark.asyncio
+async def test_mail_rule_spa_and_admin_api_match_frontend_contract(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+    shell = await client.get("/rules")
+    assert shell.status == 200
+
+    listed = await client.get(f"/api/v1/admin/mail-rules?account={ADMIN_ACCOUNT_ID}")
+    assert listed.status == 200
+    listed_payload = await listed.json()
+    assert listed_payload["data"] == {"rules": [], "active_run": None}
+
+    condition = {
+        "op": "and",
+        "conditions": [
+            {"field": "subject", "operator": "contains", "value": "receipt"},
+            {"field": "from", "operator": "ends_with", "value": "@shop.example"},
+        ],
+    }
+    created = await _post_json(
+        client,
+        "/api/v1/admin/mail-rules",
+        await _get_token(client),
+        {
+            "account": ADMIN_ACCOUNT_ID,
+            "name": "Receipts",
+            "enabled": True,
+            "match": condition,
+            "target_mailbox": "Receipts",
+            "stop_processing": True,
+            "apply_existing": True,
+        },
+    )
+    assert created.status == 201
+    created_data = (await created.json())["data"]
+    rule_id = created_data["rule"]["rule_id"]
+    run_id = created_data["run"]["run_id"]
+    assert created_data["rule"]["match"] == condition
+    assert created_data["run"]["rule_name"] == "Receipts"
+
+    updated = await _post_json(
+        client,
+        f"/api/v1/admin/mail-rules/{rule_id}/update",
+        await _get_token(client),
+        {
+            "account": ADMIN_ACCOUNT_ID,
+            "name": "Shop receipts",
+            "enabled": True,
+            "match": condition,
+            "target_mailbox": "Receipts",
+            "stop_processing": False,
+            "expected_revision": 1,
+        },
+    )
+    assert updated.status == 200
+    update_operation = next(
+        operation for operation in gateway.operations if operation[0] == "update_mail_rule"
+    )
+    assert update_operation[-1] == 1
+
+    alias_updated = await _post_json(
+        client,
+        f"/api/v1/admin/mail-rules/{rule_id}/update",
+        await _get_token(client),
+        {
+            "account": ADMIN_ACCOUNT_ID,
+            "name": "Shop receipts",
+            "enabled": True,
+            "match": condition,
+            "target_mailbox": "Receipts",
+            "stop_processing": False,
+            "revision": 2,
+        },
+    )
+    assert alias_updated.status == 200
+    assert [
+        operation for operation in gateway.operations if operation[0] == "update_mail_rule"
+    ][-1][-1] == 2
+
+    duplicate_revision = await _post_json(
+        client,
+        f"/api/v1/admin/mail-rules/{rule_id}/update",
+        await _get_token(client),
+        {
+            "account": ADMIN_ACCOUNT_ID,
+            "name": "Shop receipts",
+            "enabled": True,
+            "match": condition,
+            "target_mailbox": "Receipts",
+            "stop_processing": False,
+            "expected_revision": 2,
+            "revision": 2,
+        },
+    )
+    assert duplicate_revision.status == 400
+
+    missing_revision = await _post_json(
+        client,
+        f"/api/v1/admin/mail-rules/{rule_id}/update",
+        await _get_token(client),
+        {
+            "account": ADMIN_ACCOUNT_ID,
+            "name": "Shop receipts",
+            "enabled": True,
+            "match": condition,
+            "target_mailbox": "Receipts",
+            "stop_processing": False,
+        },
+    )
+    assert missing_revision.status == 400
+
+    reordered = await _post_json(
+        client,
+        "/api/v1/admin/mail-rules/reorder",
+        await _get_token(client),
+        {"account": ADMIN_ACCOUNT_ID, "rule_ids": [rule_id]},
+    )
+    assert reordered.status == 200
+
+    started = await _post_json(
+        client,
+        "/api/v1/admin/mail-rule-runs",
+        await _get_token(client),
+        {"account": ADMIN_ACCOUNT_ID, "rule_id": rule_id},
+    )
+    assert started.status == 201
+
+    status = await client.get(
+        f"/api/v1/admin/mail-rule-runs/{run_id}?account={ADMIN_ACCOUNT_ID}"
+    )
+    assert status.status == 200
+
+    stepped = await _post_json(
+        client,
+        f"/api/v1/admin/mail-rule-runs/{run_id}/step",
+        await _get_token(client),
+        {"account": ADMIN_ACCOUNT_ID},
+    )
+    assert stepped.status == 200
+    assert (await stepped.json())["data"]["run"]["processed"] == 2
+
+    cancelled = await _post_json(
+        client,
+        f"/api/v1/admin/mail-rule-runs/{run_id}/cancel",
+        await _get_token(client),
+        {"account": ADMIN_ACCOUNT_ID},
+    )
+    assert cancelled.status == 200
+
+    deleted = await _post_json(
+        client,
+        f"/api/v1/admin/mail-rules/{rule_id}/delete",
+        await _get_token(client),
+        {"account": ADMIN_ACCOUNT_ID},
+    )
+    assert deleted.status == 200
+
+    personal_cross_account = await client.get(
+        f"/api/v1/me/mail-rules?account={ADMIN_ACCOUNT_ID}"
+    )
+    assert personal_cross_account.status == 400
+
+
+@pytest.mark.asyncio
+async def test_mail_rule_mutations_require_recent_verification_but_reads_and_cancel_do_not(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+    gateway.step_up_until = 0
+    rule_id = "b" * 32
+    run_id = "c" * 32
+    condition = {"field": "subject", "operator": "exists"}
+    cases = (
+        (
+            "/api/v1/admin/mail-rules",
+            {
+                "account": ADMIN_ACCOUNT_ID,
+                "name": "Receipts",
+                "enabled": True,
+                "match": condition,
+                "target_mailbox": "Receipts",
+                "stop_processing": True,
+                "apply_existing": False,
+            },
+        ),
+        (
+            f"/api/v1/admin/mail-rules/{rule_id}/update",
+            {
+                "account": ADMIN_ACCOUNT_ID,
+                "name": "Receipts",
+                "enabled": True,
+                "match": condition,
+                "target_mailbox": "Receipts",
+                "stop_processing": True,
+                "expected_revision": 1,
+            },
+        ),
+        (
+            f"/api/v1/admin/mail-rules/{rule_id}/delete",
+            {"account": ADMIN_ACCOUNT_ID},
+        ),
+        (
+            "/api/v1/admin/mail-rules/reorder",
+            {"account": ADMIN_ACCOUNT_ID, "rule_ids": [rule_id]},
+        ),
+        (
+            "/api/v1/admin/mail-rule-runs",
+            {"account": ADMIN_ACCOUNT_ID, "rule_id": rule_id},
+        ),
+        (
+            f"/api/v1/admin/mail-rule-runs/{run_id}/step",
+            {"account": ADMIN_ACCOUNT_ID},
+        ),
+    )
+
+    operation_start = len(gateway.operations)
+    for path, body in cases:
+        response = await _post_json(client, path, await _get_token(client), body)
+        assert response.status == 403
+        assert (await response.json())["error"] == {
+            "code": "step_up_required",
+            "message": "Fresh authentication is required.",
+        }
+    assert not any(
+        operation[0]
+        in {
+            "create_mail_rule",
+            "update_mail_rule",
+            "delete_mail_rule",
+            "reorder_mail_rules",
+            "create_mail_rule_run",
+            "step_mail_rule_run",
+        }
+        for operation in gateway.operations[operation_start:]
+    )
+
+    listed = await client.get(f"/api/v1/admin/mail-rules?account={ADMIN_ACCOUNT_ID}")
+    status = await client.get(
+        f"/api/v1/admin/mail-rule-runs/{run_id}?account={ADMIN_ACCOUNT_ID}"
+    )
+    assert listed.status == 200
+    assert status.status == 200
+
+    cancelled = await _post_json(
+        client,
+        f"/api/v1/admin/mail-rule-runs/{run_id}/cancel",
+        await _get_token(client),
+        {"account": ADMIN_ACCOUNT_ID},
+    )
+    assert cancelled.status == 200
+    assert ("cancel_mail_rule_run", ADMIN_ACCOUNT_ID, run_id) in gateway.operations
+
+
+@pytest.mark.asyncio
+async def test_mail_rule_conflicts_are_public_safe_409_responses(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+    gateway.mail_rule_error = HelperCallError("conflict", "sensitive helper details")
+    response = await _post_json(
+        client,
+        f"/api/v1/admin/mail-rules/{'b' * 32}/update",
+        await _get_token(client),
+        {
+            "account": ADMIN_ACCOUNT_ID,
+            "name": "Stale rule",
+            "enabled": True,
+            "match": {"field": "subject", "operator": "exists"},
+            "target_mailbox": "INBOX",
+            "stop_processing": True,
+            "expected_revision": 1,
+        },
+    )
+    assert response.status == 409
+    payload = await response.json()
+    assert payload["error"] == {
+        "code": "conflict",
+        "message": "The mail rule state conflicts with this operation.",
+    }
+    assert "sensitive" not in repr(payload)
+
+    gateway.mail_rule_error = HelperCallError(
+        "step_up_required",
+        "sensitive helper verification details",
+    )
+    step_up = await _post_json(
+        client,
+        "/api/v1/admin/mail-rules",
+        await _get_token(client),
+        {
+            "account": ADMIN_ACCOUNT_ID,
+            "name": "Protected rule",
+            "enabled": True,
+            "match": {"field": "subject", "operator": "exists"},
+            "target_mailbox": "INBOX",
+            "stop_processing": True,
+            "apply_existing": False,
+        },
+    )
+    assert step_up.status == 403
+    step_up_payload = await step_up.json()
+    assert step_up_payload["error"] == {
+        "code": "step_up_required",
+        "message": "Fresh authentication is required.",
+    }
+    assert "sensitive" not in repr(step_up_payload)
+
+
+@pytest.mark.asyncio
 async def test_bulk_message_actions_validate_selection_and_use_fixed_mailbox_scope(
     web_client: tuple[TestClient, FakeGateway],
 ) -> None:
@@ -1256,14 +2087,65 @@ async def test_bulk_message_actions_validate_selection_and_use_fixed_mailbox_sco
     ) in gateway.operations
 
     token = await _get_token(client)
+    archive_freshness = await _message_action_token(client, "42", mailbox="INBOX")
     archived = await _post_json(
         client,
         "/api/v1/admin/mail-actions",
         token,
-        {**base, "action": "archive", "uids": ["42"]},
+        {
+            **base,
+            "action": "archive",
+            "uids": ["42"],
+            "freshness": [{"uid": "42", "token": archive_freshness}],
+        },
     )
     assert archived.status == 200
     assert ("archive_many", ADMIN_ACCOUNT_ID, "INBOX", ("42",)) in gateway.operations
+
+    token = await _get_token(client)
+    move_freshness = {
+        uid: await _message_action_token(client, uid, mailbox="INBOX")
+        for uid in ("42", "43")
+    }
+    moved = await _post_json(
+        client,
+        "/api/v1/admin/mail-actions",
+        token,
+        {
+            **base,
+            "action": "move",
+            "target_mailbox": "Sent",
+            "uids": ["42", "43"],
+            "freshness": [
+                {"uid": uid, "token": move_freshness[uid]} for uid in ("42", "43")
+            ],
+        },
+    )
+    moved_payload = await moved.json()
+    assert moved.status == 200
+    assert moved_payload["data"]["target_mailbox"] == "Sent"
+    assert (
+        "move_many",
+        ADMIN_ACCOUNT_ID,
+        "INBOX",
+        ("42", "43"),
+        "Sent",
+    ) in gateway.operations
+
+    token = await _get_token(client)
+    invalid_target = await _post_json(
+        client,
+        "/api/v1/admin/mail-actions",
+        token,
+        {
+            **base,
+            "action": "move",
+            "target_mailbox": "Unknown",
+            "uids": ["42"],
+        },
+    )
+    assert invalid_target.status == 400
+    assert not any(operation[-1] == "Unknown" for operation in gateway.operations)
 
     token = await _get_token(client)
     duplicate = await _post_json(
@@ -1274,6 +2156,40 @@ async def test_bulk_message_actions_validate_selection_and_use_fixed_mailbox_sco
     )
     assert duplicate.status == 400
     assert not any(operation[0] == "trash_many" for operation in gateway.operations)
+
+
+@pytest.mark.asyncio
+async def test_bulk_relocation_requires_fresh_proof_before_any_write(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+    body = {
+        "account": ADMIN_ACCOUNT_ID,
+        "mailbox": "INBOX",
+        "action": "move",
+        "target_mailbox": "Sent",
+        "uids": ["42"],
+    }
+
+    missing = await _post_json(
+        client,
+        "/api/v1/admin/mail-actions",
+        await _get_token(client),
+        body,
+    )
+    assert missing.status == 400
+    assert not any(operation[0] == "move_many" for operation in gateway.operations)
+
+    proof = await _message_action_token(client, "42", mailbox="INBOX")
+    gateway.raw_message = gateway.raw_message.replace(b"Subject:", b"Subject: changed ", 1)
+    stale = await _post_json(
+        client,
+        "/api/v1/admin/mail-actions",
+        await _get_token(client),
+        {**body, "freshness": [{"uid": "42", "token": proof}]},
+    )
+    assert stale.status == 409
+    assert not any(operation[0] == "move_many" for operation in gateway.operations)
 
 
 async def _message_action_token(
@@ -1289,6 +2205,29 @@ async def _message_action_token(
     )
     assert response.status == 200
     return str(payload["freshness_token"])
+
+
+@pytest.mark.asyncio
+async def test_single_message_can_move_to_an_authoritative_folder(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+    freshness = await _message_action_token(client, "42", mailbox="INBOX")
+
+    moved = await _post_json(
+        client,
+        "/api/v1/admin/mail/42/move",
+        await _get_token(client),
+        {
+            "account": ADMIN_ACCOUNT_ID,
+            "mailbox": "INBOX",
+            "target_mailbox": "Sent",
+            "freshness": freshness,
+        },
+    )
+
+    assert moved.status == 200
+    assert ("move", ADMIN_ACCOUNT_ID, "INBOX", "42", "Sent") in gateway.operations
 
 
 @pytest.mark.asyncio
@@ -1835,6 +2774,185 @@ async def test_action_snapshot_does_not_require_mime_preview(
     assert archived.status == 200
     assert ("archive", ADMIN_ACCOUNT_ID, "INBOX", "42") in gateway.operations
     assert not await asyncio.to_thread(_raw_spool_paths, tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_batch_action_snapshots_are_ordered_bounded_and_issued_together(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+    selected = ["46", "42", "45", "43", "44"]
+    gateway.spool_gate = asyncio.Event()
+    pending = asyncio.create_task(
+        _post_json(
+            client,
+            "/api/v1/admin/mail/action-snapshots",
+            await _get_token(client),
+            {
+                "account": ADMIN_ACCOUNT_ID,
+                "mailbox": "INBOX",
+                "uids": selected,
+            },
+        )
+    )
+
+    await asyncio.wait_for(gateway.two_spools_started.wait(), timeout=1)
+    assert gateway.spool_active == 2
+    assert not pending.done()
+    store = client.server.app[_FRESHNESS_KEY]
+    assert isinstance(store, _FreshnessStore)
+    assert not store._entries
+
+    gateway.spool_gate.set()
+    response = await pending
+    assert response.status == 200
+    data = (await response.json())["data"]
+    assert data["account"] == ADMIN_ACCOUNT_ID
+    assert data["mailbox"] == "INBOX"
+    assert [item["uid"] for item in data["freshness"]] == selected
+    assert len({item["token"] for item in data["freshness"]}) == len(selected)
+    assert gateway.spool_calls == len(selected)
+    assert not any(
+        operation[0] in {"archive_many", "trash_many", "move_many", "delete_messages"}
+        for operation in gateway.operations
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"account": ADMIN_ACCOUNT_ID, "mailbox": "INBOX", "uids": ["42", "42"]},
+        {"account": ADMIN_ACCOUNT_ID, "mailbox": "INBOX", "uids": ["\u0661"]},
+        {"account": ADMIN_ACCOUNT_ID, "mailbox": "INBOX", "uids": []},
+        {
+            "account": ADMIN_ACCOUNT_ID,
+            "mailbox": "INBOX",
+            "uids": [str(uid) for uid in range(1, 52)],
+        },
+        {"account": ADMIN_ACCOUNT_ID, "mailbox": "Unknown", "uids": ["42"]},
+    ],
+)
+async def test_batch_action_snapshots_reject_invalid_selection_before_spooling(
+    web_client: tuple[TestClient, FakeGateway],
+    payload: dict[str, object],
+) -> None:
+    client, gateway = web_client
+    response = await _post_json(
+        client,
+        "/api/v1/admin/mail/action-snapshots",
+        await _get_token(client),
+        payload,
+    )
+
+    assert response.status == 400
+    assert gateway.spool_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_batch_action_snapshots_require_csrf_and_isolate_personal_accounts(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+
+    missing_csrf = await client.post(
+        "/api/v1/admin/mail/action-snapshots",
+        json={
+            "account": ADMIN_ACCOUNT_ID,
+            "mailbox": "INBOX",
+            "uids": ["42"],
+        },
+        headers={"Origin": _origin(client)},
+    )
+    assert missing_csrf.status == 403
+    assert gateway.spool_calls == 0
+
+    async def ordinary_session(token: str) -> dict[str, object]:
+        assert token == ADMIN_SESSION_TOKEN
+        return {
+            "account_id": DISABLED_ACCOUNT_ID,
+            "email": "ordinary@example.test",
+            "role": "user",
+            "password_change_required": False,
+            "enrollment_state": "active",
+            "idle_expires_at": 2_000_000_000,
+            "absolute_expires_at": 2_000_010_000,
+            "step_up_until": 2_000_000_000,
+        }
+
+    gateway.session = ordinary_session  # type: ignore[method-assign]
+    personal = await _post_json(
+        client,
+        "/api/v1/me/mail/action-snapshots",
+        await _get_token(client),
+        {"mailbox": "INBOX", "uids": ["42"]},
+    )
+    assert personal.status == 200
+    personal_data = (await personal.json())["data"]
+    assert personal_data["account"] == DISABLED_ACCOUNT_ID
+    assert (
+        "spool_message",
+        DISABLED_ACCOUNT_ID,
+        "INBOX",
+        "42",
+    ) in gateway.operations
+
+    initial_spools = gateway.spool_calls
+    override = await _post_json(
+        client,
+        "/api/v1/me/mail/action-snapshots",
+        await _get_token(client),
+        {
+            "account": ADMIN_ACCOUNT_ID,
+            "mailbox": "INBOX",
+            "uids": ["43"],
+        },
+    )
+    assert override.status == 400
+    assert gateway.spool_calls == initial_spools
+
+
+@pytest.mark.asyncio
+async def test_batch_action_snapshot_failure_issues_no_partial_tokens(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+    original_spool = gateway.spool_message
+
+    async def fail_one_snapshot(
+        account_id: str,
+        mailbox: str,
+        message_id: str,
+        destination_path: Path,
+        *,
+        max_bytes: int,
+    ) -> int:
+        if message_id == "43":
+            raise OSError("synthetic spool failure")
+        return await original_spool(
+            account_id,
+            mailbox,
+            message_id,
+            destination_path,
+            max_bytes=max_bytes,
+        )
+
+    gateway.spool_message = fail_one_snapshot  # type: ignore[method-assign]
+    response = await _post_json(
+        client,
+        "/api/v1/admin/mail/action-snapshots",
+        await _get_token(client),
+        {
+            "account": ADMIN_ACCOUNT_ID,
+            "mailbox": "INBOX",
+            "uids": ["42", "43", "44"],
+        },
+    )
+
+    assert response.status == 502
+    store = client.server.app[_FRESHNESS_KEY]
+    assert isinstance(store, _FreshnessStore)
+    assert not store._entries
 
 
 @pytest.mark.asyncio

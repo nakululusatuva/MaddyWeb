@@ -58,6 +58,13 @@ from .protocol import (
     send_frame,
     send_stream_frame,
 )
+from .rule_snapshots import (
+    RuleSnapshotError,
+    publish_snapshot,
+    remove_snapshot,
+    replace_snapshot_set,
+)
+from .rules import Rule, compile_rule, condition_from_mapping, condition_to_mapping
 
 _SENSITIVE_KEYS = frozenset(
     {
@@ -75,6 +82,11 @@ _SENSITIVE_KEYS = frozenset(
         "challenge",
         "code",
         "credential",
+        "condition",
+        "expression",
+        "match",
+        "rule_snapshot",
+        "state",
     }
 )
 _EMAIL_RE = re.compile(r"\A[^\s<>@]+@[^\s<>@]+\Z")
@@ -106,6 +118,9 @@ _FIXED_SUBPROCESS_ENV = {
     "LC_ALL": "C",
     "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
 }
+_RULE_RUN_BATCH_SIZE = 20
+_MAX_RULE_RUN_MAILBOXES = 64
+_MAX_RULE_RESPONSE_BYTES = 48 * 1024
 
 
 def redact_for_audit(value: Any, *, key: str = "") -> Any:
@@ -170,6 +185,10 @@ class PasswordChangeRequired(AuthorizationDenied):
 
 class StepUpRequired(AuthorizationDenied):
     """A dangerous administrator operation requires fresh reauthentication."""
+
+
+class RuleMailboxConflict(ValueError):
+    """A mailbox mutation would invalidate a stored delivery rule."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1055,6 +1074,45 @@ ALLOWED_OPERATIONS: Mapping[str, _Operation] = {
     "mailboxes.create": _Operation("_mailboxes_create", mutating=True, permission="account"),
     "mailboxes.delete": _Operation("_mailboxes_delete", mutating=True, permission="account"),
     "mailboxes.rename": _Operation("_mailboxes_rename", mutating=True, permission="account"),
+    "rules.list": _Operation("_rules_list", permission="account"),
+    "rules.create": _Operation(
+        "_rules_create",
+        mutating=True,
+        permission="account",
+        step_up=True,
+    ),
+    "rules.update": _Operation(
+        "_rules_update",
+        mutating=True,
+        permission="account",
+        step_up=True,
+    ),
+    "rules.delete": _Operation(
+        "_rules_delete",
+        mutating=True,
+        permission="account",
+        step_up=True,
+    ),
+    "rules.reorder": _Operation(
+        "_rules_reorder",
+        mutating=True,
+        permission="account",
+        step_up=True,
+    ),
+    "rules.run_create": _Operation(
+        "_rules_run_create",
+        mutating=True,
+        permission="account",
+        step_up=True,
+    ),
+    "rules.run_status": _Operation("_rules_run_status", permission="account"),
+    "rules.run_step": _Operation(
+        "_rules_run_step",
+        mutating=True,
+        permission="account",
+        step_up=True,
+    ),
+    "rules.run_cancel": _Operation("_rules_run_cancel", mutating=True, permission="account"),
     "messages.list": _Operation("_messages_list", permission="account"),
     "messages.latest": _Operation(
         "_messages_latest",
@@ -1182,16 +1240,32 @@ class PrivilegedDispatcher:
         spool_dir: Path,
         smtp: SMTPSubmissionClient | None = None,
         auth_store: Any | None = None,
+        rule_snapshot_dir: Path | None = None,
+        rule_snapshot_group_id: int | None = None,
         audit: Callable[..., None] = _default_audit,
     ) -> None:
         self.maddy = maddy
         self.certificates = certificates
         self.smtp = smtp
         self.auth_store = auth_store
+        self.rule_snapshot_dir = rule_snapshot_dir
+        self.rule_snapshot_group_id = rule_snapshot_group_id
         self.spool_dir = spool_dir
         self.audit = audit
         self._lock = threading.RLock()
         self._request_context = threading.local()
+        if self.rule_snapshot_dir is not None:
+            self._reconcile_mail_rule_snapshots()
+        missing_handlers = sorted(
+            operation.method
+            for operation in ALLOWED_OPERATIONS.values()
+            if not callable(getattr(self, operation.method, None))
+        )
+        if missing_handlers:
+            raise RuntimeError(
+                "allow-listed helper operations are missing handlers: "
+                + ", ".join(missing_handlers)
+            )
 
     def close(self) -> None:
         close = getattr(self.auth_store, "close", None)
@@ -1288,7 +1362,7 @@ class PrivilegedDispatcher:
                     "InvalidSessionError",
                     "StepUpRequiredError",
                 }:
-                    raise StepUpRequired("fresh administrator authentication is required") from exc
+                    raise StepUpRequired("fresh authentication is required") from exc
                 raise
 
         params = dict(request.params)
@@ -1495,6 +1569,12 @@ class PrivilegedDispatcher:
             return f"smtp_{kind}_rejection", f"SMTP rejected {exc.stage} ({exc.code})"
         if isinstance(exc, SMTPTransportError):
             return "smtp_transport", "Local SMTP transport failed before acceptance"
+        if auth_error == "MailRuleNotFoundError":
+            return "not_found", "Mail rule or existing-mail run does not exist"
+        if auth_error == "MailRuleConflictError" or isinstance(exc, RuleMailboxConflict):
+            return "conflict", "Mail rule state conflicts with this operation"
+        if auth_error == "MailRuleLimitError":
+            return "limit_exceeded", "The mail rule limit has been reached"
         if isinstance(exc, (ValueError, InvalidMaddyArgument, ProtocolError, StreamError)):
             return "invalid_request", "Request parameters are invalid"
         if isinstance(exc, (UnsupportedVersion, UnsupportedCapability)):
@@ -2179,6 +2259,8 @@ class PrivilegedDispatcher:
         if account_record is not None and account_record.get("has_mailbox") is True:
             self.maddy.delete_imap_account(values["username"])
         if self.auth_store is not None and target is not None:
+            if self.rule_snapshot_dir is not None:
+                remove_snapshot(self.rule_snapshot_dir, target.email)
             self.auth_store.delete_account(target.account_id)
         return {"imap_account_deleted": True}
 
@@ -2206,6 +2288,13 @@ class PrivilegedDispatcher:
     def _mailboxes_delete(self, request: Request, _spool: TrustedSpool | None) -> Any:
         values = _params(request, required={"username", "mailbox", "confirm"})
         _confirmed(values)
+        if self.auth_store is not None:
+            account = self._rule_account(values["username"])
+            if self.auth_store.mailbox_rule_reference_count(
+                account.account_id,
+                values["mailbox"],
+            ):
+                raise RuleMailboxConflict("mailbox is referenced by a mail rule")
         if self.maddy.list_message_window(
             values["username"],
             values["mailbox"],
@@ -2217,8 +2306,658 @@ class PrivilegedDispatcher:
 
     def _mailboxes_rename(self, request: Request, _spool: TrustedSpool | None) -> Any:
         values = _params(request, required={"username", "old_name", "new_name"})
+        if self.auth_store is not None:
+            account = self._rule_account(values["username"])
+            if self.auth_store.mailbox_rule_reference_count(
+                account.account_id,
+                values["old_name"],
+            ):
+                raise RuleMailboxConflict("mailbox is referenced by a mail rule")
         self.maddy.rename_mailbox(values["username"], values["old_name"], values["new_name"])
         return {"renamed": True}
+
+    def _rule_account(self, username: str) -> Any:
+        if self.auth_store is None:
+            raise RuntimeError("mail rule storage is unavailable")
+        account = self.auth_store.get_account(username)
+        if account is None:
+            raise ValueError("mail rule account does not exist")
+        return account
+
+    @staticmethod
+    def _rule_expression(values: Mapping[str, Any]) -> dict[str, object]:
+        aliases = [name for name in ("match", "expression", "condition") if name in values]
+        if len(aliases) != 1:
+            raise ValueError("exactly one mail rule condition must be supplied")
+        condition = condition_from_mapping(values[aliases[0]])
+        return condition_to_mapping(condition)
+
+    def _require_rule_target(
+        self,
+        username: str,
+        target_mailbox: Any,
+        *,
+        mailboxes: Sequence[Mapping[str, Any]] | None = None,
+    ) -> str:
+        expression = {"field": "subject", "operator": "exists"}
+        target = Rule.from_mapping(
+            {"condition": expression, "target_mailbox": target_mailbox}
+        ).target_mailbox
+        records = self.maddy.list_mailboxes(username) if mailboxes is None else mailboxes
+        names = [record.get("name") for record in records if isinstance(record, Mapping)]
+        if not any(
+            name == target
+            or (
+                isinstance(name, str)
+                and name.casefold() == "inbox"
+                and target.casefold() == "inbox"
+            )
+            for name in names
+        ):
+            raise ValueError("mail rule target mailbox does not exist")
+        return target
+
+    @staticmethod
+    def _mail_rule_payload(rule: Any) -> dict[str, object]:
+        return {
+            "rule_id": rule.rule_id,
+            "name": rule.name,
+            "enabled": rule.enabled,
+            "position": rule.position,
+            "match": rule.expression,
+            "target_mailbox": rule.target_mailbox,
+            "stop_processing": rule.stop_processing,
+            "revision": rule.revision,
+            "created_at": rule.created_at,
+            "updated_at": rule.updated_at,
+        }
+
+    @staticmethod
+    def _mail_rule_run_payload(run: Any) -> dict[str, object]:
+        rule_name = run.rule_snapshot.get("rule_name")
+        payload: dict[str, object] = {
+            "run_id": run.run_id,
+            "rule_id": run.rule_id,
+            "status": run.status,
+            "processed": run.scanned,
+            "matched": run.matched,
+            "moved": run.moved,
+            "failed": run.failed,
+            "created_at": run.created_at,
+            "started_at": run.started_at,
+            "updated_at": run.updated_at,
+            "finished_at": run.finished_at,
+            "error_code": run.error_code,
+        }
+        if isinstance(rule_name, str) and rule_name:
+            payload["rule_name"] = rule_name
+        total = run.state.get("total")
+        if type(total) is int and total >= 0:
+            payload["total"] = total
+        return payload
+
+    @staticmethod
+    def _bounded_mail_rule_result(
+        rules: Sequence[Mapping[str, object]],
+        *,
+        active_run: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        result: dict[str, object] = {
+            "rules": [dict(rule) for rule in rules],
+            "active_run": None if active_run is None else dict(active_run),
+        }
+        try:
+            size = len(
+                json.dumps(
+                    result,
+                    ensure_ascii=True,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise ValueError("mail rule response is not valid JSON") from exc
+        if size > _MAX_RULE_RESPONSE_BYTES:
+            raise CommandOutputLimit("mail rule collection exceeds the response frame budget")
+        return result
+
+    def _mail_rule_list_result(self, account: Any) -> dict[str, object]:
+        active_run = self.auth_store.get_active_mail_rule_run(account.account_id)
+        return self._bounded_mail_rule_result(
+            [
+                self._mail_rule_payload(rule)
+                for rule in self.auth_store.list_mail_rules(account.account_id)
+            ],
+            active_run=(
+                None if active_run is None else self._mail_rule_run_payload(active_run)
+            ),
+        )
+
+    def _mail_rule_snapshot_records(self, account: Any) -> list[dict[str, object]]:
+        records = self.auth_store.list_mail_rules(account.account_id)
+        return [
+            {
+                "rule_id": rule.rule_id,
+                "enabled": rule.enabled,
+                "position": rule.position,
+                "condition": rule.expression,
+                "target_mailbox": rule.target_mailbox,
+                "stop_processing": rule.stop_processing,
+                "revision": rule.revision,
+            }
+            for rule in records
+        ]
+
+    def _reconcile_mail_rule_snapshots(self) -> None:
+        if self.rule_snapshot_dir is None:
+            return
+        snapshots = {
+            account.email: self._mail_rule_snapshot_records(account)
+            for account in self.auth_store.list_accounts()
+        }
+        replace_snapshot_set(
+            self.rule_snapshot_dir,
+            snapshots,
+            group_id=self.rule_snapshot_group_id,
+        )
+
+    def _publish_mail_rules(self, account: Any) -> None:
+        if self.rule_snapshot_dir is None:
+            return
+        publish_snapshot(
+            self.rule_snapshot_dir,
+            account.email,
+            self._mail_rule_snapshot_records(account),
+            group_id=self.rule_snapshot_group_id,
+        )
+
+    def _pause_mail_rule_delivery(self, account: Any) -> None:
+        if self.rule_snapshot_dir is None:
+            return
+        publish_snapshot(
+            self.rule_snapshot_dir,
+            account.email,
+            [],
+            group_id=self.rule_snapshot_group_id,
+        )
+
+    def _publish_mail_rules_after_mutation(self, account: Any) -> bool:
+        try:
+            self._publish_mail_rules(account)
+        except (OSError, RuleSnapshotError, ValueError) as exc:
+            self.audit(
+                "mail_rules.snapshot",
+                outcome="pending",
+                fields={"account": account.email, "error_type": type(exc).__name__},
+            )
+            return False
+        return True
+
+    def _rules_list(self, request: Request, _spool: TrustedSpool | None) -> Any:
+        values = _params(request, required={"username"})
+        account = self._rule_account(values["username"])
+        return self._mail_rule_list_result(account)
+
+    def _rules_create(self, request: Request, _spool: TrustedSpool | None) -> Any:
+        values = _params(
+            request,
+            required={"username", "name", "enabled", "target_mailbox", "stop_processing"},
+            optional={"match", "expression", "condition", "apply_existing"},
+        )
+        apply_existing = values.get("apply_existing", False)
+        if type(apply_existing) is not bool:
+            raise ValueError("apply_existing must be a boolean")
+        account = self._rule_account(values["username"])
+        if (
+            apply_existing
+            and self.auth_store.get_active_mail_rule_run(account.account_id) is not None
+        ):
+            raise RuleMailboxConflict("an existing-mail rule run is already active")
+        expression = self._rule_expression(values)
+        target = self._require_rule_target(values["username"], values["target_mailbox"])
+        prepared_run_state = (
+            self._new_rule_run_state(values["username"], target) if apply_existing else None
+        )
+        existing = [
+            self._mail_rule_payload(item)
+            for item in self.auth_store.list_mail_rules(account.account_id)
+        ]
+        self._bounded_mail_rule_result(
+            [
+                *existing,
+                {
+                    "rule_id": "0" * 32,
+                    "name": values["name"],
+                    "enabled": values["enabled"],
+                    "position": len(existing),
+                    "match": expression,
+                    "target_mailbox": target,
+                    "stop_processing": values["stop_processing"],
+                    "revision": 1,
+                    "created_at": 9_999_999_999,
+                    "updated_at": 9_999_999_999,
+                },
+            ]
+        )
+        self._pause_mail_rule_delivery(account)
+        run = None
+        try:
+            if apply_existing:
+                if prepared_run_state is None:
+                    raise RuntimeError("mail rule run state is unexpectedly unavailable")
+                source_mailboxes = prepared_run_state["mailboxes"]
+                mailbox_index = prepared_run_state["mailbox_index"]
+                if not isinstance(source_mailboxes, list) or type(mailbox_index) is not int:
+                    raise RuntimeError("mail rule run state is unexpectedly invalid")
+                rule, run = self.auth_store.create_mail_rule_with_run(
+                    account.account_id,
+                    name=values["name"],
+                    enabled=values["enabled"],
+                    expression=expression,
+                    target_mailbox=target,
+                    stop_processing=values["stop_processing"],
+                    run_state=prepared_run_state,
+                    run_completed=mailbox_index == len(source_mailboxes),
+                )
+            else:
+                rule = self.auth_store.create_mail_rule(
+                    account.account_id,
+                    name=values["name"],
+                    enabled=values["enabled"],
+                    expression=expression,
+                    target_mailbox=target,
+                    stop_processing=values["stop_processing"],
+                )
+        except Exception:
+            # A failed database transaction must not leave delivery paused for
+            # rules that remain authoritative and unchanged.
+            self._publish_mail_rules_after_mutation(account)
+            raise
+        delivery_ready = self._publish_mail_rules_after_mutation(account)
+        result: dict[str, object] = {
+            "rule": self._mail_rule_payload(rule),
+            "delivery_ready": delivery_ready,
+        }
+        if run is not None:
+            result["run"] = self._mail_rule_run_payload(run)
+        return result
+
+    def _rules_update(self, request: Request, _spool: TrustedSpool | None) -> Any:
+        values = _params(
+            request,
+            required={
+                "username",
+                "rule_id",
+                "name",
+                "enabled",
+                "target_mailbox",
+                "stop_processing",
+            },
+            optional={
+                "match",
+                "expression",
+                "condition",
+                "expected_revision",
+                "revision",
+            },
+        )
+        revision_fields = {"expected_revision", "revision"} & set(values)
+        if len(revision_fields) != 1:
+            raise ValueError("mail rule revision must be supplied exactly once")
+        account = self._rule_account(values["username"])
+        current = self.auth_store.get_mail_rule(account.account_id, values["rule_id"])
+        expected_revision = values[next(iter(revision_fields))]
+        if type(expected_revision) is not int or expected_revision < 1:
+            raise ValueError("mail rule revision must be a positive integer")
+        if expected_revision != current.revision:
+            raise RuleMailboxConflict("mail rule revision is stale")
+        expression = self._rule_expression(values)
+        target = self._require_rule_target(values["username"], values["target_mailbox"])
+        prospective: list[dict[str, object]] = []
+        for item in self.auth_store.list_mail_rules(account.account_id):
+            payload = self._mail_rule_payload(item)
+            if item.rule_id == current.rule_id:
+                payload.update(
+                    {
+                        "name": values["name"],
+                        "enabled": values["enabled"],
+                        "match": expression,
+                        "target_mailbox": target,
+                        "stop_processing": values["stop_processing"],
+                        "revision": current.revision + 1,
+                    }
+                )
+            prospective.append(payload)
+        self._bounded_mail_rule_result(prospective)
+        self._pause_mail_rule_delivery(account)
+        rule = self.auth_store.update_mail_rule(
+            account.account_id,
+            current.rule_id,
+            expected_revision=expected_revision,
+            name=values["name"],
+            enabled=values["enabled"],
+            expression=expression,
+            target_mailbox=target,
+            stop_processing=values["stop_processing"],
+        )
+        delivery_ready = self._publish_mail_rules_after_mutation(account)
+        return {
+            "rule": self._mail_rule_payload(rule),
+            "delivery_ready": delivery_ready,
+        }
+
+    def _rules_delete(self, request: Request, _spool: TrustedSpool | None) -> Any:
+        values = _params(request, required={"username", "rule_id"})
+        account = self._rule_account(values["username"])
+        self.auth_store.get_mail_rule(account.account_id, values["rule_id"])
+        self._pause_mail_rule_delivery(account)
+        self.auth_store.delete_mail_rule(account.account_id, values["rule_id"])
+        delivery_ready = self._publish_mail_rules_after_mutation(account)
+        return {"deleted": True, "delivery_ready": delivery_ready}
+
+    def _rules_reorder(self, request: Request, _spool: TrustedSpool | None) -> Any:
+        values = _params(request, required={"username", "rule_ids"})
+        account = self._rule_account(values["username"])
+        current_rules = self.auth_store.list_mail_rules(account.account_id)
+        current_ids = [rule.rule_id for rule in current_rules]
+        supplied_ids = values["rule_ids"]
+        if (
+            not isinstance(supplied_ids, list | tuple)
+            or any(not isinstance(rule_id, str) for rule_id in supplied_ids)
+            or len(supplied_ids) != len(set(supplied_ids))
+            or set(supplied_ids) != set(current_ids)
+        ):
+            raise ValueError("mail rule order must contain every rule exactly once")
+        current_by_id = {
+            rule.rule_id: self._mail_rule_payload(rule) for rule in current_rules
+        }
+        prospective: list[dict[str, object]] = []
+        for position, rule_id in enumerate(supplied_ids):
+            payload = current_by_id[rule_id]
+            payload["position"] = position
+            prospective.append(payload)
+        # Refuse an unrepresentable response before pausing delivery or
+        # changing authoritative metadata. The final response deliberately
+        # omits active-run state and has this same bounded rule collection.
+        self._bounded_mail_rule_result(prospective)
+        self._pause_mail_rule_delivery(account)
+        self.auth_store.reorder_mail_rules(account.account_id, values["rule_ids"])
+        delivery_ready = self._publish_mail_rules_after_mutation(account)
+        result = self._bounded_mail_rule_result(
+            [
+                self._mail_rule_payload(rule)
+                for rule in self.auth_store.list_mail_rules(account.account_id)
+            ]
+        )
+        result.pop("active_run", None)
+        result["delivery_ready"] = delivery_ready
+        return result
+
+    @staticmethod
+    def _rule_run_snapshot(rule: Any) -> dict[str, object]:
+        return {
+            "rule_id": rule.rule_id,
+            "rule_name": rule.name,
+            "condition": rule.expression,
+            "target_mailbox": rule.target_mailbox,
+            "revision": rule.revision,
+        }
+
+    def _new_rule_run_state(self, username: str, target_mailbox: str) -> dict[str, object]:
+        records = self.maddy.list_mailboxes(username)
+        if len(records) > _MAX_RULE_RUN_MAILBOXES:
+            raise ValueError("account has too many mailboxes for an existing-mail run")
+        excluded = {target_mailbox.casefold(), "trash", "archive"}
+        sources: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for record in records:
+            if not isinstance(record, Mapping):
+                raise MaddyError("Maddy returned an invalid mailbox record")
+            name = record.get("name")
+            attributes = record.get("attributes", ())
+            if (
+                not isinstance(name, str)
+                or not name
+                or not isinstance(attributes, list | tuple)
+            ):
+                raise MaddyError("Maddy returned an invalid mailbox record")
+            folded = name.casefold()
+            flags = {str(value).casefold() for value in attributes}
+            if folded in seen:
+                raise MaddyError("Maddy returned duplicate mailbox names")
+            seen.add(folded)
+            if folded in excluded or flags & {"\\trash", "\\archive"}:
+                continue
+            cursor = self.maddy.latest_message_uid(username, name)
+            sources.append({"mailbox": name, "cursor": cursor, "done": cursor == 0})
+        index = 0
+        while index < len(sources) and sources[index]["done"] is True:
+            index += 1
+        return {"mailboxes": sources, "mailbox_index": index}
+
+    def _create_rule_run(
+        self,
+        account: Any,
+        username: str,
+        rule: Any,
+        *,
+        state: dict[str, object] | None = None,
+    ) -> Any:
+        if self.auth_store.get_active_mail_rule_run(account.account_id) is not None:
+            raise RuleMailboxConflict("an existing-mail rule run is already active")
+        if state is None:
+            self._require_rule_target(username, rule.target_mailbox)
+            state = self._new_rule_run_state(username, rule.target_mailbox)
+        run = self.auth_store.create_mail_rule_run(
+            account.account_id,
+            rule.rule_id,
+            rule_snapshot=self._rule_run_snapshot(rule),
+            state=state,
+        )
+        if state["mailbox_index"] == len(state["mailboxes"]):
+            run = self.auth_store.update_mail_rule_run(
+                account.account_id,
+                run.run_id,
+                state=state,
+                status="completed",
+                scanned=0,
+                matched=0,
+                moved=0,
+                failed=0,
+            )
+        return run
+
+    def _rules_run_create(self, request: Request, _spool: TrustedSpool | None) -> Any:
+        values = _params(request, required={"username", "rule_id"})
+        account = self._rule_account(values["username"])
+        rule = self.auth_store.get_mail_rule(account.account_id, values["rule_id"])
+        run = self._create_rule_run(account, values["username"], rule)
+        return {"run": self._mail_rule_run_payload(run)}
+
+    def _rules_run_status(self, request: Request, _spool: TrustedSpool | None) -> Any:
+        values = _params(request, required={"username", "run_id"})
+        account = self._rule_account(values["username"])
+        run = self.auth_store.get_mail_rule_run(account.account_id, values["run_id"])
+        return {"run": self._mail_rule_run_payload(run)}
+
+    @staticmethod
+    def _validated_rule_run_state(run: Any) -> tuple[list[dict[str, object]], int]:
+        state = run.state
+        if not isinstance(state, Mapping) or set(state) != {"mailboxes", "mailbox_index"}:
+            raise ValueError("mail rule run state is invalid")
+        raw_sources = state.get("mailboxes")
+        index = state.get("mailbox_index")
+        if (
+            not isinstance(raw_sources, list)
+            or len(raw_sources) > _MAX_RULE_RUN_MAILBOXES
+            or type(index) is not int
+            or not 0 <= index <= len(raw_sources)
+        ):
+            raise ValueError("mail rule run state is invalid")
+        sources: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for raw in raw_sources:
+            if not isinstance(raw, Mapping) or set(raw) != {"mailbox", "cursor", "done"}:
+                raise ValueError("mail rule run mailbox state is invalid")
+            mailbox = raw.get("mailbox")
+            cursor = raw.get("cursor")
+            done = raw.get("done")
+            if (
+                not isinstance(mailbox, str)
+                or not mailbox
+                or mailbox.casefold() in seen
+                or type(cursor) is not int
+                or not 0 <= cursor <= (1 << 32) - 1
+                or type(done) is not bool
+                or (done and cursor != 0)
+            ):
+                raise ValueError("mail rule run mailbox state is invalid")
+            seen.add(mailbox.casefold())
+            sources.append({"mailbox": mailbox, "cursor": cursor, "done": done})
+        return sources, index
+
+    @staticmethod
+    def _compiled_rule_run(run: Any) -> Any:
+        snapshot = run.rule_snapshot
+        if not isinstance(snapshot, Mapping) or set(snapshot) != {
+            "rule_id",
+            "rule_name",
+            "condition",
+            "target_mailbox",
+            "revision",
+        }:
+            raise ValueError("mail rule run snapshot is invalid")
+        if (
+            not isinstance(snapshot.get("rule_id"), str)
+            or not isinstance(snapshot.get("rule_name"), str)
+            or type(snapshot.get("revision")) is not int
+            or int(snapshot["revision"]) < 1
+        ):
+            raise ValueError("mail rule run snapshot is invalid")
+        return compile_rule(
+            Rule.from_mapping(
+                {
+                    "condition": snapshot["condition"],
+                    "target_mailbox": snapshot["target_mailbox"],
+                }
+            )
+        )
+
+    def _rules_run_step(self, request: Request, _spool: TrustedSpool | None) -> Any:
+        values = _params(request, required={"username", "run_id"})
+        account = self._rule_account(values["username"])
+        run = self.auth_store.get_mail_rule_run(account.account_id, values["run_id"])
+        if run.status in {"completed", "failed", "cancelled"}:
+            return {"run": self._mail_rule_run_payload(run)}
+        sources, index = self._validated_rule_run_state(run)
+        compiled = self._compiled_rule_run(run)
+        if run.status == "queued":
+            run = self.auth_store.update_mail_rule_run(
+                account.account_id,
+                run.run_id,
+                state={"mailboxes": sources, "mailbox_index": index},
+                status="running",
+                scanned=run.scanned,
+                matched=run.matched,
+                moved=run.moved,
+                failed=run.failed,
+            )
+        while index < len(sources) and sources[index]["done"] is True:
+            index += 1
+        if index >= len(sources):
+            completed = self.auth_store.update_mail_rule_run(
+                account.account_id,
+                run.run_id,
+                state={"mailboxes": sources, "mailbox_index": index},
+                status="completed",
+                scanned=run.scanned,
+                matched=run.matched,
+                moved=run.moved,
+                failed=run.failed,
+            )
+            return {"run": self._mail_rule_run_payload(completed)}
+
+        source = sources[index]
+        mailbox = str(source["mailbox"])
+        try:
+            records = self.maddy.list_message_window(
+                values["username"],
+                mailbox,
+                limit=_RULE_RUN_BATCH_SIZE,
+                cursor_uid=int(source["cursor"]),
+            )
+            if len(records) > _RULE_RUN_BATCH_SIZE + 1:
+                raise MaddyError("Maddy returned an oversized rule-run window")
+            ordered = sorted(records, key=lambda item: int(item.get("uid", 0)), reverse=True)
+            seen_uids: set[int] = set()
+            for record in ordered:
+                uid = record.get("uid")
+                if (
+                    type(uid) is not int
+                    or not 1 <= uid <= (1 << 32) - 1
+                    or uid in seen_uids
+                ):
+                    raise MaddyError("Maddy returned an invalid rule-run UID")
+                seen_uids.add(uid)
+            candidates = ordered[:_RULE_RUN_BATCH_SIZE]
+            next_cursor = (
+                int(ordered[_RULE_RUN_BATCH_SIZE]["uid"])
+                if len(ordered) > _RULE_RUN_BATCH_SIZE
+                else 0
+            )
+            matched_uids: list[str] = []
+            for record in candidates:
+                uid = int(record["uid"])
+                raw_message = self.maddy.dump_message(values["username"], mailbox, uid)
+                if compiled.matches_raw(raw_message):
+                    matched_uids.append(str(uid))
+            if matched_uids:
+                self.maddy.move_messages(
+                    values["username"],
+                    mailbox,
+                    _selected_message_uid_set(",".join(matched_uids)),
+                    compiled.target_mailbox,
+                )
+        except MaddyError as exc:
+            failed = self.auth_store.update_mail_rule_run(
+                account.account_id,
+                run.run_id,
+                state={"mailboxes": sources, "mailbox_index": index},
+                status="failed",
+                scanned=run.scanned,
+                matched=run.matched,
+                moved=run.moved,
+                failed=run.failed + 1,
+                error_code=(
+                    "stale_cursor" if isinstance(exc, StaleMessageCursor) else "maddy_failed"
+                ),
+            )
+            return {"run": self._mail_rule_run_payload(failed)}
+
+        source["cursor"] = next_cursor
+        source["done"] = next_cursor == 0
+        if source["done"] is True:
+            index += 1
+            while index < len(sources) and sources[index]["done"] is True:
+                index += 1
+        status = "completed" if index >= len(sources) else "running"
+        updated = self.auth_store.update_mail_rule_run(
+            account.account_id,
+            run.run_id,
+            state={"mailboxes": sources, "mailbox_index": index},
+            status=status,
+            scanned=run.scanned + len(candidates),
+            matched=run.matched + len(matched_uids),
+            moved=run.moved + len(matched_uids),
+            failed=run.failed,
+        )
+        return {"run": self._mail_rule_run_payload(updated)}
+
+    def _rules_run_cancel(self, request: Request, _spool: TrustedSpool | None) -> Any:
+        values = _params(request, required={"username", "run_id"})
+        account = self._rule_account(values["username"])
+        run = self.auth_store.cancel_mail_rule_run(account.account_id, values["run_id"])
+        return {"run": self._mail_rule_run_payload(run)}
 
     def _messages_list(self, request: Request, _spool: TrustedSpool | None) -> Any:
         values = _params(

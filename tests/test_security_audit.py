@@ -106,6 +106,15 @@ def test_helper_permissions_keep_public_session_admin_and_mail_scopes_separate()
         "mailboxes.create",
         "mailboxes.delete",
         "mailboxes.rename",
+        "rules.list",
+        "rules.create",
+        "rules.update",
+        "rules.delete",
+        "rules.reorder",
+        "rules.run_create",
+        "rules.run_status",
+        "rules.run_step",
+        "rules.run_cancel",
         "messages.list",
         "messages.latest",
         "messages.get",
@@ -150,10 +159,19 @@ def test_sensitive_helper_mutations_require_recent_authentication() -> None:
         "certificates.renew",
         "messages.delete",
         "messages.delete_many",
+        "rules.create",
+        "rules.update",
+        "rules.delete",
+        "rules.reorder",
+        "rules.run_create",
+        "rules.run_step",
     }
     assert protected <= ALLOWED_OPERATIONS.keys()
     assert all(ALLOWED_OPERATIONS[name].mutating for name in protected)
     assert all(ALLOWED_OPERATIONS[name].step_up for name in protected)
+    assert ALLOWED_OPERATIONS["rules.list"].mutating is False
+    assert ALLOWED_OPERATIONS["rules.run_status"].mutating is False
+    assert ALLOWED_OPERATIONS["rules.run_cancel"].step_up is False
 
 
 def test_runtime_python_has_no_direct_shell_or_dynamic_code_execution() -> None:
