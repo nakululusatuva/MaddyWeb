@@ -160,6 +160,7 @@ def test_filter_lifecycle_checks_service_state_version_config_and_listeners() ->
     lifecycle = _read("scripts/configure-filter.sh")
     for network in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"):
         assert f'ipaddress.ip_network("{network}")' in lifecycle
+    assert 'host.get("PidMode") not in {None, ""}' in lifecycle
     assert "systemctl is-active --quiet maddy.service" in lifecycle
     assert 'record.get("Id") == sys.argv[2]' in lifecycle
     assert 'state.get("Running") is True' in lifecycle
@@ -167,6 +168,9 @@ def test_filter_lifecycle_checks_service_state_version_config_and_listeners() ->
     assert 'state.get("Restarting") is not True' in lifecycle
     assert 'observed_version" == "$maddy_version' in lifecycle
     assert 'listeners" == "$initial_maddy_listeners' in lifecycle
+    assert "/bin/busybox netstat -ltnp" in lifecycle
+    assert '$7 ~ /^[0-9]+\\//' in lifecycle
+    assert "/proc/net/tcp /proc/net/tcp6" not in lifecycle
     assert '"$pid" != "$maddy_restart_identity_before"' in lifecycle
     assert "'{{.State.StartedAt}}'" in lifecycle
     assert '"$started_at" != "$maddy_restart_identity_before"' in lifecycle

@@ -50,8 +50,8 @@ chmod 0600 "$data/tls/privkey.pem"
 chmod 0644 "$data/tls/fullchain.pem"
 
 listener_snapshot() {
-    "$docker_binary" exec "$container" /bin/cat /proc/net/tcp /proc/net/tcp6 \
-        | awk '$4 == "0A" {print $2}' \
+    "$docker_binary" exec "$container" /bin/busybox netstat -ltnp 2>/dev/null \
+        | awk '$6 == "LISTEN" && $7 ~ /^[0-9]+\// {print $4}' \
         | LC_ALL=C sort -u
 }
 

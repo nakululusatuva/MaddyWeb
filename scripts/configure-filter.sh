@@ -195,6 +195,8 @@ network = record.get("NetworkSettings") or {}
 if state.get("Running") is not True or state.get("Paused") is True:
     raise SystemExit(2)
 mode = host.get("NetworkMode")
+if host.get("PidMode") not in {None, ""}:
+    raise SystemExit(2)
 if mode == "host":
     endpoint = "127.0.0.1"
 else:
@@ -217,7 +219,7 @@ else:
         raise SystemExit(2)
 print(json.dumps({"id": record.get("Id"), "mode": mode, "endpoint": endpoint}, separators=(",", ":")))
 PY
-    ) || die "Maddy container network does not expose one private host gateway"
+    ) || die "Maddy container networking or PID isolation is unsupported"
     container_id=$("$python_binary" -c 'import json,sys; print(json.loads(sys.argv[1])["id"])' "$docker_profile")
     network_mode=$("$python_binary" -c 'import json,sys; print(json.loads(sys.argv[1])["mode"])' "$docker_profile")
     filter_host=$("$python_binary" -c 'import json,sys; print(json.loads(sys.argv[1])["endpoint"])' "$docker_profile")
@@ -413,8 +415,8 @@ native_listener_snapshot() {
 }
 
 docker_listener_snapshot() {
-    "$docker_binary" exec "$container_id" /bin/cat /proc/net/tcp /proc/net/tcp6 \
-        | awk '$4 == "0A" {print $2}' \
+    "$docker_binary" exec "$container_id" /bin/busybox netstat -ltnp 2>/dev/null \
+        | awk '$6 == "LISTEN" && $7 ~ /^[0-9]+\// {print $4}' \
         | LC_ALL=C sort -u
 }
 

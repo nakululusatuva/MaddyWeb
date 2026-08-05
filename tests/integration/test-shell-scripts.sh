@@ -43,6 +43,10 @@ grep -Fq 'systemd-tmpfiles --create "$TMPFILES_CONFIG"' "$ROOT/scripts/install.s
 grep -Fq 'MADDYWEB_APPROVAL_ROOT="/run/maddyweb-approval"' "$ROOT/scripts/lib/common.sh" || fail "approval root is not isolated"
 grep -Fq 'filter-add|filter-remove' "$ROOT/scripts/authorize-production.sh" \
     || fail "delivery filter production approval scopes are missing"
+listener_sample=$'tcp 0 0 127.0.0.1:1587 0.0.0.0:* LISTEN 1/maddy\ntcp 0 0 127.0.0.1:18787 0.0.0.0:* LISTEN -'
+process_listeners=$(awk '$6 == "LISTEN" && $7 ~ /^[0-9]+\// {print $4}' <<< "$listener_sample")
+[[ "$process_listeners" == 127.0.0.1:1587 ]] \
+    || fail "Docker listener parsing included a host-network service"
 if grep -Eq 'MADDYWEB_CONFIG|--config' "$ROOT/deploy/systemd/maddyweb-filter.service"; then
     fail "delivery filter service must not read the web application config"
 fi
