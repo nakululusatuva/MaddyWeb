@@ -1072,7 +1072,12 @@ ALLOWED_OPERATIONS: Mapping[str, _Operation] = {
     ),
     "mailboxes.list": _Operation("_mailboxes_list", permission="account"),
     "mailboxes.create": _Operation("_mailboxes_create", mutating=True, permission="account"),
-    "mailboxes.delete": _Operation("_mailboxes_delete", mutating=True, permission="account"),
+    "mailboxes.delete": _Operation(
+        "_mailboxes_delete",
+        mutating=True,
+        permission="account",
+        step_up=True,
+    ),
     "mailboxes.rename": _Operation("_mailboxes_rename", mutating=True, permission="account"),
     "rules.list": _Operation("_rules_list", permission="account"),
     "rules.create": _Operation(
@@ -2286,8 +2291,23 @@ class PrivilegedDispatcher:
         return {"created": True}
 
     def _mailboxes_delete(self, request: Request, _spool: TrustedSpool | None) -> Any:
-        values = _params(request, required={"username", "mailbox", "confirm"})
+        values = _params(
+            request,
+            required={"username", "mailbox", "disposition", "confirm"},
+            optional={"target"},
+        )
         _confirmed(values)
+        disposition = values["disposition"]
+        if disposition == "move":
+            if "target" not in values:
+                raise ValueError("move disposition requires a target mailbox")
+            target = values["target"]
+        elif disposition == "trash":
+            if "target" in values:
+                raise ValueError("trash disposition does not accept a target mailbox")
+            target = self.maddy.resolve_special_mailbox(values["username"], "trash")
+        else:
+            raise ValueError("mailbox deletion disposition is invalid")
         if self.auth_store is not None:
             account = self._rule_account(values["username"])
             if self.auth_store.mailbox_rule_reference_count(
@@ -2295,14 +2315,14 @@ class PrivilegedDispatcher:
                 values["mailbox"],
             ):
                 raise RuleMailboxConflict("mailbox is referenced by a mail rule")
-        if self.maddy.list_message_window(
+            if self.auth_store.get_active_mail_rule_run(account.account_id) is not None:
+                raise RuleMailboxConflict("an existing-mail rule run is active")
+        self.maddy.migrate_and_delete_mailbox(
             values["username"],
             values["mailbox"],
-            limit=1,
-        ):
-            raise ValueError("mailbox must be empty before deletion")
-        self.maddy.delete_mailbox(values["username"], values["mailbox"])
-        return {"deleted": True}
+            target,
+        )
+        return {"deleted": True, "target": target}
 
     def _mailboxes_rename(self, request: Request, _spool: TrustedSpool | None) -> Any:
         values = _params(request, required={"username", "old_name", "new_name"})
@@ -2428,9 +2448,7 @@ class PrivilegedDispatcher:
                 self._mail_rule_payload(rule)
                 for rule in self.auth_store.list_mail_rules(account.account_id)
             ],
-            active_run=(
-                None if active_run is None else self._mail_rule_run_payload(active_run)
-            ),
+            active_run=(None if active_run is None else self._mail_rule_run_payload(active_run)),
         )
 
     def _mail_rule_snapshot_records(self, account: Any) -> list[dict[str, object]]:
@@ -2668,9 +2686,7 @@ class PrivilegedDispatcher:
             or set(supplied_ids) != set(current_ids)
         ):
             raise ValueError("mail rule order must contain every rule exactly once")
-        current_by_id = {
-            rule.rule_id: self._mail_rule_payload(rule) for rule in current_rules
-        }
+        current_by_id = {rule.rule_id: self._mail_rule_payload(rule) for rule in current_rules}
         prospective: list[dict[str, object]] = []
         for position, rule_id in enumerate(supplied_ids):
             payload = current_by_id[rule_id]
@@ -2715,11 +2731,7 @@ class PrivilegedDispatcher:
                 raise MaddyError("Maddy returned an invalid mailbox record")
             name = record.get("name")
             attributes = record.get("attributes", ())
-            if (
-                not isinstance(name, str)
-                or not name
-                or not isinstance(attributes, list | tuple)
-            ):
+            if not isinstance(name, str) or not name or not isinstance(attributes, list | tuple):
                 raise MaddyError("Maddy returned an invalid mailbox record")
             folded = name.casefold()
             flags = {str(value).casefold() for value in attributes}
@@ -2892,11 +2904,7 @@ class PrivilegedDispatcher:
             seen_uids: set[int] = set()
             for record in ordered:
                 uid = record.get("uid")
-                if (
-                    type(uid) is not int
-                    or not 1 <= uid <= (1 << 32) - 1
-                    or uid in seen_uids
-                ):
+                if type(uid) is not int or not 1 <= uid <= (1 << 32) - 1 or uid in seen_uids:
                     raise MaddyError("Maddy returned an invalid rule-run UID")
                 seen_uids.add(uid)
             candidates = ordered[:_RULE_RUN_BATCH_SIZE]

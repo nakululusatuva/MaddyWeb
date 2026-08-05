@@ -105,6 +105,7 @@ class FakeMaddy:
         self.moved: list[tuple[str, str, str, str]] = []
         self.moved_many: list[tuple[str, str, str, str]] = []
         self.password_changes: list[tuple[str, str]] = []
+        self.mailbox_migrations: list[tuple[str, str, str]] = []
 
     def require_write_safety(self, capability: Capability) -> None:
         self.write_safety_calls.append(capability)
@@ -169,6 +170,9 @@ class FakeMaddy:
 
     def move_messages(self, username: str, source: str, uid_set: str, target: str) -> None:
         self.moved_many.append((username, source, uid_set, target))
+
+    def migrate_and_delete_mailbox(self, username: str, mailbox: str, target: str) -> None:
+        self.mailbox_migrations.append((username, mailbox, target))
 
     def dump_message_to(
         self,
@@ -260,9 +264,7 @@ class FakeRuleMaddy(FakeMaddy):
             record for record in self.mailbox_messages[source] if int(record["uid"]) in selected
         ]
         self.mailbox_messages[source] = [
-            record
-            for record in self.mailbox_messages[source]
-            if int(record["uid"]) not in selected
+            record for record in self.mailbox_messages[source] if int(record["uid"]) not in selected
         ]
         self.mailbox_messages[target].extend(moved)
 
@@ -719,6 +721,7 @@ def test_sensitive_mutations_require_helper_enforced_recent_authentication() -> 
         "certificates.renew",
         "messages.delete",
         "messages.delete_many",
+        "mailboxes.delete",
         "rules.create",
         "rules.update",
         "rules.delete",
@@ -728,6 +731,122 @@ def test_sensitive_mutations_require_helper_enforced_recent_authentication() -> 
     }
     assert all(ALLOWED_OPERATIONS[operation].step_up for operation in protected)
     assert ALLOWED_OPERATIONS["auth.recovery_regenerate"].step_up is False
+
+
+def test_mailbox_delete_requires_recent_auth_and_an_explicit_safe_destination(
+    tmp_path: Path,
+) -> None:
+    maddy = FakeMaddy()
+    with make_auth_store(tmp_path) as store:
+        account, token = provision_session(store, "sender@example.test")
+        dispatcher = make_dispatcher(tmp_path, maddy, auth_store=store)
+        blocked = dispatcher.dispatch(
+            Request.create(
+                "mailboxes.delete",
+                {
+                    "target_account_id": account.account_id,
+                    "mailbox": "Projects",
+                    "disposition": "move",
+                    "target": "INBOX",
+                    "confirm": True,
+                },
+                auth_token=token,
+            )
+        )
+        store.mark_step_up(token)
+        missing_target = dispatcher.dispatch(
+            Request.create(
+                "mailboxes.delete",
+                {
+                    "target_account_id": account.account_id,
+                    "mailbox": "Projects",
+                    "disposition": "move",
+                    "confirm": True,
+                },
+                auth_token=token,
+            )
+        )
+        moved = dispatcher.dispatch(
+            Request.create(
+                "mailboxes.delete",
+                {
+                    "target_account_id": account.account_id,
+                    "mailbox": "Projects",
+                    "disposition": "move",
+                    "target": "INBOX",
+                    "confirm": True,
+                },
+                auth_token=token,
+            )
+        )
+        trashed = dispatcher.dispatch(
+            Request.create(
+                "mailboxes.delete",
+                {
+                    "target_account_id": account.account_id,
+                    "mailbox": "Another folder",
+                    "disposition": "trash",
+                    "confirm": True,
+                },
+                auth_token=token,
+            )
+        )
+
+    assert blocked.response.error is not None
+    assert blocked.response.error.code == "step_up_required"
+    assert missing_target.response.error is not None
+    assert missing_target.response.error.code == "invalid_request"
+    assert moved.response.result == {"deleted": True, "target": "INBOX"}
+    assert trashed.response.result == {"deleted": True, "target": "Custom Trash"}
+    assert maddy.mailbox_migrations == [
+        ("sender@example.test", "Projects", "INBOX"),
+        ("sender@example.test", "Another folder", "Custom Trash"),
+    ]
+
+
+def test_mailbox_delete_rejects_an_active_existing_mail_rule_run(tmp_path: Path) -> None:
+    maddy = FakeMaddy()
+    with make_auth_store(tmp_path) as store:
+        account, token = provision_session(store, "sender@example.test")
+        store.mark_step_up(token)
+        condition = {"field": "subject", "operator": "exists"}
+        rule = store.create_mail_rule(
+            account.account_id,
+            name="Receipts",
+            enabled=True,
+            expression=condition,
+            target_mailbox="Receipts",
+            stop_processing=True,
+        )
+        store.create_mail_rule_run(
+            account.account_id,
+            rule.rule_id,
+            rule_snapshot={
+                "rule_id": rule.rule_id,
+                "rule_name": rule.name,
+                "condition": condition,
+                "target_mailbox": rule.target_mailbox,
+                "revision": rule.revision,
+            },
+            state={"mailboxes": [], "mailbox_index": 0},
+        )
+        result = make_dispatcher(tmp_path, maddy, auth_store=store).dispatch(
+            Request.create(
+                "mailboxes.delete",
+                {
+                    "target_account_id": account.account_id,
+                    "mailbox": "Projects",
+                    "disposition": "move",
+                    "target": "INBOX",
+                    "confirm": True,
+                },
+                auth_token=token,
+            )
+        )
+
+    assert result.response.error is not None
+    assert result.response.error.code == "conflict"
+    assert maddy.mailbox_migrations == []
 
 
 def test_password_login_rejection_is_generic_and_never_audits_secret(
@@ -2657,6 +2776,8 @@ def test_mail_rule_crud_publishes_snapshot_and_protects_target_folder(
                 {
                     "target_account_id": account.account_id,
                     "mailbox": "Receipts",
+                    "disposition": "move",
+                    "target": "INBOX",
                     "confirm": True,
                 },
                 auth_token=token,
@@ -2755,9 +2876,7 @@ def test_existing_mail_rule_run_is_bounded_unique_and_reports_progress(
         assert progress["matched"] == 1
         assert progress["moved"] == 1
         assert progress["failed"] == 0
-        assert maddy.moved_many == [
-            ("sender@example.test", "INBOX", "2", "Receipts")
-        ]
+        assert maddy.moved_many == [("sender@example.test", "INBOX", "2", "Receipts")]
 
         listed = dispatcher.dispatch(
             Request.create(
@@ -2856,9 +2975,7 @@ def test_mail_rule_reorder_frame_budget_fails_before_storage_mutation(
 
         assert reordered.response.error is not None
         assert reordered.response.error.code == "limit_exceeded"
-        assert [
-            rule.rule_id for rule in store.list_mail_rules(account.account_id)
-        ] == rule_ids
+        assert [rule.rule_id for rule in store.list_mail_rules(account.account_id)] == rule_ids
         assert load_snapshot(snapshots, account.email) == before
 
 

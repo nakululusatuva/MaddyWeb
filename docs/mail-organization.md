@@ -15,7 +15,10 @@ The Mail workspace includes:
 - Folder creation for the signed-in mailbox. Administrators create folders in
   the mailbox currently shown by the persistent administrator-view banner.
 - Single-message and bounded bulk moves to an existing folder.
-- Existing folder rename and empty-folder deletion APIs. INBOX and folders
+- Existing folder rename and guarded custom-folder deletion APIs. Before a
+  custom folder is removed, the user must explicitly choose either another
+  existing folder or Trash for every message. MaddyWeb completes and verifies
+  that move before removing the now-empty source folder. INBOX and folders
   marked with protected `SPECIAL-USE` attributes cannot be renamed or removed.
   A folder referenced by a filing rule must first be removed from, or replaced
   in, that rule.

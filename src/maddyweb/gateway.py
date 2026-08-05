@@ -1052,17 +1052,50 @@ class HelperGateway:
             },
         )
 
-    async def delete_named_mailbox(self, account_id: str, mailbox: str) -> None:
+    async def delete_named_mailbox(
+        self,
+        account_id: str,
+        mailbox: str,
+        *,
+        disposition: str,
+        target_mailbox: str | None = None,
+    ) -> str:
         self._invalidate_message_lists(account_id, mailbox)
-        await self._mailbox_mutation(
-            account_id,
-            "mailboxes.delete",
-            {
-                "target_account_id": account_id,
-                "mailbox": mailbox,
-                "confirm": True,
-            },
-        )
+        if target_mailbox is not None:
+            self._invalidate_message_lists(account_id, target_mailbox)
+        elif disposition == "trash":
+            # The helper resolves the account's authoritative Trash mailbox.
+            # Until a successful response names it, invalidate the whole
+            # account so an ambiguous transport failure cannot leave a stale
+            # Trash view behind.
+            self._invalidate_message_lists(account_id)
+        params: dict[str, Any] = {
+            "target_account_id": account_id,
+            "mailbox": mailbox,
+            "disposition": disposition,
+            "confirm": True,
+        }
+        if target_mailbox is not None:
+            params["target"] = target_mailbox
+        try:
+            result = _mapping(
+                await self._mailbox_mutation(account_id, "mailboxes.delete", params),
+                "mailboxes.delete",
+            )
+        finally:
+            self._invalidate_message_lists(account_id, mailbox)
+            if target_mailbox is not None:
+                self._invalidate_message_lists(account_id, target_mailbox)
+            elif disposition == "trash":
+                self._invalidate_message_lists(account_id)
+        target = result.get("target")
+        if not isinstance(target, str) or not target:
+            raise HelperCallError(
+                "invalid_response",
+                "mailboxes.delete returned no migration target",
+            )
+        self._invalidate_message_lists(account_id, target)
+        return target
 
     @staticmethod
     def _mail_rules_result(value: Any, operation: str) -> Mapping[str, Any]:

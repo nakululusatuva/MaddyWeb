@@ -524,6 +524,28 @@ def main() -> None:
             for item in service.list_messages(username, "MatrixArchive", uid_set="1:*", full=True)
         ):
             raise RuntimeError("message remove read-back failed")
+        service.create_mailbox(username, "MatrixDelete")
+        service.append_message(username, "MatrixDelete", message)
+        service.migrate_and_delete_mailbox(username, "MatrixDelete", "MatrixArchive")
+        if any(item.get("name") == "MatrixDelete" for item in service.list_mailboxes(username)):
+            raise RuntimeError("migrated mailbox deletion did not read back")
+        migrated = next(
+            (
+                item
+                for item in service.list_messages(
+                    username,
+                    "MatrixArchive",
+                    uid_set="1:*",
+                    full=True,
+                )
+                if item.get("message_id") == message_id
+            ),
+            None,
+        )
+        if migrated is None or not isinstance(migrated.get("uid"), int):
+            raise RuntimeError("mailbox deletion did not preserve migrated messages")
+        service.delete_messages(username, "MatrixArchive", str(migrated["uid"]))
+        service.migrate_and_delete_mailbox(username, "MatrixArchive", "INBOX")
         service.disable_credentials(username)
         credentials_created = False
         service.delete_imap_account(username)

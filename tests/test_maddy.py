@@ -619,6 +619,313 @@ def test_folder_delete_and_rename_verify_mutable_mailboxes() -> None:
     assert "rename" in rename_runner.calls[1]["argv"]
 
 
+@pytest.mark.parametrize("version", ("0.8.2", "0.9.5"))
+def test_folder_delete_quarantines_copies_then_removes_in_verified_order(
+    version: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quarantine = "MaddyWeb Quarantine " + "a" * 32
+    monkeypatch.setattr("maddyweb.maddy.secrets.token_hex", lambda _size: "a" * 32)
+    runner = QueueRunner(
+        [
+            (b"Projects\nINBOX\n", b"", 0),
+            (b"", b"", 0),
+            (f"{quarantine}\nINBOX\n".encode(), b"", 0),
+            (full_message_record(42, 1), b"", 0),
+            (b"", b"", 0),
+            (f"{quarantine}\nINBOX\n".encode(), b"", 0),
+            (b"", b"", 0),
+            (b"", b"", 0),
+            (f"{quarantine}\nINBOX\n".encode(), b"", 0),
+            (b"", b"", 0),
+            (b"INBOX\n", b"", 0),
+        ]
+    )
+
+    service_with(runner, version=version).migrate_and_delete_mailbox(
+        "user@example.test",
+        "Projects",
+        "INBOX",
+    )
+
+    assert "imap-mboxes" in runner.calls[1]["argv"]
+    assert "rename" in runner.calls[1]["argv"]
+    assert runner.calls[1]["argv"][-3:] == (
+        "user@example.test",
+        "Projects",
+        quarantine,
+    )
+    copy = runner.calls[4]["argv"]
+    assert "imap-msgs" in copy
+    assert "copy" in copy
+    assert copy[-4:] == ("user@example.test", quarantine, "1:42", "INBOX")
+    message_remove = runner.calls[6]["argv"]
+    assert "imap-msgs" in message_remove
+    assert "remove" in message_remove
+    assert message_remove[-3:] == ("user@example.test", quarantine, "1:42")
+    mailbox_remove = runner.calls[9]["argv"]
+    assert "imap-mboxes" in mailbox_remove
+    assert "remove" in mailbox_remove
+    assert mailbox_remove[-2:] == ("user@example.test", quarantine)
+
+
+def test_empty_folder_delete_skips_message_copy_and_removal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quarantine = "MaddyWeb Quarantine " + "a" * 32
+    monkeypatch.setattr("maddyweb.maddy.secrets.token_hex", lambda _size: "a" * 32)
+    runner = QueueRunner(
+        [
+            (b"Projects\nINBOX\n", b"", 0),
+            (b"", b"", 0),
+            (f"{quarantine}\nINBOX\n".encode(), b"", 0),
+            (b"", b"", 0),
+            (f"{quarantine}\nINBOX\n".encode(), b"", 0),
+            (b"", b"", 0),
+            (f"{quarantine}\nINBOX\n".encode(), b"", 0),
+            (b"", b"", 0),
+            (b"INBOX\n", b"", 0),
+        ]
+    )
+
+    service_with(runner).migrate_and_delete_mailbox(
+        "user@example.test",
+        "Projects",
+        "INBOX",
+    )
+
+    message_mutations = [
+        call["argv"]
+        for call in runner.calls
+        if "imap-msgs" in call["argv"] and ("copy" in call["argv"] or "remove" in call["argv"])
+    ]
+    assert message_mutations == []
+    assert "imap-mboxes" in runner.calls[7]["argv"]
+    assert "remove" in runner.calls[7]["argv"]
+
+
+def test_folder_delete_rejects_protected_source_and_invalid_target_before_move() -> None:
+    protected_runner = QueueRunner([(b"Custom Sent\t[\\Sent]\nINBOX\n", b"", 0)])
+    with pytest.raises(InvalidMaddyArgument, match="protected"):
+        service_with(protected_runner).migrate_and_delete_mailbox(
+            "user@example.test",
+            "Custom Sent",
+            "INBOX",
+        )
+    assert len(protected_runner.calls) == 1
+
+    missing_runner = QueueRunner([(b"Projects\nINBOX\n", b"", 0)])
+    with pytest.raises(InvalidMaddyArgument, match="target mailbox"):
+        service_with(missing_runner).migrate_and_delete_mailbox(
+            "user@example.test",
+            "Projects",
+            "Missing",
+        )
+    assert len(missing_runner.calls) == 1
+
+    same_runner = QueueRunner([(b"Projects\nINBOX\n", b"", 0)])
+    with pytest.raises(InvalidMaddyArgument, match="must differ"):
+        service_with(same_runner).migrate_and_delete_mailbox(
+            "user@example.test",
+            "Projects",
+            "Projects",
+        )
+    assert len(same_runner.calls) == 1
+
+    child_runner = QueueRunner([(b"Projects\nProjects/2026\nINBOX\n", b"", 0)])
+    with pytest.raises(InvalidMaddyArgument, match="child mailboxes"):
+        service_with(child_runner).migrate_and_delete_mailbox(
+            "user@example.test",
+            "Projects",
+            "INBOX",
+        )
+    assert len(child_runner.calls) == 1
+
+
+def test_folder_delete_restores_quarantine_when_a_post_copy_message_appears(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quarantine = "MaddyWeb Quarantine " + "a" * 32
+    monkeypatch.setattr("maddyweb.maddy.secrets.token_hex", lambda _size: "a" * 32)
+    appended = full_message_record(43, 1)
+    runner = QueueRunner(
+        [
+            (b"Projects\nINBOX\n", b"", 0),
+            (b"", b"", 0),
+            (f"{quarantine}\nINBOX\n".encode(), b"", 0),
+            (full_message_record(42, 1), b"", 0),
+            (b"", b"", 0),
+            (f"{quarantine}\nINBOX\n".encode(), b"", 0),
+            (b"", b"", 0),
+            (appended, b"", 0),
+            (appended, b"", 0),
+            (f"{quarantine}\nINBOX\n".encode(), b"", 0),
+            (b"", b"", 0),
+            (b"Projects\nINBOX\n", b"", 0),
+        ]
+    )
+
+    with pytest.raises(MaddyError, match="quarantined mailbox changed"):
+        service_with(runner).migrate_and_delete_mailbox(
+            "user@example.test",
+            "Projects",
+            "INBOX",
+        )
+
+    message_remove = runner.calls[6]["argv"]
+    assert "imap-msgs" in message_remove
+    assert message_remove[-1] == "1:42"
+    assert not any(
+        "imap-mboxes" in call["argv"] and "remove" in call["argv"] for call in runner.calls
+    )
+    assert runner.calls[-2]["argv"][-3:] == (
+        "user@example.test",
+        quarantine,
+        "Projects",
+    )
+
+
+def test_folder_delete_target_disappearance_preserves_quarantined_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quarantine = "MaddyWeb Quarantine " + "a" * 32
+    monkeypatch.setattr("maddyweb.maddy.secrets.token_hex", lambda _size: "a" * 32)
+    runner = QueueRunner(
+        [
+            (b"Projects\nINBOX\n", b"", 0),
+            (b"", b"", 0),
+            (f"{quarantine}\nINBOX\n".encode(), b"", 0),
+            (full_message_record(42, 1), b"", 0),
+            (b"", b"", 0),
+            (f"{quarantine}\n".encode(), b"", 0),
+            (f"{quarantine}\n".encode(), b"", 0),
+            (b"", b"", 0),
+            (b"Projects\n", b"", 0),
+        ]
+    )
+
+    with pytest.raises(MaddyError, match="destination disappeared"):
+        service_with(runner).migrate_and_delete_mailbox(
+            "user@example.test",
+            "Projects",
+            "INBOX",
+        )
+
+    assert not any(
+        "imap-msgs" in call["argv"] and "remove" in call["argv"] for call in runner.calls
+    )
+    assert not any(
+        "imap-mboxes" in call["argv"] and "remove" in call["argv"] for call in runner.calls
+    )
+    assert runner.calls[-2]["argv"][-3:] == (
+        "user@example.test",
+        quarantine,
+        "Projects",
+    )
+
+
+def test_folder_delete_copy_failure_restores_the_original_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quarantine = "MaddyWeb Quarantine " + "a" * 32
+    monkeypatch.setattr("maddyweb.maddy.secrets.token_hex", lambda _size: "a" * 32)
+    runner = QueueRunner(
+        [
+            (b"Projects\nINBOX\n", b"", 0),
+            (b"", b"", 0),
+            (f"{quarantine}\nINBOX\n".encode(), b"", 0),
+            (full_message_record(42, 1), b"", 0),
+            (b"", b"copy failed", 1),
+            (f"{quarantine}\nINBOX\n".encode(), b"", 0),
+            (b"", b"", 0),
+            (b"Projects\nINBOX\n", b"", 0),
+        ]
+    )
+
+    with pytest.raises(CommandFailed):
+        service_with(runner).migrate_and_delete_mailbox(
+            "user@example.test",
+            "Projects",
+            "INBOX",
+        )
+
+    assert not any("remove" in call["argv"] for call in runner.calls)
+    assert runner.calls[-2]["argv"][-3:] == (
+        "user@example.test",
+        quarantine,
+        "Projects",
+    )
+
+
+def test_folder_delete_does_not_overwrite_a_concurrently_recreated_original(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quarantine = "MaddyWeb Quarantine " + "a" * 32
+    monkeypatch.setattr("maddyweb.maddy.secrets.token_hex", lambda _size: "a" * 32)
+    both = f"Projects\n{quarantine}\nINBOX\n".encode()
+    runner = QueueRunner(
+        [
+            (b"Projects\nINBOX\n", b"", 0),
+            (b"", b"", 0),
+            (f"{quarantine}\nINBOX\n".encode(), b"", 0),
+            (b"", b"", 0),
+            (both, b"", 0),
+            (both, b"", 0),
+        ]
+    )
+
+    with pytest.raises(MaddyError, match="original mailbox was recreated"):
+        service_with(runner).migrate_and_delete_mailbox(
+            "user@example.test",
+            "Projects",
+            "INBOX",
+        )
+
+    assert len(runner.calls) == 6
+    assert not any(
+        "rename" in call["argv"] and call["argv"][-1] == "Projects" for call in runner.calls[2:]
+    )
+    assert not any("remove" in call["argv"] for call in runner.calls)
+
+
+def test_folder_delete_quarantine_name_collisions_are_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = "MaddyWeb Quarantine " + "a" * 32
+    second = "MaddyWeb Quarantine " + "b" * 32
+    tokens = iter(("a" * 32, "b" * 32))
+    monkeypatch.setattr("maddyweb.maddy.secrets.token_hex", lambda _size: next(tokens))
+    runner = QueueRunner(
+        [
+            (f"Projects\nINBOX\n{first}\n".encode(), b"", 0),
+            (b"", b"", 0),
+            (f"{second}\nINBOX\n{first}\n".encode(), b"", 0),
+            (b"", b"", 0),
+            (f"{second}\nINBOX\n{first}\n".encode(), b"", 0),
+            (b"", b"", 0),
+            (f"{second}\nINBOX\n{first}\n".encode(), b"", 0),
+            (b"", b"", 0),
+            (f"INBOX\n{first}\n".encode(), b"", 0),
+        ]
+    )
+    service_with(runner).migrate_and_delete_mailbox(
+        "user@example.test",
+        "Projects",
+        "INBOX",
+    )
+    assert runner.calls[1]["argv"][-1] == second
+
+    monkeypatch.setattr("maddyweb.maddy.secrets.token_hex", lambda _size: "a" * 32)
+    exhausted = QueueRunner([(f"Projects\nINBOX\n{first}\n".encode(), b"", 0)])
+    with pytest.raises(MaddyError, match="unique mailbox quarantine"):
+        service_with(exhausted).migrate_and_delete_mailbox(
+            "user@example.test",
+            "Projects",
+            "INBOX",
+        )
+    assert len(exhausted.calls) == 1
+
+
 def test_folder_rename_rejects_special_source_and_reserved_target() -> None:
     special_runner = QueueRunner([(b"Custom Sent\t[\\Sent]\n", b"", 0)])
     with pytest.raises(InvalidMaddyArgument, match="protected"):
@@ -876,9 +1183,7 @@ def test_latest_message_uid_uses_one_bounded_uid_probe() -> None:
 
 
 def test_latest_message_uid_rejects_multiple_records() -> None:
-    runner = QueueRunner(
-        [(full_message_record(41, 8) + full_message_record(42, 9), b"", 0)]
-    )
+    runner = QueueRunner([(full_message_record(41, 8) + full_message_record(42, 9), b"", 0)])
 
     with pytest.raises(MaddyError, match="invalid latest-message result"):
         service_with(runner).latest_message_uid("user@example.test", "INBOX")

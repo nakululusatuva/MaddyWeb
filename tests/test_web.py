@@ -303,8 +303,24 @@ class FakeGateway:
     ) -> None:
         self.operations.append(("rename_mailbox", account_id, old_name, new_name))
 
-    async def delete_named_mailbox(self, account_id: str, mailbox: str) -> None:
-        self.operations.append(("delete_named_mailbox", account_id, mailbox))
+    async def delete_named_mailbox(
+        self,
+        account_id: str,
+        mailbox: str,
+        *,
+        disposition: str,
+        target_mailbox: str | None = None,
+    ) -> str:
+        self.operations.append(
+            (
+                "delete_named_mailbox",
+                account_id,
+                mailbox,
+                disposition,
+                target_mailbox,
+            )
+        )
+        return target_mailbox if disposition == "move" else "Trash"
 
     async def list_mail_rules(self, account_id: str) -> dict[str, object]:
         if self.mail_rule_error is not None:
@@ -1376,6 +1392,7 @@ async def test_mailbox_payload_exposes_validated_special_use_flags(
             "Inbox",
             {"name": "Deleted Items", "attributes": [r"\Trash", r"\HasNoChildren"]},
             {"name": "Stored Mail", "attributes": [r"\ARCHIVE"]},
+            {"name": "Unified", "attributes": [r"\All"]},
         ]
 
     gateway.list_mailboxes = special_use_mailboxes  # type: ignore[method-assign]
@@ -1386,9 +1403,30 @@ async def test_mailbox_payload_exposes_validated_special_use_flags(
 
     assert response.status == 200
     assert data["mailboxes"] == [
-        {"name": "Inbox", "is_trash": False, "is_archive": False},
-        {"name": "Deleted Items", "is_trash": True, "is_archive": False},
-        {"name": "Stored Mail", "is_trash": False, "is_archive": True},
+        {
+            "name": "Inbox",
+            "is_trash": False,
+            "is_archive": False,
+            "is_protected": True,
+        },
+        {
+            "name": "Deleted Items",
+            "is_trash": True,
+            "is_archive": False,
+            "is_protected": True,
+        },
+        {
+            "name": "Stored Mail",
+            "is_trash": False,
+            "is_archive": True,
+            "is_protected": True,
+        },
+        {
+            "name": "Unified",
+            "is_trash": False,
+            "is_archive": False,
+            "is_protected": True,
+        },
     ]
     assert data["trash_available"] is True
     assert data["archive_available"] is True
@@ -1456,16 +1494,10 @@ async def test_all_mail_excludes_resolved_special_folders_and_keeps_source_ident
         ("Receipts", "42"),
         ("INBOX", "42"),
     ]
-    listed = {
-        operation[2]
-        for operation in gateway.operations
-        if operation[0] == "list_messages"
-    }
+    listed = {operation[2] for operation in gateway.operations if operation[0] == "list_messages"}
     assert listed == {"INBOX", "Receipts"}
     assert all(
-        operation[3] <= 20
-        for operation in gateway.operations
-        if operation[0] == "list_messages"
+        operation[3] <= 20 for operation in gateway.operations if operation[0] == "list_messages"
     )
 
     mixed_context = await client.get(
@@ -1509,9 +1541,7 @@ async def test_all_mail_cursor_resumes_each_source_without_uid_collisions(
             start = next(index for index, row in enumerate(mailbox_rows) if row["uid"] == offset)
         items = mailbox_rows[start : start + limit]
         next_offset = (
-            int(mailbox_rows[start + limit]["uid"])
-            if start + limit < len(mailbox_rows)
-            else None
+            int(mailbox_rows[start + limit]["uid"]) if start + limit < len(mailbox_rows) else None
         )
         return MessagePage(
             items,
@@ -1525,17 +1555,13 @@ async def test_all_mail_cursor_resumes_each_source_without_uid_collisions(
     base = f"/api/v1/admin/mail?account={ADMIN_ACCOUNT_ID}&view=all"
     _response, first = await _api_data(client, base)
     next_cursor = str(first["next_cursor"])
-    first_identities = {
-        (str(item["mailbox"]), str(item["uid"])) for item in first["messages"]
-    }
+    first_identities = {(str(item["mailbox"]), str(item["uid"])) for item in first["messages"]}
 
     assert len(first_identities) == 20
     assert next_cursor
     gateway.operations.clear()
     _response, second = await _api_data(client, f"{base}&cursor={next_cursor}")
-    second_identities = {
-        (str(item["mailbox"]), str(item["uid"])) for item in second["messages"]
-    }
+    second_identities = {(str(item["mailbox"]), str(item["uid"])) for item in second["messages"]}
     assert len(second_identities) == 20
     assert first_identities.isdisjoint(second_identities)
     assert second["previous_cursor"]
@@ -1581,9 +1607,7 @@ async def test_all_mail_fills_a_page_from_one_busy_folder_with_bounded_fanout(
         if offset:
             start = next(index for index, row in enumerate(rows) if row["uid"] == offset)
         items = rows[start : start + limit]
-        next_offset = (
-            int(rows[start + limit]["uid"]) if start + limit < len(rows) else None
-        )
+        next_offset = int(rows[start + limit]["uid"]) if start + limit < len(rows) else None
         return MessagePage(
             items,
             next_offset is not None,
@@ -1598,9 +1622,7 @@ async def test_all_mail_fills_a_page_from_one_busy_folder_with_bounded_fanout(
 
     assert len(first["messages"]) == 20
     assert {item["mailbox"] for item in first["messages"]} == {"INBOX"}
-    list_calls = [
-        operation for operation in gateway.operations if operation[0] == "list_messages"
-    ]
+    list_calls = [operation for operation in gateway.operations if operation[0] == "list_messages"]
     assert len(list_calls) <= 65
     assert all(1 <= int(operation[3]) <= 20 for operation in list_calls)
 
@@ -1611,18 +1633,14 @@ async def test_all_mail_fills_a_page_from_one_busy_folder_with_bounded_fanout(
         f"{base}&cursor={first['next_cursor']}",
     )
     assert len(second["messages"]) == 20
-    assert {
-        (str(item["mailbox"]), str(item["uid"])) for item in first["messages"]
-    }.isdisjoint(
+    assert {(str(item["mailbox"]), str(item["uid"])) for item in first["messages"]}.isdisjoint(
         (str(item["mailbox"]), str(item["uid"])) for item in second["messages"]
     )
     _response, previous = await _api_data(
         client,
         f"{base}&cursor={second['previous_cursor']}",
     )
-    assert [
-        (str(item["mailbox"]), str(item["uid"])) for item in previous["messages"]
-    ] == [
+    assert [(str(item["mailbox"]), str(item["uid"])) for item in previous["messages"]] == [
         (str(item["mailbox"]), str(item["uid"])) for item in first["messages"]
     ]
 
@@ -1639,8 +1657,7 @@ async def test_all_mail_fills_a_page_from_one_busy_folder_with_bounded_fanout(
     assert wrong_account.status == 409
 
     personal_override = await client.get(
-        "/api/v1/me/mail?"
-        + urlencode({"account": DISABLED_ACCOUNT_ID, "view": "all"})
+        "/api/v1/me/mail?" + urlencode({"account": DISABLED_ACCOUNT_ID, "view": "all"})
     )
     assert personal_override.status == 400
 
@@ -1686,9 +1703,24 @@ async def test_folder_mutation_endpoints_are_account_scoped_and_confirm_delete(
             "account": ADMIN_ACCOUNT_ID,
             "name": "Projects/Current",
             "confirmation": "Projects",
+            "disposition": "move",
+            "target_mailbox": "INBOX",
         },
     )
     assert rejected.status == 400
+    assert not any(operation[0] == "delete_named_mailbox" for operation in gateway.operations)
+
+    missing_disposition = await _post_json(
+        client,
+        "/api/v1/admin/mailboxes/delete",
+        await _get_token(client),
+        {
+            "account": ADMIN_ACCOUNT_ID,
+            "name": "Projects/Current",
+            "confirmation": "Projects/Current",
+        },
+    )
+    assert missing_disposition.status == 400
     assert not any(operation[0] == "delete_named_mailbox" for operation in gateway.operations)
 
     deleted = await _post_json(
@@ -1699,10 +1731,19 @@ async def test_folder_mutation_endpoints_are_account_scoped_and_confirm_delete(
             "account": ADMIN_ACCOUNT_ID,
             "name": "Projects/Current",
             "confirmation": "Projects/Current",
+            "disposition": "move",
+            "target_mailbox": "INBOX",
         },
     )
     assert deleted.status == 200
-    assert ("delete_named_mailbox", ADMIN_ACCOUNT_ID, "Projects/Current") in gateway.operations
+    assert (await deleted.json())["data"] == {"target_mailbox": "INBOX"}
+    assert (
+        "delete_named_mailbox",
+        ADMIN_ACCOUNT_ID,
+        "Projects/Current",
+        "move",
+        "INBOX",
+    ) in gateway.operations
 
     personal_cross_account = await _post_json(
         client,
@@ -1733,8 +1774,34 @@ async def test_folder_mutation_endpoints_are_account_scoped_and_confirm_delete(
     )
     assert referenced.status == 409
     assert (await referenced.json())["error"]["message"] == (
-        "The folder is used by a mail rule and cannot be changed."
+        "The folder is in use by mail-rule processing and cannot be changed."
     )
+
+
+@pytest.mark.asyncio
+async def test_folder_delete_propagates_recent_authentication_requirement(
+    web_client: tuple[TestClient, FakeGateway],
+) -> None:
+    client, gateway = web_client
+
+    async def step_up_required(*_args: object, **_kwargs: object) -> str:
+        raise HelperCallError("step_up_required", "internal recent-authentication gate")
+
+    gateway.delete_named_mailbox = step_up_required  # type: ignore[method-assign]
+    response = await _post_json(
+        client,
+        "/api/v1/admin/mailboxes/delete",
+        await _get_token(client),
+        {
+            "account": ADMIN_ACCOUNT_ID,
+            "name": "Projects",
+            "confirmation": "Projects",
+            "disposition": "trash",
+        },
+    )
+
+    assert response.status == 403
+    assert (await response.json())["error"]["code"] == "step_up_required"
 
 
 @pytest.mark.asyncio
@@ -1814,9 +1881,9 @@ async def test_mail_rule_spa_and_admin_api_match_frontend_contract(
         },
     )
     assert alias_updated.status == 200
-    assert [
-        operation for operation in gateway.operations if operation[0] == "update_mail_rule"
-    ][-1][-1] == 2
+    assert [operation for operation in gateway.operations if operation[0] == "update_mail_rule"][
+        -1
+    ][-1] == 2
 
     duplicate_revision = await _post_json(
         client,
@@ -1866,9 +1933,7 @@ async def test_mail_rule_spa_and_admin_api_match_frontend_contract(
     )
     assert started.status == 201
 
-    status = await client.get(
-        f"/api/v1/admin/mail-rule-runs/{run_id}?account={ADMIN_ACCOUNT_ID}"
-    )
+    status = await client.get(f"/api/v1/admin/mail-rule-runs/{run_id}?account={ADMIN_ACCOUNT_ID}")
     assert status.status == 200
 
     stepped = await _post_json(
@@ -1896,9 +1961,7 @@ async def test_mail_rule_spa_and_admin_api_match_frontend_contract(
     )
     assert deleted.status == 200
 
-    personal_cross_account = await client.get(
-        f"/api/v1/me/mail-rules?account={ADMIN_ACCOUNT_ID}"
-    )
+    personal_cross_account = await client.get(f"/api/v1/me/mail-rules?account={ADMIN_ACCOUNT_ID}")
     assert personal_cross_account.status == 400
 
 
@@ -1976,9 +2039,7 @@ async def test_mail_rule_mutations_require_recent_verification_but_reads_and_can
     )
 
     listed = await client.get(f"/api/v1/admin/mail-rules?account={ADMIN_ACCOUNT_ID}")
-    status = await client.get(
-        f"/api/v1/admin/mail-rule-runs/{run_id}?account={ADMIN_ACCOUNT_ID}"
-    )
+    status = await client.get(f"/api/v1/admin/mail-rule-runs/{run_id}?account={ADMIN_ACCOUNT_ID}")
     assert listed.status == 200
     assert status.status == 200
 
@@ -2107,8 +2168,7 @@ async def test_bulk_message_actions_validate_selection_and_use_fixed_mailbox_sco
 
     token = await _get_token(client)
     move_freshness = {
-        uid: await _message_action_token(client, uid, mailbox="INBOX")
-        for uid in ("42", "43")
+        uid: await _message_action_token(client, uid, mailbox="INBOX") for uid in ("42", "43")
     }
     moved = await _post_json(
         client,
@@ -2119,9 +2179,7 @@ async def test_bulk_message_actions_validate_selection_and_use_fixed_mailbox_sco
             "action": "move",
             "target_mailbox": "Sent",
             "uids": ["42", "43"],
-            "freshness": [
-                {"uid": uid, "token": move_freshness[uid]} for uid in ("42", "43")
-            ],
+            "freshness": [{"uid": uid, "token": move_freshness[uid]} for uid in ("42", "43")],
         },
     )
     moved_payload = await moved.json()
@@ -2596,10 +2654,30 @@ async def test_other_bulk_actions_reject_permanent_delete_fields(
                 {"name": "Archive", "attributes": []},
             ],
             [
-                {"name": "Deleted Items", "is_trash": True, "is_archive": False},
-                {"name": "Stored Mail", "is_trash": False, "is_archive": True},
-                {"name": "Trash", "is_trash": False, "is_archive": False},
-                {"name": "Archive", "is_trash": False, "is_archive": False},
+                {
+                    "name": "Deleted Items",
+                    "is_trash": True,
+                    "is_archive": False,
+                    "is_protected": True,
+                },
+                {
+                    "name": "Stored Mail",
+                    "is_trash": False,
+                    "is_archive": True,
+                    "is_protected": True,
+                },
+                {
+                    "name": "Trash",
+                    "is_trash": False,
+                    "is_archive": False,
+                    "is_protected": True,
+                },
+                {
+                    "name": "Archive",
+                    "is_trash": False,
+                    "is_archive": False,
+                    "is_protected": True,
+                },
             ],
             True,
             True,
@@ -2607,8 +2685,18 @@ async def test_other_bulk_actions_reject_permanent_delete_fields(
         (
             ["INBOX", "Saved"],
             [
-                {"name": "INBOX", "is_trash": False, "is_archive": False},
-                {"name": "Saved", "is_trash": False, "is_archive": False},
+                {
+                    "name": "INBOX",
+                    "is_trash": False,
+                    "is_archive": False,
+                    "is_protected": True,
+                },
+                {
+                    "name": "Saved",
+                    "is_trash": False,
+                    "is_archive": False,
+                    "is_protected": False,
+                },
             ],
             False,
             False,
@@ -2621,10 +2709,30 @@ async def test_other_bulk_actions_reject_permanent_delete_fields(
                 {"name": "Archive Two", "attributes": [r"\Archive"]},
             ],
             [
-                {"name": "Trash One", "is_trash": False, "is_archive": False},
-                {"name": "Trash Two", "is_trash": False, "is_archive": False},
-                {"name": "Archive One", "is_trash": False, "is_archive": False},
-                {"name": "Archive Two", "is_trash": False, "is_archive": False},
+                {
+                    "name": "Trash One",
+                    "is_trash": False,
+                    "is_archive": False,
+                    "is_protected": True,
+                },
+                {
+                    "name": "Trash Two",
+                    "is_trash": False,
+                    "is_archive": False,
+                    "is_protected": True,
+                },
+                {
+                    "name": "Archive One",
+                    "is_trash": False,
+                    "is_archive": False,
+                    "is_protected": True,
+                },
+                {
+                    "name": "Archive Two",
+                    "is_trash": False,
+                    "is_archive": False,
+                    "is_protected": True,
+                },
             ],
             False,
             False,
@@ -2632,9 +2740,24 @@ async def test_other_bulk_actions_reject_permanent_delete_fields(
         (
             ["INBOX", "Trash", {"name": "Archive", "attributes": []}],
             [
-                {"name": "INBOX", "is_trash": False, "is_archive": False},
-                {"name": "Trash", "is_trash": True, "is_archive": False},
-                {"name": "Archive", "is_trash": False, "is_archive": True},
+                {
+                    "name": "INBOX",
+                    "is_trash": False,
+                    "is_archive": False,
+                    "is_protected": True,
+                },
+                {
+                    "name": "Trash",
+                    "is_trash": True,
+                    "is_archive": False,
+                    "is_protected": True,
+                },
+                {
+                    "name": "Archive",
+                    "is_trash": False,
+                    "is_archive": True,
+                    "is_protected": True,
+                },
             ],
             True,
             True,

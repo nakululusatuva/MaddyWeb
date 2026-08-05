@@ -13,6 +13,7 @@ import io
 import json
 import os
 import re
+import secrets
 import signal
 import subprocess
 import threading
@@ -46,6 +47,8 @@ _PROTECTED_MAILBOX_NAMES = frozenset({"inbox", *_SPECIAL_USES})
 _PROTECTED_SPECIAL_USE_FLAGS = frozenset(
     {"\\all", "\\archive", "\\drafts", "\\flagged", "\\important", "\\junk", "\\sent", "\\trash"}
 )
+_MAILBOX_QUARANTINE_PREFIX = "MaddyWeb Quarantine "
+_MAILBOX_QUARANTINE_ATTEMPTS = 4
 _OFFICIAL_DOCKER_ENV_ASSIGNMENTS = frozenset(
     {
         "$(hostname) = {env:MADDY_HOSTNAME}",
@@ -2108,6 +2111,142 @@ class MaddyService:
         )
         if any(item["name"] == mailbox for item in self.list_mailboxes(username)):
             raise MaddyError("mailbox deletion read-back verification failed")
+
+    def migrate_and_delete_mailbox(
+        self,
+        username: str,
+        mailbox: str,
+        target: str,
+    ) -> None:
+        """Quarantine a custom mailbox, copy its messages, then remove it safely."""
+
+        self._require(Capability.MAILBOX_ADMIN, write=True)
+        self._require(Capability.MESSAGE_ADMIN, write=True)
+        username = _safe_positional(username, "username", max_length=254)
+        mailbox = _safe_positional(mailbox, "mailbox", max_length=255)
+        target = _safe_positional(target, "target mailbox", max_length=255)
+        mailboxes = self.list_mailboxes(username)
+        self._require_mutable_mailbox(username, mailbox, mailboxes=mailboxes)
+        descendant_prefix = f"{mailbox}/"
+        if any(
+            isinstance(record.get("name"), str)
+            and str(record["name"]).startswith(descendant_prefix)
+            for record in mailboxes
+        ):
+            raise InvalidMaddyArgument("mailbox with child mailboxes cannot be deleted")
+        if mailbox == target:
+            raise InvalidMaddyArgument("source and target mailboxes must differ")
+        target_matches = [record for record in mailboxes if record.get("name") == target]
+        if len(target_matches) != 1:
+            raise InvalidMaddyArgument("target mailbox does not exist or is ambiguous")
+        quarantine = self._new_mailbox_quarantine_name(mailboxes)
+
+        try:
+            self._invoke(
+                (
+                    "imap-mboxes",
+                    "rename",
+                    "--cfg-block",
+                    self.storage_block,
+                    username,
+                    mailbox,
+                    quarantine,
+                )
+            )
+            renamed = {item.get("name") for item in self.list_mailboxes(username)}
+            if mailbox in renamed or quarantine not in renamed or target not in renamed:
+                raise MaddyError("mailbox quarantine rename read-back verification failed")
+
+            anchor_uid = self.latest_message_uid(username, quarantine)
+            if anchor_uid:
+                snapshot_uids = f"1:{anchor_uid}"
+                self.copy_messages(username, quarantine, snapshot_uids, target)
+
+            after_copy = {item.get("name") for item in self.list_mailboxes(username)}
+            if mailbox in after_copy:
+                raise MaddyError("original mailbox was recreated during deletion")
+            if quarantine not in after_copy or target not in after_copy:
+                raise MaddyError("mailbox copy destination disappeared before source removal")
+
+            if anchor_uid:
+                self._message_uid_operation(
+                    "remove",
+                    username,
+                    quarantine,
+                    snapshot_uids,
+                    destructive=True,
+                )
+            if self.list_message_window(username, quarantine, limit=1):
+                raise MaddyError("quarantined mailbox changed while messages were being migrated")
+
+            before_remove = {item.get("name") for item in self.list_mailboxes(username)}
+            if mailbox in before_remove:
+                raise MaddyError("original mailbox was recreated during deletion")
+            if quarantine not in before_remove or target not in before_remove:
+                raise MaddyError("mailbox deletion precondition changed")
+
+            self._invoke(
+                (
+                    "imap-mboxes",
+                    "remove",
+                    "--cfg-block",
+                    self.storage_block,
+                    "-y",
+                    username,
+                    quarantine,
+                )
+            )
+            observed = {item.get("name") for item in self.list_mailboxes(username)}
+            if mailbox in observed or quarantine in observed:
+                raise MaddyError("mailbox deletion read-back verification failed")
+            if target not in observed:
+                raise MaddyError("mailbox migration target disappeared during deletion")
+        except MaddyError:
+            self._restore_mailbox_quarantine(username, mailbox, quarantine)
+            raise
+
+    def _new_mailbox_quarantine_name(self, mailboxes: Sequence[Mapping[str, Any]]) -> str:
+        existing = {record.get("name") for record in mailboxes}
+        for _attempt in range(_MAILBOX_QUARANTINE_ATTEMPTS):
+            candidate = _safe_positional(
+                f"{_MAILBOX_QUARANTINE_PREFIX}{secrets.token_hex(16)}",
+                "quarantine mailbox",
+                max_length=255,
+            )
+            if candidate not in existing:
+                return candidate
+        raise MaddyError("could not allocate a unique mailbox quarantine name")
+
+    def _restore_mailbox_quarantine(
+        self,
+        username: str,
+        mailbox: str,
+        quarantine: str,
+    ) -> None:
+        """Best-effort restoration that never targets an existing original name."""
+
+        try:
+            observed = {item.get("name") for item in self.list_mailboxes(username)}
+            if mailbox in observed or quarantine not in observed:
+                return
+            self._invoke(
+                (
+                    "imap-mboxes",
+                    "rename",
+                    "--cfg-block",
+                    self.storage_block,
+                    username,
+                    quarantine,
+                    mailbox,
+                )
+            )
+            restored = {item.get("name") for item in self.list_mailboxes(username)}
+            if mailbox not in restored or quarantine in restored:
+                raise MaddyError("mailbox quarantine restoration was not verified")
+        except MaddyError:
+            # Preserve the original operation error. A failed restoration leaves
+            # the unpredictable quarantine mailbox intact for manual recovery.
+            return
 
     def rename_mailbox(self, username: str, old_name: str, new_name: str) -> None:
         self._require(Capability.MAILBOX_ADMIN, write=True)

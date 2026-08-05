@@ -159,6 +159,7 @@ class BrowserSecurityGateway:
         self.bulk_seen_changes: list[tuple[str, str, tuple[str, ...] | None, bool]] = []
         self.bulk_moves: list[tuple[str, str, tuple[str, ...], str]] = []
         self.created_mailboxes: list[tuple[str, str]] = []
+        self.deleted_mailboxes: list[tuple[str, str, str, str | None]] = []
         self.extra_mailboxes: list[str] = []
         self.message_unread = True
         self.notification_uid = int(MESSAGE_ID)
@@ -424,6 +425,22 @@ class BrowserSecurityGateway:
         self.created_mailboxes.append((account, mailbox))
         if mailbox not in self.extra_mailboxes:
             self.extra_mailboxes.append(mailbox)
+
+    async def delete_named_mailbox(
+        self,
+        account: str,
+        mailbox: str,
+        *,
+        disposition: str,
+        target_mailbox: str | None = None,
+    ) -> str:
+        self.deleted_mailboxes.append((account, mailbox, disposition, target_mailbox))
+        if mailbox in self.extra_mailboxes:
+            self.extra_mailboxes.remove(mailbox)
+        target = target_mailbox if disposition == "move" else TRASH_MAILBOX
+        if self.message_location == mailbox:
+            self.message_location = target
+        return target
 
     async def list_messages(self, _account: str, mailbox: str, **_kwargs: object) -> MessagePage:
         items: list[dict[str, object]] = []

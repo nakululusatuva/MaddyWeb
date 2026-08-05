@@ -901,6 +901,62 @@ async def test_mailbox_mutation_invalidates_the_scoped_cache() -> None:
 
 
 @pytest.mark.asyncio
+async def test_mailbox_delete_requires_an_explicit_migration_disposition() -> None:
+    account_id = "a" * 32
+    client = FakeClient(
+        {
+            "mailboxes.delete": Response.success(
+                "template",
+                {"deleted": True, "target": "Filed"},
+            ),
+        }
+    )
+    gateway = gateway_with(client)
+
+    target = await gateway.delete_named_mailbox(
+        account_id,
+        "Projects",
+        disposition="move",
+        target_mailbox="Filed",
+    )
+
+    assert target == "Filed"
+    assert client.requests[0].operation == "mailboxes.delete"
+    assert client.requests[0].params == {
+        "target_account_id": account_id,
+        "mailbox": "Projects",
+        "disposition": "move",
+        "target": "Filed",
+        "confirm": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_trash_folder_delete_invalidates_all_message_lists() -> None:
+    account_id = "a" * 32
+    client = FakeClient(
+        {
+            "mailboxes.delete": Response.failure(
+                "template",
+                "maddy_failed",
+                "The folder operation failed.",
+            ),
+        }
+    )
+    gateway = gateway_with(client)
+    before = gateway._message_account_generation.get(account_id, 0)  # type: ignore[attr-defined]
+
+    with pytest.raises(HelperCallError):
+        await gateway.delete_named_mailbox(
+            account_id,
+            "Projects",
+            disposition="trash",
+        )
+
+    assert gateway._message_account_generation[account_id] >= before + 2  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
 async def test_message_page_preserves_authoritative_continuation() -> None:
     account_id = "a" * 32
     payload = {

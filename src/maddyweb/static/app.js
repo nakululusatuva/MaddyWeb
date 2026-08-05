@@ -132,6 +132,8 @@
     typedAction: null,
     typedExpected: "",
     typedOpener: null,
+    folderDeleteContext: null,
+    folderDeleteOpener: null,
     stepUpOpener: null,
     stepUpResolve: null,
     stepUpReject: null,
@@ -163,6 +165,7 @@
   const toast = byId("toast");
   const confirmDialog = byId("confirm-dialog");
   const typedDialog = byId("typed-confirm-dialog");
+  const folderDeleteDialog = byId("folder-delete-dialog");
   const accountDialog = byId("account-dialog");
   const stepUpDialog = byId("step-up-dialog");
   const credentialDisclosureDialog = byId("credential-disclosure-dialog");
@@ -862,6 +865,13 @@
     return operation;
   };
 
+  const errorDisplayMessage = (error, fallback = "The request could not be completed.") => {
+    const baseMessage = error instanceof ApiError ? error.message : fallback;
+    return error instanceof ApiError && error.ambiguous
+      ? `${baseMessage} The result may be unknown; refresh the affected data before another change.`
+      : baseMessage;
+  };
+
   const handleError = (error, fallback = "The request could not be completed.") => {
     if (error && error.name === "AbortError") return;
     if (error instanceof ApiError && error.code === "step_up_cancelled") return;
@@ -891,11 +901,7 @@
       showView("access-denied", true);
       return;
     }
-    const baseMessage = error instanceof ApiError ? error.message : fallback;
-    const message = error instanceof ApiError && error.ambiguous
-      ? `${baseMessage} The result may be unknown; refresh the affected data before another change.`
-      : baseMessage;
-    showAlert(message);
+    showAlert(errorDisplayMessage(error, fallback));
   };
 
   const applyTheme = (theme) => {
@@ -1577,6 +1583,18 @@
       .filter(Boolean)
   );
 
+  const mailboxIsProtected = (mailbox) => {
+    const item = objectValue(mailbox);
+    if (typeof item.is_protected === "boolean") {
+      return item.is_protected;
+    }
+    if (item.is_trash === true || item.is_archive === true) {
+      return true;
+    }
+    return new Set(["inbox", "sent", "drafts", "junk", "trash", "archive"])
+      .has(stringValue(item.name).toLowerCase());
+  };
+
   const populateMoveTarget = (select, sourceMailbox = "") => {
     if (!(select instanceof HTMLSelectElement)) return;
     const selected = select.value;
@@ -2234,6 +2252,19 @@
       folderFragment.append(link);
     }
     byId("mail-folder-list").replaceChildren(folderFragment);
+
+    const selectedFolder = mailboxes.find((item) => stringValue(item.name) === mailbox);
+    const canDeleteFolder = Boolean(
+      account
+      && mailbox
+      && !allMailView
+      && selectedFolder
+      && !mailboxIsProtected(selectedFolder),
+    );
+    const folderDelete = byId("mail-folder-delete");
+    folderDelete.hidden = !canDeleteFolder;
+    folderDelete.disabled = !canDeleteFolder;
+    byId("mail-folder-tools").classList.toggle("has-delete", canDeleteFolder);
 
     if (
       account
@@ -5434,6 +5465,7 @@
     if (!(form instanceof HTMLFormElement) || !(toggle instanceof HTMLButtonElement)) return;
     form.hidden = !open;
     toggle.setAttribute("aria-expanded", String(open));
+    byId("mail-folder-tools").classList.toggle("is-creating", open);
     if (open) byId("mail-folder-name")?.focus();
     else {
       form.reset();
@@ -5493,6 +5525,149 @@
     } finally {
       form.removeAttribute("aria-busy");
       button.disabled = false;
+    }
+  });
+
+  const selectedFolderDeleteDisposition = () => {
+    const selected = byId("folder-delete-form").querySelector(
+      'input[name="disposition"]:checked',
+    );
+    return selected instanceof HTMLInputElement ? selected.value : "";
+  };
+
+  const updateFolderDeleteForm = () => {
+    const context = objectValue(state.folderDeleteContext);
+    const disposition = selectedFolderDeleteDisposition();
+    const target = byId("folder-delete-target");
+    const confirmation = byId("folder-delete-confirmation");
+    const targetLabel = target.closest(".folder-delete-target");
+    const moving = disposition === "move";
+    target.disabled = !moving;
+    target.required = moving;
+    targetLabel?.classList.toggle("is-disabled", !moving);
+    const validDisposition = disposition === "trash"
+      ? Boolean(context.trash)
+      : moving && arrayValue(context.targets).includes(target.value);
+    byId("folder-delete-submit").disabled = !(
+      stringValue(context.name)
+      && confirmation.value === context.name
+      && validDisposition
+    );
+  };
+
+  const openFolderDelete = (opener) => {
+    const mail = objectValue(state.mail);
+    const context = selectedMailContext();
+    const mailboxes = arrayValue(mail.mailboxes || mail.folders).map(objectValue);
+    const source = mailboxes.find((item) => stringValue(item.name) === context.mailbox);
+    if (!context.account || !source || mailboxIsProtected(source)) return;
+    const trash = stringValue(
+      mailboxes.find((item) => item.is_trash === true)?.name,
+    );
+    const targets = mailboxes
+      .filter((item) => (
+        stringValue(item.name) !== context.mailbox
+        && item.is_trash !== true
+      ))
+      .map((item) => stringValue(item.name))
+      .filter(Boolean);
+    if (!targets.length && !trash) {
+      showAlert("No safe destination is available for this folder.");
+      return;
+    }
+    state.folderDeleteContext = {
+      account: context.account,
+      name: context.mailbox,
+      targets,
+      trash,
+    };
+    state.folderDeleteOpener = opener instanceof HTMLElement ? opener : document.activeElement;
+    byId("folder-delete-title").textContent = `Delete ${context.mailbox}?`;
+    byId("folder-delete-copy").textContent = (
+      "Choose where every message should go before the folder is removed."
+    );
+    byId("folder-delete-confirm-label").textContent = (
+      `Type ${context.mailbox} to confirm deletion`
+    );
+    byId("folder-delete-confirmation").value = "";
+    byId("folder-delete-status").textContent = "";
+    populateSelect(
+      byId("folder-delete-target"),
+      targets.map((name) => ({value: name, label: name})),
+      targets[0] || "",
+      "Select a folder",
+      true,
+    );
+    const moveOption = byId("folder-delete-form").querySelector(
+      'input[name="disposition"][value="move"]',
+    );
+    const trashOption = byId("folder-delete-form").querySelector(
+      'input[name="disposition"][value="trash"]',
+    );
+    if (moveOption instanceof HTMLInputElement) {
+      moveOption.disabled = targets.length === 0;
+      moveOption.checked = targets.length > 0;
+    }
+    if (trashOption instanceof HTMLInputElement) {
+      trashOption.disabled = !trash;
+      trashOption.checked = targets.length === 0 && Boolean(trash);
+    }
+    updateFolderDeleteForm();
+    folderDeleteDialog.showModal();
+    byId("folder-delete-confirmation").focus();
+  };
+
+  byId("mail-folder-delete").addEventListener("click", (event) => {
+    openFolderDelete(event.currentTarget);
+  });
+
+  byId("folder-delete-form").addEventListener("change", updateFolderDeleteForm);
+  byId("folder-delete-confirmation").addEventListener("input", updateFolderDeleteForm);
+
+  byId("folder-delete-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const context = objectValue(state.folderDeleteContext);
+    const disposition = selectedFolderDeleteDisposition();
+    const target = byId("folder-delete-target").value;
+    const confirmation = byId("folder-delete-confirmation").value;
+    const submit = byId("folder-delete-submit");
+    if (
+      !(form instanceof HTMLFormElement)
+      || !(submit instanceof HTMLButtonElement)
+      || !context.account
+      || !context.name
+      || confirmation !== context.name
+      || (disposition === "move" && !arrayValue(context.targets).includes(target))
+      || (disposition === "trash" && !context.trash)
+    ) return;
+    form.setAttribute("aria-busy", "true");
+    submit.disabled = true;
+    byId("folder-delete-status").textContent = "Moving messages and deleting folder...";
+    try {
+      const json = {
+        account: context.account,
+        name: context.name,
+        confirmation,
+        disposition,
+      };
+      if (disposition === "move") json.target_mailbox = target;
+      const payload = await mutate("/mailboxes/delete", {json});
+      const destination = stringValue(
+        objectValue(payload.data).target_mailbox,
+        disposition === "move" ? target : context.trash,
+      );
+      finishAction(payload, `Folder ${context.name} deleted.`);
+      closeDialog(folderDeleteDialog);
+      navigate(buildMailUrl({account: context.account, mailbox: destination}));
+    } catch (error) {
+      byId("folder-delete-status").textContent = errorDisplayMessage(
+        error,
+        "The folder could not be deleted.",
+      );
+    } finally {
+      form.removeAttribute("aria-busy");
+      updateFolderDeleteForm();
     }
   });
 
@@ -6590,6 +6765,14 @@
     byId("typed-confirm-input").value = "";
     if (state.typedOpener instanceof HTMLElement) state.typedOpener.focus();
     state.typedOpener = null;
+  });
+
+  folderDeleteDialog.addEventListener("close", () => {
+    byId("folder-delete-form").reset();
+    byId("folder-delete-status").textContent = "";
+    state.folderDeleteContext = null;
+    if (state.folderDeleteOpener instanceof HTMLElement) state.folderDeleteOpener.focus();
+    state.folderDeleteOpener = null;
   });
 
   accountDialog.addEventListener("close", () => {

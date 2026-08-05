@@ -275,7 +275,14 @@ class Gateway(MailGateway, Protocol):
         new_name: str,
     ) -> None: ...
 
-    async def delete_named_mailbox(self, account_id: str, mailbox: str) -> None: ...
+    async def delete_named_mailbox(
+        self,
+        account_id: str,
+        mailbox: str,
+        *,
+        disposition: str,
+        target_mailbox: str | None = None,
+    ) -> str: ...
 
     async def list_mail_rules(self, account_id: str) -> Mapping[str, object]: ...
 
@@ -1062,10 +1069,7 @@ async def _list_all_mail_page(
 
     pages = dict(
         await asyncio.gather(
-            *(
-                fetch(mailbox, offset, per_mailbox_limit)
-                for mailbox, offset in active
-            )
+            *(fetch(mailbox, offset, per_mailbox_limit) for mailbox, offset in active)
         )
     )
     positions = {mailbox: 0 for mailbox, _offset in active}
@@ -1896,6 +1900,20 @@ def _mailbox_payload(record: object) -> dict[str, object]:
         "name": name,
         "is_trash": r"\trash" in normalized_attributes,
         "is_archive": r"\archive" in normalized_attributes,
+        "is_protected": name.casefold() in {"inbox", "archive", "drafts", "junk", "sent", "trash"}
+        or bool(
+            normalized_attributes
+            & {
+                r"\all",
+                r"\archive",
+                r"\drafts",
+                r"\flagged",
+                r"\important",
+                r"\junk",
+                r"\sent",
+                r"\trash",
+            }
+        ),
     }
 
 
@@ -1922,6 +1940,7 @@ def _resolved_mailbox_payloads(
             "name": mailbox["name"],
             "is_trash": trash_target is not None and mailbox["name"] == trash_target,
             "is_archive": archive_target is not None and mailbox["name"] == archive_target,
+            "is_protected": mailbox["is_protected"],
         }
         for mailbox in mailboxes
     ]
@@ -2990,9 +3009,7 @@ async def api_mailbox(request: web.Request) -> web.Response:
     cursor_token = query.get("cursor")
     if context_only and cursor_token is not None:
         raise web.HTTPBadRequest(text="Mailbox context does not accept a pagination cursor.")
-    if cursor_token is not None and (
-        not account or (not all_mail_view and not mailbox_name)
-    ):
+    if cursor_token is not None and (not account or (not all_mail_view and not mailbox_name)):
         raise web.HTTPBadRequest(text="Pagination cursor lacks account or mailbox context.")
     page_size = _settings(request).page_size
     if personal_scope:
@@ -4443,22 +4460,42 @@ async def rename_mailbox(request: web.Request) -> web.Response:
 async def delete_named_mailbox(request: web.Request) -> web.Response:
     values = await _read_json_object(
         request,
-        allowed_fields=frozenset({"account", "name", "confirmation"}),
+        allowed_fields=frozenset(
+            {"account", "name", "confirmation", "disposition", "target_mailbox"}
+        ),
     )
     account = _account_context(request, values)
     name = _mailbox_name(_json_text(values, "name"))
     if _json_text(values, "confirmation") != name:
         raise web.HTTPBadRequest(text="Folder confirmation does not match.")
+    disposition = _json_text(values, "disposition")
+    target_mailbox: str | None = None
+    if disposition == "move":
+        target_mailbox = _mailbox_name(_json_text(values, "target_mailbox"))
+    elif disposition == "trash":
+        if "target_mailbox" in values:
+            raise web.HTTPBadRequest(text="Trash deletion does not accept a target mailbox.")
+    else:
+        raise web.HTTPBadRequest(text="Folder deletion disposition is invalid.")
     try:
-        await _gateway(request).delete_named_mailbox(account, name)
+        target = await _gateway(request).delete_named_mailbox(
+            account,
+            name,
+            disposition=disposition,
+            target_mailbox=target_mailbox,
+        )
     except Exception as exc:
         return await _folder_rule_reference_error(
             request,
-            "Could not delete empty mailbox",
+            "Could not delete mailbox",
             exc,
         )
     _parsed_message_cache(request).invalidate(account, name)
-    return _api_response(message="Empty folder deleted.")
+    _parsed_message_cache(request).invalidate(account, target)
+    return _api_response(
+        data={"target_mailbox": target},
+        message="Folder deleted after its messages were moved.",
+    )
 
 
 def _mail_rule_public_id(value: str, label: str) -> str:
@@ -4499,10 +4536,16 @@ async def _folder_rule_reference_error(
     if isinstance(exc, HelperCallError) and exc.code == "conflict":
         return _api_error(
             "conflict",
-            "The folder is used by a mail rule and cannot be changed.",
+            "The folder is in use by mail-rule processing and cannot be changed.",
             status=409,
         )
-    return await _gateway_error(request, title)
+    if isinstance(exc, HelperCallError) and exc.code == "invalid_request":
+        return _api_error(
+            "invalid_request",
+            "The folder operation is invalid.",
+            status=400,
+        )
+    return await _mutation_gateway_error(request, title, exc)
 
 
 async def _mail_rule_gateway_error(

@@ -169,7 +169,18 @@ class BrowserGateway:
             {"name": "Archive", "attributes": ["\\Archive"]},
             {"name": "Sent", "attributes": ["\\Sent"]},
             {"name": "Trash", "attributes": ["\\Trash"]},
+            {"name": "Projects", "attributes": []},
         ]
+
+    async def delete_named_mailbox(
+        self,
+        _account: str,
+        _mailbox: str,
+        *,
+        disposition: str,
+        target_mailbox: str | None = None,
+    ) -> str:
+        return target_mailbox if disposition == "move" else "Trash"
 
     async def list_messages(
         self,

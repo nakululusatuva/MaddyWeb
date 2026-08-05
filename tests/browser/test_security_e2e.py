@@ -1664,6 +1664,152 @@ async def test_folder_creation_uses_a_bounded_inline_form_and_opens_the_folder(
     assert await page.locator("#mail-mailbox").input_value() == "Projects/2026"
 
 
+async def test_custom_folder_delete_moves_messages_before_removing_the_folder(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    live_application.gateway.extra_mailboxes.append("Projects")
+    live_application.gateway.message_location = "Projects"
+    await page.goto(live_application.base_url + _mailbox_path("Projects"))
+    await page.locator("#mail-folder-delete").wait_for()
+
+    tools = await page.locator("#mail-folder-tools").bounding_box()
+    selector = await page.locator("#mail-selector").bounding_box()
+    assert tools is not None
+    assert selector is not None
+    assert selector["y"] >= tools["y"] + tools["height"] + 12
+
+    await page.locator("#mail-folder-delete").click()
+    dialog = page.locator("#folder-delete-dialog")
+    await dialog.wait_for()
+    assert await dialog.get_by_text(
+        "Move messages to another folder", exact=True
+    ).is_visible()
+    await page.locator("#folder-delete-target").select_option(MAILBOX)
+    await page.locator("#folder-delete-confirmation").fill("Project")
+    assert await page.locator("#folder-delete-submit").is_disabled()
+    await page.locator("#folder-delete-confirmation").fill("Projects")
+
+    async with page.expect_response(
+        lambda response: response.request.method == "POST"
+        and response.url.endswith("/api/v1/admin/mailboxes/delete")
+    ) as deleted_response:
+        await page.locator("#folder-delete-submit").click()
+    assert (await deleted_response.value).status == 200
+    await page.wait_for_url(f"**{_mailbox_path(MAILBOX)}")
+    assert live_application.gateway.deleted_mailboxes == [
+        (ACCOUNT, "Projects", "move", MAILBOX)
+    ]
+    assert live_application.gateway.message_location == MAILBOX
+    assert "Projects" not in live_application.gateway.extra_mailboxes
+
+
+async def test_custom_folder_delete_can_move_every_message_to_trash(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    live_application.gateway.extra_mailboxes.append("Temporary")
+    live_application.gateway.message_location = "Temporary"
+    await page.goto(live_application.base_url + _mailbox_path("Temporary"))
+    await page.locator("#mail-folder-delete").click()
+    await page.locator(
+        '#folder-delete-form input[name="disposition"][value="trash"]'
+    ).check()
+    assert await page.locator("#folder-delete-target").is_disabled()
+    await page.locator("#folder-delete-confirmation").fill("Temporary")
+    await page.locator("#folder-delete-submit").click()
+
+    await page.wait_for_url(f"**{_mailbox_path(TRASH_MAILBOX)}")
+    assert live_application.gateway.deleted_mailboxes == [
+        (ACCOUNT, "Temporary", "trash", None)
+    ]
+    assert live_application.gateway.message_location == TRASH_MAILBOX
+
+
+async def test_ambiguous_folder_delete_keeps_the_dialog_and_requires_refresh(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    live_application.gateway.extra_mailboxes.append("Temporary")
+    await page.goto(live_application.base_url + _mailbox_path("Temporary"))
+
+    async def fail_delete(route: Route) -> None:
+        await route.fulfill(
+            status=502,
+            content_type="application/json",
+            body=json.dumps(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "helper_unavailable",
+                        "message": "The folder operation could not be confirmed.",
+                    },
+                }
+            ),
+        )
+
+    await page.route("**/api/v1/admin/mailboxes/delete", fail_delete)
+    await page.locator("#mail-folder-delete").click()
+    await page.locator("#folder-delete-confirmation").fill("Temporary")
+    await page.locator("#folder-delete-submit").click()
+
+    dialog = page.locator("#folder-delete-dialog")
+    await dialog.get_by_text("The result may be unknown", exact=False).wait_for()
+    assert await dialog.is_visible()
+    assert "mailbox=Temporary" in page.url
+
+
+async def test_folder_and_bulk_action_layout_keeps_controls_in_clear_groups(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    await page.set_viewport_size({"width": 1074, "height": 1000})
+    await _load_inbox(page, live_application)
+
+    tools = await page.locator("#mail-folder-tools").bounding_box()
+    selector = await page.locator("#mail-selector").bounding_box()
+    assert tools is not None
+    assert selector is not None
+    assert selector["y"] >= tools["y"] + tools["height"] + 12
+
+    action_rows = []
+    for selector_value in (
+        "#mail-mark-read",
+        "#mail-mark-unread",
+        "#mail-bulk-archive",
+        "#mail-bulk-trash",
+    ):
+        bounds = await page.locator(selector_value).bounding_box()
+        assert bounds is not None
+        action_rows.append(round(bounds["y"]))
+    assert len(set(action_rows)) == 1
+    move_target = await page.locator("#mail-bulk-move-target").bounding_box()
+    move_button = await page.locator("#mail-bulk-move").bounding_box()
+    assert move_target is not None
+    assert move_button is not None
+    assert abs(move_target["y"] - move_button["y"]) <= 1
+    assert await page.locator("#mail-bulk-toolbar").evaluate(
+        "element => element.scrollWidth <= element.clientWidth"
+    )
+
+
+async def test_trash_bulk_actions_remain_visible_at_wide_desktop_breakpoint(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    await page.set_viewport_size({"width": 1440, "height": 1000})
+    await page.goto(live_application.base_url + _mailbox_path(TRASH_MAILBOX))
+    await page.locator("#mail-bulk-permanent-delete").wait_for()
+
+    move_target = page.locator("#mail-bulk-move-target")
+    move_button = page.locator("#mail-bulk-move")
+    assert await move_target.is_visible()
+    assert await move_button.is_visible()
+    assert await page.locator("#mail-bulk-toolbar").evaluate(
+        "element => element.scrollWidth <= element.clientWidth"
+    )
+
+
 async def test_completed_folder_creation_does_not_hijack_a_newer_route(
     page: Page,
     live_application: LiveApplication,
@@ -3851,10 +3997,16 @@ async def test_folder_and_rule_builder_controls_have_mobile_touch_targets(
 
     await page.route("**/api/v1/admin/mail-rules?*", empty_mail_rules)
     await page.set_viewport_size({"width": 390, "height": 844})
-    await page.goto(live_application.base_url + _mailbox_path())
-    await page.locator("#message-list-body tr").wait_for()
+    live_application.gateway.extra_mailboxes.append("Mobile folder")
+    await page.goto(live_application.base_url + _mailbox_path("Mobile folder"))
+    await page.get_by_role("heading", name="Mobile folder", exact=True).wait_for()
     await page.locator("#mobile-folders-button").click()
     folder_toggle = page.locator("#mail-folder-create-toggle")
+    folder_delete = page.locator("#mail-folder-delete")
+    delete_bounds = await folder_delete.bounding_box()
+    assert delete_bounds is not None
+    assert delete_bounds["height"] >= 44 - TOUCH_TARGET_GEOMETRY_TOLERANCE_PX
+    assert delete_bounds["width"] >= 44 - TOUCH_TARGET_GEOMETRY_TOLERANCE_PX
     await folder_toggle.click()
     controls = [
         folder_toggle,

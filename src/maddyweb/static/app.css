@@ -3949,13 +3949,28 @@ html[data-view="message"] .app-footer {
 }
 
 /* Folder management, cross-folder views, and message moves. */
+.mail-folder-tools {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  margin-bottom: 15px;
+  padding-bottom: 15px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 82%, transparent);
+}
+
 .mail-folder-create {
   display: grid;
   gap: 8px;
 }
 
+.mail-folder-tools:not(.has-delete) .mail-folder-create,
+.mail-folder-tools.is-creating .mail-folder-create {
+  grid-column: 1 / -1;
+}
+
 .mail-folder-create-toggle {
   display: flex;
+  width: 100%;
   min-height: 38px;
   align-items: center;
   gap: 9px;
@@ -3968,6 +3983,40 @@ html[data-view="message"] .app-footer {
   font-size: 12px;
   font-weight: 720;
   cursor: pointer;
+}
+
+.mail-folder-delete {
+  display: grid;
+  width: 38px;
+  min-height: 38px;
+  place-items: center;
+  padding: 8px;
+  border: 1px solid color-mix(in srgb, var(--danger) 48%, var(--border));
+  border-radius: 10px;
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 5%, transparent);
+  font: inherit;
+  cursor: pointer;
+}
+
+.mail-folder-delete svg {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentcolor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.mail-folder-delete:hover {
+  border-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+}
+
+.mail-folder-delete[hidden],
+.mail-folder-tools.is-creating .mail-folder-delete {
+  display: none;
 }
 
 .mail-folder-create-toggle:hover,
@@ -3997,6 +4046,88 @@ html[data-view="message"] .app-footer {
 
 .mail-folder-create-form[hidden] {
   display: none;
+}
+
+.folder-delete-card {
+  gap: 16px;
+}
+
+.folder-delete-options {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.folder-delete-options legend,
+.folder-delete-confirm > span,
+.folder-delete-target > span {
+  margin-bottom: 6px;
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 780;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.folder-delete-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 11px 12px;
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  background: color-mix(in srgb, var(--surface-muted) 48%, var(--surface));
+  cursor: pointer;
+}
+
+.folder-delete-option:has(input:checked) {
+  border-color: var(--primary);
+  background: var(--primary-soft);
+}
+
+.folder-delete-option input {
+  width: 17px;
+  height: 17px;
+  flex: 0 0 auto;
+  margin: 2px 0 0;
+  accent-color: var(--primary);
+}
+
+.folder-delete-option > span {
+  display: grid;
+  gap: 3px;
+}
+
+.folder-delete-option small {
+  color: var(--text-muted);
+  line-height: 1.45;
+}
+
+.folder-delete-target,
+.folder-delete-confirm {
+  display: grid;
+}
+
+.folder-delete-target {
+  margin: -2px 0 2px 27px;
+}
+
+.folder-delete-target select,
+.folder-delete-confirm input {
+  width: 100%;
+  min-height: 42px;
+  padding: 8px 11px;
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  color: var(--text);
+  background: var(--surface);
+  font: inherit;
+}
+
+.folder-delete-target.is-disabled {
+  opacity: 0.58;
 }
 
 .mail-folder-create-form label {
@@ -4342,10 +4473,15 @@ html[data-view="message"] .app-footer {
 
 @media (max-width: 900px) {
   .mail-folder-create-toggle,
+  .mail-folder-delete,
   .mail-folder-create-actions .button,
   .mail-rule-actions .button,
   .rule-node-button {
     min-height: 44px;
+  }
+
+  .mail-folder-delete {
+    width: 44px;
   }
 
   .mail-bulk-move-control,
@@ -4701,7 +4837,7 @@ html[data-view="message"] .app-footer {
 .mail-bulk-toolbar {
   display: grid;
   flex: 0 0 auto;
-  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 7px 10px;
   padding: 8px 12px;
@@ -4742,14 +4878,15 @@ html[data-view="message"] .app-footer {
 }
 
 .mail-bulk-actions {
-  display: flex;
+  display: grid;
   grid-column: 1 / -1;
-  flex-wrap: wrap;
+  grid-template-columns: repeat(4, max-content);
   gap: 5px;
   overflow: visible;
 }
 
-.mail-bulk-actions .button {
+.mail-bulk-actions .button,
+.mail-mark-all-read {
   min-height: 29px;
   flex: 0 0 auto;
   padding: 4px 7px;
@@ -4757,6 +4894,29 @@ html[data-view="message"] .app-footer {
   box-shadow: none;
   font-size: 9px;
   white-space: nowrap;
+}
+
+.mail-mark-all-read {
+  box-shadow: none;
+}
+
+.mail-bulk-actions .mail-bulk-move-control {
+  width: 100%;
+  min-width: 0;
+  grid-column: 1 / -1;
+  order: 2;
+}
+
+#mail-bulk-permanent-delete {
+  order: 1;
+}
+
+.mail-bulk-actions .mail-bulk-move-control select {
+  width: 100%;
+}
+
+.mail-bulk-actions .mail-bulk-move-control .button {
+  min-height: 34px;
 }
 
 .mail-switch-loader {
@@ -5070,6 +5230,17 @@ html[data-view="message"] .app-footer {
   .mail-list-table .message-table tr {
     padding-inline: 11px;
   }
+
+  .mail-bulk-actions {
+    display: grid;
+    grid-template-columns: repeat(4, max-content);
+    overflow: visible;
+  }
+
+  .mail-bulk-actions .mail-bulk-move-control {
+    width: 100%;
+    grid-column: 1 / -1;
+  }
 }
 
 @media (max-width: 900px) {
@@ -5102,6 +5273,17 @@ html[data-view="message"] .app-footer {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 7px;
+  }
+
+  .mail-bulk-toolbar {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .mail-mark-all-read {
+    width: 100%;
+    min-height: 42px;
+    grid-column: 1 / -1;
+    font-size: 10px;
   }
 
   .mail-bulk-actions > .button {
