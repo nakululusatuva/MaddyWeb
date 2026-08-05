@@ -528,12 +528,16 @@ The editor accepts exactly one top-level
 Python command or `/data/maddyweb-filter/maddyweb-filter-client`; the account
 placeholder remains a separate command argument. Configuration is backed up,
 rendered, verified where the Maddy version supports `verify-config`, atomically
-replaced, read back, reloaded, and restored on failure. The lifecycle checks
-the unchanged Maddy version, process or container identity, configuration and
-listener set after every reload. Native activation uses a controlled restart
-so the Maddy process acquires its dedicated client-reader group. Maddy 0.8.2
-also requires this path because it has no `verify-config` or hot-reload
-contract.
+replaced, read back, and applied with a controlled full restart. A failed
+activation restores the exact original configuration and performs another
+controlled restart before the transaction is considered recovered. The
+lifecycle checks the unchanged Maddy version, a new process start identity,
+the exact configuration and the unchanged listener set after every restart.
+The full restart is intentional for every supported Maddy version: consecutive
+hot reloads can leave the `storage.imapsql` update pipe unavailable. Native
+activation also needs the restart so the Maddy process acquires its dedicated
+client-reader group. Expect a brief Maddy service interruption during this
+separately approved maintenance transaction.
 
 Before rolling back to a release that does not contain
 `maddyweb.filter_client`, remove the managed block as its own reviewed
@@ -550,7 +554,7 @@ sudo bash scripts/configure-filter.sh \
   --approval-file /run/maddyweb-approval/<reviewed-file> --apply
 ```
 
-Removal verifies and deletes only the exact managed marker block, reloads
+Removal verifies and deletes only the exact managed marker block, restarts
 Maddy, stops the bridge, and then removes the client token copies and wrapper.
 It never edits an unrelated filter block. Snapshots remain private so a later
 re-enable can republish or reuse rule state.

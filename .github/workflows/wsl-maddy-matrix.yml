@@ -72,7 +72,8 @@ jobs:
           $WslRepository = ($WslPathOutput | Select-Object -Last 1).Trim()
           foreach ($Script in @(
             'tests/integration/test-filter-docker-client.sh',
-            'tests/integration/test-filter-maddy-delivery.sh'
+            'tests/integration/test-filter-maddy-delivery.sh',
+            'tests/integration/test-filter-restart-lifecycle.sh'
           )) {
             & wsl.exe -d $env:WSL_DISTRO --user root --exec env `
               PYTHON_BINARY=python3.14 bash "$WslRepository/$Script"

@@ -115,6 +115,47 @@ def test_filter_lifecycle_arms_and_verifies_every_live_config_change() -> None:
     assert 'declare -F restore_config' in lifecycle
 
 
+def test_filter_config_changes_and_restoration_use_controlled_restarts() -> None:
+    lifecycle = _read("scripts/configure-filter.sh")
+    assert "SIGUSR2" not in lifecycle
+    assert "reload_maddy" not in lifecycle
+
+    restart = lifecycle.index("restart_maddy() {")
+    restart_end = lifecycle.index("\n}\n\nverify_candidate()", restart)
+    restart_body = lifecycle[restart:restart_end]
+    assert "systemctl restart maddy.service" in restart_body
+    assert '"$docker_binary" restart --time 10 "$container_id"' in restart_body
+    assert "maddy_restart_expected=true" in restart_body
+    assert "maddy_restart_identity_before" in restart_body
+
+    restoration = lifecycle.index("restore_config() {")
+    restoration_end = lifecycle.index('if [[ "$action" == add ]]', restoration)
+    restoration_body = lifecycle[restoration:restoration_end]
+    restore_replace = restoration_body.index('replace_config "$source_config"')
+    restore_restart = restoration_body.index("restart_maddy", restore_replace)
+    restore_gate = restoration_body.index(
+        'maddy_state_gate "$source_config"', restore_restart
+    )
+    restore_readback = restoration_body.index(
+        'verify_live_config "$source_config"', restore_gate
+    )
+    assert restore_replace < restore_restart < restore_gate < restore_readback
+
+    addition = lifecycle.index('if [[ "$action" == add ]]', restoration_end)
+    add_replace = lifecycle.index('replace_config "$candidate_config"', addition)
+    add_restart = lifecycle.index("restart_maddy", add_replace)
+    add_gate = lifecycle.index('maddy_state_gate "$candidate_config"', add_restart)
+    assert add_replace < add_restart < add_gate
+
+    removal = lifecycle.index(
+        'if [[ "$filter_config_present" == true ]]', add_gate
+    )
+    remove_replace = lifecycle.index('replace_config "$candidate_config"', removal)
+    remove_restart = lifecycle.index("restart_maddy", remove_replace)
+    remove_gate = lifecycle.index('maddy_state_gate "$candidate_config"', remove_restart)
+    assert remove_replace < remove_restart < remove_gate
+
+
 def test_filter_lifecycle_checks_service_state_version_config_and_listeners() -> None:
     lifecycle = _read("scripts/configure-filter.sh")
     for network in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"):
@@ -126,6 +167,9 @@ def test_filter_lifecycle_checks_service_state_version_config_and_listeners() ->
     assert 'state.get("Restarting") is not True' in lifecycle
     assert 'observed_version" == "$maddy_version' in lifecycle
     assert 'listeners" == "$initial_maddy_listeners' in lifecycle
+    assert '"$pid" != "$maddy_restart_identity_before"' in lifecycle
+    assert "'{{.State.StartedAt}}'" in lifecycle
+    assert '"$started_at" != "$maddy_restart_identity_before"' in lifecycle
     assert "verify_candidate /data/maddy.conf" in lifecycle
 
 

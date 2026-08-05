@@ -115,9 +115,10 @@ config_replaced=false
 restoring_config=false
 service_started=false
 native_membership_added=false
-force_native_restart=false
 filter_was_active=false
 filter_config_present=true
+maddy_restart_expected=false
+maddy_restart_identity_before=""
 
 cleanup() {
     local status=$?
@@ -480,17 +481,21 @@ else
     fi
 fi
 
-reload_maddy() {
+restart_maddy() {
+    maddy_restart_expected=true
     if [[ "$maddy_mode" == native ]]; then
-        if [[ "$maddy_version" == 0.8.2 || "$force_native_restart" == true ]]; then
-            systemctl restart maddy.service
-        else
-            systemctl kill --kill-who=main --signal=SIGUSR2 maddy.service
-        fi
-    elif [[ "$maddy_version" == 0.8.2 ]]; then
-        "$docker_binary" restart --time 10 "$container_id" >/dev/null
+        maddy_restart_identity_before=$(
+            systemctl show --property MainPID --value maddy.service 2>/dev/null
+        ) || return 1
+        [[ "$maddy_restart_identity_before" =~ ^[0-9]+$ ]] || return 1
+        systemctl restart maddy.service
     else
-        "$docker_binary" kill --signal=SIGUSR2 "$container_id" >/dev/null
+        maddy_restart_identity_before=$(
+            "$docker_binary" inspect --format '{{.State.StartedAt}}' \
+                "$container_id" 2>/dev/null
+        ) || return 1
+        [[ -n "$maddy_restart_identity_before" ]] || return 1
+        "$docker_binary" restart --time 10 "$container_id" >/dev/null
     fi
 }
 
@@ -507,15 +512,16 @@ verify_candidate() {
 
 maddy_state_gate() {
     local expected_source=${1:?expected config source is required}
-    local pid listeners state version_output observed_version
+    local pid listeners state started_at version_output observed_version
     for _ in {1..50}; do
         if [[ "$maddy_mode" == native ]]; then
             if systemctl is-active --quiet maddy.service; then
                 pid=$(systemctl show --property MainPID --value maddy.service 2>/dev/null || true)
                 if [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then
-                    if [[ "$maddy_version" == 0.8.2 \
-                        || "$force_native_restart" == true \
-                        || "$pid" == "$native_pid_before" ]]; then
+                    if [[ "$maddy_restart_expected" == true \
+                        && "$pid" != "$maddy_restart_identity_before" ]] \
+                        || [[ "$maddy_restart_expected" == false \
+                            && "$pid" == "$native_pid_before" ]]; then
                         version_output=$($maddy_binary version 2>&1 || true)
                         observed_version=$(extract_maddy_version "$version_output" 2>/dev/null || true)
                         listeners=$(native_listener_snapshot "$pid" 2>/dev/null || true)
@@ -523,6 +529,7 @@ maddy_state_gate() {
                             && "$listeners" == "$initial_maddy_listeners" ]] \
                             && verify_live_config "$expected_source" \
                             && verify_candidate "$maddy_config"; then
+                            maddy_restart_expected=false
                             return 0
                         fi
                     fi
@@ -561,15 +568,23 @@ PY
                 state=not-ready
             fi
             if [[ "$state" == ready ]]; then
+                started_at=$(
+                    "$docker_binary" inspect --format '{{.State.StartedAt}}' \
+                        "$container_id" 2>/dev/null || true
+                )
                 version_output=$(
                     "$docker_binary" exec "$container_id" /bin/maddy version 2>&1 || true
                 )
                 observed_version=$(extract_maddy_version "$version_output" 2>/dev/null || true)
                 listeners=$(docker_listener_snapshot 2>/dev/null || true)
-                if [[ "$observed_version" == "$maddy_version" \
+                if [[ "$maddy_restart_expected" == false \
+                    || "$started_at" != "$maddy_restart_identity_before" ]] \
+                    && [[ -n "$started_at" \
+                    && "$observed_version" == "$maddy_version" \
                     && "$listeners" == "$initial_maddy_listeners" ]] \
                     && verify_live_config "$expected_source" \
                     && verify_candidate /data/maddy.conf; then
+                    maddy_restart_expected=false
                     return 0
                 fi
             fi
@@ -641,7 +656,7 @@ restore_config() {
     [[ "$config_replaced" == true ]] || return 0
     restoring_config=true
     if replace_config "$source_config" \
-        && reload_maddy \
+        && restart_maddy \
         && maddy_state_gate "$source_config" \
         && verify_live_config "$source_config"; then
         restoring_config=false
@@ -687,7 +702,6 @@ PY
             *" $client_gid "*) ;;
             *) die "native Maddy service identity did not acquire the client reader group" ;;
         esac
-        force_native_restart=true
         install -d -o root -g maddyweb-filter-client -m 0750 -- /etc/maddyweb-filter
         install_host_file_atomic "$token_source" \
             /etc/maddyweb-filter/client.token root maddyweb-filter-client 0640
@@ -725,7 +739,7 @@ PY
     wait_for_filter_listener \
         || die "delivery filter is not listening on exactly its reviewed private endpoint"
     replace_config "$candidate_config"
-    reload_maddy
+    restart_maddy
     maddy_state_gate "$candidate_config"
 else
     if [[ "$filter_config_present" == true ]]; then
@@ -738,7 +752,7 @@ else
             "$docker_binary" exec "$container_id" /bin/busybox rm -f "$docker_candidate"
         fi
         replace_config "$candidate_config"
-        reload_maddy
+        restart_maddy
         maddy_state_gate "$candidate_config"
         config_replaced=false
     else
