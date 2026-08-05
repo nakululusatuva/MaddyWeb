@@ -101,6 +101,7 @@
     sessionTimer: 0,
     sessionRefreshAt: 0,
     sessionRefreshPromise: null,
+    sessionResumePromise: null,
     mailEventSource: null,
     mailEventAccount: "",
     newMailNotices: [],
@@ -111,6 +112,16 @@
     accounts: [],
     mail: null,
     message: null,
+    mailRules: [],
+    mailRulesAccount: "",
+    ruleMailboxes: [],
+    mailRuleCondition: null,
+    selectedMailRuleId: "",
+    mailRuleRun: null,
+    mailRulesBusy: false,
+    mailRuleRunDriver: null,
+    mailRuleRunCancelRequested: "",
+    mailRuleRunNeedsRefresh: "",
     certificates: null,
     passkeys: [],
     sessions: [],
@@ -155,6 +166,38 @@
   const accountDialog = byId("account-dialog");
   const stepUpDialog = byId("step-up-dialog");
   const credentialDisclosureDialog = byId("credential-disclosure-dialog");
+  const startupRecovery = byId("startup-recovery");
+  const sessionResumeGuard = byId("session-resume-guard");
+
+  const dismissStartupRecovery = () => {
+    if (!(startupRecovery instanceof HTMLElement)) return;
+    startupRecovery.hidden = true;
+    startupRecovery.classList.remove("is-ready");
+  };
+
+  const revealStartupRecovery = () => {
+    if (!(startupRecovery instanceof HTMLElement)) return;
+    startupRecovery.hidden = false;
+    startupRecovery.classList.add("is-ready");
+  };
+
+  const setSessionResumeGuard = (mode = "hidden") => {
+    if (!(sessionResumeGuard instanceof HTMLElement)) return;
+    const guarded = mode !== "hidden";
+    sessionResumeGuard.hidden = !guarded;
+    sessionResumeGuard.classList.toggle("is-error", mode === "error");
+    sessionResumeGuard.setAttribute("role", mode === "error" ? "alert" : "status");
+    byId("session-resume-title").textContent = mode === "error"
+      ? "Session check interrupted"
+      : "Checking your session";
+    byId("session-resume-detail").textContent = mode === "error"
+      ? "Reload this page before viewing or changing mailbox data."
+      : "Confirming that this restored page is still authorized...";
+    byId("session-resume-reload").hidden = mode !== "error";
+    for (const node of [document.querySelector(".app-header"), document.querySelector(".workspace")]) {
+      if (node instanceof HTMLElement) node.inert = guarded;
+    }
+  };
 
   const setLoading = (message = "") => {
     if (loadingStatus) loadingStatus.textContent = message;
@@ -289,6 +332,12 @@
       || logicalPath.startsWith("/mail/")
       || logicalPath === "/mail-actions"
       || logicalPath === "/mail-events"
+      || logicalPath === "/mailboxes"
+      || logicalPath.startsWith("/mailboxes/")
+      || logicalPath === "/mail-rules"
+      || logicalPath.startsWith("/mail-rules/")
+      || logicalPath === "/mail-rule-runs"
+      || logicalPath.startsWith("/mail-rule-runs/")
     ) {
       mappedPath = state.role === "admin"
         ? `/admin${logicalPath}`
@@ -605,6 +654,28 @@
     applySessionData(data);
     if (!state.csrfToken) throw new ApiError("The server did not provide a CSRF token.");
     return state.csrfToken;
+  };
+
+  const revalidateRestoredSession = () => {
+    if (state.sessionResumePromise instanceof Promise) return state.sessionResumePromise;
+    closeMailEvents();
+    setSessionResumeGuard("checking");
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), SESSION_BOOTSTRAP_TIMEOUT_MS);
+    state.sessionResumePromise = (async () => {
+      try {
+        await refreshSession(controller.signal);
+        setSessionResumeGuard("hidden");
+        startMailEvents();
+      } catch (error) {
+        closeMailEvents();
+        setSessionResumeGuard("error");
+      } finally {
+        window.clearTimeout(timeout);
+        state.sessionResumePromise = null;
+      }
+    })();
+    return state.sessionResumePromise;
   };
 
   const refreshSessionAfterActivity = () => {
@@ -946,6 +1017,7 @@
     const messageMatch = /^\/mail\/([1-9][0-9]{0,9})$/.exec(path);
     if (messageMatch) return {name: "message", uid: messageMatch[1]};
     if (path === "/compose") return {name: "compose"};
+    if (path === "/rules") return {name: "rules"};
     if (path === "/accounts") return {name: "accounts"};
     if (path === "/certificates") return {name: "certificates"};
     if (path === "/security") return {name: "security"};
@@ -959,6 +1031,7 @@
       mail: "Mailboxes",
       message: "Message",
       compose: "Compose",
+      rules: "Mail rules",
       accounts: "Accounts",
       certificates: "Certificates",
       security: "Security",
@@ -973,6 +1046,7 @@
     return {
       account: query.get("account") || scopedAccount(),
       mailbox: query.get("mailbox") || "",
+      view: query.get("view") === "all" ? "all" : "mailbox",
     };
   };
 
@@ -982,9 +1056,12 @@
     const loaded = objectValue(state.mail);
     const loadedAccount = stringValue(loaded.selected_account);
     const loadedMailbox = stringValue(loaded.selected_mailbox);
-    if (!loadedAccount || !loadedMailbox) return true;
+    const loadedView = stringValue(loaded.selected_view, "mailbox");
+    if (!loadedAccount || (requested.view !== "all" && !loadedMailbox)) return true;
     if (requested.account && requested.account !== loadedAccount) return true;
-    return Boolean(requested.mailbox && requested.mailbox !== loadedMailbox);
+    if (requested.view !== loadedView) return true;
+    return requested.view !== "all"
+      && Boolean(requested.mailbox && requested.mailbox !== loadedMailbox);
   };
 
   const setMailSwitchLoading = (active, mailbox = "") => {
@@ -993,35 +1070,79 @@
     if (!(pane instanceof HTMLElement) || !(loader instanceof HTMLElement)) return;
     if (!active) {
       loader.hidden = true;
+      loader.classList.remove("is-error");
+      loader.setAttribute("role", "status");
+      byId("mail-switch-retry").hidden = true;
       pane.removeAttribute("aria-busy");
       return;
     }
-    byId("mail-switch-title").textContent = mailbox
-      ? `Opening ${mailbox}`
-      : "Opening mailbox";
+    const requested = requestedMailContext();
+    byId("mail-switch-title").textContent = requested.view === "all"
+      ? "Opening All Mail"
+      : mailbox
+        ? `Opening ${mailbox}`
+        : "Opening mailbox";
+    byId("mail-switch-detail").textContent = "Fetching the latest messages...";
+    byId("mail-switch-retry").hidden = true;
+    loader.classList.remove("is-error");
+    loader.setAttribute("role", "status");
     pane.setAttribute("aria-busy", "true");
     loader.hidden = false;
     document.querySelectorAll(".mail-folder-link").forEach((link) => {
       if (!(link instanceof HTMLAnchorElement)) return;
-      const linkMailbox = new URL(link.href).searchParams.get("mailbox") || "";
-      if (mailbox && linkMailbox === mailbox) link.setAttribute("aria-current", "page");
+      const linkUrl = new URL(link.href);
+      const linkMailbox = linkUrl.searchParams.get("mailbox") || "";
+      const selected = requested.view === "all"
+        ? linkUrl.searchParams.get("view") === "all"
+        : Boolean(mailbox) && linkMailbox === mailbox;
+      if (selected) link.setAttribute("aria-current", "page");
       else link.removeAttribute("aria-current");
     });
+  };
+
+  const setMailSwitchError = () => {
+    const pane = byId("mail-view");
+    const loader = byId("mail-switch-loader");
+    if (!(pane instanceof HTMLElement) || !(loader instanceof HTMLElement)) return;
+    const requested = requestedMailContext();
+    byId("mail-switch-title").textContent = requested.view === "all"
+      ? "All Mail could not be opened"
+      : requested.mailbox
+        ? `${requested.mailbox} could not be opened`
+        : "The mailbox could not be opened";
+    byId("mail-switch-detail").textContent = (
+      "Previously loaded messages are hidden because they belong to another mailbox state."
+    );
+    byId("mail-switch-retry").hidden = false;
+    loader.classList.add("is-error");
+    loader.setAttribute("role", "alert");
+    loader.hidden = false;
+    pane.removeAttribute("aria-busy");
   };
 
   const syncSelectedMessageRow = (route) => {
     const requested = requestedMailContext();
     const loaded = objectValue(state.mail);
+    const loadedView = stringValue(loaded.selected_view, "mailbox");
     const loadedMailboxMatches = (
       stringValue(loaded.selected_account) === requested.account
-      && stringValue(loaded.selected_mailbox) === requested.mailbox
+      && loadedView === requested.view
+      && (
+        loadedView === "all"
+        || stringValue(loaded.selected_mailbox) === requested.mailbox
+      )
     );
     const selectedUid = route.name === "message" && loadedMailboxMatches
       ? route.uid
       : "";
     document.querySelectorAll("#message-list-body tr").forEach((row) => {
       if (!(row instanceof HTMLTableRowElement)) return;
-      const selected = Boolean(selectedUid) && row.dataset.uid === selectedUid;
+      const selected = Boolean(selectedUid)
+        && row.dataset.uid === selectedUid
+        && (
+          requested.view !== "all"
+          || row.dataset.mailbox === requested.mailbox
+        );
       row.classList.toggle("is-selected", selected);
       if (selected) row.setAttribute("aria-current", "true");
       else row.removeAttribute("aria-current");
@@ -1209,12 +1330,14 @@
     mailbox = "",
     cursor = "",
     search = "",
+    view = "",
   }) => {
     const url = new URL("/mail", window.location.origin);
     if (account && state.role === "admin") {
       url.searchParams.set("account", account);
     }
-    if (mailbox) url.searchParams.set("mailbox", mailbox);
+    if (view === "all") url.searchParams.set("view", "all");
+    else if (mailbox) url.searchParams.set("mailbox", mailbox);
     if (cursor) url.searchParams.set("cursor", cursor);
     const boundedSearch = stringValue(search).trim().slice(0, 120);
     if (boundedSearch) url.searchParams.set("search", boundedSearch);
@@ -1371,8 +1494,14 @@
   const setMessageRowBusy = (row, busy) => {
     if (busy) row.setAttribute("aria-busy", "true");
     else row.removeAttribute("aria-busy");
-    for (const control of row.querySelectorAll(".message-row-action, .message-select-checkbox")) {
-      if (control instanceof HTMLButtonElement || control instanceof HTMLInputElement) {
+    for (const control of row.querySelectorAll(
+      ".message-row-action, .message-select-checkbox, .message-row-move-target",
+    )) {
+      if (
+        control instanceof HTMLButtonElement
+        || control instanceof HTMLInputElement
+        || control instanceof HTMLSelectElement
+      ) {
         control.disabled = busy || control.dataset.unavailable === "true";
       }
     }
@@ -1400,6 +1529,69 @@
       .filter((message) => messageMatchesSearch(message, search));
   };
 
+  const messageSelectionKey = (mailbox, uid) => JSON.stringify([
+    stringValue(mailbox),
+    stringValue(uid),
+  ]);
+
+  const selectionContext = (value, account = "", fallbackMailbox = "") => {
+    if (value && typeof value === "object") {
+      return {
+        account: stringValue(value.account, account),
+        mailbox: stringValue(value.mailbox, fallbackMailbox),
+        uid: stringValue(value.uid),
+      };
+    }
+    const source = stringValue(value);
+    try {
+      const parsed = JSON.parse(source);
+      if (
+        Array.isArray(parsed)
+        && parsed.length === 2
+        && typeof parsed[0] === "string"
+        && typeof parsed[1] === "string"
+      ) {
+        return {account, mailbox: parsed[0], uid: parsed[1]};
+      }
+    } catch {
+      // Row actions historically passed bare UIDs; retain that bounded path.
+    }
+    return {account, mailbox: fallbackMailbox, uid: source};
+  };
+
+  const selectedMessageContexts = (values = state.selectedMessageUids) => {
+    const context = selectedMailContext();
+    return [...values]
+      .map((value) => selectionContext(value, context.account, context.mailbox))
+      .filter((item) => item.account && item.mailbox && item.uid);
+  };
+
+  const selectedViewIsAll = () => (
+    stringValue(objectValue(state.mail).selected_view, "mailbox") === "all"
+  );
+
+  const realMailboxes = (mail = objectValue(state.mail)) => (
+    arrayValue(mail.mailboxes || mail.folders)
+      .map(objectValue)
+      .map((item) => stringValue(item.name))
+      .filter(Boolean)
+  );
+
+  const populateMoveTarget = (select, sourceMailbox = "") => {
+    if (!(select instanceof HTMLSelectElement)) return;
+    const selected = select.value;
+    const folders = realMailboxes()
+      .filter((name) => name !== sourceMailbox)
+      .map((name) => ({value: name, label: name}));
+    populateSelect(
+      select,
+      folders,
+      folders.some((item) => item.value === selected) ? selected : "",
+      "Move to...",
+    );
+    select.disabled = folders.length === 0;
+  };
+
   const updateBulkToolbar = () => {
     const mail = objectValue(state.mail);
     const allMessages = arrayValue(mail.messages || mail.items).map(objectValue);
@@ -1417,6 +1609,7 @@
       .map(objectValue)
       .find((item) => stringValue(item.name) === stringValue(mail.selected_mailbox));
     const isTrash = objectValue(selectedMailbox).is_trash === true;
+    const allMail = selectedViewIsAll();
     byId("mail-bulk-archive").disabled = (
       selectedCount === 0
       || state.mailBulkBusy
@@ -1435,7 +1628,17 @@
     permanentDelete.disabled = !isTrash || selectedCount === 0 || state.mailBulkBusy;
     byId("mail-mark-all-read").disabled = (
       state.mailBulkBusy
+      || allMail
       || !allMessages.some((message) => message.unread === true)
+    );
+    const moveTarget = byId("mail-bulk-move-target");
+    populateMoveTarget(moveTarget, allMail ? "" : stringValue(mail.selected_mailbox));
+    const targetMailbox = moveTarget instanceof HTMLSelectElement ? moveTarget.value : "";
+    if (moveTarget instanceof HTMLSelectElement) {
+      moveTarget.disabled = state.mailBulkBusy || selectedCount === 0 || !realMailboxes(mail).length;
+    }
+    byId("mail-bulk-move").disabled = (
+      state.mailBulkBusy || selectedCount === 0 || !targetMailbox
     );
     document.querySelectorAll(".message-select-checkbox").forEach((control) => {
       if (control instanceof HTMLInputElement) control.disabled = state.mailBulkBusy;
@@ -1451,51 +1654,137 @@
     };
   };
 
-  const runBulkMessageAction = async (action, messageIds = null) => {
-    if (state.mailBulkBusy) return;
+  const runBulkMessageAction = async (action, messageIds = null, targetMailbox = "") => {
+    if (state.mailBulkBusy) return false;
     const context = selectedMailContext();
-    const selected = messageIds === null
-      ? [...state.selectedMessageUids]
-      : [...messageIds];
-    if (!context.account || !context.mailbox) return;
-    if (action !== "mark_all_read" && selected.length === 0) return;
+    const selected = action === "mark_all_read"
+      ? []
+      : selectedMessageContexts(messageIds === null ? state.selectedMessageUids : messageIds);
+    if (!context.account || (action === "mark_all_read" && !context.mailbox)) return false;
+    if (action !== "mark_all_read" && selected.length === 0) return false;
+    if (action === "move" && !realMailboxes().includes(targetMailbox)) {
+      showAlert("Select an existing destination folder.");
+      return false;
+    }
     const signal = state.routeController?.signal;
-    if (!(signal instanceof AbortSignal)) return;
+    if (!(signal instanceof AbortSignal)) return false;
     state.mailBulkBusy = true;
     updateBulkToolbar();
     clearAlert();
+    let completedGroups = 0;
     try {
-      const payload = await mutate("/mail-actions", {
-        guardSignal: signal,
-        json: {
-          account: context.account,
-          mailbox: context.mailbox,
-          action,
-          ...(action === "mark_all_read" ? {} : {uids: selected}),
-        },
-      });
-      if (signal.aborted) return;
-      finishAction(payload, "Mailbox updated.");
+      const groups = new Map();
+      if (action === "mark_all_read") {
+        groups.set(context.mailbox, []);
+      } else {
+        const mailboxRecords = arrayValue(objectValue(state.mail).mailboxes || objectValue(state.mail).folders)
+          .map(objectValue);
+        for (const item of selected) {
+          if (action === "move" && item.mailbox === targetMailbox) continue;
+          const source = mailboxRecords.find(
+            (record) => stringValue(record.name) === item.mailbox,
+          );
+          if (action === "archive" && objectValue(source).is_archive === true) continue;
+          if (action === "trash" && objectValue(source).is_trash === true) continue;
+          if (!groups.has(item.mailbox)) groups.set(item.mailbox, []);
+          groups.get(item.mailbox).push(item.uid);
+        }
+      }
+      if (!groups.size) {
+        showAlert(action === "move"
+          ? "The selected messages are already in that folder."
+          : "No selected messages can use that action from their current folders.");
+        return false;
+      }
+      const freshnessByMailbox = new Map();
+      if (new Set(["archive", "trash", "move"]).has(action)) {
+        for (const [sourceMailbox, uids] of groups) {
+          signal.throwIfAborted();
+          freshnessByMailbox.set(
+            sourceMailbox,
+            await loadMessageActionSnapshots(
+              {account: context.account, mailbox: sourceMailbox},
+              uids,
+              signal,
+            ),
+          );
+        }
+      }
+      let payload = null;
+      for (const [sourceMailbox, uids] of groups) {
+        payload = await mutate("/mail-actions", {
+          guardSignal: signal,
+          json: {
+            account: context.account,
+            mailbox: sourceMailbox,
+            action,
+            ...(action === "mark_all_read" ? {} : {uids}),
+            ...(action === "move" ? {target_mailbox: targetMailbox} : {}),
+            ...(freshnessByMailbox.has(sourceMailbox)
+              ? {freshness: freshnessByMailbox.get(sourceMailbox)}
+              : {}),
+          },
+        });
+        signal.throwIfAborted();
+        completedGroups += 1;
+      }
+      if (signal.aborted) return false;
+      finishAction(payload || {}, action === "move" ? "Messages moved." : "Mailbox updated.");
       const mail = objectValue(state.mail);
       const messages = arrayValue(mail.messages || mail.items).map(objectValue);
-      const selectedSet = new Set(selected);
+      const selectedSet = new Set(selected.map((item) => (
+        messageSelectionKey(item.mailbox, item.uid)
+      )));
       if (action === "mark_read" || action === "mark_unread" || action === "mark_all_read") {
         const unread = action === "mark_unread";
         for (const message of messages) {
-          if (action === "mark_all_read" || selectedSet.has(stringValue(message.uid))) {
+          const messageMailbox = stringValue(message.mailbox, context.mailbox);
+          if (
+            action === "mark_all_read"
+            || selectedSet.has(messageSelectionKey(messageMailbox, stringValue(message.uid)))
+          ) {
             message.unread = unread;
           }
         }
-      } else {
+      } else if (!selectedViewIsAll()) {
         const remaining = messages.filter(
-          (message) => !selectedSet.has(stringValue(message.uid)),
+          (message) => !selectedSet.has(messageSelectionKey(
+            stringValue(message.mailbox, context.mailbox),
+            stringValue(message.uid),
+          )),
         );
         if (Array.isArray(mail.messages)) mail.messages = remaining;
         else mail.items = remaining;
+      } else {
+        await loadMail(signal);
+        return true;
       }
       renderMail(mail);
+      return true;
     } catch (error) {
-      if (!signal.aborted) handleError(error);
+      if (!signal.aborted) {
+        if (completedGroups > 0 || (error instanceof ApiError && error.ambiguous)) {
+          state.selectedMessageUids.clear();
+          try {
+            await loadMail(signal);
+          } catch {
+            requireMailRefreshAfterUnknownResult();
+          }
+          handleError(new ApiError(
+            completedGroups > 0
+              ? "Some source folders were updated before a later operation failed."
+              : "The mailbox result could not be confirmed.",
+            {
+              code: error instanceof ApiError ? error.code : "mail_action_failed",
+              status: error instanceof ApiError ? error.status : 0,
+              ambiguous: true,
+            },
+          ));
+        } else {
+          handleError(error);
+        }
+      }
+      return false;
     } finally {
       state.mailBulkBusy = false;
       if (!signal.aborted) updateBulkToolbar();
@@ -1503,9 +1792,11 @@
   };
 
   const refreshMessageList = (context) => {
+    const allMailView = new URLSearchParams(window.location.search).get("view") === "all";
     navigate(buildMailUrl({
       account: context.account,
       mailbox: context.mailbox,
+      view: allMailView ? "all" : "",
       search: currentMailSearch(),
     }), {replace: true, focus: false});
   };
@@ -1525,14 +1816,22 @@
     return button;
   };
 
-  const messageReadActionButton = (unread, context) => (
+  const messageReadActionButton = (unread, context, row) => (
     messageActionButton(
       unread ? "Mark as read" : "Mark as unread",
       context,
-      () => runBulkMessageAction(
-        unread ? "mark_read" : "mark_unread",
-        [context.uid],
-      ),
+      async (button) => {
+        setMessageRowBusy(row, true);
+        try {
+          await runBulkMessageAction(
+            unread ? "mark_read" : "mark_unread",
+            [context],
+          );
+        } finally {
+          setMessageRowBusy(row, false);
+          if (document.contains(button)) button.focus();
+        }
+      },
       unread ? "Mark read" : "Mark unread",
     )
   );
@@ -1540,7 +1839,7 @@
   const archiveMessageFromRow = async (context, row, button) => {
     setMessageRowBusy(row, true);
     try {
-      await runBulkMessageAction("archive", [context.uid]);
+      await runBulkMessageAction("archive", [context]);
     } finally {
       setMessageRowBusy(row, false);
       if (document.contains(button)) button.focus();
@@ -1558,7 +1857,7 @@
       action: async () => {
         setMessageRowBusy(row, true);
         try {
-          await runBulkMessageAction("trash", [context.uid]);
+          await runBulkMessageAction("trash", [context]);
         } finally {
           setMessageRowBusy(row, false);
         }
@@ -1587,34 +1886,52 @@
     return freshness;
   };
 
-  const loadMessageActionSnapshots = async (context, uids, signal) => {
-    const snapshots = new Array(uids.length);
+  const loadMessageActionSnapshots = async (
+    context,
+    uids,
+    signal,
+    {showProgress = false} = {},
+  ) => {
     const actionButton = byId("typed-confirm-action");
-    let nextIndex = 0;
-    let completed = 0;
-    let failure = null;
-    const worker = async () => {
-      while (!failure && nextIndex < uids.length) {
-        const index = nextIndex;
-        nextIndex += 1;
-        const uid = uids[index];
-        try {
-          signal.throwIfAborted();
-          const token = await loadMessageActionSnapshot({...context, uid}, signal);
-          snapshots[index] = {uid, token};
-          completed += 1;
-          if (actionButton instanceof HTMLButtonElement) {
-            actionButton.textContent = `Verifying ${completed} of ${uids.length}`;
-          }
-        } catch (error) {
-          failure = error;
-        }
+    if (showProgress && actionButton instanceof HTMLButtonElement) {
+      actionButton.textContent = `Verifying ${uids.length} message${uids.length === 1 ? "" : "s"}`;
+    }
+    signal.throwIfAborted();
+    const payload = await mutate("/mail/action-snapshots", {
+      guardSignal: signal,
+      stepUp: false,
+      json: {
+        account: context.account,
+        mailbox: context.mailbox,
+        uids,
+      },
+    });
+    signal.throwIfAborted();
+    const data = objectValue(payload.data);
+    const snapshots = arrayValue(data.freshness).map(objectValue);
+    const tokens = new Set();
+    if (
+      stringValue(data.account) !== context.account
+      || stringValue(data.mailbox) !== context.mailbox
+      || snapshots.length !== uids.length
+    ) {
+      throw new ApiError("The message selection changed; refresh the mailbox and try again.", {
+        code: "stale_message",
+        status: 409,
+      });
+    }
+    for (let index = 0; index < snapshots.length; index += 1) {
+      const uid = stringValue(snapshots[index].uid);
+      const token = stringValue(snapshots[index].token);
+      if (uid !== uids[index] || !token || tokens.has(token)) {
+        throw new ApiError("The message selection changed; refresh the mailbox and try again.", {
+          code: "stale_message",
+          status: 409,
+        });
       }
-    };
-    await Promise.all(
-      Array.from({length: Math.min(2, uids.length)}, () => worker()),
-    );
-    if (failure) throw failure;
+      tokens.add(token);
+      snapshots[index] = {uid, token};
+    }
     return snapshots;
   };
 
@@ -1643,7 +1960,12 @@
     updateBulkToolbar();
     clearAlert();
     try {
-      const freshness = await loadMessageActionSnapshots(context, uids, routeSignal);
+      const freshness = await loadMessageActionSnapshots(
+        context,
+        uids,
+        routeSignal,
+        {showProgress: true},
+      );
       routeSignal.throwIfAborted();
       const actionButton = byId("typed-confirm-action");
       if (actionButton instanceof HTMLButtonElement) {
@@ -1726,7 +2048,10 @@
           const mail = objectValue(state.mail);
           const remaining = arrayValue(mail.messages || mail.items)
             .map(objectValue)
-            .filter((message) => stringValue(message.uid) !== context.uid);
+            .filter((message) => !(
+              stringValue(message.uid) === context.uid
+              && stringValue(message.mailbox, context.mailbox) === context.mailbox
+            ));
           if (Array.isArray(mail.messages)) mail.messages = remaining;
           else mail.items = remaining;
           renderMail(mail);
@@ -1740,13 +2065,22 @@
   const renderMail = (mail) => {
     state.selectedMessageUids.clear();
     state.mailBulkBusy = false;
-    const requestedAccount = new URLSearchParams(window.location.search).get("account") || "";
+    const bulkMoveTarget = byId("mail-bulk-move-target");
+    if (bulkMoveTarget instanceof HTMLSelectElement) bulkMoveTarget.value = "";
+    const currentQuery = new URLSearchParams(window.location.search);
+    const requestedAccount = currentQuery.get("account") || "";
     const account = stringValue(
       mail.selected_account,
       requestedAccount || scopedAccount(),
     );
-    const requestedMailbox = new URLSearchParams(window.location.search).get("mailbox") || "";
-    const mailbox = stringValue(mail.selected_mailbox, requestedMailbox);
+    const requestedMailbox = currentQuery.get("mailbox") || "";
+    const requestedView = currentQuery.get("view") === "all" ? "all" : "mailbox";
+    const selectedView = stringValue(mail.selected_view, requestedView) === "all"
+      ? "all"
+      : "mailbox";
+    mail.selected_view = selectedView;
+    const allMailView = selectedView === "all";
+    const mailbox = allMailView ? "" : stringValue(mail.selected_mailbox, requestedMailbox);
     if (state.role === "admin" && account) {
       state.effectiveAccount = account;
     }
@@ -1803,11 +2137,6 @@
     const allMessages = arrayValue(mail.messages || mail.items).map(objectValue);
     const search = currentMailSearch();
     const messages = allMessages.filter((message) => messageMatchesSearch(message, search));
-    const selectedMailbox = mailboxes.find(
-      (item) => stringValue(item.name) === mailbox,
-    );
-    const currentIsTrash = objectValue(selectedMailbox).is_trash === true;
-    const currentIsArchive = objectValue(selectedMailbox).is_archive === true;
     const trashAvailable = mail.trash_available === true;
     const archiveAvailable = mail.archive_available === true;
 
@@ -1823,20 +2152,24 @@
     );
     populateSelect(
       byId("mail-mailbox"),
-      mailboxes.map((item) => {
-        const name = stringValue(item.name);
-        return {value: name, label: name};
-      }),
-      mailbox,
+      [
+        {value: "__all__", label: "All Mail"},
+        ...mailboxes.map((item) => {
+          const name = stringValue(item.name);
+          return {value: name, label: name};
+        }),
+      ],
+      allMailView ? "__all__" : mailbox,
       account ? "Select a mailbox" : "Select an account first",
-      Boolean(account && mailboxes.length),
+      Boolean(account),
     );
     byId("mail-mailbox").disabled = !account;
     byId("mail-mailbox").required = Boolean(account && mailboxes.length);
     byId("mail-identity-card").hidden = state.role === "admin";
     byId("current-mailbox-identity").textContent = accountLabel;
-    byId("mail-title").textContent = mailbox || "Mail";
-    byId("mail-list-summary").textContent = mailbox
+    const mailTitle = allMailView ? "All Mail" : mailbox;
+    byId("mail-title").textContent = mailTitle || "Mail";
+    byId("mail-list-summary").textContent = mailTitle
       ? search
         ? `${messages.length} of ${allMessages.length} message${
           allMessages.length === 1 ? "" : "s"
@@ -1846,18 +2179,28 @@
     const searchInput = byId("mail-search-input");
     if (searchInput instanceof HTMLInputElement) {
       if (searchInput.value !== search) searchInput.value = search;
-      searchInput.disabled = !account || !mailbox || allMessages.length === 0;
+      searchInput.disabled = !account || (!allMailView && !mailbox) || allMessages.length === 0;
     }
     byId("mail-search-clear").hidden = !search;
 
     const folderFragment = document.createDocumentFragment();
+    const allMailLink = element("a", {className: "mail-folder-link"});
+    allMailLink.href = buildMailUrl({account, view: "all", search});
+    allMailLink.dataset.route = "";
+    allMailLink.dataset.kind = "all";
+    if (allMailView) allMailLink.setAttribute("aria-current", "page");
+    allMailLink.append(
+      element("span", {className: "mail-folder-icon", text: "*"}),
+      element("span", {className: "mail-folder-name", text: "All Mail"}),
+    );
+    folderFragment.append(allMailLink);
     for (const item of mailboxes) {
       const name = stringValue(item.name);
       if (!name) continue;
       const link = element("a", {className: "mail-folder-link"});
       link.href = buildMailUrl({account, mailbox: name, search});
       link.dataset.route = "";
-      if (name === mailbox) link.setAttribute("aria-current", "page");
+      if (!allMailView && name === mailbox) link.setAttribute("aria-current", "page");
       const normalized = name.toLowerCase();
       const kind = item.is_trash === true
         ? "trash"
@@ -1892,10 +2235,10 @@
     }
     byId("mail-folder-list").replaceChildren(folderFragment);
 
-    const currentQuery = new URLSearchParams(window.location.search);
     if (
       account
       && mailbox
+      && !allMailView
       && (
         state.role !== "admin"
         || currentQuery.get("account") === account
@@ -1912,24 +2255,35 @@
     const fragment = document.createDocumentFragment();
     const activeRoute = parseRoute();
     const activeMessageUid = activeRoute.name === "message" ? activeRoute.uid : "";
+    const activeMessageMailbox = activeRoute.name === "message"
+      ? currentQuery.get("mailbox") || ""
+      : "";
     const activeCursor = currentQuery.get("cursor") || "";
     for (const message of messages) {
       const uid = stringValue(message.uid);
+      const messageMailbox = stringValue(message.mailbox, mailbox);
+      if (!uid || !messageMailbox) continue;
       const url = new URL(`/mail/${encodeURIComponent(uid)}`, window.location.origin);
       if (state.role === "admin") {
         url.searchParams.set("account", account);
       }
-      url.searchParams.set("mailbox", mailbox);
+      url.searchParams.set("mailbox", messageMailbox);
+      if (allMailView) url.searchParams.set("view", "all");
       if (activeCursor) url.searchParams.set("cursor", activeCursor);
       if (search) url.searchParams.set("search", search);
       const sender = stringValue(message.sender, "Unknown sender");
       const subject = stringValue(message.subject, "(No subject)");
-      const context = {account, mailbox, uid, sender, subject};
+      const context = {account, mailbox: messageMailbox, uid, sender, subject};
       const row = element("tr", {
         className: message.unread === true ? "message-unread" : "",
       });
       row.dataset.uid = uid;
-      if (uid === activeMessageUid) {
+      row.dataset.mailbox = messageMailbox;
+      row.dataset.selectionKey = messageSelectionKey(messageMailbox, uid);
+      if (
+        uid === activeMessageUid
+        && (!allMailView || messageMailbox === activeMessageMailbox)
+      ) {
         row.classList.add("is-selected");
         row.setAttribute("aria-current", "true");
       }
@@ -1963,8 +2317,9 @@
       });
       selectMessage.setAttribute("aria-label", `Select message: ${subject}`);
       selectMessage.addEventListener("change", () => {
-        if (selectMessage.checked) state.selectedMessageUids.add(uid);
-        else state.selectedMessageUids.delete(uid);
+        const key = messageSelectionKey(messageMailbox, uid);
+        if (selectMessage.checked) state.selectedMessageUids.add(key);
+        else state.selectedMessageUids.delete(key);
         row.classList.toggle("is-bulk-selected", selectMessage.checked);
         updateBulkToolbar();
       });
@@ -1998,11 +2353,22 @@
           text: message.unread === true ? "Unread" : "Read",
         }),
       );
+      if (allMailView) {
+        subjectCell.append(element("span", {
+          className: "message-mailbox-label",
+          text: messageMailbox,
+        }));
+      }
       const actionCell = element("td", {className: "message-actions-cell"});
       const actionGroup = element("div", {className: "message-row-actions"});
       actionGroup.setAttribute("role", "group");
       actionGroup.setAttribute("aria-label", `Actions for ${subject}`);
-      const permanentDelete = currentIsTrash || !trashAvailable;
+      const sourceMailbox = mailboxes.find(
+        (item) => stringValue(item.name) === messageMailbox,
+      );
+      const sourceIsTrash = objectValue(sourceMailbox).is_trash === true;
+      const sourceIsArchive = objectValue(sourceMailbox).is_archive === true;
+      const permanentDelete = sourceIsTrash || !trashAvailable;
       const deleteButton = permanentDelete
         ? messageActionButton(
           "Permanently delete",
@@ -2017,15 +2383,15 @@
       const archiveButton = messageActionButton("Archive", context, (button) => (
         archiveMessageFromRow(context, row, button)
       ));
-      if (currentIsArchive || !archiveAvailable) {
+      if (sourceIsArchive || !archiveAvailable) {
         archiveButton.dataset.unavailable = "true";
         archiveButton.disabled = true;
-        archiveButton.title = currentIsArchive
+        archiveButton.title = sourceIsArchive
           ? "This message is already archived."
           : "This account does not have an available Archive mailbox.";
       }
       actionGroup.append(
-        messageReadActionButton(message.unread === true, context),
+        messageReadActionButton(message.unread === true, context, row),
         messageActionButton("Forward", context, () => {
           state.pendingForwardSubject = null;
           navigate(buildForwardUrl({...context, mode: "inline"}));
@@ -2033,7 +2399,7 @@
         messageActionButton("Forward as attachment", context, () => {
           state.pendingForwardSubject = {
             account,
-            mailbox,
+            mailbox: messageMailbox,
             uid,
             mode: "attachment",
             subject: boundedForwardedSubject(subject),
@@ -2043,6 +2409,36 @@
         deleteButton,
         archiveButton,
       );
+      const rowMove = element("span", {className: "mail-move-control message-row-move"});
+      const rowMoveSelect = element("select", {className: "message-row-move-target"});
+      rowMoveSelect.setAttribute("aria-label", `Move ${subject} to folder`);
+      populateSelect(
+        rowMoveSelect,
+        mailboxes
+          .map((item) => stringValue(item.name))
+          .filter((name) => name && name !== messageMailbox)
+          .map((name) => ({value: name, label: name})),
+        "",
+        "Move to...",
+      );
+      const rowMoveButton = messageActionButton("Move", context, async (button) => {
+        if (!rowMoveSelect.value) return;
+        setMessageRowBusy(row, true);
+        try {
+          await runBulkMessageAction("move", [context], rowMoveSelect.value);
+        } finally {
+          setMessageRowBusy(row, false);
+          if (document.contains(button)) button.focus();
+        }
+      });
+      rowMoveButton.dataset.unavailable = "true";
+      rowMoveButton.disabled = true;
+      rowMoveSelect.addEventListener("change", () => {
+        rowMoveButton.dataset.unavailable = String(!rowMoveSelect.value);
+        rowMoveButton.disabled = !rowMoveSelect.value || state.mailBulkBusy;
+      });
+      rowMove.append(rowMoveSelect, rowMoveButton);
+      actionGroup.append(rowMove);
       actionCell.append(actionGroup);
       const date = stringValue(message.date, "Unknown date");
       const dateCell = element("td", {text: compactMessageDate(date)});
@@ -2058,7 +2454,8 @@
     if (state.restoreMessageListPosition && activeMessageUid) {
       const selectedRow = [...document.querySelectorAll("#message-list-body tr")]
         .find((row) => row instanceof HTMLTableRowElement
-          && row.dataset.uid === activeMessageUid);
+          && row.dataset.uid === activeMessageUid
+          && (!allMailView || row.dataset.mailbox === activeMessageMailbox));
       const scrollPane = document.querySelector(".mail-list-table");
       if (
         selectedRow instanceof HTMLTableRowElement
@@ -2083,15 +2480,17 @@
     updateBulkToolbar();
     const empty = byId("message-empty");
     empty.hidden = messages.length !== 0;
-    empty.textContent = account && mailbox
+    empty.textContent = account && (allMailView || mailbox)
       ? search && allMessages.length
         ? "No sender or subject on this page matches your search."
-        : mailbox.trim().toLowerCase() === "sent"
+        : !allMailView && mailbox.trim().toLowerCase() === "sent"
         ? (
           "No sent copies are stored here. MaddyWeb saves a copy after it sends; "
           + "other mail clients must save their own Sent copy."
         )
-        : "This mailbox has no messages."
+        : allMailView
+          ? "No messages are stored in this account."
+          : "This mailbox has no messages."
       : "Select an account and mailbox.";
 
     const previous = byId("mail-previous");
@@ -2104,6 +2503,7 @@
       previous.href = buildMailUrl({
         account,
         mailbox,
+        view: allMailView ? "all" : "",
         cursor: previousCursor,
         search,
       });
@@ -2112,6 +2512,7 @@
       next.href = buildMailUrl({
         account,
         mailbox,
+        view: allMailView ? "all" : "",
         cursor: nextCursor,
         search,
       });
@@ -2123,10 +2524,13 @@
   const loadMail = async (signal) => {
     setLoading("Loading mailbox data.");
     const query = new URLSearchParams();
-    for (const name of ["account", "mailbox", "cursor"]) {
-      const value = new URLSearchParams(window.location.search).get(name);
+    const routeQuery = new URLSearchParams(window.location.search);
+    const allMailView = routeQuery.get("view") === "all";
+    for (const name of ["account", "mailbox", "cursor", "view"]) {
+      const value = routeQuery.get(name);
       if (
         value
+        && !(allMailView && name === "mailbox")
         && (
           name !== "account"
           || state.role === "admin"
@@ -2138,7 +2542,7 @@
     state.mail = data;
     renderMail(data);
     const selectedMailbox = stringValue(data.selected_mailbox);
-    if (!query.get("mailbox") && selectedMailbox) {
+    if (!allMailView && !query.get("mailbox") && selectedMailbox) {
       window.history.replaceState(
         null,
         "",
@@ -2365,6 +2769,7 @@
       mailbox,
       cursor: routeQuery.get("cursor") || "",
       search: routeQuery.get("search") || "",
+      view: routeQuery.get("view") === "all" ? "all" : "",
     });
     const messageContextUrl = (action) => {
       const url = new URL("/compose", window.location.origin);
@@ -2393,6 +2798,11 @@
     }
     renderMessageBody(message);
     renderAttachments(message);
+    populateMoveTarget(byId("message-move-target"), mailbox);
+    const moveTarget = byId("message-move-target");
+    byId("message-move").disabled = !(
+      moveTarget instanceof HTMLSelectElement && moveTarget.value
+    );
     byId("message-trash").disabled = !stringValue(message.freshness_token);
     byId("message-delete").disabled = !stringValue(message.freshness_token);
     showLoadedMessage();
@@ -2402,14 +2812,16 @@
     const mail = objectValue(state.mail);
     const account = stringValue(message.account, scopedAccount());
     const mailbox = stringValue(message.mailbox);
-    if (
-      stringValue(mail.selected_account) !== account
-      || stringValue(mail.selected_mailbox) !== mailbox
-    ) return null;
+    const allMailView = stringValue(mail.selected_view, "mailbox") === "all";
+    if (stringValue(mail.selected_account) !== account) return null;
+    if (!allMailView && stringValue(mail.selected_mailbox) !== mailbox) return null;
     const uid = stringValue(message.uid);
     return arrayValue(mail.messages || mail.items)
       .map(objectValue)
-      .find((item) => stringValue(item.uid) === uid) || null;
+      .find((item) => (
+        stringValue(item.uid) === uid
+        && (!allMailView || stringValue(item.mailbox) === mailbox)
+      )) || null;
   };
 
   const updateLoadedMessageSummaryReadState = (message, unread) => {
@@ -2418,7 +2830,10 @@
     summary.unread = unread;
     const uid = stringValue(message.uid);
     const row = [...document.querySelectorAll("#message-list-body tr")]
-      .find((candidate) => candidate.dataset.uid === uid);
+      .find((candidate) => (
+        candidate.dataset.uid === uid
+        && candidate.dataset.mailbox === stringValue(message.mailbox)
+      ));
     if (!(row instanceof HTMLTableRowElement)) return;
     row.classList.toggle("message-unread", unread);
     const unreadDot = row.querySelector(".message-unread-dot");
@@ -3717,6 +4132,805 @@
     }
   };
 
+  const RULE_MAX_NODES = 32;
+  const RULE_MAX_DEPTH = 4;
+  const RULE_MAX_EXPRESSION_BYTES = 32 * 1024;
+  const RULE_FIELDS = [
+    ["from", "From", "string"],
+    ["to", "To", "string"],
+    ["cc", "Cc", "string"],
+    ["bcc", "Bcc", "string"],
+    ["reply_to", "Reply-To", "string"],
+    ["subject", "Subject", "string"],
+    ["list_id", "List ID", "string"],
+    ["header", "Custom header", "string"],
+    ["size", "Message size (bytes)", "number"],
+    ["has_attachment", "Has attachment", "boolean"],
+  ];
+  const RULE_STRING_TESTS = [
+    ["contains", "contains"],
+    ["not_contains", "does not contain"],
+    ["equals", "is exactly"],
+    ["not_equals", "is not"],
+    ["starts_with", "starts with"],
+    ["ends_with", "ends with"],
+    ["exists", "exists"],
+  ];
+  const RULE_NUMBER_TESTS = [
+    ["eq", "equals"],
+    ["lt", "is less than"],
+    ["lte", "is at most"],
+    ["gt", "is greater than"],
+    ["gte", "is at least"],
+  ];
+  const RULE_BOOLEAN_TESTS = [["eq", "is"]];
+
+  const ruleFieldType = (field) => (
+    RULE_FIELDS.find(([name]) => name === field)?.[2] || "string"
+  );
+
+  const ruleTestsForField = (field) => {
+    const type = ruleFieldType(field);
+    if (type === "number") return RULE_NUMBER_TESTS;
+    if (type === "boolean") return RULE_BOOLEAN_TESTS;
+    return RULE_STRING_TESTS;
+  };
+
+  const defaultRuleCondition = () => ({
+    op: "and",
+    conditions: [{field: "from", operator: "contains", value: ""}],
+  });
+
+  const normalizeRuleCondition = (source) => {
+    let count = 0;
+    const visit = (value, depth) => {
+      count += 1;
+      const input = objectValue(value);
+      const op = stringValue(input.op).toLowerCase();
+      if (depth < RULE_MAX_DEPTH && (op === "and" || op === "or")) {
+        const children = [];
+        for (const child of arrayValue(input.conditions || input.children)) {
+          if (count >= RULE_MAX_NODES) break;
+          children.push(visit(child, depth + 1));
+        }
+        return {op, conditions: children.length ? children : [visit({}, depth + 1)]};
+      }
+      if (depth < RULE_MAX_DEPTH && count < RULE_MAX_NODES && op === "not") {
+        return {op: "not", condition: visit(input.condition || input.child, depth + 1)};
+      }
+      const field = RULE_FIELDS.some(([name]) => name === input.field)
+        ? input.field
+        : "from";
+      const tests = ruleTestsForField(field);
+      const operator = tests.some(([name]) => name === (input.operator || input.test))
+        ? input.operator || input.test
+        : tests[0][0];
+      const type = ruleFieldType(field);
+      return {
+        field,
+        operator,
+        ...(field === "header" ? {header: stringValue(input.header).slice(0, 78)} : {}),
+        ...(operator === "exists"
+          ? {}
+          : type === "number"
+            ? {value: Number.isSafeInteger(input.value) && input.value >= 0 ? input.value : 0}
+            : type === "boolean"
+              ? {value: input.value === true || input.value === "true"}
+              : {value: stringValue(input.value).slice(0, 1024)}),
+      };
+    };
+    return visit(source && typeof source === "object" ? source : defaultRuleCondition(), 1);
+  };
+
+  const ruleConditionStats = (node, depth = 1) => {
+    const value = objectValue(node);
+    if (value.op === "and" || value.op === "or") {
+      return arrayValue(value.conditions).reduce((stats, child) => {
+        const nested = ruleConditionStats(child, depth + 1);
+        return {
+          count: stats.count + nested.count,
+          depth: Math.max(stats.depth, nested.depth),
+        };
+      }, {count: 1, depth});
+    }
+    if (value.op === "not") {
+      const nested = ruleConditionStats(value.condition, depth + 1);
+      return {count: 1 + nested.count, depth: Math.max(depth, nested.depth)};
+    }
+    return {count: 1, depth};
+  };
+
+  const validRuleCondition = (node) => {
+    const value = objectValue(node);
+    if (value.op === "and" || value.op === "or") {
+      const children = arrayValue(value.conditions);
+      return children.length > 0 && children.every(validRuleCondition);
+    }
+    if (value.op === "not") return validRuleCondition(value.condition);
+    const type = ruleFieldType(value.field);
+    return RULE_FIELDS.some(([name]) => name === value.field)
+      && ruleTestsForField(value.field).some(([name]) => name === value.operator)
+      && (value.field !== "header" || /^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,78}$/.test(
+        stringValue(value.header),
+      ))
+      && (
+        value.operator === "exists"
+        || (type === "number" && Number.isSafeInteger(value.value) && value.value >= 0)
+        || (type === "boolean" && typeof value.value === "boolean")
+        || (type === "string" && Boolean(stringValue(value.value).trim()))
+      );
+  };
+
+  const ruleAccount = () => state.effectiveAccount || scopedAccount();
+
+  const ruleAccountLabel = (account) => {
+    const principal = objectValue(state.principal);
+    if (account === stringValue(principal.account_id)) {
+      return stringValue(principal.email, account);
+    }
+    const match = arrayValue(objectValue(state.mail).accounts)
+      .map(objectValue)
+      .find((item) => accountId(item) === account);
+    return match ? accountAddress(match) : account;
+  };
+
+  const ruleApiUrl = (path) => {
+    const url = new URL(path, window.location.origin);
+    const account = ruleAccount();
+    if (state.role === "admin" && account) url.searchParams.set("account", account);
+    return `${url.pathname}${url.search}`;
+  };
+
+  const ruleBody = (value = {}) => ({
+    ...(state.role === "admin" ? {account: ruleAccount()} : {}),
+    ...value,
+  });
+
+  const setRuleFormStatus = (message, error = false) => {
+    const status = byId("mail-rule-form-status");
+    status.textContent = message;
+    status.classList.toggle("field-error", error);
+  };
+
+  const replaceRuleNode = (parent, index, value) => {
+    if (!parent) state.mailRuleCondition = value;
+    else if (parent.op === "not") parent.condition = value;
+    else parent.conditions[index] = value;
+    renderRuleConditionTree();
+  };
+
+  const removeRuleNode = (parent, index) => {
+    if (!parent) {
+      state.mailRuleCondition = defaultRuleCondition();
+    } else if (parent.op === "not") {
+      parent.condition = {field: "from", operator: "contains", value: ""};
+    } else {
+      parent.conditions.splice(index, 1);
+      if (!parent.conditions.length) {
+        parent.conditions.push({field: "from", operator: "contains", value: ""});
+      }
+    }
+    renderRuleConditionTree();
+  };
+
+  const ruleIconButton = (label, text, handler) => {
+    const button = element("button", {
+      className: "button button-secondary rule-node-button",
+      text,
+      title: label,
+      type: "button",
+    });
+    button.setAttribute("aria-label", label);
+    button.addEventListener("click", handler);
+    return button;
+  };
+
+  const renderRuleConditionNode = (node, parent = null, index = 0, depth = 1) => {
+    const value = objectValue(node);
+    const operator = stringValue(value.op);
+    if (operator === "and" || operator === "or" || operator === "not") {
+      const group = element("section", {className: "rule-condition-group"});
+      group.dataset.depth = String(depth);
+      const heading = element("div", {className: "rule-condition-group-heading"});
+      const operatorLabel = element("label", {className: "rule-operator-label"});
+      operatorLabel.append(element("span", {text: depth === 1 ? "Match" : "Group"}));
+      const operatorSelect = element("select", {className: "rule-operator-select"});
+      populateSelect(operatorSelect, [
+        {value: "and", label: "All (AND)"},
+        {value: "or", label: "Any (OR)"},
+        {value: "not", label: "Not"},
+      ], operator, "Select operator", true);
+      operatorSelect.addEventListener("change", () => {
+        const next = operatorSelect.value;
+        if (next === "not") {
+          const first = operator === "not" ? value.condition : arrayValue(value.conditions)[0];
+          replaceRuleNode(parent, index, {op: "not", condition: first || {
+            field: "from", operator: "contains", value: "",
+          }});
+        } else {
+          const conditions = operator === "not" ? [value.condition] : arrayValue(value.conditions);
+          replaceRuleNode(parent, index, {op: next, conditions: conditions.length ? conditions : [{
+            field: "from", operator: "contains", value: "",
+          }]});
+        }
+      });
+      operatorLabel.append(operatorSelect);
+      const controls = element("div", {className: "rule-node-actions"});
+      const stats = ruleConditionStats(state.mailRuleCondition);
+      const canAdd = stats.count < RULE_MAX_NODES && operator !== "not";
+      const canNest = canAdd && depth < RULE_MAX_DEPTH;
+      const addCondition = ruleIconButton("Add condition", "+ Condition", () => {
+        value.conditions.push({field: "from", operator: "contains", value: ""});
+        renderRuleConditionTree();
+      });
+      addCondition.disabled = !canAdd;
+      const addGroup = ruleIconButton("Add nested group", "+ Group", () => {
+        value.conditions.push(defaultRuleCondition());
+        renderRuleConditionTree();
+      });
+      addGroup.disabled = !canNest;
+      if (operator !== "not") controls.append(addCondition, addGroup);
+      if (parent) {
+        controls.append(ruleIconButton("Remove group", "Remove", () => {
+          removeRuleNode(parent, index);
+        }));
+      }
+      heading.append(operatorLabel, controls);
+      group.append(heading);
+      const children = operator === "not" ? [value.condition] : arrayValue(value.conditions);
+      const childList = element("div", {className: "rule-condition-children"});
+      children.forEach((child, childIndex) => {
+        childList.append(renderRuleConditionNode(child, value, childIndex, depth + 1));
+      });
+      group.append(childList);
+      return group;
+    }
+
+    const row = element("div", {className: "rule-condition-row"});
+    const fieldSelect = element("select", {className: "rule-condition-field"});
+    fieldSelect.setAttribute("aria-label", "Message field");
+    populateSelect(
+      fieldSelect,
+      RULE_FIELDS.map(([field, label]) => ({value: field, label})),
+      stringValue(value.field, "from"),
+      "Field",
+      true,
+    );
+    const testSelect = element("select", {className: "rule-condition-test"});
+    testSelect.setAttribute("aria-label", "Comparison");
+    const fieldType = ruleFieldType(value.field);
+    const fieldTests = ruleTestsForField(value.field);
+    populateSelect(
+      testSelect,
+      fieldTests.map(([test, label]) => ({value: test, label})),
+      stringValue(value.operator, fieldTests[0][0]),
+      "Comparison",
+      true,
+    );
+    const headerInput = element("input", {
+      className: "rule-condition-header",
+      type: "text",
+    });
+    headerInput.maxLength = 78;
+    headerInput.placeholder = "Header name";
+    headerInput.value = stringValue(value.header);
+    headerInput.setAttribute("aria-label", "Custom header name");
+    const customHeader = value.field === "header";
+    headerInput.hidden = !customHeader;
+    headerInput.disabled = !customHeader;
+    row.classList.toggle("has-header", customHeader);
+    const input = fieldType === "boolean"
+      ? element("select", {className: "rule-condition-value"})
+      : element("input", {
+        className: "rule-condition-value",
+        type: fieldType === "number" ? "number" : "text",
+      });
+    if (input instanceof HTMLInputElement) {
+      if (fieldType === "number") {
+        input.min = "0";
+        input.max = String(Number.MAX_SAFE_INTEGER);
+        input.step = "1";
+        input.placeholder = "Bytes";
+        input.value = Number.isSafeInteger(value.value) ? String(value.value) : "";
+      } else {
+        input.maxLength = 1024;
+        input.placeholder = "Value";
+        input.value = stringValue(value.value);
+      }
+    }
+    if (fieldType === "boolean" && input instanceof HTMLSelectElement) {
+      populateSelect(input, [
+        {value: "true", label: "Yes"},
+        {value: "false", label: "No"},
+      ], value.value === false ? "false" : "true", "Value", true);
+    }
+    input.setAttribute("aria-label", "Condition value");
+    input.hidden = value.operator === "exists";
+    input.disabled = value.operator === "exists";
+    fieldSelect.addEventListener("change", () => {
+      value.field = fieldSelect.value;
+      if (value.field === "header") value.header = stringValue(value.header);
+      else delete value.header;
+      const nextType = ruleFieldType(value.field);
+      value.operator = ruleTestsForField(value.field)[0][0];
+      value.value = nextType === "number" ? 0 : nextType === "boolean" ? true : "";
+      renderRuleConditionTree();
+    });
+    testSelect.addEventListener("change", () => {
+      value.operator = testSelect.value;
+      if (value.operator === "exists") delete value.value;
+      else if (!("value" in value)) {
+        value.value = fieldType === "number" ? 0 : fieldType === "boolean" ? true : "";
+      }
+      renderRuleConditionTree();
+    });
+    input.addEventListener("input", () => {
+      if (fieldType === "number" && input instanceof HTMLInputElement) {
+        const parsed = input.valueAsNumber;
+        value.value = Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+      } else if (fieldType === "boolean" && input instanceof HTMLSelectElement) {
+        value.value = input.value === "true";
+      } else {
+        value.value = input.value.slice(0, 1024);
+      }
+    });
+    headerInput.addEventListener("input", () => {
+      value.header = headerInput.value.slice(0, 78);
+    });
+    row.append(
+      fieldSelect,
+      headerInput,
+      testSelect,
+      input,
+      ruleIconButton("Remove condition", "Remove", () => removeRuleNode(parent, index)),
+    );
+    return row;
+  };
+
+  function renderRuleConditionTree() {
+    if (!state.mailRuleCondition) state.mailRuleCondition = defaultRuleCondition();
+    const tree = byId("mail-rule-condition-tree");
+    tree.replaceChildren(renderRuleConditionNode(state.mailRuleCondition));
+    const stats = ruleConditionStats(state.mailRuleCondition);
+    tree.dataset.nodeCount = String(stats.count);
+    tree.dataset.depth = String(stats.depth);
+    if (stats.count >= RULE_MAX_NODES || stats.depth >= RULE_MAX_DEPTH) {
+      setRuleFormStatus(
+        `Builder limit: ${stats.count} of ${RULE_MAX_NODES} nodes, ${stats.depth} of ${RULE_MAX_DEPTH} levels.`,
+      );
+    }
+  }
+
+  const ruleId = (rule) => stringValue(rule.id || rule.rule_id);
+
+  const resetMailRuleForm = () => {
+    state.selectedMailRuleId = "";
+    state.mailRuleCondition = defaultRuleCondition();
+    const form = byId("mail-rule-form");
+    if (form instanceof HTMLFormElement) form.reset();
+    byId("mail-rule-id").value = "";
+    byId("mail-rule-enabled").checked = true;
+    byId("mail-rule-stop").checked = true;
+    byId("mail-rule-editor-title").textContent = "New rule";
+    setRuleFormStatus("");
+    renderRuleConditionTree();
+    populateSelect(
+      byId("mail-rule-target"),
+      state.ruleMailboxes.map((name) => ({value: name, label: name})),
+      "",
+      "Select a folder",
+      true,
+    );
+  };
+
+  const editMailRule = (rule) => {
+    const id = ruleId(rule);
+    state.selectedMailRuleId = id;
+    state.mailRuleCondition = normalizeRuleCondition(
+      rule.match || rule.expression || rule.condition || rule.conditions,
+    );
+    byId("mail-rule-id").value = id;
+    byId("mail-rule-name").value = stringValue(rule.name);
+    byId("mail-rule-enabled").checked = rule.enabled !== false;
+    byId("mail-rule-stop").checked = rule.stop_processing !== false;
+    byId("mail-rule-apply-existing").checked = false;
+    byId("mail-rule-editor-title").textContent = "Edit rule";
+    populateSelect(
+      byId("mail-rule-target"),
+      state.ruleMailboxes.map((name) => ({value: name, label: name})),
+      stringValue(rule.target_mailbox),
+      "Select a folder",
+      true,
+    );
+    setRuleFormStatus("");
+    renderRuleConditionTree();
+    byId("mail-rule-name")?.focus();
+  };
+
+  const mailRuleSummary = (node) => {
+    const value = objectValue(node);
+    if (value.op === "and" || value.op === "or") {
+      return `${value.op.toUpperCase()} group with ${arrayValue(value.conditions).length} condition${
+        arrayValue(value.conditions).length === 1 ? "" : "s"
+      }`;
+    }
+    if (value.op === "not") return "NOT group";
+    const field = RULE_FIELDS.find(([name]) => name === value.field)?.[1] || "Field";
+    const test = ruleTestsForField(value.field)
+      .find(([name]) => name === value.operator)?.[1] || "matches";
+    const renderedValue = ruleFieldType(value.field) === "boolean"
+      ? value.value === true ? "Yes" : "No"
+      : stringValue(value.value);
+    return `${field} ${test}${value.operator === "exists" ? "" : ` ${renderedValue}`}`;
+  };
+
+  const setMailRulesBusy = (busy) => {
+    state.mailRulesBusy = busy;
+    const view = byId("rules-view");
+    if (busy) view.setAttribute("aria-busy", "true");
+    else view.removeAttribute("aria-busy");
+    for (const control of view.querySelectorAll("button, input, select")) {
+      if (
+        control instanceof HTMLButtonElement
+        || control instanceof HTMLInputElement
+        || control instanceof HTMLSelectElement
+      ) control.disabled = busy;
+    }
+    if (!busy) {
+      renderMailRules();
+      renderMailRuleRun(state.mailRuleRun);
+      renderRuleConditionTree();
+    }
+  };
+
+  const reorderMailRule = async (id, direction) => {
+    const current = state.mailRules.findIndex((rule) => ruleId(rule) === id);
+    const target = current + direction;
+    if (current < 0 || target < 0 || target >= state.mailRules.length) return;
+    const signal = state.routeController?.signal;
+    const account = ruleAccount();
+    if (!mailRuleRouteIsActive(signal) || state.mailRulesAccount !== account) return;
+    const next = [...state.mailRules];
+    [next[current], next[target]] = [next[target], next[current]];
+    setMailRulesBusy(true);
+    try {
+      const payload = await mutate("/mail-rules/reorder", {
+        json: ruleBody({rule_ids: next.map(ruleId)}),
+        guardSignal: signal,
+      });
+      if (!mailRuleRouteIsActive(signal) || ruleAccount() !== account) return;
+      state.mailRules = next;
+      renderMailRules();
+      finishAction(payload, "Rule order updated.");
+    } catch (error) {
+      handleError(error, "Rule order could not be updated.");
+    } finally {
+      setMailRulesBusy(false);
+    }
+  };
+
+  const deleteMailRule = (rule, opener) => {
+    const id = ruleId(rule);
+    if (!id) return;
+    openConfirm({
+      title: "Delete mail rule?",
+      message: `Delete ${stringValue(rule.name, "this rule")}? Existing messages are not changed.`,
+      label: "Delete rule",
+      danger: true,
+      opener,
+      action: async () => {
+        const signal = state.routeController?.signal;
+        const account = ruleAccount();
+        if (!mailRuleRouteIsActive(signal) || state.mailRulesAccount !== account) return;
+        const payload = await mutate(`/mail-rules/${encodeURIComponent(id)}/delete`, {
+          json: ruleBody({}),
+          guardSignal: signal,
+        });
+        if (!mailRuleRouteIsActive(signal) || ruleAccount() !== account) return;
+        state.mailRules = state.mailRules.filter((item) => ruleId(item) !== id);
+        if (state.selectedMailRuleId === id) resetMailRuleForm();
+        renderMailRules();
+        finishAction(payload, "Rule deleted.");
+      },
+    });
+  };
+
+  const mailRuleRunId = (run) => stringValue(
+    objectValue(run).run_id || objectValue(run).id,
+  );
+
+  const mailRuleRunStatus = (run) => stringValue(
+    objectValue(run).status || objectValue(run).state,
+    "pending",
+  ).toLowerCase();
+
+  const mailRuleRunIsActive = (run) => (
+    Boolean(mailRuleRunId(run))
+    && !new Set(["completed", "cancelled", "failed"]).has(mailRuleRunStatus(run))
+  );
+
+  const mailRuleRouteIsActive = (signal) => (
+    signal instanceof AbortSignal
+    && !signal.aborted
+    && state.routeController?.signal === signal
+    && parseRoute().name === "rules"
+  );
+
+  const renderMailRuleRun = (run) => {
+    const value = objectValue(run);
+    const id = mailRuleRunId(value);
+    const card = byId("mail-rule-run-card");
+    if (!id) {
+      card.hidden = true;
+      state.mailRuleRun = null;
+      return;
+    }
+    state.mailRuleRun = value;
+    card.hidden = false;
+    const status = mailRuleRunStatus(value);
+    const processed = Number.isSafeInteger(value.processed) ? value.processed : 0;
+    const total = Number.isSafeInteger(value.total) && value.total > 0 ? value.total : 0;
+    byId("mail-rule-run-title").textContent = stringValue(value.rule_name, "Existing-mail run");
+    byId("mail-rule-run-state").textContent = status.replaceAll("_", " ");
+    byId("mail-rule-run-state").className = `status-pill ${
+      status === "completed" ? "status-positive" : status === "failed" ? "status-warning" : "status-neutral"
+    }`;
+    byId("mail-rule-run-summary").textContent = total
+      ? `${processed} of ${total} messages processed.`
+      : `${processed} messages processed.`;
+    const progress = byId("mail-rule-run-progress");
+    progress.max = total || 1;
+    progress.value = total ? Math.min(processed, total) : 0;
+    const active = mailRuleRunIsActive(value);
+    const driving = state.mailRuleRunDriver?.runId === id;
+    const cancelRequested = state.mailRuleRunCancelRequested === id;
+    const needsRefresh = state.mailRuleRunNeedsRefresh === id;
+    const step = byId("mail-rule-run-step");
+    step.textContent = driving
+      ? "Processing automatically..."
+      : needsRefresh
+        ? "Refresh before resuming"
+        : "Resume processing";
+    step.disabled = !active || state.mailRulesBusy || driving || needsRefresh || cancelRequested;
+    byId("mail-rule-run-cancel").disabled = (
+      !active || state.mailRulesBusy || cancelRequested
+    );
+  };
+
+  const driveMailRuleRun = (signal) => {
+    const initialRun = objectValue(state.mailRuleRun);
+    const id = mailRuleRunId(initialRun);
+    if (!id || !mailRuleRunIsActive(initialRun) || !mailRuleRouteIsActive(signal)) {
+      return Promise.resolve();
+    }
+    const current = state.mailRuleRunDriver;
+    if (current?.runId === id && current.signal === signal) return current.promise;
+
+    const driver = {runId: id, signal, promise: null};
+    state.mailRuleRunDriver = driver;
+    state.mailRuleRunNeedsRefresh = "";
+    byId("mail-rule-run-status").textContent = "Processing existing messages automatically...";
+    renderMailRuleRun(initialRun);
+
+    driver.promise = (async () => {
+      let terminalStatus = "";
+      try {
+        while (mailRuleRouteIsActive(signal)) {
+          const currentRun = objectValue(state.mailRuleRun);
+          if (
+            mailRuleRunId(currentRun) !== id
+            || !mailRuleRunIsActive(currentRun)
+            || state.mailRuleRunCancelRequested === id
+          ) break;
+          signal.throwIfAborted();
+          const payload = await mutate(`/mail-rule-runs/${encodeURIComponent(id)}/step`, {
+            json: ruleBody({}),
+            guardSignal: signal,
+          });
+          if (!mailRuleRouteIsActive(signal)) break;
+          const data = objectValue(payload.data);
+          const updatedRun = objectValue(data.run || data);
+          if (mailRuleRunId(updatedRun) !== id) {
+            throw new ApiError("The server returned an invalid rule-run status.", {
+              code: "invalid_backend_response",
+              ambiguous: true,
+            });
+          }
+          renderMailRuleRun(updatedRun);
+          if (!mailRuleRunIsActive(updatedRun)) {
+            terminalStatus = mailRuleRunStatus(updatedRun);
+            break;
+          }
+          await new Promise((resolve) => window.setTimeout(resolve, 0));
+        }
+      } catch (error) {
+        if (signal.aborted || (error && error.name === "AbortError")) return;
+        if (error instanceof ApiError && error.ambiguous) {
+          state.mailRuleRunNeedsRefresh = id;
+          byId("mail-rule-run-status").textContent = (
+            "The latest batch result is unknown. Reload Rules before resuming."
+          );
+        } else {
+          byId("mail-rule-run-status").textContent = "Automatic processing stopped.";
+        }
+        handleError(error, "The existing-mail run could not continue.");
+      } finally {
+        if (state.mailRuleRunDriver === driver) {
+          state.mailRuleRunDriver = null;
+          if (mailRuleRouteIsActive(signal)) {
+            if (terminalStatus === "completed") {
+              byId("mail-rule-run-status").textContent = "Existing messages are up to date.";
+              showToast("Existing-mail run completed.");
+            } else if (terminalStatus === "failed") {
+              byId("mail-rule-run-status").textContent = "The existing-mail run stopped with an error.";
+            } else if (terminalStatus === "cancelled") {
+              byId("mail-rule-run-status").textContent = "Existing-mail run cancelled.";
+            }
+            renderMailRuleRun(state.mailRuleRun);
+          }
+        }
+      }
+    })();
+    return driver.promise;
+  };
+
+  const startMailRuleRun = async (rule) => {
+    const id = ruleId(rule);
+    if (!id || state.mailRulesBusy) return;
+    const signal = state.routeController?.signal;
+    if (
+      !mailRuleRouteIsActive(signal)
+      || state.mailRulesAccount !== ruleAccount()
+    ) return;
+    setMailRulesBusy(true);
+    byId("mail-rule-run-status").textContent = "Starting existing-mail run...";
+    try {
+      const payload = await mutate("/mail-rule-runs", {
+        json: ruleBody({rule_id: id}),
+        guardSignal: signal,
+      });
+      if (!mailRuleRouteIsActive(signal)) return;
+      const data = objectValue(payload.data);
+      const run = data.run || data;
+      state.mailRuleRunNeedsRefresh = "";
+      renderMailRuleRun(run);
+      finishAction(payload, "Existing-mail run started.");
+      void driveMailRuleRun(signal);
+    } catch (error) {
+      byId("mail-rule-run-status").textContent = "Existing-mail run could not be started.";
+      handleError(error, "The existing-mail run could not be started.");
+    } finally {
+      setMailRulesBusy(false);
+    }
+  };
+
+  function renderMailRules() {
+    const fragment = document.createDocumentFragment();
+    state.mailRules.forEach((rule, index) => {
+      const id = ruleId(rule);
+      const item = element("li", {className: "mail-rule-card"});
+      if (id === state.selectedMailRuleId) item.classList.add("is-selected");
+      const copy = element("div", {className: "mail-rule-copy"});
+      copy.append(
+        element("h3", {text: stringValue(rule.name, "Unnamed rule")}),
+        element("p", {text: `${mailRuleSummary(
+          rule.match || rule.expression || rule.condition || rule.conditions,
+        )} -> ${
+          stringValue(rule.target_mailbox, "No target folder")
+        }`}),
+      );
+      copy.append(element("span", {
+        className: `status-pill ${rule.enabled === false ? "status-neutral" : "status-positive"}`,
+        text: rule.enabled === false ? "Disabled" : "Enabled",
+      }));
+      const actions = element("div", {className: "mail-rule-actions"});
+      const edit = ruleIconButton(`Edit ${stringValue(rule.name)}`, "Edit", () => editMailRule(rule));
+      const up = ruleIconButton(`Move ${stringValue(rule.name)} earlier`, "Up", () => {
+        void reorderMailRule(id, -1);
+      });
+      const down = ruleIconButton(`Move ${stringValue(rule.name)} later`, "Down", () => {
+        void reorderMailRule(id, 1);
+      });
+      up.disabled = index === 0;
+      down.disabled = index === state.mailRules.length - 1;
+      const apply = ruleIconButton(`Apply ${stringValue(rule.name)} to existing mail`, "Run", () => {
+        void startMailRuleRun(rule);
+      });
+      const remove = ruleIconButton(`Delete ${stringValue(rule.name)}`, "Delete", (event) => {
+        deleteMailRule(rule, event.currentTarget);
+      });
+      remove.classList.add("rule-node-button-danger");
+      actions.append(edit, up, down, apply, remove);
+      item.append(copy, actions);
+      fragment.append(item);
+    });
+    byId("mail-rules-list").replaceChildren(fragment);
+    byId("mail-rules-count").textContent = `${state.mailRules.length} rule${
+      state.mailRules.length === 1 ? "" : "s"
+    }`;
+    byId("mail-rules-empty").hidden = state.mailRules.length !== 0;
+  }
+
+  const loadMailRuleRun = async (run, signal) => {
+    const id = mailRuleRunId(run);
+    if (!id) {
+      renderMailRuleRun(null);
+      return;
+    }
+    const data = await apiData(ruleApiUrl(`/mail-rule-runs/${encodeURIComponent(id)}`), {signal});
+    state.mailRuleRunNeedsRefresh = "";
+    renderMailRuleRun(data.run || data);
+  };
+
+  const loadMailRules = async (signal) => {
+    setLoading("Loading mail rules.");
+    byId("mail-rules-loading").hidden = false;
+    byId("mail-rules-loading").textContent = "Loading mail rules...";
+    const account = ruleAccount();
+    byId("mail-rules-account").textContent = account
+      ? `Rules for ${ruleAccountLabel(account)}`
+      : "Select a mailbox before configuring rules.";
+    state.mailRulesAccount = "";
+    state.mailRules = [];
+    state.ruleMailboxes = [];
+    state.mailRuleRun = null;
+    renderMailRules();
+    resetMailRuleForm();
+    renderMailRuleRun(null);
+    byId("mail-rules-empty").hidden = true;
+    if (!account) {
+      byId("mail-rules-loading").textContent = "No mailbox is selected.";
+      return;
+    }
+    setMailRulesBusy(true);
+    let resumeRun = false;
+    let loaded = false;
+    try {
+      const [rulesData, mailboxData] = await Promise.all([
+        apiData(ruleApiUrl("/mail-rules"), {signal}),
+        apiData(ruleApiUrl("/mail?phase=context"), {signal}),
+      ]);
+      if (!mailRuleRouteIsActive(signal) || ruleAccount() !== account) return;
+      state.mailRules = arrayValue(rulesData.rules || rulesData.items).map(objectValue);
+      state.mailRulesAccount = account;
+      state.ruleMailboxes = arrayValue(mailboxData.mailboxes || mailboxData.folders)
+        .map((item) => stringValue(objectValue(item).name || item))
+        .filter(Boolean);
+      resetMailRuleForm();
+      const activeRun = rulesData.active_run || rulesData.run;
+      if (activeRun) {
+        await loadMailRuleRun(activeRun, signal);
+        if (!mailRuleRouteIsActive(signal) || ruleAccount() !== account) return;
+        resumeRun = true;
+      }
+      else renderMailRuleRun(null);
+      loaded = true;
+      byId("mail-rules-loading").hidden = true;
+    } catch (error) {
+      if (mailRuleRouteIsActive(signal) && ruleAccount() === account) {
+        byId("mail-rules-loading").textContent = error instanceof ApiError
+          ? error.message
+          : "Mail rules could not be loaded.";
+        byId("mail-rules-empty").hidden = true;
+      }
+      throw error;
+    } finally {
+      if (mailRuleRouteIsActive(signal) && ruleAccount() === account) {
+        setMailRulesBusy(false);
+        if (!loaded) {
+          byId("mail-rules-empty").hidden = true;
+          for (const control of byId("rules-view").querySelectorAll("button, input, select")) {
+            if (
+              control instanceof HTMLButtonElement
+              || control instanceof HTMLInputElement
+              || control instanceof HTMLSelectElement
+            ) control.disabled = true;
+          }
+        } else if (resumeRun) void driveMailRuleRun(signal);
+      }
+    }
+  };
+
   const closeDialog = (dialog) => {
     if (dialog instanceof HTMLDialogElement && dialog.open) dialog.close();
   };
@@ -3867,6 +5081,8 @@
       route = {name: "access-denied"};
     } else if (mailOnly.has(route.name) && !capabilityAllowed("mail.read")) {
       route = {name: "access-denied"};
+    } else if (route.name === "rules" && !capabilityAllowed("mail.mutate")) {
+      route = {name: "access-denied"};
     } else if (route.name === "compose" && !capabilityAllowed("mail.send")) {
       route = {name: "access-denied"};
     }
@@ -3879,8 +5095,9 @@
     }
     syncSelectedMessageRow(route);
     const requestedMail = requestedMailContext();
+    const mailSwitchRequested = mailRouteNeedsRefresh(route);
     setMailSwitchLoading(
-      mailRouteNeedsRefresh(route),
+      mailSwitchRequested,
       requestedMail.mailbox,
     );
     clearAlert();
@@ -3903,8 +5120,13 @@
       else if (route.name === "message") {
         const query = new URLSearchParams(window.location.search);
         const currentMail = objectValue(state.mail);
+        const requestedView = query.get("view") === "all" ? "all" : "mailbox";
         const matchesLoadedMail = stringValue(currentMail.selected_account) === (query.get("account") || scopedAccount())
-          && stringValue(currentMail.selected_mailbox) === query.get("mailbox");
+          && stringValue(currentMail.selected_view, "mailbox") === requestedView
+          && (
+            requestedView === "all"
+            || stringValue(currentMail.selected_mailbox) === query.get("mailbox")
+          );
         let message;
         if (matchesLoadedMail) message = await loadMessage(route, signal);
         else [, message] = await Promise.all([loadMail(signal), loadMessage(route, signal)]);
@@ -3912,6 +5134,7 @@
         focusViewHeading(byId("message-view"), shouldFocus);
       }
       else if (route.name === "compose") await loadCompose(signal);
+      else if (route.name === "rules") await loadMailRules(signal);
       else if (route.name === "accounts") await loadAccounts(signal);
       else if (route.name === "certificates") await loadCertificates(signal);
       else if (route.name === "security") await loadSecurity(signal);
@@ -3923,7 +5146,8 @@
     } finally {
       if (!signal.aborted) {
         setLoading("");
-        setMailSwitchLoading(false);
+        if (mailSwitchRequested && mailRouteNeedsRefresh(route)) setMailSwitchError();
+        else setMailSwitchLoading(false);
       }
     }
   };
@@ -3951,7 +5175,14 @@
   window.addEventListener("popstate", () => void renderRoute());
   window.addEventListener("pagehide", closeMailEvents);
   window.addEventListener("pageshow", (event) => {
-    if (event.persisted && state.authState === "active") startMailEvents();
+    if (!event.persisted) return;
+    if (state.authState === "active") {
+      void revalidateRestoredSession();
+      return;
+    }
+    if (state.authState === "checking" || state.authState === "error") {
+      window.location.reload();
+    }
   });
   for (const eventName of ["pointerdown", "keydown", "touchstart"]) {
     document.addEventListener(eventName, (event) => {
@@ -3998,6 +5229,165 @@
     }
   });
 
+  byId("mail-rule-new").addEventListener("click", () => {
+    resetMailRuleForm();
+    byId("mail-rule-name")?.focus();
+  });
+
+  byId("mail-rule-reset").addEventListener("click", () => {
+    resetMailRuleForm();
+  });
+
+  byId("mail-rule-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    if (
+      !(form instanceof HTMLFormElement)
+      || !form.reportValidity()
+      || state.mailRulesBusy
+    ) return;
+    const stats = ruleConditionStats(state.mailRuleCondition);
+    if (
+      stats.count > RULE_MAX_NODES
+      || stats.depth > RULE_MAX_DEPTH
+      || !validRuleCondition(state.mailRuleCondition)
+    ) {
+      setRuleFormStatus(
+        "Complete every condition and keep the rule within the builder limits.",
+        true,
+      );
+      return;
+    }
+    const id = stringValue(byId("mail-rule-id").value);
+    const applyExisting = byId("mail-rule-apply-existing").checked === true;
+    const expressionBytes = new TextEncoder().encode(
+      JSON.stringify(state.mailRuleCondition),
+    ).byteLength;
+    if (expressionBytes > RULE_MAX_EXPRESSION_BYTES) {
+      setRuleFormStatus(
+        "This rule is too large. Shorten condition values or remove conditions.",
+        true,
+      );
+      return;
+    }
+    const currentRule = id
+      ? state.mailRules.find((rule) => ruleId(rule) === id)
+      : null;
+    const expectedRevision = Number(objectValue(currentRule).revision);
+    if (id && (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1)) {
+      setRuleFormStatus("This rule changed or is stale. Refresh the rules list and retry.", true);
+      return;
+    }
+    const body = {
+      name: stringValue(byId("mail-rule-name").value).trim(),
+      enabled: byId("mail-rule-enabled").checked === true,
+      match: state.mailRuleCondition,
+      target_mailbox: stringValue(byId("mail-rule-target").value),
+      stop_processing: byId("mail-rule-stop").checked === true,
+      ...(id ? {expected_revision: expectedRevision} : {}),
+      ...(!id ? {apply_existing: applyExisting} : {}),
+    };
+    if (!body.name || !state.ruleMailboxes.includes(body.target_mailbox)) {
+      setRuleFormStatus("Enter a name and select an existing destination folder.", true);
+      return;
+    }
+    const signal = state.routeController?.signal;
+    if (
+      !mailRuleRouteIsActive(signal)
+      || state.mailRulesAccount !== ruleAccount()
+    ) {
+      setRuleFormStatus("Reload the rules for this mailbox before saving.", true);
+      return;
+    }
+    setMailRulesBusy(true);
+    setRuleFormStatus(id ? "Updating rule..." : "Creating rule...");
+    try {
+      const payload = await mutate(
+        id ? `/mail-rules/${encodeURIComponent(id)}/update` : "/mail-rules",
+        {json: ruleBody(body), guardSignal: signal},
+      );
+      if (!mailRuleRouteIsActive(signal)) return;
+      const data = objectValue(payload.data);
+      await loadMailRules(signal);
+      const createdRun = data.run || data.rule_run;
+      if (createdRun && mailRuleRunId(state.mailRuleRun) !== mailRuleRunId(createdRun)) {
+        state.mailRuleRunNeedsRefresh = "";
+        renderMailRuleRun(createdRun);
+      }
+      if (id && applyExisting) {
+        const updated = state.mailRules.find((rule) => ruleId(rule) === id) || {id};
+        setMailRulesBusy(false);
+        await startMailRuleRun(updated);
+      } else if (createdRun) {
+        void driveMailRuleRun(signal);
+      }
+      finishAction(payload, id ? "Rule updated." : "Rule created.");
+      setRuleFormStatus("");
+    } catch (error) {
+      setRuleFormStatus(
+        error instanceof ApiError ? error.message : "The rule could not be saved.",
+        true,
+      );
+    } finally {
+      setMailRulesBusy(false);
+    }
+  });
+
+  byId("mail-rule-run-step").addEventListener("click", () => {
+    const run = objectValue(state.mailRuleRun);
+    const id = mailRuleRunId(run);
+    const signal = state.routeController?.signal;
+    if (
+      !id
+      || state.mailRulesBusy
+      || state.mailRuleRunNeedsRefresh === id
+      || !mailRuleRouteIsActive(signal)
+    ) return;
+    void driveMailRuleRun(signal);
+  });
+
+  byId("mail-rule-run-cancel").addEventListener("click", (event) => {
+    const run = objectValue(state.mailRuleRun);
+    const id = stringValue(run.run_id || run.id);
+    if (!id || state.mailRulesBusy) return;
+    openConfirm({
+      title: "Cancel existing-mail run?",
+      message: "Messages already processed stay in their destination folders.",
+      label: "Cancel run",
+      opener: event.currentTarget,
+      action: async () => {
+        state.mailRuleRunCancelRequested = id;
+        renderMailRuleRun(state.mailRuleRun);
+        byId("mail-rule-run-status").textContent = "Cancelling existing-mail run...";
+        try {
+          const signal = state.routeController?.signal;
+          const payload = await mutate(`/mail-rule-runs/${encodeURIComponent(id)}/cancel`, {
+            json: ruleBody({}),
+            guardSignal: signal,
+          });
+          if (!mailRuleRouteIsActive(signal)) return;
+          const data = objectValue(payload.data);
+          renderMailRuleRun(data.run || data);
+          byId("mail-rule-run-status").textContent = "Existing-mail run cancelled.";
+          finishAction(payload, "Rule run cancelled.");
+        } catch (error) {
+          if (error instanceof ApiError && error.ambiguous) {
+            state.mailRuleRunNeedsRefresh = id;
+            byId("mail-rule-run-status").textContent = (
+              "The cancellation result is unknown. Reload Rules before resuming."
+            );
+          }
+          throw error;
+        } finally {
+          if (state.mailRuleRunCancelRequested === id) {
+            state.mailRuleRunCancelRequested = "";
+            renderMailRuleRun(state.mailRuleRun);
+          }
+        }
+      },
+    });
+  });
+
   const applyMailSearch = (value) => {
     const search = stringValue(value).trim().slice(0, 120);
     const url = new URL(window.location.href);
@@ -4026,6 +5416,10 @@
     input.focus();
   });
 
+  byId("mail-switch-retry").addEventListener("click", () => {
+    if (parseRoute().name === "mail") void renderRoute(false);
+  });
+
   byId("mail-account").addEventListener("change", (event) => {
     const value = event.target instanceof HTMLSelectElement ? event.target.value : "";
     if (state.role === "admin") {
@@ -4034,12 +5428,81 @@
     navigate(buildMailUrl({account: value}));
   });
 
+  const setFolderCreateOpen = (open) => {
+    const form = byId("mail-folder-create-form");
+    const toggle = byId("mail-folder-create-toggle");
+    if (!(form instanceof HTMLFormElement) || !(toggle instanceof HTMLButtonElement)) return;
+    form.hidden = !open;
+    toggle.setAttribute("aria-expanded", String(open));
+    if (open) byId("mail-folder-name")?.focus();
+    else {
+      form.reset();
+      byId("mail-folder-create-status").textContent = "";
+    }
+  };
+
+  byId("mail-folder-create-toggle").addEventListener("click", () => {
+    const form = byId("mail-folder-create-form");
+    setFolderCreateOpen(form instanceof HTMLFormElement && form.hidden);
+  });
+
+  byId("mail-folder-create-cancel").addEventListener("click", () => {
+    setFolderCreateOpen(false);
+    byId("mail-folder-create-toggle")?.focus();
+  });
+
+  byId("mail-folder-create-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    if (!(form instanceof HTMLFormElement) || !form.reportValidity()) return;
+    const input = form.elements.namedItem("name");
+    const button = form.querySelector('button[type="submit"]');
+    if (!(input instanceof HTMLInputElement) || !(button instanceof HTMLButtonElement)) return;
+    const name = input.value.trim();
+    if (!name || /[\u0000-\u001f\u007f]/.test(name)) {
+      byId("mail-folder-create-status").textContent = "Enter a valid folder name.";
+      return;
+    }
+    const context = selectedMailContext();
+    if (!context.account) return;
+    const signal = state.routeController?.signal;
+    if (!(signal instanceof AbortSignal) || signal.aborted) return;
+    button.disabled = true;
+    form.setAttribute("aria-busy", "true");
+    byId("mail-folder-create-status").textContent = "Creating folder...";
+    try {
+      const payload = await mutate("/mailboxes", {
+        json: {account: context.account, name},
+        guardSignal: signal,
+      });
+      if (
+        signal.aborted
+        || state.routeController?.signal !== signal
+        || !new Set(["mail", "message"]).has(parseRoute().name)
+        || selectedMailContext().account !== context.account
+      ) return;
+      const created = stringValue(objectValue(payload.data).name, name);
+      finishAction(payload, `Folder ${created} created.`);
+      setFolderCreateOpen(false);
+      navigate(buildMailUrl({account: context.account, mailbox: created}));
+    } catch (error) {
+      if (signal.aborted || (error && error.name === "AbortError")) return;
+      byId("mail-folder-create-status").textContent = error instanceof ApiError
+        ? error.message
+        : "The folder could not be created.";
+    } finally {
+      form.removeAttribute("aria-busy");
+      button.disabled = false;
+    }
+  });
+
   byId("mail-mailbox").addEventListener("change", (event) => {
     const mailbox = event.target instanceof HTMLSelectElement ? event.target.value : "";
     const account = byId("mail-account").value || scopedAccount();
     navigate(buildMailUrl({
       account,
-      mailbox,
+      mailbox: mailbox === "__all__" ? "" : mailbox,
+      view: mailbox === "__all__" ? "all" : "",
       search: currentMailSearch(),
     }));
   });
@@ -4053,8 +5516,10 @@
       if (!(control instanceof HTMLInputElement)) return;
       control.checked = checked;
       const row = control.closest("tr");
-      const uid = row instanceof HTMLTableRowElement ? stringValue(row.dataset.uid) : "";
-      if (checked && uid) state.selectedMessageUids.add(uid);
+      const key = row instanceof HTMLTableRowElement
+        ? stringValue(row.dataset.selectionKey)
+        : "";
+      if (checked && key) state.selectedMessageUids.add(key);
       if (row) row.classList.toggle("is-bulk-selected", checked);
     });
     updateBulkToolbar();
@@ -4070,6 +5535,16 @@
 
   byId("mail-bulk-archive").addEventListener("click", () => {
     void runBulkMessageAction("archive");
+  });
+
+  byId("mail-bulk-move-target").addEventListener("change", () => {
+    updateBulkToolbar();
+  });
+
+  byId("mail-bulk-move").addEventListener("click", () => {
+    const target = byId("mail-bulk-move-target");
+    if (!(target instanceof HTMLSelectElement) || !target.value) return;
+    void runBulkMessageAction("move", null, target.value);
   });
 
   byId("mail-bulk-trash").addEventListener("click", (event) => {
@@ -4091,7 +5566,9 @@
     const selectedMailbox = arrayValue(objectValue(state.mail).mailboxes || objectValue(state.mail).folders)
       .map(objectValue)
       .find((item) => stringValue(item.name) === context.mailbox);
-    const uids = [...state.selectedMessageUids];
+    const uids = selectedMessageContexts()
+      .filter((item) => item.mailbox === context.mailbox)
+      .map((item) => item.uid);
     const routeSignal = state.routeController?.signal;
     if (
       !context.account
@@ -4897,12 +6374,14 @@
         });
         finishAction(payload, "Message moved to Trash.");
         const data = objectValue(payload.data);
+        const allMailView = new URLSearchParams(window.location.search).get("view") === "all";
         navigate(buildMailUrl({
           account: stringValue(
             data.account,
             stringValue(message.account, scopedAccount()),
           ),
           mailbox: stringValue(data.mailbox, "Trash"),
+          view: allMailView ? "all" : "",
         }));
       },
     });
@@ -4927,12 +6406,53 @@
           },
         });
         finishAction(payload, "Message permanently deleted.");
+        const allMailView = new URLSearchParams(window.location.search).get("view") === "all";
         navigate(buildMailUrl({
           account: stringValue(message.account, scopedAccount()),
           mailbox: stringValue(message.mailbox),
+          view: allMailView ? "all" : "",
         }));
       },
     });
+  });
+
+  byId("message-move-target").addEventListener("change", (event) => {
+    const select = event.currentTarget;
+    byId("message-move").disabled = !(
+      select instanceof HTMLSelectElement && select.value
+    );
+  });
+
+  byId("message-move").addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    const select = byId("message-move-target");
+    const message = objectValue(state.message);
+    const context = {
+      account: stringValue(message.account, scopedAccount()),
+      mailbox: stringValue(message.mailbox),
+      uid: stringValue(message.uid),
+    };
+    if (
+      !(button instanceof HTMLButtonElement)
+      || !(select instanceof HTMLSelectElement)
+      || !select.value
+      || !context.account
+      || !context.mailbox
+      || !context.uid
+    ) return;
+    button.disabled = true;
+    const moved = await runBulkMessageAction("move", [context], select.value);
+    if (moved) {
+      const query = new URLSearchParams(window.location.search);
+      navigate(buildMailUrl({
+        account: context.account,
+        mailbox: context.mailbox,
+        view: query.get("view") === "all" ? "all" : "",
+        search: query.get("search") || "",
+      }));
+    } else {
+      button.disabled = false;
+    }
   });
 
   byId("timer-action").addEventListener("click", (event) => {
@@ -5110,6 +6630,7 @@
 
   const initialize = async () => {
     try {
+      dismissStartupRecovery();
       initializeTheme();
       setBodyMode("write");
       renderSourceInWrite();
@@ -5129,6 +6650,7 @@
           badge.className = "status-pill status-warning";
         }
       }
+      revealStartupRecovery();
       handleError(
         error,
         "The application could not be initialized. Reload the page to retry.",
@@ -5137,6 +6659,7 @@
   };
 
   void initialize().catch((error) => {
+    revealStartupRecovery();
     handleError(
       error,
       "The application could not be initialized. Reload the page to retry.",

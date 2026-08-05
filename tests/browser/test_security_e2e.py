@@ -32,6 +32,7 @@ from conftest import (
     NEW_ACCOUNT_ID,
     NORMAL_ACCOUNT,
     NORMAL_ACCOUNT_ADDRESS,
+    SENT_MAILBOX,
     SESSION_COOKIE_NAME,
     SESSION_TOKEN,
     TRASH_MAILBOX,
@@ -235,11 +236,144 @@ async def test_session_bootstrap_timeout_exits_connecting_with_retryable_error(
         await alert.wait_for(state="visible", timeout=2_000)
         assert await page.locator("html").get_attribute("data-auth-state") == "error"
         assert await page.locator("#runtime-badge").inner_text() == "CONNECTION FAILED"
+        assert await page.locator("#startup-recovery").is_visible()
+        assert await page.locator("#startup-recovery a").get_attribute("href") == ""
         assert await alert.inner_text() == (
             "The secure session request timed out. Reload the page to retry."
         )
     finally:
         release_session.set()
+
+
+async def test_failed_workspace_script_exposes_reload_recovery_without_business_data(
+    page: Page,
+    normal_user_application: LiveApplication,
+) -> None:
+    await _install_session(page, normal_user_application)
+    workspace_attempts = 0
+    api_requests: list[str] = []
+
+    async def fail_first_workspace_load(route: Route) -> None:
+        nonlocal workspace_attempts
+        workspace_attempts += 1
+        if workspace_attempts == 1:
+            await route.abort("failed")
+            return
+        await route.continue_()
+
+    page.on(
+        "request",
+        lambda request: api_requests.append(urlsplit(request.url).path)
+        if urlsplit(request.url).path.startswith("/api/v1/")
+        else None,
+    )
+    await page.route("**/static/workspace.js?*", fail_first_workspace_load)
+    await page.goto(normal_user_application.base_url + "/mail", wait_until="domcontentloaded")
+
+    assert workspace_attempts == 1
+    assert api_requests == []
+    assert await page.locator("html").get_attribute("data-auth-state") == "checking"
+    assert await page.locator("#runtime-badge").inner_text() == "CONNECTING"
+    assert await page.locator('[data-role="admin"]').evaluate_all(
+        "nodes => nodes.every(node => node.hidden)"
+    )
+
+    await page.locator("#startup-recovery").evaluate(
+        "node => { node.style.animationDelay = '0s'; }"
+    )
+    recovery = page.locator("#startup-recovery")
+    await recovery.wait_for(state="visible", timeout=2_000)
+    assert "This page did not finish opening" in await recovery.inner_text()
+
+    async with page.expect_navigation(wait_until="domcontentloaded"):
+        await recovery.get_by_role("link", name="Reload this page").click()
+    await page.locator("#message-list-body tr").wait_for()
+
+    assert workspace_attempts == 2
+    assert await page.locator("html").get_attribute("data-auth-state") == "active"
+    assert await page.locator("#runtime-badge").inner_text() == "CONNECTED"
+    assert await recovery.is_hidden()
+
+
+async def test_bfcache_restore_reloads_a_failed_session_bootstrap(
+    page: Page,
+    normal_user_application: LiveApplication,
+) -> None:
+    await _install_session(page, normal_user_application)
+    session_attempts = 0
+
+    async def fail_first_session_load(route: Route) -> None:
+        nonlocal session_attempts
+        session_attempts += 1
+        if session_attempts == 1:
+            await route.fulfill(
+                status=503,
+                content_type="application/json",
+                body=(
+                    '{"api_version":"v1","ok":false,"error":'
+                    '{"code":"authentication_unavailable",'
+                    '"message":"Authentication is temporarily unavailable."}}'
+                ),
+            )
+            return
+        await route.continue_()
+
+    await page.route("**/api/v1/auth/session", fail_first_session_load)
+    await page.goto(normal_user_application.base_url + "/mail", wait_until="domcontentloaded")
+    recovery = page.locator("#startup-recovery")
+    await recovery.wait_for(state="visible", timeout=2_000)
+
+    assert session_attempts == 1
+    assert await page.locator("html").get_attribute("data-auth-state") == "error"
+
+    async with page.expect_navigation(wait_until="domcontentloaded"):
+        await page.evaluate(
+            "window.dispatchEvent(new PageTransitionEvent('pageshow', {persisted: true}))"
+        )
+    await page.locator("#message-list-body tr").wait_for()
+
+    assert session_attempts == 2
+    assert await page.locator("html").get_attribute("data-auth-state") == "active"
+    assert await page.locator("#runtime-badge").inner_text() == "CONNECTED"
+    assert await recovery.is_hidden()
+
+
+async def test_bfcache_restore_keeps_cached_mail_covered_when_revalidation_fails(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    await _load_inbox(page, live_application)
+
+    async def fail_session_recheck(route: Route) -> None:
+        await route.fulfill(
+            status=503,
+            content_type="application/json",
+            body=json.dumps(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "authentication_unavailable",
+                        "message": "Authentication is temporarily unavailable.",
+                    },
+                }
+            ),
+        )
+
+    await page.route("**/api/v1/auth/session", fail_session_recheck)
+    await page.evaluate(
+        """() => {
+          window.dispatchEvent(new PageTransitionEvent("pagehide", {persisted: true}));
+          window.dispatchEvent(new PageTransitionEvent("pageshow", {persisted: true}));
+        }"""
+    )
+
+    guard = page.locator("#session-resume-guard")
+    await guard.wait_for(state="visible")
+    await page.locator("#session-resume-reload").wait_for(state="visible")
+    assert await guard.get_attribute("role") == "alert"
+    assert "Session check interrupted" in await guard.inner_text()
+    assert await page.locator(".workspace").evaluate("node => node.inert")
+    assert await page.locator("#message-list-body tr").count() == 1
 
 
 async def test_required_password_change_opens_security_without_overview_flicker(
@@ -427,12 +561,30 @@ async def test_new_mail_notice_is_server_pushed_without_frontend_mailbox_polling
     assert await banner.is_hidden()
 
     event_streams_before_restore = requests.count("/api/v1/admin/mail-events")
+    session_requests_before_restore = requests.count("/api/v1/auth/session")
+    session_recheck_started = asyncio.Event()
+    release_session_recheck = asyncio.Event()
+
+    async def pause_restored_session_recheck(route: Route) -> None:
+        session_recheck_started.set()
+        await release_session_recheck.wait()
+        await route.continue_()
+
+    await page.route("**/api/v1/auth/session", pause_restored_session_recheck)
     await page.evaluate(
         """() => {
           window.dispatchEvent(new PageTransitionEvent("pagehide", {persisted: true}));
           window.dispatchEvent(new PageTransitionEvent("pageshow", {persisted: true}));
         }"""
     )
+    await asyncio.wait_for(session_recheck_started.wait(), timeout=2)
+    guard = page.locator("#session-resume-guard")
+    assert await guard.is_visible()
+    assert await page.locator(".workspace").evaluate("node => node.inert")
+    assert await page.locator(".app-header").evaluate("node => node.inert")
+    release_session_recheck.set()
+    await guard.wait_for(state="hidden")
+    assert requests.count("/api/v1/auth/session") == session_requests_before_restore + 1
     for _ in range(40):
         if requests.count("/api/v1/admin/mail-events") > event_streams_before_restore:
             break
@@ -506,6 +658,108 @@ async def test_mailbox_switch_shows_a_scoped_loading_state(
     assert await page.locator("#mail-view").get_attribute("aria-busy") is None
     assert await page.locator("#mail-title").inner_text() == "Sent"
     assert await page.locator("#mail-mailbox").input_value() == "Sent"
+
+
+async def test_failed_mailbox_switch_keeps_old_rows_covered_until_retry(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    await _load_inbox(page, live_application)
+    sent_attempts = 0
+
+    async def fail_first_sent_mailbox(route: Route) -> None:
+        nonlocal sent_attempts
+        if "mailbox=Sent" not in route.request.url:
+            await route.continue_()
+            return
+        sent_attempts += 1
+        if sent_attempts == 1:
+            await route.fulfill(
+                status=503,
+                content_type="application/json",
+                body=json.dumps(
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": "mailbox_unavailable",
+                            "message": "The requested mailbox is temporarily unavailable.",
+                        },
+                    }
+                ),
+            )
+            return
+        await route.continue_()
+
+    await page.route("**/api/v1/admin/mail?*", fail_first_sent_mailbox)
+    await page.locator('#mail-folder-list a[data-kind="sent"]').click()
+
+    loader = page.locator("#mail-switch-loader")
+    await loader.wait_for(state="visible")
+    await page.locator("#mail-switch-retry").wait_for(state="visible")
+    assert await loader.get_attribute("role") == "alert"
+    assert await page.locator("#mail-view").get_attribute("aria-busy") is None
+    assert "Previously loaded messages are hidden" in await loader.inner_text()
+    assert await page.locator("#message-list-body tr").count() == 1
+    assert "mailbox=Sent" in page.url
+
+    loader_bounds = await loader.bounding_box()
+    table_bounds = await page.locator(".mail-list-table").bounding_box()
+    assert loader_bounds is not None
+    assert table_bounds is not None
+    assert loader_bounds["x"] <= table_bounds["x"] + 1
+    assert loader_bounds["y"] <= table_bounds["y"] + 1
+    assert loader_bounds["x"] + loader_bounds["width"] >= (
+        table_bounds["x"] + table_bounds["width"] - 1
+    )
+    assert loader_bounds["y"] + loader_bounds["height"] >= (
+        table_bounds["y"] + table_bounds["height"] - 1
+    )
+
+    await page.locator("#mail-switch-retry").click()
+    await loader.wait_for(state="hidden")
+    assert sent_attempts == 2
+    assert await page.locator("#mail-title").inner_text() == "Sent"
+
+
+@pytest.mark.parametrize("action", ["read", "move"])
+async def test_row_mutations_expose_a_busy_state_on_slow_links(
+    page: Page,
+    live_application: LiveApplication,
+    action: str,
+) -> None:
+    await _load_inbox(page, live_application)
+    request_started = asyncio.Event()
+    release_request = asyncio.Event()
+
+    async def pause_mail_action(route: Route) -> None:
+        request_started.set()
+        await release_request.wait()
+        await route.continue_()
+
+    await page.route("**/api/v1/admin/mail-actions", pause_mail_action)
+    row = page.locator("#message-list-body tr")
+    if action == "move":
+        await row.locator(".message-row-move-target").select_option("Sent")
+        button = row.get_by_role("button", name="Move", exact=True)
+    else:
+        button = row.get_by_role("button", name="Mark as read", exact=True)
+
+    try:
+        await button.click()
+        await asyncio.wait_for(request_started.wait(), timeout=2)
+        assert await row.get_attribute("aria-busy") == "true"
+        assert await row.locator("button, input, select").evaluate_all(
+            "nodes => nodes.every(node => node.disabled)"
+        )
+    finally:
+        release_request.set()
+
+    if action == "move":
+        await page.locator("#message-empty").wait_for()
+    else:
+        await page.wait_for_function(
+            "() => document.querySelector('.message-read-status')?.textContent === 'Read'"
+        )
 
 
 async def test_mailbox_read_state_and_bulk_selection_actions(
@@ -1157,7 +1411,7 @@ async def test_mailbox_auto_opens_inbox_and_rows_support_pointer_and_keyboard_na
     await page.set_viewport_size({"width": 320, "height": 844})
     await _load_mailbox(page, live_application, MAILBOX)
     actions = page.locator(".message-row-action")
-    assert await actions.count() == 5
+    assert await actions.count() == 6
     assert await page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
     for index in range(await actions.count()):
         bounds = await actions.nth(index).bounding_box()
@@ -1185,6 +1439,674 @@ async def test_mailbox_rows_fit_the_desktop_message_pane(
             assert bounds["x"] >= pane_bounds["x"]
             assert bounds["x"] + bounds["width"] <= pane_bounds["x"] + pane_bounds["width"] + 1
 
+
+async def test_all_mail_keeps_each_messages_source_mailbox_context(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    query = urlencode({"account": ACCOUNT, "view": "all"})
+    await page.goto(f"{live_application.base_url}/mail?{query}")
+
+    await page.get_by_role("heading", name="All Mail", exact=True).wait_for()
+    assert await page.locator("#mail-mailbox").input_value() == "__all__"
+    assert await page.locator(
+        '.mail-folder-link[data-kind="all"]'
+    ).get_attribute("aria-current") == "page"
+    row = page.locator("#message-list-body tr")
+    await row.wait_for()
+    assert await row.get_attribute("data-mailbox") == MAILBOX
+    assert await row.locator(".message-mailbox-label").inner_text() == MAILBOX
+
+    await row.locator(".message-subject-cell a").click()
+    await page.wait_for_url(
+        f"**/mail/{MESSAGE_ID}?account={ACCOUNT}&mailbox={MAILBOX}&view=all"
+    )
+    await page.get_by_role(
+        "heading", name="Browser security fixture", exact=True
+    ).wait_for()
+    back_href = ""
+    for _ in range(50):
+        back_href = await page.locator("#message-back").get_attribute("href") or ""
+        if "view=all" in back_href:
+            break
+        await asyncio.sleep(0.02)
+    back_url = urlsplit(back_href)
+    assert back_url.path == "/mail"
+    assert "view=all" in back_url.query
+
+
+async def test_all_mail_batches_freshness_once_per_source_before_any_move(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    source_messages = {
+        MAILBOX: ("42", "43"),
+        SENT_MAILBOX: ("44", "45"),
+    }
+
+    async def messages_by_source(
+        _account: str,
+        mailbox: str,
+        **_kwargs: object,
+    ) -> MessagePage:
+        return MessagePage(
+            [
+                {
+                    "id": uid,
+                    "sender": f"sender-{uid}@example.test",
+                    "subject": f"Grouped message {uid}",
+                    "date": f"2026-07-23 12:{uid} UTC",
+                    "unread": True,
+                }
+                for uid in source_messages.get(mailbox, ())
+            ],
+            False,
+        )
+
+    live_application.gateway.list_messages = messages_by_source  # type: ignore[method-assign]
+    second_preflight_ready = asyncio.Event()
+    release_second_preflight = asyncio.Event()
+    snapshot_requests: list[dict[str, object]] = []
+
+    async def hold_second_snapshot(route: Route) -> None:
+        payload = route.request.post_data_json
+        assert isinstance(payload, dict)
+        snapshot_requests.append(payload)
+        response = await route.fetch()
+        if len(snapshot_requests) == 2:
+            second_preflight_ready.set()
+            await release_second_preflight.wait()
+        await route.fulfill(response=response)
+
+    await page.route(
+        "**/api/v1/admin/mail/action-snapshots",
+        hold_second_snapshot,
+    )
+    await page.goto(
+        live_application.base_url
+        + "/mail?"
+        + urlencode({"account": ACCOUNT, "view": "all"})
+    )
+    await page.get_by_role("heading", name="All Mail", exact=True).wait_for()
+    await page.locator("#message-list-body tr").nth(3).wait_for()
+    await page.locator("#mail-select-page").check()
+    await page.locator("#mail-bulk-move-target").select_option(ARCHIVE_MAILBOX)
+    await page.locator("#mail-bulk-move").click()
+
+    await asyncio.wait_for(second_preflight_ready.wait(), timeout=2)
+    assert live_application.gateway.bulk_moves == []
+    assert len(snapshot_requests) == 2
+    by_mailbox = {str(payload["mailbox"]): payload for payload in snapshot_requests}
+    assert by_mailbox == {
+        mailbox: {
+            "account": ACCOUNT,
+            "mailbox": mailbox,
+            "uids": list(uids),
+        }
+        for mailbox, uids in source_messages.items()
+    }
+
+    release_second_preflight.set()
+    for _attempt in range(100):
+        if len(live_application.gateway.bulk_moves) == 2:
+            break
+        await asyncio.sleep(0.02)
+    assert live_application.gateway.bulk_moves == [
+        (ACCOUNT, MAILBOX, source_messages[MAILBOX], ARCHIVE_MAILBOX),
+        (ACCOUNT, SENT_MAILBOX, source_messages[SENT_MAILBOX], ARCHIVE_MAILBOX),
+    ]
+
+
+async def test_normal_user_batch_snapshot_never_sends_an_account_override(
+    page: Page,
+    normal_user_application: LiveApplication,
+) -> None:
+    await _install_session(page, normal_user_application)
+    requests: list[object] = []
+
+    def capture_request(request: object) -> None:
+        path = urlsplit(getattr(request, "url", "")).path
+        if path.endswith(("/action-snapshots", "/mail-actions")):
+            requests.append(request)
+
+    page.on("request", capture_request)
+    await page.goto(normal_user_application.base_url + "/mail")
+    row = page.locator("#message-list-body tr")
+    await row.wait_for()
+    await row.get_by_role("button", name="Archive", exact=True).click()
+    await page.locator("#message-empty").wait_for()
+
+    assert [
+        (getattr(request, "method", ""), urlsplit(getattr(request, "url", "")).path)
+        for request in requests
+    ] == [
+        ("POST", "/api/v1/me/mail/action-snapshots"),
+        ("POST", "/api/v1/me/mail-actions"),
+    ]
+    assert all("account" not in getattr(request, "post_data_json", {}) for request in requests)
+    assert normal_user_application.gateway.bulk_moves == [
+        (NORMAL_ACCOUNT, MAILBOX, (MESSAGE_ID,), ARCHIVE_MAILBOX)
+    ]
+
+
+async def test_row_bulk_and_detail_move_controls_target_existing_folders(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    await _load_inbox(page, live_application)
+    row = page.locator("#message-list-body tr")
+    await row.locator(".message-row-move-target").select_option("Sent")
+    await row.get_by_role("button", name="Move", exact=True).click()
+    await page.locator("#message-empty").wait_for()
+    assert live_application.gateway.bulk_moves[-1] == (
+        ACCOUNT,
+        MAILBOX,
+        (MESSAGE_ID,),
+        "Sent",
+    )
+
+    live_application.gateway.message_location = MAILBOX
+    await page.goto(live_application.base_url + _mailbox_path())
+    await page.locator("#message-list-body tr").wait_for()
+    await page.locator(".message-select-checkbox").check()
+    await page.locator("#mail-bulk-move-target").select_option("Sent")
+    await page.locator("#mail-bulk-move").click()
+    await page.locator("#message-empty").wait_for()
+    assert live_application.gateway.bulk_moves[-1] == (
+        ACCOUNT,
+        MAILBOX,
+        (MESSAGE_ID,),
+        "Sent",
+    )
+
+    live_application.gateway.message_location = MAILBOX
+    await page.goto(live_application.base_url + _message_path())
+    await page.get_by_role(
+        "heading", name="Browser security fixture", exact=True
+    ).wait_for()
+    await page.locator("#message-move-target").select_option("Sent")
+    await page.locator("#message-move").click()
+    await page.wait_for_url(f"**{_mailbox_path()}")
+    assert live_application.gateway.bulk_moves[-1] == (
+        ACCOUNT,
+        MAILBOX,
+        (MESSAGE_ID,),
+        "Sent",
+    )
+
+
+async def test_folder_creation_uses_a_bounded_inline_form_and_opens_the_folder(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    await _load_inbox(page, live_application)
+    toggle = page.locator("#mail-folder-create-toggle")
+    await toggle.click()
+    assert await toggle.get_attribute("aria-expanded") == "true"
+    await page.locator("#mail-folder-name").fill("Projects/2026")
+    async with page.expect_response(
+        lambda response: response.request.method == "POST"
+        and response.url.endswith("/api/v1/admin/mailboxes")
+    ) as created_response:
+        await page.locator("#mail-folder-create-form").get_by_role(
+            "button", name="Create", exact=True
+        ).click()
+    assert (await created_response.value).status == 201
+    await page.wait_for_url("**/mail?account=*&mailbox=Projects%2F2026")
+    assert live_application.gateway.created_mailboxes == [
+        (ACCOUNT, "Projects/2026")
+    ]
+    for _ in range(50):
+        if await page.locator("#mail-mailbox").input_value() == "Projects/2026":
+            break
+        await asyncio.sleep(0.02)
+    assert await page.locator("#mail-mailbox").input_value() == "Projects/2026"
+
+
+async def test_completed_folder_creation_does_not_hijack_a_newer_route(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    await _load_inbox(page, live_application)
+    request_started = asyncio.Event()
+    release_request = asyncio.Event()
+
+    async def pause_folder_creation(route: Route) -> None:
+        request_started.set()
+        await release_request.wait()
+        await route.continue_()
+
+    await page.route("**/api/v1/admin/mailboxes", pause_folder_creation)
+    await page.locator("#mail-folder-create-toggle").click()
+    await page.locator("#mail-folder-name").fill("Slow folder")
+    await page.locator("#mail-folder-create-form").get_by_role(
+        "button", name="Create", exact=True
+    ).click()
+    await asyncio.wait_for(request_started.wait(), timeout=2)
+
+    await page.locator('a[data-section="security"]').click()
+    await page.get_by_role("heading", name="Security", exact=True).wait_for()
+    release_request.set()
+    for _ in range(50):
+        if live_application.gateway.created_mailboxes:
+            break
+        await asyncio.sleep(0.02)
+
+    assert live_application.gateway.created_mailboxes == [(ACCOUNT, "Slow folder")]
+    assert urlsplit(page.url).path == "/security"
+
+
+async def test_mail_rule_builder_posts_the_canonical_bounded_condition_tree(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    posted: list[dict[str, object]] = []
+    stored_rules: list[dict[str, object]] = []
+    first_save_started = asyncio.Event()
+    release_first_save = asyncio.Event()
+
+    async def mail_rules(route: Route) -> None:
+        request = route.request
+        if request.method == "GET":
+            payload = {"ok": True, "data": {"rules": stored_rules}}
+        else:
+            body = json.loads(request.post_data or "{}")
+            posted.append(body)
+            if len(posted) == 1:
+                first_save_started.set()
+                await release_first_save.wait()
+            rule = {
+                "rule_id": "11111111111111111111111111111111",
+                "name": body["name"],
+                "enabled": body["enabled"],
+                "match": body["match"],
+                "target_mailbox": body["target_mailbox"],
+                "stop_processing": body["stop_processing"],
+                "revision": int(body.get("expected_revision", 0)) + 1,
+            }
+            stored_rules[:] = [rule]
+            payload = {"ok": True, "data": {"rule": rule}, "message": "Rule created."}
+        await route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(payload),
+        )
+
+    await page.route("**/api/v1/admin/mail-rules**", mail_rules)
+    await _load_inbox(page, live_application)
+    await page.locator('.nav-link[data-section="rules"]').click()
+    await page.get_by_role("heading", name="Mail rules", exact=True).wait_for()
+
+    await page.locator("#mail-rule-name").fill("File project reports")
+    await page.locator("#mail-rule-target").select_option(ARCHIVE_MAILBOX)
+    root_group = page.locator("#mail-rule-condition-tree > .rule-condition-group")
+    await root_group.get_by_role("button", name="Add nested group").click()
+    condition_values = page.locator(".rule-condition-value")
+    await condition_values.nth(0).fill("reports@example.test")
+    nested_group = page.locator('.rule-condition-group[data-depth="2"]')
+    await nested_group.locator(".rule-operator-select").select_option("or")
+    await condition_values.nth(1).fill("Quarterly")
+    root_heading = root_group.locator(":scope > .rule-condition-group-heading")
+    await root_heading.get_by_role("button", name="Add condition", exact=True).click()
+    await root_heading.get_by_role("button", name="Add condition", exact=True).click()
+    fields = page.locator(".rule-condition-field")
+    comparisons = page.locator(".rule-condition-test")
+    await fields.nth(2).select_option("size")
+    await comparisons.nth(2).select_option("gt")
+    await page.locator(".rule-condition-value").nth(2).fill("1048576")
+    await fields.nth(3).select_option("has_attachment")
+    await page.locator(".rule-condition-value").nth(3).select_option("true")
+
+    await page.locator("#mail-rule-save").click()
+    await asyncio.wait_for(first_save_started.wait(), timeout=2)
+    try:
+        for selector in [
+            "#mail-rule-new",
+            "#mail-rule-name",
+            "#mail-rule-enabled",
+            "#mail-rule-stop",
+            "#mail-rule-target",
+            "#mail-rule-apply-existing",
+            "#mail-rule-save",
+            "#mail-rule-reset",
+            ".rule-condition-field",
+            ".rule-condition-test",
+            ".rule-condition-value",
+        ]:
+            assert await page.locator(selector).first.is_disabled()
+    finally:
+        release_first_save.set()
+    for _ in range(50):
+        if posted:
+            break
+        await asyncio.sleep(0.02)
+    assert len(posted) == 1
+    assert posted[0]["match"] == {
+        "op": "and",
+        "conditions": [
+            {
+                "field": "from",
+                "operator": "contains",
+                "value": "reports@example.test",
+            },
+            {
+                "op": "or",
+                "conditions": [
+                    {
+                        "field": "from",
+                        "operator": "contains",
+                        "value": "Quarterly",
+                    }
+                ],
+            },
+            {
+                "field": "size",
+                "operator": "gt",
+                "value": 1048576,
+            },
+            {
+                "field": "has_attachment",
+                "operator": "eq",
+                "value": True,
+            },
+        ],
+    }
+    assert "children" not in json.dumps(posted[0]["match"])
+    await page.get_by_role("heading", name="File project reports", exact=True).wait_for()
+
+    await page.get_by_role("button", name="Edit File project reports", exact=True).click()
+    restored_values = page.locator(".rule-condition-value")
+    assert await restored_values.nth(0).input_value() == "reports@example.test"
+    assert await restored_values.nth(1).input_value() == "Quarterly"
+    assert await restored_values.nth(2).input_value() == "1048576"
+    assert await restored_values.nth(3).input_value() == "true"
+    await page.locator("#mail-rule-name").fill("File updated project reports")
+    await page.locator("#mail-rule-save").click()
+    for _ in range(50):
+        if len(posted) == 2:
+            break
+        await asyncio.sleep(0.02)
+    assert len(posted) == 2, await page.locator("#mail-rule-form-status").inner_text()
+    assert posted[1]["expected_revision"] == 1
+    await page.get_by_role(
+        "heading", name="File updated project reports", exact=True
+    ).wait_for()
+
+
+async def test_slow_cross_account_rule_load_never_exposes_previous_rules(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    second_account = "f" * 32
+    second_address = "second@example.test"
+    live_application.gateway.accounts.append(
+        {
+            "id": second_account,
+            "address": second_address,
+            "has_credentials": True,
+            "has_mailbox": True,
+            "append_limit": 1_048_576,
+        }
+    )
+    second_load_started = asyncio.Event()
+    release_second_load = asyncio.Event()
+
+    def rule_payload(rule_id: str, name: str) -> dict[str, object]:
+        return {
+            "rule_id": rule_id,
+            "name": name,
+            "enabled": True,
+            "match": {"field": "subject", "operator": "contains", "value": name},
+            "target_mailbox": ARCHIVE_MAILBOX,
+            "stop_processing": True,
+            "revision": 1,
+        }
+
+    async def mail_rules(route: Route) -> None:
+        if f"account={second_account}" in route.request.url:
+            second_load_started.set()
+            await release_second_load.wait()
+            rule = rule_payload("2" * 32, "Second account rule")
+        else:
+            rule = rule_payload("1" * 32, "First account rule")
+        await route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"ok": True, "data": {"rules": [rule]}}),
+        )
+
+    await page.route("**/api/v1/admin/mail-rules?*", mail_rules)
+    await _load_inbox(page, live_application)
+    await page.locator('a[data-section="rules"]').click()
+    await page.get_by_role("heading", name="First account rule", exact=True).wait_for()
+
+    await page.locator('a[data-section="mail"]').click()
+    await page.locator("#message-list-body tr").wait_for()
+    await page.locator("#mail-account").select_option(second_account)
+    await page.wait_for_url(f"**/mail?account={second_account}*")
+    await page.locator('a[data-section="rules"]').click()
+    await asyncio.wait_for(second_load_started.wait(), timeout=2)
+    try:
+        assert await page.get_by_role(
+            "heading", name="First account rule", exact=True
+        ).count() == 0
+        assert await page.locator("#mail-rules-loading").is_visible()
+        assert await page.locator("#mail-rule-name").is_disabled()
+        assert await page.locator("#mail-rule-new").is_disabled()
+        assert second_address in await page.locator("#mail-rules-account").inner_text()
+    finally:
+        release_second_load.set()
+
+    await page.get_by_role("heading", name="Second account rule", exact=True).wait_for()
+    assert await page.locator("#mail-rule-name").is_enabled()
+
+
+async def test_failed_rule_reload_clears_stale_rules_and_disables_editor(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    request_count = 0
+    rule = {
+        "rule_id": "3" * 32,
+        "name": "Loaded before failure",
+        "enabled": True,
+        "match": {"field": "subject", "operator": "contains", "value": "Report"},
+        "target_mailbox": ARCHIVE_MAILBOX,
+        "stop_processing": True,
+        "revision": 1,
+    }
+
+    async def mail_rules(route: Route) -> None:
+        nonlocal request_count
+        request_count += 1
+        if request_count == 1:
+            await route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps({"ok": True, "data": {"rules": [rule]}}),
+            )
+            return
+        await route.fulfill(
+            status=503,
+            content_type="application/json",
+            body=json.dumps(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "rules_unavailable",
+                        "message": "Mail rules are temporarily unavailable.",
+                    },
+                }
+            ),
+        )
+
+    await page.route("**/api/v1/admin/mail-rules?*", mail_rules)
+    await _load_inbox(page, live_application)
+    await page.locator('a[data-section="rules"]').click()
+    await page.get_by_role("heading", name="Loaded before failure", exact=True).wait_for()
+    await page.locator('a[data-section="mail"]').click()
+    await page.locator("#message-list-body tr").wait_for()
+    await page.locator('a[data-section="rules"]').click()
+
+    await page.locator("#mail-rules-loading").get_by_text(
+        "Mail rules are temporarily unavailable.", exact=True
+    ).wait_for()
+    assert await page.get_by_role(
+        "heading", name="Loaded before failure", exact=True
+    ).count() == 0
+    assert await page.locator("#mail-rule-name").is_disabled()
+    assert await page.locator("#mail-rule-new").is_disabled()
+    assert await page.locator("#mail-rules-empty").is_hidden()
+
+
+async def test_existing_mail_rule_run_advances_sequentially_until_completed(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    rule_id = "1" * 32
+    run_id = "2" * 32
+    run = {
+        "run_id": run_id,
+        "rule_id": rule_id,
+        "rule_name": "File project reports",
+        "status": "queued",
+        "processed": 0,
+        "total": 60,
+    }
+    rule = {
+        "rule_id": rule_id,
+        "name": "File project reports",
+        "enabled": True,
+        "match": {"field": "subject", "operator": "contains", "value": "Report"},
+        "target_mailbox": ARCHIVE_MAILBOX,
+        "stop_processing": True,
+        "revision": 1,
+    }
+    step_results = [
+        {**run, "status": "running", "processed": 20},
+        {**run, "status": "running", "processed": 40},
+        {**run, "status": "completed", "processed": 60},
+    ]
+    step_calls = 0
+    in_flight = 0
+    maximum_in_flight = 0
+
+    async def mail_rules(route: Route) -> None:
+        await route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(
+                {"ok": True, "data": {"rules": [rule], "active_run": run}}
+            ),
+        )
+
+    async def mail_rule_run(route: Route) -> None:
+        nonlocal step_calls, in_flight, maximum_in_flight
+        if route.request.method == "GET":
+            payload = {"ok": True, "data": {"run": run}}
+        else:
+            index = step_calls
+            step_calls += 1
+            in_flight += 1
+            maximum_in_flight = max(maximum_in_flight, in_flight)
+            try:
+                await asyncio.sleep(0.02)
+                result = step_results[min(index, len(step_results) - 1)]
+                payload = {
+                    "ok": True,
+                    "data": {"run": result},
+                    "message": "Rule batch processed.",
+                }
+            finally:
+                in_flight -= 1
+        await route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(payload),
+        )
+
+    await page.route("**/api/v1/admin/mail-rules?*", mail_rules)
+    await page.route("**/api/v1/admin/mail-rule-runs/**", mail_rule_run)
+    await page.goto(live_application.base_url + "/rules")
+    await page.wait_for_function(
+        "() => document.querySelector('#mail-rule-run-state')?.textContent === 'completed'"
+    )
+    await page.wait_for_timeout(100)
+
+    assert step_calls == len(step_results)
+    assert maximum_in_flight == 1
+    assert await page.locator("#mail-rule-run-summary").inner_text() == (
+        "60 of 60 messages processed."
+    )
+    assert await page.locator("#mail-rule-run-step").is_disabled()
+    assert await page.locator("#mail-rule-run-cancel").is_disabled()
+
+
+async def test_existing_mail_rule_run_stops_after_rules_route_is_aborted(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    rule_id = "3" * 32
+    run_id = "4" * 32
+    run = {
+        "run_id": run_id,
+        "rule_id": rule_id,
+        "rule_name": "File project reports",
+        "status": "running",
+        "processed": 0,
+        "total": 40,
+    }
+    rule = {
+        "rule_id": rule_id,
+        "name": "File project reports",
+        "enabled": True,
+        "match": {"field": "subject", "operator": "contains", "value": "Report"},
+        "target_mailbox": ARCHIVE_MAILBOX,
+        "stop_processing": True,
+        "revision": 1,
+    }
+    step_started = asyncio.Event()
+    release_step = asyncio.Event()
+    step_calls = 0
+
+    async def mail_rules(route: Route) -> None:
+        await route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(
+                {"ok": True, "data": {"rules": [rule], "active_run": run}}
+            ),
+        )
+
+    async def mail_rule_run(route: Route) -> None:
+        nonlocal step_calls
+        if route.request.method == "GET":
+            result = run
+        else:
+            step_calls += 1
+            step_started.set()
+            await release_step.wait()
+            result = {**run, "processed": 20}
+        await route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"ok": True, "data": {"run": result}}),
+        )
+
+    await page.route("**/api/v1/admin/mail-rules?*", mail_rules)
+    await page.route("**/api/v1/admin/mail-rule-runs/**", mail_rule_run)
+    await page.goto(live_application.base_url + "/rules")
+    await asyncio.wait_for(step_started.wait(), timeout=2)
+    try:
+        assert await page.locator("#mail-rule-run-cancel").is_enabled()
+        assert "Processing" in await page.locator("#mail-rule-run-status").inner_text()
+        await page.locator('a[data-section="security"]').click()
+        await page.get_by_role("heading", name="Security", exact=True).wait_for()
+    finally:
+        release_step.set()
+    await page.wait_for_timeout(100)
+
+    assert step_calls == 1
 
 async def test_mailbox_search_filters_sender_and_subject_on_the_loaded_page(
     page: Page,
@@ -1531,7 +2453,7 @@ async def test_forward_as_attachment_does_not_require_a_parseable_message(
     ]
 
 
-async def test_mailbox_actions_avoid_body_reads_and_close_pending_confirmations(
+async def test_mailbox_actions_preflight_freshness_and_close_pending_confirmations(
     page: Page,
     live_application: LiveApplication,
 ) -> None:
@@ -1541,8 +2463,10 @@ async def test_mailbox_actions_avoid_body_reads_and_close_pending_confirmations(
     row = page.locator("#message-list-body tr")
     live_application.gateway.archive_move_release.clear()
     await row.get_by_role("button", name="Archive", exact=True).click()
+    await asyncio.wait_for(live_application.gateway.message_read_started.wait(), timeout=2)
+    assert not live_application.gateway.archive_move_started.is_set()
+    live_application.gateway.message_read_release.set()
     await asyncio.wait_for(live_application.gateway.archive_move_started.wait(), timeout=2)
-    assert not live_application.gateway.message_read_started.is_set()
     await page.go_back()
     live_application.gateway.archive_move_release.set()
     await page.get_by_role("heading", name=MAILBOX, exact=True).wait_for()
@@ -1663,7 +2587,7 @@ async def test_trash_bulk_permanent_delete_requires_per_message_freshness_and_on
 
     def capture_action_request(request: object) -> None:
         path = urlsplit(getattr(request, "url", "")).path
-        if path.endswith("/action-snapshot") or path.endswith("/mail-actions"):
+        if path.endswith("/action-snapshots") or path.endswith("/mail-actions"):
             action_requests.append(request)
 
     page.on("request", capture_action_request)
@@ -1701,11 +2625,16 @@ async def test_trash_bulk_permanent_delete_requires_per_message_freshness_and_on
         (getattr(request, "method", ""), urlsplit(getattr(request, "url", "")).path)
         for request in action_requests
     ]
-    assert set(action_records[:-1]) == {
-        ("GET", f"/api/v1/admin/mail/{MESSAGE_ID}/action-snapshot"),
-        ("GET", f"/api/v1/admin/mail/{second_message_id}/action-snapshot"),
-    }
+    assert action_records[:-1] == [
+        ("POST", "/api/v1/admin/mail/action-snapshots"),
+    ]
     assert action_records[-1] == ("POST", "/api/v1/admin/mail-actions")
+    snapshot_payload = getattr(action_requests[0], "post_data_json", None)
+    assert snapshot_payload == {
+        "account": ACCOUNT,
+        "mailbox": TRASH_MAILBOX,
+        "uids": [MESSAGE_ID, second_message_id],
+    }
     payload = getattr(action_requests[-1], "post_data_json", None)
     assert isinstance(payload, dict)
     assert payload == {
@@ -2883,6 +3812,7 @@ async def test_theme_persists_and_mobile_navigation_has_safe_touch_targets(
     assert await visible_links.all_inner_texts() == [
         "Compose",
         "Mail",
+        "Rules",
         "Security",
         "Overview",
         "Accounts",
@@ -2905,6 +3835,54 @@ async def test_theme_persists_and_mobile_navigation_has_safe_touch_targets(
     assert theme_bounds is not None
     assert theme_bounds["height"] >= 44
     assert theme_bounds["width"] >= 44
+
+
+async def test_folder_and_rule_builder_controls_have_mobile_touch_targets(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    async def empty_mail_rules(route: Route) -> None:
+        await route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"ok": True, "data": {"rules": []}}),
+        )
+
+    await page.route("**/api/v1/admin/mail-rules?*", empty_mail_rules)
+    await page.set_viewport_size({"width": 390, "height": 844})
+    await page.goto(live_application.base_url + _mailbox_path())
+    await page.locator("#message-list-body tr").wait_for()
+    await page.locator("#mobile-folders-button").click()
+    folder_toggle = page.locator("#mail-folder-create-toggle")
+    await folder_toggle.click()
+    controls = [
+        folder_toggle,
+        page.locator("#mail-folder-create-form").get_by_role(
+            "button", name="Create", exact=True
+        ),
+        page.locator("#mail-folder-create-cancel"),
+    ]
+    for control in controls:
+        bounds = await control.bounding_box()
+        assert bounds is not None
+        assert bounds["height"] >= 44
+
+    await page.locator('a[data-section="rules"]').click()
+    await page.get_by_role("heading", name="Mail rules", exact=True).wait_for()
+    for control in await page.locator(".rule-node-button").all():
+        bounds = await control.bounding_box()
+        assert bounds is not None
+        assert bounds["height"] >= 44
+    for selector in (
+        "#mail-rule-enabled",
+        "#mail-rule-stop",
+        "#mail-rule-apply-existing",
+    ):
+        bounds = await page.locator(selector).bounding_box()
+        assert bounds is not None
+        assert 16 <= bounds["width"] <= 20
+        assert 16 <= bounds["height"] <= 20
+    assert await page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
 
 
 async def test_client_uses_safe_dom_construction_without_unsafe_html_sinks() -> None:

@@ -718,6 +718,8 @@ async def test_home_static_assets_and_strict_headers(
     assert 'id="new-mail-notice"' in page
     assert 'id="new-mail-dismiss"' in page
     assert 'id="new-mail-announcer"' in page
+    assert 'id="startup-recovery"' in page
+    assert 'href="">Reload this page</a>' in page
     assert 'id="mail-bulk-permanent-delete"' in page
     assert 'id="compose-sender-name"' in page
     assert 'name="sender_name"' in page
@@ -1742,6 +1744,7 @@ async def test_mail_rule_spa_and_admin_api_match_frontend_contract(
     client, gateway = web_client
     shell = await client.get("/rules")
     assert shell.status == 200
+    assert 'id="rules-view"' in await shell.text()
 
     listed = await client.get(f"/api/v1/admin/mail-rules?account={ADMIN_ACCOUNT_ID}")
     assert listed.status == 200

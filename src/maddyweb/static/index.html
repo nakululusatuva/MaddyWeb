@@ -49,6 +49,17 @@
     </div>
   </header>
 
+  <div id="session-resume-guard" class="session-resume-guard" role="status" aria-live="polite" aria-atomic="true" hidden>
+    <div class="session-resume-card">
+      <span id="session-resume-spinner" class="mail-switch-spinner" aria-hidden="true"></span>
+      <span class="session-resume-copy">
+        <strong id="session-resume-title">Checking your session</strong>
+        <small id="session-resume-detail">Confirming that this restored page is still authorized...</small>
+      </span>
+      <a id="session-resume-reload" class="button button-primary" href="" hidden>Reload this page</a>
+    </div>
+  </div>
+
   <div class="workspace">
     <aside class="sidebar">
       <nav class="primary-nav" aria-label="Main navigation">
@@ -59,6 +70,10 @@
         <a class="nav-link" href="/mail" data-route data-section="mail" data-capability="mail.read">
           <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h18v14H3z"></path><path d="m3 6 9 7 9-7"></path></svg>
           <span>Mail</span>
+        </a>
+        <a class="nav-link" href="/rules" data-route data-section="rules" data-capability="mail.mutate">
+          <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h10M4 12h7M4 18h10"></path><path d="m16 10 4 2-4 2z"></path></svg>
+          <span>Rules</span>
         </a>
         <a class="nav-link" href="/security" data-route data-section="security" data-authenticated-only>
           <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 5 6v5c0 4.6 2.9 8.5 7 10 4.1-1.5 7-5.4 7-10V6z"></path><path d="m9 12 2 2 4-5"></path></svg>
@@ -86,6 +101,14 @@
 
     <main id="main" class="app-main" tabindex="-1">
       <div id="global-alert" class="notice notice-error" role="alert" hidden></div>
+      <section id="startup-recovery" class="startup-recovery" role="status" aria-live="polite">
+        <div>
+          <p class="eyebrow">Connection interrupted</p>
+          <h1>This page did not finish opening</h1>
+          <p>The server may already be available again. Reload this page to resume your session.</p>
+        </div>
+        <a class="button button-primary" href="">Reload this page</a>
+      </section>
       <div id="loading-status" class="sr-only" role="status" aria-live="polite"></div>
       <aside id="admin-workspace-indicator" class="admin-workspace-indicator" hidden>
         <span class="admin-workspace-icon" aria-hidden="true">A</span>
@@ -123,6 +146,21 @@
             <span aria-hidden="true">+</span>
             New message
           </a>
+          <div class="mail-folder-create">
+            <button id="mail-folder-create-toggle" class="mail-folder-create-toggle" type="button" aria-expanded="false" aria-controls="mail-folder-create-form">
+              <span aria-hidden="true">+</span>
+              New folder
+            </button>
+            <form id="mail-folder-create-form" class="mail-folder-create-form" hidden>
+              <label for="mail-folder-name">Folder name</label>
+              <input id="mail-folder-name" name="name" maxlength="255" autocomplete="off" required placeholder="Projects/2026">
+              <div class="mail-folder-create-actions">
+                <button class="button button-primary" type="submit">Create</button>
+                <button id="mail-folder-create-cancel" class="button button-secondary" type="button">Cancel</button>
+              </div>
+              <p id="mail-folder-create-status" class="field-help" role="status" aria-live="polite"></p>
+            </form>
+          </div>
           <div id="mail-selector" class="mail-selector">
             <label id="mail-account-field">
               <span>Viewing mailbox</span>
@@ -186,6 +224,11 @@
               <button id="mail-mark-unread" class="button button-secondary" type="button" disabled>Mark unread</button>
               <button id="mail-bulk-archive" class="button button-secondary" type="button" disabled>Archive</button>
               <button id="mail-bulk-trash" class="button button-secondary" type="button" disabled>Trash</button>
+              <span class="mail-move-control mail-bulk-move-control">
+                <label class="sr-only" for="mail-bulk-move-target">Move selected messages to folder</label>
+                <select id="mail-bulk-move-target" disabled><option value="">Move to...</option></select>
+                <button id="mail-bulk-move" class="button button-secondary" type="button" disabled>Move</button>
+              </span>
               <button id="mail-bulk-permanent-delete" class="button button-danger" type="button" hidden disabled>Permanently delete</button>
               <button id="mail-mark-all-read" class="button button-secondary" type="button" disabled>Mark all as read</button>
             </div>
@@ -195,8 +238,9 @@
               <span class="mail-switch-spinner" aria-hidden="true"></span>
               <span class="mail-switch-copy">
                 <strong id="mail-switch-title">Opening mailbox</strong>
-                <small>Fetching the latest messages...</small>
+                <small id="mail-switch-detail">Fetching the latest messages...</small>
               </span>
+              <button id="mail-switch-retry" class="button button-primary" type="button" hidden>Retry</button>
             </div>
           </div>
           <div class="mail-list-table">
@@ -233,6 +277,11 @@
             <a id="message-forward" class="button button-secondary" href="/compose" data-route>Forward</a>
             <a id="message-raw" class="button button-secondary" href="#">Download raw .eml</a>
             <button id="message-body-toggle" class="button button-secondary message-body-toggle" type="button" aria-controls="message-html-body message-source-body" aria-pressed="false" hidden>View source</button>
+            <span class="mail-move-control message-move-control">
+              <label class="sr-only" for="message-move-target">Move this message to folder</label>
+              <select id="message-move-target" disabled><option value="">Move to...</option></select>
+              <button id="message-move" class="button button-secondary" type="button" disabled>Move</button>
+            </span>
             <button id="message-trash" class="button button-secondary" type="button">Move to Trash</button>
             <button id="message-delete" class="button button-danger" type="button">Permanently delete</button>
           </nav>
@@ -246,6 +295,73 @@
           </article>
           <section class="attachment-card"><div class="card-heading"><div><p class="eyebrow">Files</p><h2>Attachments</h2></div></div><ul id="attachment-list" class="attachment-list"></ul></section>
         </section>
+      </section>
+
+      <section id="rules-view" class="view" data-view="rules" aria-labelledby="rules-title" hidden>
+        <div class="page-heading rules-heading">
+          <div>
+            <p class="eyebrow">Message automation</p>
+            <h1 id="rules-title">Mail rules</h1>
+            <p>Create Thunderbird-style conditions that move matching messages into an existing folder.</p>
+          </div>
+          <button id="mail-rule-new" class="button button-primary" type="button">New rule</button>
+        </div>
+        <p id="mail-rules-account" class="rules-account-context"></p>
+        <div class="rules-layout">
+          <article class="data-card rules-list-card" aria-labelledby="mail-rules-list-title">
+            <div class="card-heading">
+              <div><p class="eyebrow">Order matters</p><h2 id="mail-rules-list-title">Rules</h2></div>
+              <span id="mail-rules-count" class="status-pill status-neutral">Loading</span>
+            </div>
+            <div id="mail-rules-loading" class="rules-loading" role="status" aria-live="polite">Loading mail rules...</div>
+            <ol id="mail-rules-list" class="mail-rules-list"></ol>
+            <div id="mail-rules-empty" class="empty-state" hidden>No rules yet. Create one to organize incoming mail.</div>
+          </article>
+
+          <article class="data-card rule-editor-card" aria-labelledby="mail-rule-editor-title">
+            <div class="card-heading">
+              <div><p class="eyebrow">Rule builder</p><h2 id="mail-rule-editor-title">New rule</h2></div>
+            </div>
+            <form id="mail-rule-form" autocomplete="off">
+              <input id="mail-rule-id" name="rule_id" type="hidden">
+              <div class="rule-basics">
+                <label>Rule name<input id="mail-rule-name" name="name" maxlength="120" required placeholder="Move project updates"></label>
+                <label class="checkbox-row"><input id="mail-rule-enabled" name="enabled" type="checkbox" checked> Enable this rule</label>
+                <label class="checkbox-row"><input id="mail-rule-stop" name="stop_processing" type="checkbox" checked> Stop after this rule matches</label>
+              </div>
+              <fieldset class="rule-condition-fieldset">
+                <legend>Match conditions</legend>
+                <p class="field-help">Combine up to 32 conditions in four nested AND, OR, or NOT levels.</p>
+                <div id="mail-rule-condition-tree" class="rule-condition-tree"></div>
+              </fieldset>
+              <div class="rule-delivery-grid">
+                <label>Move matching mail to
+                  <select id="mail-rule-target" name="target_mailbox" required><option value="">Select a folder</option></select>
+                </label>
+                <label class="checkbox-row rule-apply-existing"><input id="mail-rule-apply-existing" name="apply_existing" type="checkbox"> Apply to existing messages after saving</label>
+              </div>
+              <div class="rule-form-actions">
+                <button id="mail-rule-save" class="button button-primary" type="submit">Save rule</button>
+                <button id="mail-rule-reset" class="button button-secondary" type="button">Reset</button>
+              </div>
+              <p id="mail-rule-form-status" class="field-help" role="status" aria-live="polite"></p>
+            </form>
+          </article>
+        </div>
+
+        <article id="mail-rule-run-card" class="data-card rule-run-card" aria-labelledby="mail-rule-run-title" hidden>
+          <div class="card-heading">
+            <div><p class="eyebrow">Existing mail</p><h2 id="mail-rule-run-title">Rule run</h2></div>
+            <span id="mail-rule-run-state" class="status-pill status-neutral">Pending</span>
+          </div>
+          <p id="mail-rule-run-summary">Waiting for server status.</p>
+          <progress id="mail-rule-run-progress" max="1" value="0">0%</progress>
+          <div class="rule-run-actions">
+            <button id="mail-rule-run-step" class="button button-primary" type="button">Process next batch</button>
+            <button id="mail-rule-run-cancel" class="button button-secondary" type="button">Cancel run</button>
+          </div>
+          <p id="mail-rule-run-status" class="field-help" role="status" aria-live="polite"></p>
+        </article>
       </section>
 
       <section id="compose-view" class="view" data-view="compose" aria-labelledby="compose-title" hidden>

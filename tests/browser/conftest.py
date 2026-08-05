@@ -158,6 +158,8 @@ class BrowserSecurityGateway:
         self.step_up_granted = False
         self.bulk_seen_changes: list[tuple[str, str, tuple[str, ...] | None, bool]] = []
         self.bulk_moves: list[tuple[str, str, tuple[str, ...], str]] = []
+        self.created_mailboxes: list[tuple[str, str]] = []
+        self.extra_mailboxes: list[str] = []
         self.message_unread = True
         self.notification_uid = int(MESSAGE_ID)
         self.notification_checks = 0
@@ -415,7 +417,13 @@ class BrowserSecurityGateway:
             {"name": SENT_MAILBOX, "attributes": ["\\Sent"]},
             {"name": TRASH_MAILBOX, "attributes": ["\\Trash"]},
             {"name": ARCHIVE_MAILBOX, "attributes": ["\\Archive"]},
+            *({"name": name, "attributes": []} for name in self.extra_mailboxes),
         ]
+
+    async def create_mailbox(self, account: str, mailbox: str) -> None:
+        self.created_mailboxes.append((account, mailbox))
+        if mailbox not in self.extra_mailboxes:
+            self.extra_mailboxes.append(mailbox)
 
     async def list_messages(self, _account: str, mailbox: str, **_kwargs: object) -> MessagePage:
         items: list[dict[str, object]] = []
@@ -517,6 +525,17 @@ class BrowserSecurityGateway:
         self.message_location = ARCHIVE_MAILBOX
         self.archive_move_finished.set()
         return ARCHIVE_MAILBOX
+
+    async def move_messages(
+        self,
+        account: str,
+        mailbox: str,
+        message_ids: Sequence[str],
+        target_mailbox: str,
+    ) -> str:
+        self.bulk_moves.append((account, mailbox, tuple(message_ids), target_mailbox))
+        self.message_location = target_mailbox
+        return target_mailbox
 
     async def delete_message_permanently(
         self,
