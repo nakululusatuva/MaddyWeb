@@ -15,13 +15,16 @@ the requirement that the Maddy version, CLI capability fingerprint, and integrat
 the Trivy version. It checks:
 
 - repository contents, dependency locks, secrets, and configuration errors;
+- Ruff policy across source, scripts, tests, and configuration, with assertion suppression limited to tests;
 - known Python vulnerabilities in `requirements.lock`;
 - high-severity static findings in Python source code;
+- the explicit audit regression suite in `tests/test_security_audit.py`, plus the authentication, helper,
+  mail, and Web security suites it names;
 - the JSON frame, Maddy CLI, configuration, and MIME parsers with 20,000 deterministic mutation inputs;
 - the exact Maddy 0.9.5 image digest in `tests/integration/maddy-image-lock.json`
   as an informational item.
 
-The first four items are mandatory MaddyWeb release gates. The last item still scans the exact pinned digest and retains
+The first six items are mandatory MaddyWeb release gates. The last item still scans the exact pinned digest and retains
 the Trivy log in the GitHub Actions summary. Vulnerabilities or scanner failures produce information or warnings,
 but do not fail the MaddyWeb security workflow. A malformed image lock file or a reference that is not a full digest
 remains a repository integrity error and continues to block.

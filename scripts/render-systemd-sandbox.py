@@ -86,6 +86,11 @@ def render(config_path: Path) -> tuple[str, str]:
                 config.certificates.deployed_key_path,
             ):
                 helper_lines.append(f"ReadWritePaths={parent}")
+    else:
+        # The base helper unit hides Docker's control socket. Only an explicit
+        # Docker-mode configuration may replace that deny-list with this one
+        # fixed local socket mount. The Web unit never receives this drop-in.
+        helper_lines.extend(("InaccessiblePaths=", "BindReadOnlyPaths=-/run/docker.sock"))
     helper = _HEADER + "\n".join(helper_lines) + ("\n" if helper_lines else "")
     return web, helper
 

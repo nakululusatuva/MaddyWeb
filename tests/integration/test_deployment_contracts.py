@@ -503,7 +503,9 @@ def test_private_temp_paths_do_not_render_host_write_allowlists(
     assert "ReadWritePaths=" not in web
 
 
-def test_docker_helper_does_not_gain_native_host_paths(tmp_path: Path) -> None:
+def test_docker_helper_gets_only_the_fixed_socket_and_no_native_host_paths(
+    tmp_path: Path,
+) -> None:
     output = tmp_path / "output"
     output.mkdir()
     subprocess.run(  # noqa: S603
@@ -531,7 +533,11 @@ def test_docker_helper_does_not_gain_native_host_paths(tmp_path: Path) -> None:
         "/run/maddyweb",
         "/var/lib/maddyweb-auth",
     }
-    assert "ReadOnlyPaths=" not in helper_drop_in
+    assert helper_drop_in.count("InaccessiblePaths=\n") == 1
+    assert "BindReadOnlyPaths=-/run/docker.sock" in helper_drop_in
+    assert not any(
+        line.startswith("ReadOnlyPaths=") for line in helper_drop_in.splitlines()
+    )
     assert "ReadWritePaths=" not in helper_drop_in
 
 
@@ -573,6 +579,8 @@ def test_certificate_enabled_helper_gets_only_configured_certificate_write_roots
         "ReadWritePaths=-/var/log/letsencrypt",
         "ReadWritePaths=-/var/www/mail",
         "ReadWritePaths=-/srv/www/acme",
+        "InaccessiblePaths=",
+        "BindReadOnlyPaths=-/run/docker.sock",
     ]
 
 
@@ -741,6 +749,7 @@ def test_systemd_privilege_boundary() -> None:
         "/run/maddyweb",
         "/var/lib/maddyweb-auth",
     }
+    assert "InaccessiblePaths=-/run/docker.sock -/var/run/docker.sock" in helper
     assert "ListenStream=/run/maddyweb/helper.sock" in socket
     assert "SocketUser=root" in socket
     assert "SocketGroup=maddyweb" in socket

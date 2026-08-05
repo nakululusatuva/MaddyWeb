@@ -21,6 +21,17 @@ def fail(message: str) -> Never:
     raise SystemExit(1)
 
 
+def reject_duplicate_object_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """Build one JSON object while rejecting parser-dependent duplicate keys."""
+
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            fail("manifest contains duplicate object keys")
+        result[key] = value
+    return result
+
+
 def open_regular_non_link(
     path: Path,
     maximum: int | None = None,
@@ -135,7 +146,10 @@ def main() -> None:
     if re.fullmatch(r"[0-9a-f]{64}", args.expected_sha256) is None:
         fail("expected checksum must be 64 lowercase hexadecimal characters")
     try:
-        manifest = json.loads(read_regular(args.manifest, 16 * 1024).decode("utf-8"))
+        manifest = json.loads(
+            read_regular(args.manifest, 16 * 1024).decode("utf-8"),
+            object_pairs_hook=reject_duplicate_object_keys,
+        )
     except OSError, UnicodeDecodeError, json.JSONDecodeError:
         fail("manifest is not valid UTF-8 JSON")
     required_keys = {"format", "commit", "artifact", "sha256"}

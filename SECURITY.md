@@ -35,7 +35,9 @@ private mounts, the drop-in grants write access only to that exact directory. Th
 configuration and write access to the data directory and the parent of each certificate deployment target. Only explicit
 `webroot_roots` configuration grants the helper additional write access to the Certbot configuration root and those exact webroots,
 supporting atomic updates to `archive`, `live`, and `renewal` and HTTP-01 challenges. The Docker
-helper does not receive Docker socket permission, and the Web process still explicitly cannot see the Docker socket.
+helper receives the fixed local Docker socket only when `maddy.mode = "docker"`; native-mode helpers and the Web process
+explicitly cannot see either Docker socket path. Docker socket access remains equivalent to host root and is confined to
+the allowlisted helper protocol described below.
 
 ## Credentials and secrets
 

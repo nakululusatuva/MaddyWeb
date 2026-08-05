@@ -44,7 +44,7 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 ReadWritePaths=/var/backups/maddyweb /run/maddyweb /var/lib/maddyweb-auth
-BindReadOnlyPaths=-/run/docker.sock
+InaccessiblePaths=-/run/docker.sock -/var/run/docker.sock
 
 [Install]
 WantedBy=multi-user.target

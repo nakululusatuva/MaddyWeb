@@ -22,7 +22,9 @@ jobs:
       - name: Install pinned audit tools and test runtime
         run: |
           python -m pip install --disable-pip-version-check \
-            'pip-audit==2.10.1' 'bandit==1.9.4' -e '.[test]'
+            'pip-audit==2.10.1' 'bandit==1.9.4' 'ruff==0.15.22' -e '.[test]'
+      - name: Enforce source and configuration policy
+        run: python -m ruff check .
       - name: Audit hash-locked production dependencies
         run: |
           for attempt in 1 2; do
@@ -32,6 +34,12 @@ jobs:
           done
       - name: Reject high-severity Python findings
         run: python -m bandit -q -lll -r src scripts
+      - name: Run security audit regression suite
+        run: |
+          python -m pytest -q tests/test_security_audit.py \
+            tests/test_security.py tests/test_web_auth.py tests/test_mail.py \
+            tests/test_helper.py tests/test_web.py \
+            tests/integration/test_deployment_contracts.py
       - name: Run extended deterministic parser fuzzing
         env:
           MADDYWEB_FUZZ_CASES: "20000"
