@@ -650,7 +650,7 @@
     const days = Math.floor(totalMinutes / (24 * 60));
     const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
     const minutes = totalMinutes % 60;
-    return `${days} d ${hours} h ${minutes} mins`;
+    return `${days}d ${hours}h ${minutes}m`;
   };
 
   const applySessionUi = () => {

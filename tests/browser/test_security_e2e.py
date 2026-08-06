@@ -489,7 +489,7 @@ async def test_session_countdown_includes_days_hours_and_minutes(
     await page.get_by_role("heading", name="Security", exact=True).wait_for()
 
     assert await page.locator("#session-expiry").inner_text() == (
-        "Session expires in 2 d 3 h 4 mins"
+        "Session expires in 2d 3h 4m"
     )
 
 
