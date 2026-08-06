@@ -878,6 +878,15 @@ async def test_mail_selection_checkboxes_remain_compact_after_deselect(
         assert page_geometry["width"] <= 20
         assert page_geometry["height"] <= 20
         assert page_geometry["boxShadow"] == "none"
+        alignment_delta = await page.locator(".mail-bulk-select").evaluate(
+            """node => {
+                const checkbox = node.querySelector('input').getBoundingClientRect();
+                const label = node.querySelector('span').getBoundingClientRect();
+                return (label.top + label.height / 2)
+                    - (checkbox.top + checkbox.height / 2);
+            }"""
+        )
+        assert abs(alignment_delta) <= 0.5
 
 
 async def test_opening_an_unread_message_marks_it_read(

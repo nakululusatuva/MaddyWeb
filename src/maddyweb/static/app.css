@@ -5024,6 +5024,10 @@ html[data-view="message"] .app-footer {
   white-space: nowrap;
 }
 
+.mail-bulk-select > span {
+  margin-bottom: 0;
+}
+
 .mail-bulk-select input,
 .message-select-checkbox {
   width: 16px;
