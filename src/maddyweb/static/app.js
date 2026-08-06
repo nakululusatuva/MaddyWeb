@@ -185,7 +185,7 @@
     activeMenuOpener: null,
     activeMenuRow: null,
     activeMenuPoint: null,
-    activeMenuScrollArmed: false,
+    activeMenuIgnoreScrollUntil: 0,
     folderMenuContext: null,
     folderRenameContext: null,
     folderRenameOpener: null,
@@ -256,7 +256,7 @@
     state.activeMenuOpener = null;
     state.activeMenuRow = null;
     state.activeMenuPoint = null;
-    state.activeMenuScrollArmed = false;
+    state.activeMenuIgnoreScrollUntil = 0;
     state.folderMenuContext = null;
     state.messageMenuContexts = [];
     if (restoreFocus && opener instanceof HTMLElement && document.contains(opener)) {
@@ -310,7 +310,7 @@
     state.activeMenuOpener = opener instanceof HTMLElement ? opener : document.activeElement;
     state.activeMenuRow = row instanceof HTMLElement ? row : null;
     state.activeMenuPoint = point || menuAnchorPoint(opener);
-    state.activeMenuScrollArmed = false;
+    state.activeMenuIgnoreScrollUntil = window.performance.now() + 250;
     if (state.activeMenuRow) state.activeMenuRow.classList.add("is-context-open");
     if (
       opener instanceof HTMLElement
@@ -319,11 +319,6 @@
       opener.setAttribute("aria-expanded", "true");
     }
     positionFloatingMenu(menu, state.activeMenuPoint);
-    window.requestAnimationFrame(() => {
-      if (state.activeMenu === menu && !menu.hidden) {
-        state.activeMenuScrollArmed = true;
-      }
-    });
     const first = floatingMenuItems(menu)[0];
     if (first) first.focus({preventScroll: true});
     return true;
@@ -7415,7 +7410,10 @@
 
   document.addEventListener("scroll", (event) => {
     if (!(state.activeMenu instanceof HTMLElement) || state.activeMenu.hidden) return;
-    if (!state.activeMenuScrollArmed) return;
+    if (
+      event.isTrusted
+      && window.performance.now() < state.activeMenuIgnoreScrollUntil
+    ) return;
     if (
       event.target instanceof Node
       && state.activeMenu.contains(event.target)
