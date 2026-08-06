@@ -57,6 +57,55 @@
     return node;
   };
 
+  const ICON_PATHS = Object.freeze({
+    archive: ["M4 8h16v11H4z", "M3 4h18v4H3z", "M9 12h6"],
+    attachment: ["m20.5 11.5-8.9 8.9a6 6 0 0 1-8.5-8.5l9.2-9.2a4 4 0 0 1 5.7 5.7l-9.2 9.2a2 2 0 1 1-2.8-2.8l8.5-8.5"],
+    back: ["m15 18-6-6 6-6"],
+    delete: ["M4 7h16", "M9 7V4h6v3", "M7 7l1 13h8l1-13", "M10 11v5", "M14 11v5"],
+    external: ["M14 3h7v7", "M10 14 21 3", "M21 14v7H3V3h7"],
+    forward: ["m15 7 5 5-5 5", "M20 12h-8a8 8 0 0 0-8 8"],
+    more: ["M6 12h.01", "M12 12h.01", "M18 12h.01"],
+    move: ["M3 6h7l2 2h9v11H3z", "m13 5 3 3-3 3", "M9 16h7"],
+    open: ["M3 7h18v11H3z", "m3 3 6 5 6-5"],
+    read: ["M3 6h18v12H3z", "m3 3 6 5 6-5"],
+    rename: ["M4 20h4L19 9l-4-4L4 16z", "M14 6l4 4"],
+    reply: ["m9 17-5-5 5-5", "M4 12h8a8 8 0 0 1 8 8"],
+    replyAll: ["m7 17-5-5 5-5", "m5 10-3-3 3-3", "M2 12h9a8 8 0 0 1 8 8"],
+    unread: ["M3 8l9-5 9 5v11H3z", "m3 3 6 4 6-4"],
+  });
+
+  const MENU_ACTION_ICONS = Object.freeze({
+    archive: "archive",
+    back: "back",
+    delete: "delete",
+    forward: "forward",
+    "forward-attachment": "attachment",
+    "mark-read": "read",
+    "mark-unread": "unread",
+    move: "move",
+    "move-to": "move",
+    open: "open",
+    "open-new-tab": "external",
+    "permanent-delete": "delete",
+    rename: "rename",
+    reply: "reply",
+    "reply-all": "replyAll",
+    trash: "delete",
+  });
+
+  const actionIcon = (name) => {
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("aria-hidden", "true");
+    svg.setAttribute("focusable", "false");
+    for (const value of ICON_PATHS[name] || ICON_PATHS.more) {
+      const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      path.setAttribute("d", value);
+      svg.append(path);
+    }
+    return svg;
+  };
+
   const byId = (id) => document.getElementById(id);
   const stringValue = (value, fallback = "") => {
     if (typeof value === "string") return value;
@@ -132,8 +181,16 @@
     typedAction: null,
     typedExpected: "",
     typedOpener: null,
+    activeMenu: null,
+    activeMenuOpener: null,
+    activeMenuRow: null,
+    activeMenuPoint: null,
+    folderMenuContext: null,
+    folderRenameContext: null,
+    folderRenameOpener: null,
     folderDeleteContext: null,
     folderDeleteOpener: null,
+    messageMenuContexts: [],
     stepUpOpener: null,
     stepUpResolve: null,
     stepUpReject: null,
@@ -166,11 +223,129 @@
   const confirmDialog = byId("confirm-dialog");
   const typedDialog = byId("typed-confirm-dialog");
   const folderDeleteDialog = byId("folder-delete-dialog");
+  const folderRenameDialog = byId("folder-rename-dialog");
+  const folderMenu = byId("mail-folder-menu");
+  const messageContextMenu = byId("message-context-menu");
   const accountDialog = byId("account-dialog");
   const stepUpDialog = byId("step-up-dialog");
   const credentialDisclosureDialog = byId("credential-disclosure-dialog");
   const startupRecovery = byId("startup-recovery");
   const sessionResumeGuard = byId("session-resume-guard");
+
+  const floatingMenuItems = (menu) => [...menu.querySelectorAll('[role="menuitem"]')]
+    .filter((item) => item instanceof HTMLButtonElement && !item.disabled);
+
+  const closeFloatingMenus = ({restoreFocus = false} = {}) => {
+    const opener = state.activeMenuOpener;
+    for (const menu of [folderMenu, messageContextMenu]) {
+      if (!(menu instanceof HTMLElement)) continue;
+      menu.hidden = true;
+      menu.style.removeProperty("left");
+      menu.style.removeProperty("top");
+      menu.style.removeProperty("visibility");
+    }
+    document.querySelectorAll(
+      '[aria-controls="mail-folder-menu"], [aria-controls="message-context-menu"]',
+    )
+      .forEach((control) => control.setAttribute("aria-expanded", "false"));
+    if (state.activeMenuRow instanceof HTMLElement) {
+      state.activeMenuRow.classList.remove("is-context-open");
+    }
+    state.activeMenu = null;
+    state.activeMenuOpener = null;
+    state.activeMenuRow = null;
+    state.activeMenuPoint = null;
+    state.folderMenuContext = null;
+    state.messageMenuContexts = [];
+    if (restoreFocus && opener instanceof HTMLElement && document.contains(opener)) {
+      opener.focus({preventScroll: true});
+    }
+  };
+
+  const positionFloatingMenu = (menu, point) => {
+    if (!(menu instanceof HTMLElement)) return;
+    const margin = 8;
+    menu.style.visibility = "hidden";
+    menu.hidden = false;
+    menu.style.left = "0px";
+    menu.style.top = "0px";
+    const bounds = menu.getBoundingClientRect();
+    const left = Math.max(
+      margin,
+      Math.min(point.x, window.innerWidth - bounds.width - margin),
+    );
+    const top = Math.max(
+      margin,
+      Math.min(point.y, window.innerHeight - bounds.height - margin),
+    );
+    menu.style.left = `${Math.round(left)}px`;
+    menu.style.top = `${Math.round(top)}px`;
+    menu.style.visibility = "visible";
+  };
+
+  const menuAnchorPoint = (opener) => {
+    if (!(opener instanceof HTMLElement)) {
+      return {x: Math.round(window.innerWidth / 2), y: Math.round(window.innerHeight / 2)};
+    }
+    const bounds = opener.getBoundingClientRect();
+    return {x: bounds.right - 4, y: bounds.bottom + 4};
+  };
+
+  const openFloatingMenu = (menu, {opener = null, row = null, point = null} = {}) => {
+    if (!(menu instanceof HTMLElement)) return;
+    if (
+      point === null
+      && !menu.hidden
+      && state.activeMenu === menu
+      && opener instanceof HTMLElement
+      && state.activeMenuOpener === opener
+    ) {
+      closeFloatingMenus();
+      return false;
+    }
+    closeFloatingMenus();
+    state.activeMenu = menu;
+    state.activeMenuOpener = opener instanceof HTMLElement ? opener : document.activeElement;
+    state.activeMenuRow = row instanceof HTMLElement ? row : null;
+    state.activeMenuPoint = point || menuAnchorPoint(opener);
+    if (state.activeMenuRow) state.activeMenuRow.classList.add("is-context-open");
+    if (
+      opener instanceof HTMLElement
+      && (opener.hasAttribute("aria-haspopup") || opener.hasAttribute("aria-controls"))
+    ) {
+      opener.setAttribute("aria-expanded", "true");
+    }
+    positionFloatingMenu(menu, state.activeMenuPoint);
+    const first = floatingMenuItems(menu)[0];
+    if (first) first.focus({preventScroll: true});
+    return true;
+  };
+
+  const menuButton = ({label, action, handler, danger = false, disabled = false}) => {
+    const button = element("button", {
+      className: danger ? "context-menu-item is-danger" : "context-menu-item",
+      type: "button",
+    });
+    button.setAttribute("role", "menuitem");
+    button.dataset.action = action;
+    button.disabled = disabled;
+    button.append(
+      actionIcon(MENU_ACTION_ICONS[action] || "more"),
+      element("span", {className: "context-menu-item-label", text: label}),
+    );
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      if (button.disabled) return;
+      void handler(button);
+    });
+    return button;
+  };
+
+  const menuSeparator = () => {
+    const separator = element("div", {className: "context-menu-separator"});
+    separator.setAttribute("role", "separator");
+    return separator;
+  };
 
   const dismissStartupRecovery = () => {
     if (!(startupRecovery instanceof HTMLElement)) return;
@@ -1158,6 +1333,7 @@
   const navigate = (target, options = {}) => {
     const url = target instanceof URL ? target : new URL(target, window.location.href);
     if (url.origin !== window.location.origin) return;
+    closeFloatingMenus();
     if (options.replace) window.history.replaceState(null, "", url);
     else window.history.pushState(null, "", url);
     void renderRoute(options.focus !== false);
@@ -1501,7 +1677,7 @@
     if (busy) row.setAttribute("aria-busy", "true");
     else row.removeAttribute("aria-busy");
     for (const control of row.querySelectorAll(
-      ".message-row-action, .message-select-checkbox, .message-row-move-target",
+      ".message-row-action, .message-select-checkbox",
     )) {
       if (
         control instanceof HTMLButtonElement
@@ -1621,42 +1797,11 @@
     selectPage.checked = messages.length > 0 && selectedCount === messages.length;
     selectPage.indeterminate = selectedCount > 0 && selectedCount < messages.length;
     byId("mail-selection-count").textContent = `${selectedCount} selected`;
-    byId("mail-mark-read").disabled = selectedCount === 0 || state.mailBulkBusy;
-    byId("mail-mark-unread").disabled = selectedCount === 0 || state.mailBulkBusy;
-    const selectedMailbox = arrayValue(mail.mailboxes || mail.folders)
-      .map(objectValue)
-      .find((item) => stringValue(item.name) === stringValue(mail.selected_mailbox));
-    const isTrash = objectValue(selectedMailbox).is_trash === true;
     const allMail = selectedViewIsAll();
-    byId("mail-bulk-archive").disabled = (
-      selectedCount === 0
-      || state.mailBulkBusy
-      || mail.archive_available !== true
-      || objectValue(selectedMailbox).is_archive === true
-    );
-    byId("mail-bulk-trash").disabled = (
-      selectedCount === 0
-      || state.mailBulkBusy
-      || mail.trash_available !== true
-      || isTrash
-    );
-    byId("mail-bulk-trash").hidden = isTrash;
-    const permanentDelete = byId("mail-bulk-permanent-delete");
-    permanentDelete.hidden = !isTrash;
-    permanentDelete.disabled = !isTrash || selectedCount === 0 || state.mailBulkBusy;
     byId("mail-mark-all-read").disabled = (
       state.mailBulkBusy
       || allMail
       || !allMessages.some((message) => message.unread === true)
-    );
-    const moveTarget = byId("mail-bulk-move-target");
-    populateMoveTarget(moveTarget, allMail ? "" : stringValue(mail.selected_mailbox));
-    const targetMailbox = moveTarget instanceof HTMLSelectElement ? moveTarget.value : "";
-    if (moveTarget instanceof HTMLSelectElement) {
-      moveTarget.disabled = state.mailBulkBusy || selectedCount === 0 || !realMailboxes(mail).length;
-    }
-    byId("mail-bulk-move").disabled = (
-      state.mailBulkBusy || selectedCount === 0 || !targetMailbox
     );
     document.querySelectorAll(".message-select-checkbox").forEach((control) => {
       if (control instanceof HTMLInputElement) control.disabled = state.mailBulkBusy;
@@ -1819,14 +1964,17 @@
     }), {replace: true, focus: false});
   };
 
-  const messageActionButton = (label, context, handler, visibleLabel = label) => {
+  const messageActionButton = (label, context, handler, icon = "more") => {
     const button = element("button", {
       className: "message-row-action",
-      text: visibleLabel,
       title: `${label}: ${context.subject}`,
       type: "button",
     });
     button.setAttribute("aria-label", label);
+    button.append(
+      actionIcon(icon),
+      element("span", {className: "sr-only", text: label}),
+    );
     button.addEventListener("click", (event) => {
       event.stopPropagation();
       void handler(button);
@@ -1850,7 +1998,7 @@
           if (document.contains(button)) button.focus();
         }
       },
-      unread ? "Mark read" : "Mark unread",
+      "read",
     )
   );
 
@@ -2038,53 +2186,346 @@
     }
   };
 
-  const permanentlyDeleteMessageFromRow = (context, row, button) => {
+  const permanentlyDeleteSingleMessage = async (context, routeSignal) => {
+    if (state.mailBulkBusy || routeSignal.aborted) return;
+    state.mailBulkBusy = true;
+    updateBulkToolbar();
     clearAlert();
+    try {
+      const freshness = await loadMessageActionSnapshot(context, routeSignal);
+      routeSignal.throwIfAborted();
+      const payload = await mutate(`/mail/${encodeURIComponent(context.uid)}/delete`, {
+        guardSignal: routeSignal,
+        json: {
+          account: context.account,
+          mailbox: context.mailbox,
+          freshness,
+          confirmation: DELETE_MESSAGE_CONFIRMATION,
+        },
+      });
+      routeSignal.throwIfAborted();
+      finishAction(payload, "Message permanently deleted.");
+      const mail = objectValue(state.mail);
+      const remaining = arrayValue(mail.messages || mail.items)
+        .map(objectValue)
+        .filter((message) => !(
+          stringValue(message.uid) === context.uid
+          && stringValue(message.mailbox, context.mailbox) === context.mailbox
+        ));
+      if (Array.isArray(mail.messages)) mail.messages = remaining;
+      else mail.items = remaining;
+      state.selectedMessageUids.delete(messageSelectionKey(context.mailbox, context.uid));
+      const route = parseRoute();
+      if (route.name === "message" && route.uid === context.uid) {
+        state.message = null;
+        refreshMessageList(context);
+      } else {
+        renderMail(mail);
+      }
+    } catch (error) {
+      if (!routeSignal.aborted) {
+        state.mail = null;
+        try {
+          await loadMail(routeSignal);
+          state.mailReloadedError = error;
+        } catch {
+          requireMailRefreshAfterUnknownResult();
+        }
+      }
+      throw error;
+    } finally {
+      state.mailBulkBusy = false;
+      if (!routeSignal.aborted) updateBulkToolbar();
+    }
+  };
+
+  const mailboxRecord = (name) => arrayValue(
+    objectValue(state.mail).mailboxes || objectValue(state.mail).folders,
+  ).map(objectValue).find((item) => stringValue(item.name) === name);
+
+  const messageContextWithLiveState = (value) => {
+    const context = objectValue(value);
+    const mail = objectValue(state.mail);
+    const live = arrayValue(mail.messages || mail.items)
+      .map(objectValue)
+      .find((message) => (
+        stringValue(message.uid) === stringValue(context.uid)
+        && stringValue(message.mailbox, context.mailbox) === stringValue(context.mailbox)
+      ));
+    return {
+      ...context,
+      unread: live ? live.unread === true : context.unread === true,
+    };
+  };
+
+  const messageComposeUrl = (context, action) => {
+    const url = new URL("/compose", window.location.origin);
+    url.searchParams.set(action, context.uid);
+    url.searchParams.set("mailbox", context.mailbox);
+    if (state.role === "admin") url.searchParams.set("account", context.account);
+    return `${url.pathname}${url.search}`;
+  };
+
+  const openPermanentDeleteForContexts = (contexts, opener) => {
+    const selected = arrayValue(contexts).map(messageContextWithLiveState);
+    const first = selected[0];
+    if (
+      !first
+      || selected.some((item) => (
+        stringValue(item.account) !== stringValue(first.account)
+        || stringValue(item.mailbox) !== stringValue(first.mailbox)
+      ))
+    ) return;
     const routeSignal = state.routeController?.signal;
     if (!(routeSignal instanceof AbortSignal)) return;
+    const uids = selected.map((item) => stringValue(item.uid)).filter(Boolean);
+    if (uids.length !== selected.length) return;
+    const count = uids.length;
     openTypedConfirm({
-      title: "Permanently delete message?",
-      message: "This removes the selected message immediately and cannot be undone.",
+      title: `Permanently delete ${count} message${count === 1 ? "" : "s"}?`,
+      message: `This permanently deletes the selected message${
+        count === 1 ? "" : "s"
+      } from Trash. This cannot be undone.`,
       expected: DELETE_MESSAGE_CONFIRMATION,
-      opener: button,
-      action: async () => {
-        if (routeSignal.aborted) return;
-        setMessageRowBusy(row, true);
-        try {
-          const freshness = await loadMessageActionSnapshot(context, routeSignal);
-          const payload = await mutate(`/mail/${encodeURIComponent(context.uid)}/delete`, {
-            guardSignal: routeSignal,
-            json: {
-              account: context.account,
-              mailbox: context.mailbox,
-              freshness,
-              confirmation: DELETE_MESSAGE_CONFIRMATION,
-            },
-          });
-          if (routeSignal.aborted) return;
-          finishAction(payload, "Message permanently deleted.");
-          const mail = objectValue(state.mail);
-          const remaining = arrayValue(mail.messages || mail.items)
-            .map(objectValue)
-            .filter((message) => !(
-              stringValue(message.uid) === context.uid
-              && stringValue(message.mailbox, context.mailbox) === context.mailbox
-            ));
-          if (Array.isArray(mail.messages)) mail.messages = remaining;
-          else mail.items = remaining;
-          renderMail(mail);
-        } finally {
-          setMessageRowBusy(row, false);
-        }
-      },
+      label: count === 1 ? "Delete permanently" : `Delete ${count} permanently`,
+      opener,
+      action: () => count === 1
+        ? permanentlyDeleteSingleMessage(first, routeSignal)
+        : permanentlyDeleteSelectedMessages(
+          {account: stringValue(first.account), mailbox: stringValue(first.mailbox)},
+          uids,
+          routeSignal,
+        ),
     });
   };
 
+  const runMessageMenuAction = async (action, contexts, targetMailbox = "") => {
+    closeFloatingMenus();
+    await runBulkMessageAction(action, contexts, targetMailbox);
+  };
+
+  const renderMessageMoveMenu = (contexts) => {
+    const selected = arrayValue(contexts).map(objectValue);
+    const sourceNames = new Set(selected.map((item) => stringValue(item.mailbox)));
+    const targets = realMailboxes().filter((name) => (
+      sourceNames.size > 1 || !sourceNames.has(name)
+    ));
+    const fragment = document.createDocumentFragment();
+    fragment.append(menuButton({
+      label: "Back to message actions",
+      action: "back",
+      handler: () => renderMessageContextMenu(selected),
+    }));
+    fragment.append(menuSeparator());
+    for (const name of targets) {
+      const target = menuButton({
+        label: name,
+        action: "move",
+        handler: () => runMessageMenuAction("move", selected, name),
+      });
+      target.dataset.targetMailbox = name;
+      fragment.append(target);
+    }
+    if (!targets.length) {
+      fragment.append(element("p", {
+        className: "context-menu-empty",
+        text: "No other folder is available.",
+      }));
+    }
+    messageContextMenu.replaceChildren(fragment);
+    messageContextMenu.setAttribute("aria-label", "Move messages to folder");
+    positionFloatingMenu(messageContextMenu, state.activeMenuPoint || {x: 8, y: 8});
+    floatingMenuItems(messageContextMenu)[0]?.focus({preventScroll: true});
+  };
+
+  const renderMessageContextMenu = (contexts) => {
+    const selected = arrayValue(contexts).map(messageContextWithLiveState);
+    const single = selected.length === 1 ? selected[0] : null;
+    const records = selected.map((item) => objectValue(mailboxRecord(stringValue(item.mailbox))));
+    const allTrash = records.length > 0 && records.every((item) => item.is_trash === true);
+    const allArchive = records.length > 0 && records.every((item) => item.is_archive === true);
+    const mail = objectValue(state.mail);
+    const fragment = document.createDocumentFragment();
+    if (single) {
+      fragment.append(
+        menuButton({
+          label: "Open",
+          action: "open",
+          handler: () => {
+            closeFloatingMenus();
+            navigate(stringValue(single.href, `/mail/${encodeURIComponent(stringValue(single.uid))}`));
+          },
+        }),
+        menuButton({
+          label: "Open in new tab",
+          action: "open-new-tab",
+          handler: () => {
+            const href = stringValue(single.href);
+            closeFloatingMenus();
+            if (href) window.open(href, "_blank", "noopener,noreferrer");
+          },
+        }),
+        menuSeparator(),
+        menuButton({
+          label: "Reply",
+          action: "reply",
+          handler: () => {
+            closeFloatingMenus();
+            navigate(messageComposeUrl(single, "reply"));
+          },
+        }),
+        menuButton({
+          label: "Reply all",
+          action: "reply-all",
+          handler: () => {
+            closeFloatingMenus();
+            navigate(messageComposeUrl(single, "reply_all"));
+          },
+        }),
+        menuButton({
+          label: "Forward",
+          action: "forward",
+          handler: () => {
+            state.pendingForwardSubject = null;
+            closeFloatingMenus();
+            navigate(buildForwardUrl({...single, mode: "inline"}));
+          },
+        }),
+        menuButton({
+          label: "Forward as attachment",
+          action: "forward-attachment",
+          handler: () => {
+            state.pendingForwardSubject = {
+              account: stringValue(single.account),
+              mailbox: stringValue(single.mailbox),
+              uid: stringValue(single.uid),
+              mode: "attachment",
+              subject: boundedForwardedSubject(stringValue(single.subject)),
+            };
+            closeFloatingMenus();
+            navigate(buildForwardUrl({...single, mode: "attachment"}));
+          },
+        }),
+        menuSeparator(),
+        menuButton({
+          label: single.unread === true ? "Mark as read" : "Mark as unread",
+          action: single.unread === true ? "mark-read" : "mark-unread",
+          handler: () => runMessageMenuAction(
+            single.unread === true ? "mark_read" : "mark_unread",
+            selected,
+          ),
+        }),
+      );
+    } else {
+      fragment.append(
+        element("p", {
+          className: "context-menu-heading",
+          text: `${selected.length} selected`,
+        }),
+        menuButton({
+          label: "Mark as read",
+          action: "mark-read",
+          handler: () => runMessageMenuAction("mark_read", selected),
+        }),
+        menuButton({
+          label: "Mark as unread",
+          action: "mark-unread",
+          handler: () => runMessageMenuAction("mark_unread", selected),
+        }),
+      );
+    }
+    fragment.append(menuButton({
+      label: "Move to...",
+      action: "move-to",
+      handler: () => renderMessageMoveMenu(selected),
+      disabled: realMailboxes().length < 2 && new Set(
+        selected.map((item) => stringValue(item.mailbox)),
+      ).size <= 1,
+    }));
+    if (!allArchive && mail.archive_available === true) {
+      fragment.append(menuButton({
+        label: "Archive",
+        action: "archive",
+        handler: () => runMessageMenuAction("archive", selected),
+      }));
+    }
+    if (!allTrash && mail.trash_available === true) {
+      fragment.append(menuButton({
+        label: "Move to Trash",
+        action: "trash",
+        handler: (button) => {
+          const opener = state.activeMenuOpener instanceof HTMLElement
+            ? state.activeMenuOpener
+            : button;
+          closeFloatingMenus();
+          openConfirm({
+            title: `Move ${selected.length} message${selected.length === 1 ? "" : "s"} to Trash?`,
+            message: "The selected messages will leave their current folders and move to Trash.",
+            label: "Move to Trash",
+            danger: true,
+            opener,
+            action: () => runBulkMessageAction("trash", selected),
+          });
+        },
+      }));
+    }
+    if (allTrash && new Set(selected.map((item) => stringValue(item.mailbox))).size === 1) {
+      fragment.append(menuButton({
+        label: "Permanently delete",
+        action: "permanent-delete",
+        danger: true,
+        handler: (button) => {
+          const opener = state.activeMenuOpener instanceof HTMLElement
+            ? state.activeMenuOpener
+            : button;
+          closeFloatingMenus();
+          openPermanentDeleteForContexts(selected, opener);
+        },
+      }));
+    }
+    messageContextMenu.replaceChildren(fragment);
+    messageContextMenu.setAttribute(
+      "aria-label",
+      selected.length === 1 ? "Message actions" : `Actions for ${selected.length} messages`,
+    );
+    if (!messageContextMenu.hidden && state.activeMenuPoint) {
+      positionFloatingMenu(messageContextMenu, state.activeMenuPoint);
+      floatingMenuItems(messageContextMenu)[0]?.focus({preventScroll: true});
+    }
+  };
+
+  const openMessageContextMenu = (
+    contexts,
+    {opener = null, row = null, point = null, mode = "root"} = {},
+  ) => {
+    const selected = arrayValue(contexts).map(objectValue);
+    if (!selected.length || state.mailBulkBusy) return;
+    renderMessageContextMenu(selected);
+    if (!openFloatingMenu(messageContextMenu, {opener, row, point})) return;
+    state.messageMenuContexts = selected;
+    if (mode === "move") renderMessageMoveMenu(selected);
+  };
+
+  const openMessageMenuForRow = (
+    context,
+    row,
+    {point = null, opener = row} = {},
+  ) => {
+    const key = messageSelectionKey(context.mailbox, context.uid);
+    let contexts;
+    if (state.selectedMessageUids.has(key)) {
+      contexts = selectedMessageContexts();
+      if (contexts.length === 1) contexts = [context];
+    } else {
+      contexts = [context];
+    }
+    openMessageContextMenu(contexts, {opener, row, point});
+  };
+
   const renderMail = (mail) => {
+    closeFloatingMenus();
     state.selectedMessageUids.clear();
     state.mailBulkBusy = false;
-    const bulkMoveTarget = byId("mail-bulk-move-target");
-    if (bulkMoveTarget instanceof HTMLSelectElement) bulkMoveTarget.value = "";
     const currentQuery = new URLSearchParams(window.location.search);
     const requestedAccount = currentQuery.get("account") || "";
     const account = stringValue(
@@ -2122,6 +2563,7 @@
       : state.role === "admin"
         ? account
         : stringValue(objectValue(state.principal).email, account);
+    mail.selected_account_label = accountLabel;
     if (!workspaceIndicator.hidden) {
       byId("admin-workspace-address").textContent = accountLabel;
     }
@@ -2202,6 +2644,8 @@
     byId("mail-search-clear").hidden = !search;
 
     const folderFragment = document.createDocumentFragment();
+    const allMailItem = element("div", {className: "mail-folder-item"});
+    allMailItem.dataset.mailbox = "__all__";
     const allMailLink = element("a", {className: "mail-folder-link"});
     allMailLink.href = buildMailUrl({account, view: "all", search});
     allMailLink.dataset.route = "";
@@ -2211,10 +2655,13 @@
       element("span", {className: "mail-folder-icon", text: "*"}),
       element("span", {className: "mail-folder-name", text: "All Mail"}),
     );
-    folderFragment.append(allMailLink);
+    allMailItem.append(allMailLink);
+    folderFragment.append(allMailItem);
     for (const item of mailboxes) {
       const name = stringValue(item.name);
       if (!name) continue;
+      const folderItem = element("div", {className: "mail-folder-item"});
+      folderItem.dataset.mailbox = name;
       const link = element("a", {className: "mail-folder-link"});
       link.href = buildMailUrl({account, mailbox: name, search});
       link.dataset.route = "";
@@ -2249,22 +2696,32 @@
         element("span", {className: "mail-folder-icon", text: symbol}),
         element("span", {className: "mail-folder-name", text: name}),
       );
-      folderFragment.append(link);
+      folderItem.append(link);
+      if (!mailboxIsProtected(item)) {
+        folderItem.classList.add("has-menu");
+        const folderActions = element("button", {
+          className: "mail-folder-menu-button",
+          title: `Folder actions for ${name}`,
+          type: "button",
+        });
+        folderActions.setAttribute("aria-label", `Folder actions for ${name}`);
+        folderActions.setAttribute("aria-haspopup", "menu");
+        folderActions.setAttribute("aria-expanded", "false");
+        folderActions.setAttribute("aria-controls", "mail-folder-menu");
+        folderActions.append(
+          actionIcon("more"),
+          element("span", {className: "sr-only", text: `Folder actions for ${name}`}),
+        );
+        folderActions.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          openFolderMenu({account, name}, folderActions);
+        });
+        folderItem.append(folderActions);
+      }
+      folderFragment.append(folderItem);
     }
     byId("mail-folder-list").replaceChildren(folderFragment);
-
-    const selectedFolder = mailboxes.find((item) => stringValue(item.name) === mailbox);
-    const canDeleteFolder = Boolean(
-      account
-      && mailbox
-      && !allMailView
-      && selectedFolder
-      && !mailboxIsProtected(selectedFolder),
-    );
-    const folderDelete = byId("mail-folder-delete");
-    folderDelete.hidden = !canDeleteFolder;
-    folderDelete.disabled = !canDeleteFolder;
-    byId("mail-folder-tools").classList.toggle("has-delete", canDeleteFolder);
 
     if (
       account
@@ -2304,7 +2761,15 @@
       if (search) url.searchParams.set("search", search);
       const sender = stringValue(message.sender, "Unknown sender");
       const subject = stringValue(message.subject, "(No subject)");
-      const context = {account, mailbox: messageMailbox, uid, sender, subject};
+      const context = {
+        account,
+        mailbox: messageMailbox,
+        uid,
+        sender,
+        subject,
+        unread: message.unread === true,
+        href: `${url.pathname}${url.search}`,
+      };
       const row = element("tr", {
         className: message.unread === true ? "message-unread" : "",
       });
@@ -2336,11 +2801,6 @@
         if (interactive) return;
         openRow();
       });
-      row.addEventListener("keydown", (event) => {
-        if (event.target !== row || (event.key !== "Enter" && event.key !== " ")) return;
-        event.preventDefault();
-        openRow();
-      });
       const senderCell = element("td", {className: "message-sender-cell"});
       const selectMessage = element("input", {
         className: "message-select-checkbox",
@@ -2353,6 +2813,33 @@
         else state.selectedMessageUids.delete(key);
         row.classList.toggle("is-bulk-selected", selectMessage.checked);
         updateBulkToolbar();
+      });
+      row.addEventListener("contextmenu", (event) => {
+        const interactive = event.target instanceof Element
+          ? event.target.closest("button, input, select, textarea, [contenteditable]")
+          : null;
+        if (interactive) return;
+        event.preventDefault();
+        event.stopPropagation();
+        openMessageMenuForRow(context, row, {
+          point: {
+            x: event.clientX,
+            y: event.clientY,
+          },
+        });
+      });
+      row.addEventListener("keydown", (event) => {
+        if (event.target !== row) return;
+        if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
+          event.preventDefault();
+          openMessageMenuForRow(context, row, {
+            point: menuAnchorPoint(row),
+          });
+          return;
+        }
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        openRow();
       });
       senderCell.append(
         selectMessage,
@@ -2377,107 +2864,85 @@
       });
       subjectLink.href = `${url.pathname}${url.search}`;
       subjectLink.dataset.route = "";
-      subjectCell.append(
-        subjectLink,
-        element("span", {
-          className: "message-read-status",
-          text: message.unread === true ? "Unread" : "Read",
-        }),
+      const readStatus = element("span", {
+        className: "message-read-status",
+        text: message.unread === true ? "Unread" : "Read",
+      });
+      const actionGroup = element("div", {className: "message-quick-actions"});
+      actionGroup.setAttribute("role", "group");
+      actionGroup.setAttribute("aria-label", `Quick actions for ${subject}`);
+      const sourceMailbox = mailboxes.find(
+        (item) => stringValue(item.name) === messageMailbox,
       );
+      const sourceIsTrash = objectValue(sourceMailbox).is_trash === true;
+      const sourceIsArchive = objectValue(sourceMailbox).is_archive === true;
+      actionGroup.append(
+        messageReadActionButton(message.unread === true, context, row),
+      );
+      if (!sourceIsArchive && archiveAvailable) {
+        actionGroup.append(messageActionButton(
+          "Archive",
+          context,
+          (button) => archiveMessageFromRow(context, row, button),
+          "archive",
+        ));
+      }
+      if (!sourceIsTrash && trashAvailable) {
+        actionGroup.append(messageActionButton(
+          "Move to Trash",
+          context,
+          (button) => deleteMessageFromRow(context, row, button),
+          "delete",
+        ));
+      }
+      if (mailboxes.some((item) => stringValue(item.name) !== messageMailbox)) {
+        const moveButton = messageActionButton(
+          "Move to folder",
+          context,
+          (button) => openMessageContextMenu([context], {
+            opener: button,
+            row,
+            mode: "move",
+          }),
+          "move",
+        );
+        moveButton.setAttribute("aria-haspopup", "menu");
+        moveButton.setAttribute("aria-expanded", "false");
+        moveButton.setAttribute("aria-controls", "message-context-menu");
+        actionGroup.append(moveButton);
+      }
+      const moreButton = messageActionButton(
+        "More actions",
+        context,
+        (button) => openMessageMenuForRow(
+          context,
+          row,
+          {opener: button},
+        ),
+        "more",
+      );
+      moreButton.classList.add("message-more-button");
+      moreButton.setAttribute("aria-haspopup", "menu");
+      moreButton.setAttribute("aria-expanded", "false");
+      moreButton.setAttribute("aria-controls", "message-context-menu");
+      actionGroup.append(moreButton);
+      const subjectActionSlot = element("div", {
+        className: "message-subject-action-slot",
+      });
+      subjectActionSlot.append(subjectLink, actionGroup);
+      subjectCell.append(subjectActionSlot, readStatus);
       if (allMailView) {
         subjectCell.append(element("span", {
           className: "message-mailbox-label",
           text: messageMailbox,
         }));
       }
-      const actionCell = element("td", {className: "message-actions-cell"});
-      const actionGroup = element("div", {className: "message-row-actions"});
-      actionGroup.setAttribute("role", "group");
-      actionGroup.setAttribute("aria-label", `Actions for ${subject}`);
-      const sourceMailbox = mailboxes.find(
-        (item) => stringValue(item.name) === messageMailbox,
-      );
-      const sourceIsTrash = objectValue(sourceMailbox).is_trash === true;
-      const sourceIsArchive = objectValue(sourceMailbox).is_archive === true;
-      const permanentDelete = sourceIsTrash || !trashAvailable;
-      const deleteButton = permanentDelete
-        ? messageActionButton(
-          "Permanently delete",
-          context,
-          (button) => permanentlyDeleteMessageFromRow(context, row, button),
-          "Delete permanently",
-        )
-        : messageActionButton("Delete", context, (button) => (
-          deleteMessageFromRow(context, row, button)
-        ));
-      if (permanentDelete) deleteButton.classList.add("message-row-action-danger");
-      const archiveButton = messageActionButton("Archive", context, (button) => (
-        archiveMessageFromRow(context, row, button)
-      ));
-      if (sourceIsArchive || !archiveAvailable) {
-        archiveButton.dataset.unavailable = "true";
-        archiveButton.disabled = true;
-        archiveButton.title = sourceIsArchive
-          ? "This message is already archived."
-          : "This account does not have an available Archive mailbox.";
-      }
-      actionGroup.append(
-        messageReadActionButton(message.unread === true, context, row),
-        messageActionButton("Forward", context, () => {
-          state.pendingForwardSubject = null;
-          navigate(buildForwardUrl({...context, mode: "inline"}));
-        }),
-        messageActionButton("Forward as attachment", context, () => {
-          state.pendingForwardSubject = {
-            account,
-            mailbox: messageMailbox,
-            uid,
-            mode: "attachment",
-            subject: boundedForwardedSubject(subject),
-          };
-          navigate(buildForwardUrl({...context, mode: "attachment"}));
-        }, "Attach"),
-        deleteButton,
-        archiveButton,
-      );
-      const rowMove = element("span", {className: "mail-move-control message-row-move"});
-      const rowMoveSelect = element("select", {className: "message-row-move-target"});
-      rowMoveSelect.setAttribute("aria-label", `Move ${subject} to folder`);
-      populateSelect(
-        rowMoveSelect,
-        mailboxes
-          .map((item) => stringValue(item.name))
-          .filter((name) => name && name !== messageMailbox)
-          .map((name) => ({value: name, label: name})),
-        "",
-        "Move to...",
-      );
-      const rowMoveButton = messageActionButton("Move", context, async (button) => {
-        if (!rowMoveSelect.value) return;
-        setMessageRowBusy(row, true);
-        try {
-          await runBulkMessageAction("move", [context], rowMoveSelect.value);
-        } finally {
-          setMessageRowBusy(row, false);
-          if (document.contains(button)) button.focus();
-        }
-      });
-      rowMoveButton.dataset.unavailable = "true";
-      rowMoveButton.disabled = true;
-      rowMoveSelect.addEventListener("change", () => {
-        rowMoveButton.dataset.unavailable = String(!rowMoveSelect.value);
-        rowMoveButton.disabled = !rowMoveSelect.value || state.mailBulkBusy;
-      });
-      rowMove.append(rowMoveSelect, rowMoveButton);
-      actionGroup.append(rowMove);
-      actionCell.append(actionGroup);
       const date = stringValue(message.date, "Unknown date");
       const dateCell = element("td", {text: compactMessageDate(date)});
       dateCell.title = date;
       row.append(
         subjectCell,
         dateCell,
-        actionCell,
       );
       fragment.append(row);
     }
@@ -2775,7 +3240,13 @@
       : stringValue(message.subject, "(No subject)");
     byId("message-title").textContent = subject;
     const account = stringValue(message.account, scopedAccount());
-    byId("message-summary").textContent = `${account} / ${
+    const accountLabel = stringValue(
+      objectValue(state.mail).selected_account_label,
+      state.role === "admin"
+        ? account
+        : stringValue(objectValue(state.principal).email, account),
+    );
+    byId("message-summary").textContent = `${accountLabel} / ${
       stringValue(message.mailbox)
     } / UID ${stringValue(message.uid)}`;
     byId("message-sender").textContent = oversized
@@ -5099,6 +5570,7 @@
   };
 
   const renderRoute = async (shouldFocus = true) => {
+    closeFloatingMenus();
     let route = parseRoute();
     const adminOnly = new Set(["overview", "accounts", "certificates"]);
     const mailOnly = new Set(["mail", "message"]);
@@ -5204,9 +5676,16 @@
   });
 
   window.addEventListener("popstate", () => void renderRoute());
-  window.addEventListener("pagehide", closeMailEvents);
+  window.addEventListener("pagehide", () => {
+    closeFloatingMenus();
+    closeMailEvents();
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") closeFloatingMenus();
+  });
   window.addEventListener("pageshow", (event) => {
     if (!event.persisted) return;
+    closeFloatingMenus();
     if (state.authState === "active") {
       void revalidateRestoredSession();
       return;
@@ -5528,6 +6007,129 @@
     }
   });
 
+  const openFolderRename = (context, opener) => {
+    const mail = objectValue(state.mail);
+    const source = arrayValue(mail.mailboxes || mail.folders)
+      .map(objectValue)
+      .find((item) => stringValue(item.name) === context.name);
+    if (
+      !context.account
+      || stringValue(mail.selected_account, scopedAccount()) !== context.account
+      || !source
+      || mailboxIsProtected(source)
+    ) return;
+    state.folderRenameContext = {account: context.account, name: context.name};
+    state.folderRenameOpener = opener instanceof HTMLElement ? opener : document.activeElement;
+    byId("folder-rename-title").textContent = `Rename ${context.name}`;
+    byId("folder-rename-copy").textContent = (
+      "Choose a new name for this folder. Existing messages stay in the renamed folder."
+    );
+    byId("folder-rename-name").value = context.name;
+    byId("folder-rename-status").textContent = "";
+    folderRenameDialog.showModal();
+    byId("folder-rename-name").focus();
+    byId("folder-rename-name").select();
+  };
+
+  const openFolderMenu = (context, opener) => {
+    const mail = objectValue(state.mail);
+    const source = arrayValue(mail.mailboxes || mail.folders)
+      .map(objectValue)
+      .find((item) => stringValue(item.name) === context.name);
+    if (
+      !context.account
+      || stringValue(mail.selected_account, scopedAccount()) !== context.account
+      || !source
+      || mailboxIsProtected(source)
+    ) return;
+    const fragment = document.createDocumentFragment();
+    fragment.append(
+      menuButton({
+        label: "Rename",
+        action: "rename",
+        handler: () => {
+          closeFloatingMenus();
+          openFolderRename(context, opener);
+        },
+      }),
+      menuButton({
+        label: "Delete",
+        action: "delete",
+        danger: true,
+        handler: () => {
+          closeFloatingMenus();
+          openFolderDelete(context, opener);
+        },
+      }),
+    );
+    folderMenu.replaceChildren(fragment);
+    folderMenu.setAttribute("aria-label", `Actions for ${context.name}`);
+    state.folderMenuContext = {account: context.account, name: context.name};
+    if (!openFloatingMenu(folderMenu, {opener})) return;
+    state.folderMenuContext = {account: context.account, name: context.name};
+  };
+
+  byId("folder-rename-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const context = objectValue(state.folderRenameContext);
+    const input = byId("folder-rename-name");
+    const submit = byId("folder-rename-submit");
+    if (
+      !(form instanceof HTMLFormElement)
+      || !(input instanceof HTMLInputElement)
+      || !(submit instanceof HTMLButtonElement)
+      || !form.reportValidity()
+      || !context.account
+      || !context.name
+    ) return;
+    const name = input.value.trim();
+    if (!name || name === context.name || /[\u0000-\u001f\u007f]/.test(name)) {
+      byId("folder-rename-status").textContent = name === context.name
+        ? "Enter a different folder name."
+        : "Enter a valid folder name.";
+      return;
+    }
+    const signal = state.routeController?.signal;
+    if (!(signal instanceof AbortSignal) || signal.aborted) return;
+    form.setAttribute("aria-busy", "true");
+    submit.disabled = true;
+    byId("folder-rename-status").textContent = "Renaming folder...";
+    try {
+      const payload = await mutate("/mailboxes/rename", {
+        guardSignal: signal,
+        json: {
+          account: context.account,
+          old_name: context.name,
+          new_name: name,
+        },
+      });
+      if (signal.aborted) return;
+      const renamed = stringValue(objectValue(payload.data).name, name);
+      const mail = objectValue(state.mail);
+      const current = stringValue(mail.selected_mailbox) === context.name
+        && stringValue(mail.selected_view, "mailbox") !== "all";
+      finishAction(payload, `Folder ${context.name} renamed to ${renamed}.`);
+      closeDialog(folderRenameDialog);
+      state.folderRenameContext = null;
+      state.mail = null;
+      if (current) {
+        navigate(buildMailUrl({account: context.account, mailbox: renamed}));
+      } else {
+        void renderRoute(false);
+      }
+    } catch (error) {
+      if (signal.aborted || (error && error.name === "AbortError")) return;
+      byId("folder-rename-status").textContent = errorDisplayMessage(
+        error,
+        "The folder could not be renamed.",
+      );
+    } finally {
+      form.removeAttribute("aria-busy");
+      submit.disabled = false;
+    }
+  });
+
   const selectedFolderDeleteDisposition = () => {
     const selected = byId("folder-delete-form").querySelector(
       'input[name="disposition"]:checked',
@@ -5555,18 +6157,22 @@
     );
   };
 
-  const openFolderDelete = (opener) => {
+  const openFolderDelete = (folderContext, opener) => {
     const mail = objectValue(state.mail);
-    const context = selectedMailContext();
     const mailboxes = arrayValue(mail.mailboxes || mail.folders).map(objectValue);
-    const source = mailboxes.find((item) => stringValue(item.name) === context.mailbox);
-    if (!context.account || !source || mailboxIsProtected(source)) return;
+    const source = mailboxes.find((item) => stringValue(item.name) === folderContext.name);
+    if (
+      !folderContext.account
+      || stringValue(mail.selected_account, scopedAccount()) !== folderContext.account
+      || !source
+      || mailboxIsProtected(source)
+    ) return;
     const trash = stringValue(
       mailboxes.find((item) => item.is_trash === true)?.name,
     );
     const targets = mailboxes
       .filter((item) => (
-        stringValue(item.name) !== context.mailbox
+        stringValue(item.name) !== folderContext.name
         && item.is_trash !== true
       ))
       .map((item) => stringValue(item.name))
@@ -5576,18 +6182,22 @@
       return;
     }
     state.folderDeleteContext = {
-      account: context.account,
-      name: context.mailbox,
+      account: folderContext.account,
+      name: folderContext.name,
       targets,
       trash,
+      current: (
+        stringValue(mail.selected_mailbox) === folderContext.name
+        && stringValue(mail.selected_view, "mailbox") !== "all"
+      ),
     };
     state.folderDeleteOpener = opener instanceof HTMLElement ? opener : document.activeElement;
-    byId("folder-delete-title").textContent = `Delete ${context.mailbox}?`;
+    byId("folder-delete-title").textContent = `Delete ${folderContext.name}?`;
     byId("folder-delete-copy").textContent = (
       "Choose where every message should go before the folder is removed."
     );
     byId("folder-delete-confirm-label").textContent = (
-      `Type ${context.mailbox} to confirm deletion`
+      `Type ${folderContext.name} to confirm deletion`
     );
     byId("folder-delete-confirmation").value = "";
     byId("folder-delete-status").textContent = "";
@@ -5616,10 +6226,6 @@
     folderDeleteDialog.showModal();
     byId("folder-delete-confirmation").focus();
   };
-
-  byId("mail-folder-delete").addEventListener("click", (event) => {
-    openFolderDelete(event.currentTarget);
-  });
 
   byId("folder-delete-form").addEventListener("change", updateFolderDeleteForm);
   byId("folder-delete-confirmation").addEventListener("input", updateFolderDeleteForm);
@@ -5659,7 +6265,13 @@
       );
       finishAction(payload, `Folder ${context.name} deleted.`);
       closeDialog(folderDeleteDialog);
-      navigate(buildMailUrl({account: context.account, mailbox: destination}));
+      state.folderDeleteContext = null;
+      state.mail = null;
+      if (context.current === true) {
+        navigate(buildMailUrl({account: context.account, mailbox: destination}));
+      } else {
+        void renderRoute(false);
+      }
     } catch (error) {
       byId("folder-delete-status").textContent = errorDisplayMessage(
         error,
@@ -5698,71 +6310,6 @@
       if (row) row.classList.toggle("is-bulk-selected", checked);
     });
     updateBulkToolbar();
-  });
-
-  byId("mail-mark-read").addEventListener("click", () => {
-    void runBulkMessageAction("mark_read");
-  });
-
-  byId("mail-mark-unread").addEventListener("click", () => {
-    void runBulkMessageAction("mark_unread");
-  });
-
-  byId("mail-bulk-archive").addEventListener("click", () => {
-    void runBulkMessageAction("archive");
-  });
-
-  byId("mail-bulk-move-target").addEventListener("change", () => {
-    updateBulkToolbar();
-  });
-
-  byId("mail-bulk-move").addEventListener("click", () => {
-    const target = byId("mail-bulk-move-target");
-    if (!(target instanceof HTMLSelectElement) || !target.value) return;
-    void runBulkMessageAction("move", null, target.value);
-  });
-
-  byId("mail-bulk-trash").addEventListener("click", (event) => {
-    const selectedCount = state.selectedMessageUids.size;
-    if (!selectedCount) return;
-    openConfirm({
-      title: `Move ${selectedCount} message${selectedCount === 1 ? "" : "s"} to Trash?`,
-      message: "The selected messages will leave this mailbox and move to Trash.",
-      label: "Move to Trash",
-      danger: true,
-      opener: event.currentTarget,
-      action: () => runBulkMessageAction("trash"),
-    });
-  });
-
-  byId("mail-bulk-permanent-delete").addEventListener("click", (event) => {
-    if (state.mailBulkBusy) return;
-    const context = selectedMailContext();
-    const selectedMailbox = arrayValue(objectValue(state.mail).mailboxes || objectValue(state.mail).folders)
-      .map(objectValue)
-      .find((item) => stringValue(item.name) === context.mailbox);
-    const uids = selectedMessageContexts()
-      .filter((item) => item.mailbox === context.mailbox)
-      .map((item) => item.uid);
-    const routeSignal = state.routeController?.signal;
-    if (
-      !context.account
-      || !context.mailbox
-      || objectValue(selectedMailbox).is_trash !== true
-      || !uids.length
-      || !(routeSignal instanceof AbortSignal)
-    ) return;
-    const count = uids.length;
-    openTypedConfirm({
-      title: `Permanently delete ${count} message${count === 1 ? "" : "s"} from Trash?`,
-      message: `This permanently deletes the ${count} selected message${
-        count === 1 ? "" : "s"
-      } from Trash. This cannot be undone.`,
-      expected: DELETE_MESSAGE_CONFIRMATION,
-      label: `Delete ${count} permanently`,
-      opener: event.currentTarget,
-      action: () => permanentlyDeleteSelectedMessages(context, uids, routeSignal),
-    });
   });
 
   byId("mail-mark-all-read").addEventListener("click", (event) => {
@@ -6775,6 +7322,14 @@
     state.folderDeleteOpener = null;
   });
 
+  folderRenameDialog.addEventListener("close", () => {
+    byId("folder-rename-form").reset();
+    byId("folder-rename-status").textContent = "";
+    state.folderRenameContext = null;
+    if (state.folderRenameOpener instanceof HTMLElement) state.folderRenameOpener.focus();
+    state.folderRenameOpener = null;
+  });
+
   accountDialog.addEventListener("close", () => {
     byId("change-password-form").reset();
     state.selectedAccount = null;
@@ -6810,6 +7365,56 @@
   credentialDisclosureDialog.addEventListener("cancel", (event) => {
     event.preventDefault();
   });
+
+  for (const menu of [folderMenu, messageContextMenu]) {
+    menu.addEventListener("keydown", (event) => {
+      const items = floatingMenuItems(menu);
+      const index = items.indexOf(document.activeElement);
+      let next = -1;
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeFloatingMenus({restoreFocus: true});
+        return;
+      }
+      if (event.key === "ArrowDown") next = index < 0 ? 0 : (index + 1) % items.length;
+      else if (event.key === "ArrowUp") next = index < 0
+        ? items.length - 1
+        : (index - 1 + items.length) % items.length;
+      else if (event.key === "Home") next = 0;
+      else if (event.key === "End") next = items.length - 1;
+      else if (event.key === "Tab") {
+        closeFloatingMenus();
+        return;
+      }
+      if (next >= 0 && items[next]) {
+        event.preventDefault();
+        items[next].focus();
+      }
+    });
+  }
+
+  document.addEventListener("pointerdown", (event) => {
+    const menu = state.activeMenu;
+    if (!(menu instanceof HTMLElement) || menu.hidden) return;
+    if (event.target instanceof Node && menu.contains(event.target)) return;
+    if (
+      state.activeMenuOpener instanceof HTMLElement
+      && event.target instanceof Node
+      && state.activeMenuOpener.contains(event.target)
+    ) return;
+    closeFloatingMenus();
+  }, true);
+
+  document.addEventListener("scroll", (event) => {
+    if (!(state.activeMenu instanceof HTMLElement) || state.activeMenu.hidden) return;
+    if (
+      event.target instanceof Node
+      && state.activeMenu.contains(event.target)
+    ) return;
+    closeFloatingMenus({restoreFocus: true});
+  }, true);
+
+  window.addEventListener("resize", () => closeFloatingMenus({restoreFocus: true}));
 
   const initialize = async () => {
     try {

@@ -157,8 +157,11 @@ class BrowserSecurityGateway:
         self.require_create_step_up = False
         self.step_up_granted = False
         self.bulk_seen_changes: list[tuple[str, str, tuple[str, ...] | None, bool]] = []
+        self.message_seen_changes: list[tuple[str, str, str, bool]] = []
         self.bulk_moves: list[tuple[str, str, tuple[str, ...], str]] = []
+        self.message_moves: list[tuple[str, str, str, str]] = []
         self.created_mailboxes: list[tuple[str, str]] = []
+        self.renamed_mailboxes: list[tuple[str, str, str]] = []
         self.deleted_mailboxes: list[tuple[str, str, str, str | None]] = []
         self.extra_mailboxes: list[str] = []
         self.message_unread = True
@@ -426,6 +429,21 @@ class BrowserSecurityGateway:
         if mailbox not in self.extra_mailboxes:
             self.extra_mailboxes.append(mailbox)
 
+    async def rename_mailbox(
+        self,
+        account: str,
+        old_name: str,
+        new_name: str,
+    ) -> None:
+        if old_name not in self.extra_mailboxes:
+            raise ValueError("unknown fixture mailbox")
+        if any(name.casefold() == new_name.casefold() for name in self.extra_mailboxes):
+            raise ValueError("fixture mailbox already exists")
+        self.renamed_mailboxes.append((account, old_name, new_name))
+        self.extra_mailboxes[self.extra_mailboxes.index(old_name)] = new_name
+        if self.message_location == old_name:
+            self.message_location = new_name
+
     async def delete_named_mailbox(
         self,
         account: str,
@@ -434,10 +452,13 @@ class BrowserSecurityGateway:
         disposition: str,
         target_mailbox: str | None = None,
     ) -> str:
-        self.deleted_mailboxes.append((account, mailbox, disposition, target_mailbox))
-        if mailbox in self.extra_mailboxes:
-            self.extra_mailboxes.remove(mailbox)
         target = target_mailbox if disposition == "move" else TRASH_MAILBOX
+        if target is None:
+            raise ValueError("fixture deletion target is required")
+        if mailbox not in self.extra_mailboxes:
+            raise ValueError("unknown fixture mailbox")
+        self.deleted_mailboxes.append((account, mailbox, disposition, target_mailbox))
+        self.extra_mailboxes.remove(mailbox)
         if self.message_location == mailbox:
             self.message_location = target
         return target
@@ -505,6 +526,19 @@ class BrowserSecurityGateway:
         self.archive_move_finished.set()
         return ARCHIVE_MAILBOX
 
+    async def move_message(
+        self,
+        account: str,
+        mailbox: str,
+        message_id: str,
+        target: str,
+    ) -> str:
+        if self.message_location != mailbox or message_id != MESSAGE_ID:
+            raise ValueError("unknown fixture message location")
+        self.message_moves.append((account, mailbox, message_id, target))
+        self.message_location = target
+        return target
+
     async def set_messages_seen(
         self,
         account: str,
@@ -515,6 +549,19 @@ class BrowserSecurityGateway:
     ) -> None:
         selected = None if message_ids is None else tuple(message_ids)
         self.bulk_seen_changes.append((account, mailbox, selected, seen))
+        self.message_unread = not seen
+
+    async def set_message_seen(
+        self,
+        account: str,
+        mailbox: str,
+        message_id: str,
+        *,
+        seen: bool,
+    ) -> None:
+        if self.message_location != mailbox or message_id != MESSAGE_ID:
+            raise ValueError("unknown fixture message location")
+        self.message_seen_changes.append((account, mailbox, message_id, seen))
         self.message_unread = not seen
 
     async def move_messages_to_trash(

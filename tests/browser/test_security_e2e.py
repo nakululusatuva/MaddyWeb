@@ -739,19 +739,17 @@ async def test_row_mutations_expose_a_busy_state_on_slow_links(
 
     await page.route("**/api/v1/admin/mail-actions", pause_mail_action)
     row = page.locator("#message-list-body tr")
-    if action == "move":
-        await row.locator(".message-row-move-target").select_option("Sent")
-        button = row.get_by_role("button", name="Move", exact=True)
-    else:
-        button = row.get_by_role("button", name="Mark as read", exact=True)
-
     try:
-        await button.click()
+        if action == "move":
+            await _message_menu_move(page, row, "Sent")
+        else:
+            await _message_menu_action(page, row, "mark-read")
         await asyncio.wait_for(request_started.wait(), timeout=2)
-        assert await row.get_attribute("aria-busy") == "true"
-        assert await row.locator("button, input, select").evaluate_all(
-            "nodes => nodes.every(node => node.disabled)"
+        assert await page.locator("#mail-bulk-toolbar").evaluate(
+            "node => node.classList.contains('is-busy')"
         )
+        assert await page.locator("#mail-select-page").is_disabled()
+        assert await row.locator(".message-select-checkbox").is_disabled()
     finally:
         release_request.set()
 
@@ -774,8 +772,10 @@ async def test_mailbox_read_state_and_bulk_selection_actions(
     await row.locator(".message-select-checkbox").check()
     assert await page.locator("#mail-selection-count").inner_text() == "1 selected"
     assert await page.locator("#mail-select-page").is_checked()
-    assert await page.locator("#mail-mark-read").is_enabled()
-    await page.locator("#mail-mark-read").click()
+    assert await page.locator("#mail-mark-read").count() == 0
+    assert await page.locator("#mail-bulk-archive").count() == 0
+    assert await page.locator("#mail-bulk-move-target").count() == 0
+    await _message_menu_action(page, row, "mark-read")
     await page.wait_for_function(
         "() => document.querySelector('.message-read-status')?.textContent === 'Read'"
     )
@@ -786,7 +786,7 @@ async def test_mailbox_read_state_and_bulk_selection_actions(
         True,
     )
 
-    await page.get_by_role("button", name="Mark as unread", exact=True).click()
+    await _message_menu_action(page, row, "mark-unread")
     await page.wait_for_function(
         "() => document.querySelector('.message-read-status')?.textContent === 'Unread'"
     )
@@ -803,7 +803,7 @@ async def test_mailbox_read_state_and_bulk_selection_actions(
     )
 
     await page.locator(".message-select-checkbox").check()
-    await page.locator("#mail-bulk-archive").click()
+    await _message_menu_action(page, row, "archive")
     await page.locator("#message-empty").wait_for(state="visible")
     assert live_application.gateway.bulk_moves[-1] == (
         ACCOUNT,
@@ -811,6 +811,54 @@ async def test_mailbox_read_state_and_bulk_selection_actions(
         (MESSAGE_ID,),
         ARCHIVE_MAILBOX,
     )
+
+
+async def test_mail_selection_checkboxes_remain_compact_after_deselect(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    geometry_script = """
+        node => {
+          const bounds = node.getBoundingClientRect();
+          const style = getComputedStyle(node);
+          return {
+            width: bounds.width,
+            height: bounds.height,
+            boxShadow: style.boxShadow,
+          };
+        }
+    """
+    for viewport_width in (1440, 390):
+        await page.set_viewport_size({"width": viewport_width, "height": 844})
+        await _load_mailbox(page, live_application, MAILBOX)
+        row = page.locator("#message-list-body tr").first
+        message_checkbox = row.locator(".message-select-checkbox")
+
+        await message_checkbox.check()
+        assert await page.locator("#mail-selection-count").inner_text() == "1 selected"
+        await message_checkbox.uncheck()
+        assert await message_checkbox.is_checked() is False
+        assert await page.locator("#mail-selection-count").inner_text() == "0 selected"
+        assert await row.evaluate(
+            "node => node.classList.contains('is-bulk-selected')"
+        ) is False
+        message_geometry = await message_checkbox.evaluate(geometry_script)
+        assert message_geometry["width"] <= 20
+        assert message_geometry["height"] <= 20
+        assert message_geometry["boxShadow"] == "none"
+
+        page_checkbox = page.locator("#mail-select-page")
+        await page_checkbox.check()
+        await page_checkbox.uncheck()
+        assert await page_checkbox.is_checked() is False
+        assert await page.locator("#mail-selection-count").inner_text() == "0 selected"
+        assert await row.evaluate(
+            "node => node.classList.contains('is-bulk-selected')"
+        ) is False
+        page_geometry = await page_checkbox.evaluate(geometry_script)
+        assert page_geometry["width"] <= 20
+        assert page_geometry["height"] <= 20
+        assert page_geometry["boxShadow"] == "none"
 
 
 async def test_opening_an_unread_message_marks_it_read(
@@ -836,7 +884,10 @@ async def test_opening_an_unread_message_marks_it_read(
 
     assert (await read_response.value).status == 200
     assert await row.locator(".message-unread-dot").count() == 0
-    assert await row.get_by_role("button", name="Mark as unread", exact=True).count() == 1
+    menu = await _open_message_menu(page, row)
+    assert await menu.locator(
+        '[role="menuitem"][data-action="mark-unread"]'
+    ).count() == 1
     assert live_application.gateway.bulk_seen_changes[-1] == (
         ACCOUNT,
         MAILBOX,
@@ -859,7 +910,7 @@ async def _load_inbox(page: Page, live_application: LiveApplication) -> None:
     await page.goto(live_application.base_url + "/mail")
     await page.locator("#mail-account").select_option(ACCOUNT)
     message_link = page.locator("#message-list-body a")
-    await message_link.wait_for()
+    await message_link.first.wait_for()
     assert await page.locator("#mail-account").input_value() == ACCOUNT
     assert await page.locator("#mail-mailbox").input_value() == MAILBOX
     await page.wait_for_url(f"**{_mailbox_path()}")
@@ -876,6 +927,51 @@ async def _load_mailbox(
     await page.goto(f"{live_application.base_url}/mail?{query}")
     await page.locator("#message-list-body tr").first.wait_for()
     assert await page.locator("#mail-mailbox").input_value() == mailbox
+
+
+def _folder_item(page: Page, mailbox: str):
+    return page.locator(f'.mail-folder-item[data-mailbox="{mailbox}"]')
+
+
+async def _open_folder_menu(page: Page, mailbox: str):
+    item = _folder_item(page, mailbox)
+    button = item.locator(".mail-folder-menu-button")
+    await button.scroll_into_view_if_needed()
+    await page.wait_for_timeout(25)
+    await button.click()
+    menu = page.locator("#mail-folder-menu")
+    await menu.wait_for(state="visible")
+    return menu
+
+
+async def _open_message_menu(page: Page, row, *, keyboard: bool = False):
+    if keyboard:
+        await row.focus()
+        await row.press("Shift+F10")
+    else:
+        await row.click(button="right")
+    menu = page.locator("#message-context-menu")
+    await menu.wait_for(state="visible")
+    return menu
+
+
+async def _message_menu_action(
+    page: Page,
+    row,
+    action: str,
+    *,
+    keyboard: bool = False,
+) -> None:
+    menu = await _open_message_menu(page, row, keyboard=keyboard)
+    await menu.locator(f'[role="menuitem"][data-action="{action}"]').click()
+
+
+async def _message_menu_move(page: Page, row, target_mailbox: str) -> None:
+    menu = await _open_message_menu(page, row)
+    await menu.locator('[role="menuitem"][data-action="move-to"]').click()
+    await menu.locator(
+        f'[role="menuitem"][data-target-mailbox="{target_mailbox}"]'
+    ).click()
 
 
 async def _open_message(page: Page, live_application: LiveApplication) -> None:
@@ -1401,6 +1497,12 @@ async def test_mailbox_auto_opens_inbox_and_rows_support_pointer_and_keyboard_na
 
     await row.locator("td").first.click()
     await page.wait_for_url(f"**{_message_path()}")
+    expected_summary = f"{ACCOUNT_ADDRESS} / {MAILBOX} / UID {MESSAGE_ID}"
+    await page.wait_for_function(
+        "expected => document.querySelector('#message-summary')?.textContent === expected",
+        arg=expected_summary,
+    )
+    assert await page.locator("#message-summary").inner_text() == expected_summary
     await page.go_back()
     await page.locator("#message-list-body tr").wait_for()
 
@@ -1411,34 +1513,272 @@ async def test_mailbox_auto_opens_inbox_and_rows_support_pointer_and_keyboard_na
 
     await page.set_viewport_size({"width": 320, "height": 844})
     await _load_mailbox(page, live_application, MAILBOX)
-    actions = page.locator(".message-row-action")
-    assert await actions.count() == 6
+    quick_actions = page.locator(".message-quick-actions")
+    assert await quick_actions.is_visible()
+    assert await quick_actions.locator(
+        ".message-row-action:not(.message-more-button)"
+    ).evaluate_all("nodes => nodes.every(node => getComputedStyle(node).display === 'none')")
+    more = page.locator(".message-more-button")
+    assert await more.is_visible()
     assert await page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
-    for index in range(await actions.count()):
-        bounds = await actions.nth(index).bounding_box()
-        assert bounds is not None
-        assert bounds["height"] >= 44 - TOUCH_TARGET_GEOMETRY_TOLERANCE_PX
+    bounds = await more.bounding_box()
+    assert bounds is not None
+    assert bounds["height"] >= 44 - TOUCH_TARGET_GEOMETRY_TOLERANCE_PX
+    assert bounds["width"] >= 44 - TOUCH_TARGET_GEOMETRY_TOLERANCE_PX
 
 
 async def test_mailbox_rows_fit_the_desktop_message_pane(
     page: Page,
     live_application: LiveApplication,
 ) -> None:
-    for width in (1440, 1024):
+    for width in (1440, 1074, 1024):
         await page.set_viewport_size({"width": width, "height": 900})
         await _load_inbox(page, live_application)
+        await page.mouse.move(0, 0)
 
         pane = page.locator("#mail-view")
         pane_bounds = await pane.bounding_box()
+        row = page.locator("#message-list-body tr")
+        row_before = await row.bounding_box()
+        subject = row.locator(".message-subject-cell")
+        subject_bounds = await subject.bounding_box()
+        quick_actions = row.locator(".message-quick-actions")
         assert pane_bounds is not None
+        assert row_before is not None
+        assert subject_bounds is not None
         assert await page.locator(".mail-list-table").evaluate(
             "node => node.scrollWidth <= node.clientWidth"
         )
-        for action in await page.locator(".message-row-action").all():
+        assert await quick_actions.evaluate(
+            "node => getComputedStyle(node).opacity === '0'"
+        )
+        assert await quick_actions.evaluate(
+            "node => getComputedStyle(node).pointerEvents === 'none'"
+        )
+
+        await row.hover()
+        await page.wait_for_function(
+            "() => getComputedStyle(document.querySelector("
+            "'.message-quick-actions')).opacity === '1'"
+        )
+        row_after = await row.bounding_box()
+        quick_bounds = await quick_actions.bounding_box()
+        assert row_after is not None
+        assert quick_bounds is not None
+        assert abs(row_after["height"] - row_before["height"]) <= 1
+        assert await quick_actions.evaluate(
+            "node => getComputedStyle(node).flexWrap === 'nowrap'"
+        )
+        for action in await quick_actions.locator("button").all():
             bounds = await action.bounding_box()
             assert bounds is not None
             assert bounds["x"] >= pane_bounds["x"]
             assert bounds["x"] + bounds["width"] <= pane_bounds["x"] + pane_bounds["width"] + 1
+        if width == 1024:
+            assert quick_bounds["x"] < subject_bounds["x"] + subject_bounds["width"]
+
+
+async def test_message_actions_switch_from_hover_to_touch_at_the_mobile_boundary(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    await page.set_viewport_size({"width": 901, "height": 900})
+    await _load_inbox(page, live_application)
+    row = page.locator("#message-list-body tr")
+    quick_actions = row.locator(".message-quick-actions")
+    assert await quick_actions.evaluate(
+        "node => getComputedStyle(node).opacity === '0'"
+    )
+    await row.hover()
+    await page.wait_for_function(
+        "() => getComputedStyle(document.querySelector("
+        "'.message-quick-actions')).opacity === '1'"
+    )
+
+    await page.set_viewport_size({"width": 900, "height": 900})
+    assert await quick_actions.is_visible()
+    assert await quick_actions.locator(
+        ".message-row-action:not(.message-more-button)"
+    ).evaluate_all("nodes => nodes.every(node => getComputedStyle(node).display === 'none')")
+    more = row.locator(".message-more-button")
+    assert await more.is_visible()
+    bounds = await more.bounding_box()
+    assert bounds is not None
+    assert bounds["height"] >= 44 - TOUCH_TARGET_GEOMETRY_TOLERANCE_PX
+
+
+async def test_message_actions_do_not_cover_read_status_badges(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    async def messages_with_both_read_states(
+        _account: str,
+        mailbox: str,
+        **_kwargs: object,
+    ) -> MessagePage:
+        if mailbox != MAILBOX:
+            return MessagePage([], False)
+        return MessagePage(
+            [
+                {
+                    "id": MESSAGE_ID,
+                    "sender": "read@example.test",
+                    "subject": "Read message",
+                    "date": "2026-08-06 12:00 UTC",
+                    "unread": False,
+                },
+                {
+                    "id": "43",
+                    "sender": "unread@example.test",
+                    "subject": "Unread message",
+                    "date": "2026-08-06 11:00 UTC",
+                    "unread": True,
+                },
+            ],
+            False,
+        )
+
+    live_application.gateway.list_messages = (  # type: ignore[method-assign]
+        messages_with_both_read_states
+    )
+    for viewport_width in (1440, 1024, 901, 900, 390):
+        await page.set_viewport_size({"width": viewport_width, "height": 844})
+        await _load_mailbox(page, live_application, MAILBOX)
+        rows = page.locator("#message-list-body tr")
+        assert await rows.count() == 2
+
+        for row in await rows.all():
+            status = row.locator(".message-read-status")
+            quick_actions = row.locator(".message-quick-actions")
+            more = row.locator(".message-more-button")
+            if viewport_width > 900:
+                await row.hover()
+                await page.wait_for_function(
+                    "node => getComputedStyle(node.querySelector("
+                    "'.message-quick-actions')).opacity === '1'",
+                    arg=await row.element_handle(),
+                )
+            assert await status.is_visible()
+            assert await quick_actions.is_visible()
+            assert await more.is_visible()
+
+            geometry = await status.evaluate(
+                """node => {
+                    const bounds = node.getBoundingClientRect();
+                    const range = document.createRange();
+                    range.selectNodeContents(node);
+                    const textBounds = range.getBoundingClientRect();
+                    const actions = node.closest('tr')
+                        .querySelector('.message-quick-actions')
+                        .getBoundingClientRect();
+                    const more = node.closest('tr')
+                        .querySelector('.message-more-button')
+                        .getBoundingClientRect();
+                    return {
+                        bounds: {
+                            left: bounds.left,
+                            right: bounds.right,
+                            width: bounds.width,
+                        },
+                        textBounds: {
+                            left: textBounds.left,
+                            right: textBounds.right,
+                            width: textBounds.width,
+                        },
+                        actions: {left: actions.left, right: actions.right},
+                        more: {left: more.left, right: more.right},
+                        clientWidth: node.clientWidth,
+                        scrollWidth: node.scrollWidth,
+                    };
+                }"""
+            )
+            assert geometry["scrollWidth"] <= geometry["clientWidth"] + 1
+            assert geometry["textBounds"]["left"] >= geometry["bounds"]["left"] - 1
+            assert geometry["textBounds"]["right"] <= geometry["bounds"]["right"] + 1
+            assert (
+                geometry["bounds"]["right"] <= geometry["actions"]["left"] + 1
+                or geometry["actions"]["right"] <= geometry["bounds"]["left"] + 1
+            )
+            assert (
+                geometry["bounds"]["right"] <= geometry["more"]["left"] + 1
+                or geometry["more"]["right"] <= geometry["bounds"]["left"] + 1
+            )
+
+
+async def test_hover_quick_actions_are_compact_and_do_not_open_the_message(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    await page.set_viewport_size({"width": 1440, "height": 900})
+    await _load_inbox(page, live_application)
+    row = page.locator("#message-list-body tr")
+    quick_actions = row.locator(".message-quick-actions")
+    await row.hover()
+    await page.wait_for_function(
+        "() => getComputedStyle(document.querySelector("
+        "'.message-quick-actions')).opacity === '1'"
+    )
+
+    labels = set(
+        await quick_actions.locator("button[aria-label]").evaluate_all(
+            "nodes => nodes.map(node => node.getAttribute('aria-label'))"
+        )
+    )
+    assert {"Mark as read", "Archive", "Move to Trash", "Move to folder"}.issubset(
+        labels
+    )
+    assert not {"Reply", "Reply all", "Forward", "Forward as attachment"}.intersection(
+        labels
+    )
+    more = row.locator(".message-more-button")
+    assert await more.count() == 1
+    more_style = await more.evaluate(
+        """node => {
+            const style = getComputedStyle(node);
+            const iconStyle = getComputedStyle(node.querySelector("svg"));
+            return {
+                borderTopWidth: style.borderTopWidth,
+                borderRightWidth: style.borderRightWidth,
+                borderBottomWidth: style.borderBottomWidth,
+                borderLeftWidth: style.borderLeftWidth,
+                boxShadow: style.boxShadow,
+                iconWidth: Number.parseFloat(iconStyle.width),
+                iconHeight: Number.parseFloat(iconStyle.height),
+                iconStrokeWidth: Number.parseFloat(iconStyle.strokeWidth),
+            };
+        }"""
+    )
+    assert {
+        key: value
+        for key, value in more_style.items()
+        if key not in {"iconWidth", "iconHeight", "iconStrokeWidth"}
+    } == {
+        "borderTopWidth": "0px",
+        "borderRightWidth": "0px",
+        "borderBottomWidth": "0px",
+        "borderLeftWidth": "0px",
+        "boxShadow": "none",
+    }
+    regular_stroke_width = await quick_actions.locator(
+        ".message-row-action:not(.message-more-button) svg"
+    ).first.evaluate("node => Number.parseFloat(getComputedStyle(node).strokeWidth)")
+    assert more_style["iconWidth"] >= 20
+    assert more_style["iconHeight"] >= 20
+    assert more_style["iconStrokeWidth"] >= 4.5
+    assert more_style["iconStrokeWidth"] >= regular_stroke_width + 2
+    controls = await quick_actions.locator("button").all()
+    control_rows = []
+    for control in controls:
+        bounds = await control.bounding_box()
+        assert bounds is not None
+        control_rows.append(round(bounds["y"]))
+    assert max(control_rows) - min(control_rows) <= 1
+
+    await quick_actions.get_by_role("button", name="Mark as read", exact=True).click()
+    await page.wait_for_function(
+        "() => document.querySelector('.message-read-status')?.textContent === 'Read'"
+    )
+    assert urlsplit(page.url).path == "/mail"
 
 
 async def test_all_mail_keeps_each_messages_source_mailbox_context(
@@ -1474,6 +1814,42 @@ async def test_all_mail_keeps_each_messages_source_mailbox_context(
     back_url = urlsplit(back_href)
     assert back_url.path == "/mail"
     assert "view=all" in back_url.query
+
+
+async def test_desktop_hover_actions_do_not_cover_all_mail_badges(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    query = urlencode({"account": ACCOUNT, "view": "all"})
+    for viewport_width in (1440, 1024, 901):
+        await page.set_viewport_size({"width": viewport_width, "height": 844})
+        await page.goto(f"{live_application.base_url}/mail?{query}")
+        row = page.locator("#message-list-body tr")
+        await row.wait_for()
+        await row.hover()
+        await page.wait_for_function(
+            "node => getComputedStyle(node.querySelector("
+            "'.message-quick-actions')).opacity === '1'",
+            arg=await row.element_handle(),
+        )
+
+        geometry = await row.evaluate(
+            """node => {
+                const bounds = selector => {
+                    const box = node.querySelector(selector).getBoundingClientRect();
+                    return {left: box.left, right: box.right, width: box.width};
+                };
+                return {
+                    actions: bounds('.message-quick-actions'),
+                    status: bounds('.message-read-status'),
+                    mailbox: bounds('.message-mailbox-label'),
+                };
+            }"""
+        )
+        assert geometry["actions"]["right"] <= geometry["status"]["left"] + 1
+        assert geometry["actions"]["right"] <= geometry["mailbox"]["left"] + 1
+        assert geometry["status"]["width"] > 0
+        assert geometry["mailbox"]["width"] > 0
 
 
 async def test_all_mail_batches_freshness_once_per_source_before_any_move(
@@ -1531,8 +1907,11 @@ async def test_all_mail_batches_freshness_once_per_source_before_any_move(
     await page.get_by_role("heading", name="All Mail", exact=True).wait_for()
     await page.locator("#message-list-body tr").nth(3).wait_for()
     await page.locator("#mail-select-page").check()
-    await page.locator("#mail-bulk-move-target").select_option(ARCHIVE_MAILBOX)
-    await page.locator("#mail-bulk-move").click()
+    await _message_menu_move(
+        page,
+        page.locator("#message-list-body tr").first,
+        ARCHIVE_MAILBOX,
+    )
 
     await asyncio.wait_for(second_preflight_ready.wait(), timeout=2)
     assert live_application.gateway.bulk_moves == []
@@ -1574,7 +1953,7 @@ async def test_normal_user_batch_snapshot_never_sends_an_account_override(
     await page.goto(normal_user_application.base_url + "/mail")
     row = page.locator("#message-list-body tr")
     await row.wait_for()
-    await row.get_by_role("button", name="Archive", exact=True).click()
+    await _message_menu_action(page, row, "archive")
     await page.locator("#message-empty").wait_for()
 
     assert [
@@ -1596,8 +1975,7 @@ async def test_row_bulk_and_detail_move_controls_target_existing_folders(
 ) -> None:
     await _load_inbox(page, live_application)
     row = page.locator("#message-list-body tr")
-    await row.locator(".message-row-move-target").select_option("Sent")
-    await row.get_by_role("button", name="Move", exact=True).click()
+    await _message_menu_move(page, row, "Sent")
     await page.locator("#message-empty").wait_for()
     assert live_application.gateway.bulk_moves[-1] == (
         ACCOUNT,
@@ -1609,9 +1987,9 @@ async def test_row_bulk_and_detail_move_controls_target_existing_folders(
     live_application.gateway.message_location = MAILBOX
     await page.goto(live_application.base_url + _mailbox_path())
     await page.locator("#message-list-body tr").wait_for()
-    await page.locator(".message-select-checkbox").check()
-    await page.locator("#mail-bulk-move-target").select_option("Sent")
-    await page.locator("#mail-bulk-move").click()
+    selected_row = page.locator("#message-list-body tr")
+    await selected_row.locator(".message-select-checkbox").check()
+    await _message_menu_move(page, selected_row, "Sent")
     await page.locator("#message-empty").wait_for()
     assert live_application.gateway.bulk_moves[-1] == (
         ACCOUNT,
@@ -1634,6 +2012,470 @@ async def test_row_bulk_and_detail_move_controls_target_existing_folders(
         (MESSAGE_ID,),
         "Sent",
     )
+
+
+async def test_message_context_menu_scopes_single_and_bulk_actions(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    second_message_id = "43"
+
+    async def two_messages(
+        _account: str,
+        mailbox: str,
+        **_kwargs: object,
+    ) -> MessagePage:
+        if mailbox != MAILBOX:
+            return MessagePage([], False)
+        return MessagePage(
+            [
+                {
+                    "id": uid,
+                    "sender": f"sender-{uid}@example.test",
+                    "subject": f"Context message {uid}",
+                    "date": "2026-08-06 12:00 UTC",
+                    "unread": True,
+                }
+                for uid in (MESSAGE_ID, second_message_id)
+            ],
+            False,
+        )
+
+    live_application.gateway.list_messages = two_messages  # type: ignore[method-assign]
+    await _load_inbox(page, live_application)
+    rows = page.locator("#message-list-body tr")
+    await rows.nth(1).wait_for()
+
+    menu = await _open_message_menu(page, rows.nth(1))
+    assert await rows.first.locator(".message-select-checkbox").is_checked() is False
+    assert await rows.nth(1).locator(".message-select-checkbox").is_checked() is False
+    assert await page.locator("#mail-selection-count").inner_text() == "0 selected"
+    assert await menu.locator('[role="menuitem"][data-action="open"]').is_visible()
+    await page.keyboard.press("Escape")
+
+    await rows.first.locator(".message-select-checkbox").check()
+    menu = await _open_message_menu(page, rows.first)
+    assert await page.locator("#mail-selection-count").inner_text() == "1 selected"
+    single_actions = set(
+        await menu.locator('[role="menuitem"][data-action]').evaluate_all(
+            "nodes => nodes.map(node => node.dataset.action)"
+        )
+    )
+    assert {
+        "open",
+        "open-new-tab",
+        "reply",
+        "reply-all",
+        "forward",
+        "forward-attachment",
+        "mark-read",
+        "move-to",
+        "archive",
+        "trash",
+    }.issubset(single_actions)
+    await page.keyboard.press("Escape")
+
+    menu = await _open_message_menu(page, rows.nth(1))
+    assert await rows.first.locator(".message-select-checkbox").is_checked()
+    assert await rows.nth(1).locator(".message-select-checkbox").is_checked() is False
+    assert await page.locator("#mail-selection-count").inner_text() == "1 selected"
+    unselected_row_actions = set(
+        await menu.locator('[role="menuitem"][data-action]').evaluate_all(
+            "nodes => nodes.map(node => node.dataset.action)"
+        )
+    )
+    assert {"open", "reply", "reply-all", "forward"}.issubset(unselected_row_actions)
+    await page.keyboard.press("Escape")
+
+    await page.locator("#mail-select-page").check()
+    menu = await _open_message_menu(page, rows.first)
+    assert await rows.first.locator(".message-select-checkbox").is_checked()
+    assert await rows.nth(1).locator(".message-select-checkbox").is_checked()
+    assert await page.locator("#mail-selection-count").inner_text() == "2 selected"
+    bulk_actions = set(
+        await menu.locator('[role="menuitem"][data-action]').evaluate_all(
+            "nodes => nodes.map(node => node.dataset.action)"
+        )
+    )
+    assert {"mark-read", "mark-unread", "move-to", "archive", "trash"}.issubset(
+        bulk_actions
+    )
+    assert not {"open", "reply", "reply-all", "forward"}.intersection(bulk_actions)
+    await menu.locator('[role="menuitem"][data-action="mark-read"]').click()
+    for _attempt in range(50):
+        if live_application.gateway.bulk_seen_changes:
+            break
+        await asyncio.sleep(0.02)
+    assert live_application.gateway.bulk_seen_changes[-1] == (
+        ACCOUNT,
+        MAILBOX,
+        (MESSAGE_ID, second_message_id),
+        True,
+    )
+
+
+async def test_message_context_menu_supports_keyboard_and_stays_in_the_viewport(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    await page.set_viewport_size({"width": 1024, "height": 600})
+    await _load_inbox(page, live_application)
+    row = page.locator("#message-list-body tr")
+
+    menu = await _open_message_menu(page, row, keyboard=True)
+    assert await menu.locator('[role="menuitem"]').first.evaluate(
+        "node => node === document.activeElement"
+    )
+    await page.keyboard.press("End")
+    assert await menu.locator('[role="menuitem"]:not([disabled])').last.evaluate(
+        "node => node === document.activeElement"
+    )
+    await page.keyboard.press("Home")
+    assert await menu.locator('[role="menuitem"]:not([disabled])').first.evaluate(
+        "node => node === document.activeElement"
+    )
+    await page.keyboard.press("Escape")
+    await menu.wait_for(state="hidden")
+    assert await row.evaluate("node => node === document.activeElement")
+
+    await row.evaluate(
+        """node => node.dispatchEvent(new MouseEvent("contextmenu", {
+          bubbles: true,
+          cancelable: true,
+          clientX: window.innerWidth - 1,
+          clientY: window.innerHeight - 1,
+        }))"""
+    )
+    await menu.wait_for(state="visible")
+    bounds = await menu.bounding_box()
+    assert bounds is not None
+    assert bounds["x"] >= 0
+    assert bounds["y"] >= 0
+    assert bounds["x"] + bounds["width"] <= 1024 + 1
+    assert bounds["y"] + bounds["height"] <= 600 + 1
+
+    await page.evaluate("document.dispatchEvent(new Event('scroll'))")
+    await menu.wait_for(state="hidden")
+    await _open_message_menu(page, row)
+    await page.locator("#mail-title").click()
+    await menu.wait_for(state="hidden")
+    await _open_message_menu(page, row)
+    await page.set_viewport_size({"width": 1000, "height": 600})
+    await menu.wait_for(state="hidden")
+    await _open_message_menu(page, row)
+    await page.locator('a[data-section="security"]').click()
+    await page.get_by_role("heading", name="Security", exact=True).wait_for()
+    assert await menu.is_hidden()
+
+
+async def test_message_context_menu_uses_icons_and_fits_a_tall_viewport(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    await page.set_viewport_size({"width": 1280, "height": 1000})
+    await _load_inbox(page, live_application)
+    menu = await _open_message_menu(page, page.locator("#message-list-body tr"))
+    items = menu.locator('[role="menuitem"]')
+
+    assert await items.count() >= 8
+    assert await items.evaluate_all(
+        """nodes => nodes.every(node => (
+            node.firstElementChild?.matches("svg[aria-hidden='true']")
+            && node.lastElementChild?.matches(".context-menu-item-label")
+        ))"""
+    )
+    assert await menu.evaluate("node => node.scrollHeight <= node.clientHeight")
+    bounds = await menu.bounding_box()
+    assert bounds is not None
+    assert bounds["x"] >= 0
+    assert bounds["y"] >= 0
+    assert bounds["x"] + bounds["width"] <= 1280 + 1
+    assert bounds["y"] + bounds["height"] <= 1000 + 1
+
+
+async def test_message_context_menu_closes_on_browser_history_navigation(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    await _load_inbox(page, live_application)
+    row = page.locator("#message-list-body tr")
+    await page.evaluate("history.pushState(null, '', '/security')")
+    menu = await _open_message_menu(page, row)
+    assert await menu.is_visible()
+
+    await page.go_back()
+    await menu.wait_for(state="hidden")
+    await page.get_by_role("heading", name=MAILBOX, exact=True).wait_for()
+
+
+async def test_message_more_button_opens_the_full_menu_on_touch_layouts(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    for width in (390, 320):
+        await page.set_viewport_size({"width": width, "height": 844})
+        await _load_mailbox(page, live_application, MAILBOX)
+        row = page.locator("#message-list-body tr")
+        more = row.locator(".message-more-button")
+        quick_actions = row.locator(".message-quick-actions")
+        await more.scroll_into_view_if_needed()
+        await page.wait_for_timeout(25)
+        assert await quick_actions.evaluate(
+            "node => getComputedStyle(node).backgroundColor"
+        ) == await row.evaluate("node => getComputedStyle(node).backgroundColor")
+        await more.click()
+        menu = page.locator("#message-context-menu")
+        await menu.wait_for(state="visible")
+        assert await quick_actions.evaluate(
+            "node => getComputedStyle(node).backgroundColor"
+        ) == await row.evaluate("node => getComputedStyle(node).backgroundColor")
+        assert await menu.locator(
+            '[role="menuitem"][data-action="forward"]'
+        ).is_visible()
+        assert await menu.locator(
+            '[role="menuitem"][data-action="move-to"]'
+        ).is_visible()
+        bounds = await more.bounding_box()
+        assert bounds is not None
+        assert bounds["height"] >= 44 - TOUCH_TARGET_GEOMETRY_TOLERANCE_PX
+        assert bounds["width"] >= 44 - TOUCH_TARGET_GEOMETRY_TOLERANCE_PX
+        await page.keyboard.press("Escape")
+
+
+async def test_touch_more_button_applies_to_the_selected_message_set(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    second_message_id = "43"
+
+    async def two_messages(
+        _account: str,
+        mailbox: str,
+        **_kwargs: object,
+    ) -> MessagePage:
+        if mailbox != MAILBOX:
+            return MessagePage([], False)
+        return MessagePage(
+            [
+                {
+                    "id": uid,
+                    "sender": f"sender-{uid}@example.test",
+                    "subject": f"Touch message {uid}",
+                    "date": "2026-08-06 12:00 UTC",
+                    "unread": True,
+                }
+                for uid in (MESSAGE_ID, second_message_id)
+            ],
+            False,
+        )
+
+    live_application.gateway.list_messages = two_messages  # type: ignore[method-assign]
+    await page.set_viewport_size({"width": 390, "height": 844})
+    await _load_mailbox(page, live_application, MAILBOX)
+    await page.locator("#mail-select-page").check()
+    rows = page.locator("#message-list-body tr")
+    await rows.first.locator(".message-more-button").click()
+
+    menu = page.locator("#message-context-menu")
+    await menu.wait_for(state="visible")
+    assert await menu.locator(".context-menu-heading").inner_text() == "2 selected"
+    assert await menu.locator('[data-action="open"]').count() == 0
+    await menu.locator('[data-action="mark-read"]').click()
+    for _attempt in range(50):
+        if live_application.gateway.bulk_seen_changes:
+            break
+        await asyncio.sleep(0.02)
+    assert live_application.gateway.bulk_seen_changes[-1] == (
+        ACCOUNT,
+        MAILBOX,
+        (MESSAGE_ID, second_message_id),
+        True,
+    )
+
+
+async def test_message_menu_does_not_create_a_persistent_selection(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    second_message_id = "43"
+
+    async def two_messages(
+        _account: str,
+        mailbox: str,
+        **_kwargs: object,
+    ) -> MessagePage:
+        if mailbox != MAILBOX:
+            return MessagePage([], False)
+        return MessagePage(
+            [
+                {
+                    "id": uid,
+                    "sender": f"sender-{uid}@example.test",
+                    "subject": f"Transient menu state {uid}",
+                    "date": "2026-08-06 12:00 UTC",
+                    "unread": True,
+                }
+                for uid in (MESSAGE_ID, second_message_id)
+            ],
+            False,
+        )
+
+    live_application.gateway.list_messages = two_messages  # type: ignore[method-assign]
+    await page.set_viewport_size({"width": 900, "height": 844})
+    await _load_mailbox(page, live_application, MAILBOX)
+    row = page.locator("#message-list-body tr").nth(1)
+    checkbox = row.locator(".message-select-checkbox")
+    more = row.locator(".message-more-button")
+    menu = page.locator("#message-context-menu")
+    initial_background = await row.evaluate(
+        "node => getComputedStyle(node).backgroundColor"
+    )
+
+    await more.click()
+    await menu.wait_for(state="visible")
+    assert await checkbox.is_checked() is False
+    assert await page.locator("#mail-selection-count").inner_text() == "0 selected"
+    assert await row.evaluate("node => node.classList.contains('is-context-open')")
+    assert await row.evaluate("node => node.classList.contains('is-bulk-selected')") is False
+
+    await page.keyboard.press("Escape")
+    await menu.wait_for(state="hidden")
+    await page.mouse.move(0, 0)
+    await page.wait_for_timeout(150)
+    assert await more.get_attribute("aria-expanded") == "false"
+    assert await checkbox.is_checked() is False
+    assert await page.locator("#mail-selection-count").inner_text() == "0 selected"
+    assert await row.evaluate("node => node.classList.contains('is-context-open')") is False
+    assert await row.evaluate("node => node.classList.contains('is-bulk-selected')") is False
+    assert await row.evaluate(
+        "node => getComputedStyle(node).backgroundColor"
+    ) == initial_background
+
+    await row.click(button="right")
+    await menu.wait_for(state="visible")
+    assert await checkbox.is_checked() is False
+    assert await page.locator("#mail-selection-count").inner_text() == "0 selected"
+    assert await row.evaluate("node => node.classList.contains('is-context-open')")
+    assert await row.evaluate("node => node.classList.contains('is-bulk-selected')") is False
+
+    await page.keyboard.press("Escape")
+    await menu.wait_for(state="hidden")
+    await page.mouse.move(0, 0)
+    await page.wait_for_timeout(150)
+    assert await row.evaluate("node => node.classList.contains('is-context-open')") is False
+    assert await row.evaluate("node => node.classList.contains('is-bulk-selected')") is False
+    assert await checkbox.is_checked() is False
+    assert await page.locator("#mail-selection-count").inner_text() == "0 selected"
+    assert await row.evaluate(
+        "node => getComputedStyle(node).backgroundColor"
+    ) == initial_background
+
+
+async def test_same_message_menu_opener_toggles_closed_and_clears_transient_state(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    await page.set_viewport_size({"width": 900, "height": 844})
+    await _load_mailbox(page, live_application, MAILBOX)
+    row = page.locator("#message-list-body tr")
+    more = row.locator(".message-more-button")
+    menu = page.locator("#message-context-menu")
+
+    await more.scroll_into_view_if_needed()
+    await page.wait_for_timeout(25)
+    await more.click()
+    await menu.wait_for(state="visible")
+    assert await more.get_attribute("aria-expanded") == "true"
+    assert await row.evaluate("node => node.classList.contains('is-context-open')")
+
+    await more.evaluate("node => node.click()")
+    await menu.wait_for(state="hidden")
+    assert await more.get_attribute("aria-expanded") == "false"
+    assert await row.evaluate("node => node.classList.contains('is-context-open')") is False
+    assert await page.locator(
+        '#message-list-body [aria-controls="message-context-menu"][aria-expanded="true"]'
+    ).count() == 0
+
+
+async def test_quick_action_background_tracks_normal_opened_and_bulk_row_fills(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    message_ids = (MESSAGE_ID, "43", "44")
+
+    async def three_messages(
+        _account: str,
+        mailbox: str,
+        **_kwargs: object,
+    ) -> MessagePage:
+        if mailbox != MAILBOX:
+            return MessagePage([], False)
+        return MessagePage(
+            [
+                {
+                    "id": uid,
+                    "sender": f"sender-{uid}@example.test",
+                    "subject": f"Row fill state {uid}",
+                    "date": "2026-08-06 12:00 UTC",
+                    "unread": True,
+                }
+                for uid in message_ids
+            ],
+            False,
+        )
+
+    live_application.gateway.list_messages = three_messages  # type: ignore[method-assign]
+    await page.set_viewport_size({"width": 900, "height": 844})
+    await _load_mailbox(page, live_application, MAILBOX)
+    rows = page.locator("#message-list-body tr")
+    normal_row = rows.nth(2)
+    normal_actions = normal_row.locator(".message-quick-actions")
+    normal_background = await normal_row.evaluate(
+        "node => getComputedStyle(node).backgroundColor"
+    )
+    assert await normal_actions.evaluate(
+        "node => getComputedStyle(node).backgroundColor"
+    ) == normal_background
+
+    normal_more = normal_row.locator(".message-more-button")
+    await normal_more.click()
+    await page.locator("#message-context-menu").wait_for(state="visible")
+    await page.keyboard.press("Escape")
+    await page.locator("#message-context-menu").wait_for(state="hidden")
+    await page.mouse.move(0, 0)
+    await page.wait_for_timeout(150)
+    assert await normal_row.evaluate(
+        "node => getComputedStyle(node).backgroundColor"
+    ) == normal_background
+    assert await normal_actions.evaluate(
+        "node => getComputedStyle(node).backgroundColor"
+    ) == normal_background
+
+    await rows.nth(1).locator(".message-select-checkbox").check()
+    await rows.first.locator(".message-subject-cell a").click()
+    await page.wait_for_url(f"**{_message_path()}")
+
+    opened_row = page.locator(f'#message-list-body tr[data-uid="{MESSAGE_ID}"]')
+    bulk_row = page.locator('#message-list-body tr[data-uid="43"]')
+    normal_row = page.locator('#message-list-body tr[data-uid="44"]')
+    assert await opened_row.evaluate("node => node.classList.contains('is-selected')")
+    assert await bulk_row.evaluate("node => node.classList.contains('is-bulk-selected')")
+    assert await normal_row.evaluate(
+        "node => !node.classList.contains('is-selected') "
+        "&& !node.classList.contains('is-bulk-selected')"
+    )
+
+    backgrounds: list[str] = []
+    for row in (opened_row, bulk_row, normal_row):
+        row_background = await row.evaluate(
+            "node => getComputedStyle(node).backgroundColor"
+        )
+        action_background = await row.locator(".message-quick-actions").evaluate(
+            "node => getComputedStyle(node).backgroundColor"
+        )
+        assert action_background == row_background
+        backgrounds.append(row_background)
+    assert len(set(backgrounds)) == 3
 
 
 async def test_folder_creation_uses_a_bounded_inline_form_and_opens_the_folder(
@@ -1664,6 +2506,128 @@ async def test_folder_creation_uses_a_bounded_inline_form_and_opens_the_folder(
     assert await page.locator("#mail-mailbox").input_value() == "Projects/2026"
 
 
+async def test_custom_folder_menu_renames_the_clicked_non_current_folder(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    live_application.gateway.extra_mailboxes.extend(["Projects", "Receipts"])
+    await _load_inbox(page, live_application)
+
+    menu = await _open_folder_menu(page, "Projects")
+    await menu.locator('[role="menuitem"][data-action="rename"]').click()
+    dialog = page.locator("#folder-rename-dialog")
+    await dialog.wait_for(state="visible")
+    name = page.locator("#folder-rename-name")
+    assert await name.input_value() == "Projects"
+    await name.fill("Client projects")
+    async with page.expect_response(
+        lambda response: response.request.method == "POST"
+        and response.url.endswith("/api/v1/admin/mailboxes/rename")
+    ) as renamed_response:
+        await page.locator("#folder-rename-submit").click()
+
+    assert (await renamed_response.value).status == 200
+    await dialog.wait_for(state="hidden")
+    assert live_application.gateway.renamed_mailboxes == [
+        (ACCOUNT, "Projects", "Client projects")
+    ]
+    await _folder_item(page, "Client projects").wait_for()
+    assert await _folder_item(page, "Projects").count() == 0
+    assert await _folder_item(page, "Client projects").count() == 1
+    assert await page.locator("#mail-mailbox").input_value() == MAILBOX
+    assert f"mailbox={MAILBOX}" in page.url
+
+
+async def test_folder_menu_and_rename_conflict_preserve_focus_and_context(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    live_application.gateway.extra_mailboxes.append("Projects")
+    await _load_inbox(page, live_application)
+    button = _folder_item(page, "Projects").locator(".mail-folder-menu-button")
+
+    menu = await _open_folder_menu(page, "Projects")
+    assert await button.get_attribute("aria-expanded") == "true"
+    await page.keyboard.press("Escape")
+    await menu.wait_for(state="hidden")
+    assert await button.get_attribute("aria-expanded") == "false"
+    assert await button.evaluate("node => node === document.activeElement")
+
+    async def reject_referenced_folder(route: Route) -> None:
+        await route.fulfill(
+            status=409,
+            content_type="application/json",
+            body=json.dumps(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "mailbox_in_use",
+                        "message": "The folder is referenced by an enabled mail rule.",
+                    },
+                }
+            ),
+        )
+
+    await page.route(
+        "**/api/v1/admin/mailboxes/rename",
+        reject_referenced_folder,
+    )
+    menu = await _open_folder_menu(page, "Projects")
+    await menu.locator('[role="menuitem"][data-action="rename"]').click()
+    await page.locator("#folder-rename-name").fill("Referenced projects")
+    await page.locator("#folder-rename-submit").click()
+
+    dialog = page.locator("#folder-rename-dialog")
+    await dialog.get_by_text("enabled mail rule", exact=False).wait_for()
+    assert await dialog.is_visible()
+    assert live_application.gateway.renamed_mailboxes == []
+    assert await page.locator("#mail-mailbox").input_value() == MAILBOX
+
+
+async def test_same_folder_menu_opener_toggles_closed_and_clears_expanded_state(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    live_application.gateway.extra_mailboxes.append("Projects")
+    await _load_inbox(page, live_application)
+    item = _folder_item(page, "Projects")
+    button = item.locator(".mail-folder-menu-button")
+    menu = page.locator("#mail-folder-menu")
+
+    await _open_folder_menu(page, "Projects")
+    assert await button.get_attribute("aria-expanded") == "true"
+
+    await button.evaluate("node => node.click()")
+    await menu.wait_for(state="hidden")
+    assert await button.get_attribute("aria-expanded") == "false"
+    assert await page.locator(
+        '#mail-folder-list [aria-controls="mail-folder-menu"][aria-expanded="true"]'
+    ).count() == 0
+
+
+async def test_custom_folder_delete_targets_the_clicked_non_current_folder(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    live_application.gateway.extra_mailboxes.append("Projects")
+    await _load_inbox(page, live_application)
+
+    menu = await _open_folder_menu(page, "Projects")
+    await menu.locator('[role="menuitem"][data-action="delete"]').click()
+    await page.locator(
+        '#folder-delete-form input[name="disposition"][value="trash"]'
+    ).check()
+    await page.locator("#folder-delete-confirmation").fill("Projects")
+    await page.locator("#folder-delete-submit").click()
+
+    await page.locator("#folder-delete-dialog").wait_for(state="hidden")
+    assert live_application.gateway.deleted_mailboxes == [
+        (ACCOUNT, "Projects", "trash", None)
+    ]
+    assert await page.locator("#mail-mailbox").input_value() == MAILBOX
+    assert f"mailbox={MAILBOX}" in page.url
+
+
 async def test_custom_folder_delete_moves_messages_before_removing_the_folder(
     page: Page,
     live_application: LiveApplication,
@@ -1671,15 +2635,23 @@ async def test_custom_folder_delete_moves_messages_before_removing_the_folder(
     live_application.gateway.extra_mailboxes.append("Projects")
     live_application.gateway.message_location = "Projects"
     await page.goto(live_application.base_url + _mailbox_path("Projects"))
-    await page.locator("#mail-folder-delete").wait_for()
+    folder_item = _folder_item(page, "Projects")
+    await folder_item.wait_for()
+    assert await page.locator("#mail-folder-delete").count() == 0
+    item_bounds = await folder_item.bounding_box()
+    button_bounds = await folder_item.locator(
+        ".mail-folder-menu-button"
+    ).bounding_box()
+    assert item_bounds is not None
+    assert button_bounds is not None
+    assert button_bounds["x"] >= item_bounds["x"]
+    assert button_bounds["x"] + button_bounds["width"] <= (
+        item_bounds["x"] + item_bounds["width"] + 1
+    )
 
-    tools = await page.locator("#mail-folder-tools").bounding_box()
-    selector = await page.locator("#mail-selector").bounding_box()
-    assert tools is not None
-    assert selector is not None
-    assert selector["y"] >= tools["y"] + tools["height"] + 12
-
-    await page.locator("#mail-folder-delete").click()
+    menu = await _open_folder_menu(page, "Projects")
+    assert await menu.locator('[role="menuitem"][data-action="rename"]').count() == 1
+    await menu.locator('[role="menuitem"][data-action="delete"]').click()
     dialog = page.locator("#folder-delete-dialog")
     await dialog.wait_for()
     assert await dialog.get_by_text(
@@ -1711,7 +2683,8 @@ async def test_custom_folder_delete_can_move_every_message_to_trash(
     live_application.gateway.extra_mailboxes.append("Temporary")
     live_application.gateway.message_location = "Temporary"
     await page.goto(live_application.base_url + _mailbox_path("Temporary"))
-    await page.locator("#mail-folder-delete").click()
+    menu = await _open_folder_menu(page, "Temporary")
+    await menu.locator('[role="menuitem"][data-action="delete"]').click()
     await page.locator(
         '#folder-delete-form input[name="disposition"][value="trash"]'
     ).check()
@@ -1749,7 +2722,8 @@ async def test_ambiguous_folder_delete_keeps_the_dialog_and_requires_refresh(
         )
 
     await page.route("**/api/v1/admin/mailboxes/delete", fail_delete)
-    await page.locator("#mail-folder-delete").click()
+    menu = await _open_folder_menu(page, "Temporary")
+    await menu.locator('[role="menuitem"][data-action="delete"]').click()
     await page.locator("#folder-delete-confirmation").fill("Temporary")
     await page.locator("#folder-delete-submit").click()
 
@@ -1759,11 +2733,12 @@ async def test_ambiguous_folder_delete_keeps_the_dialog_and_requires_refresh(
     assert "mailbox=Temporary" in page.url
 
 
-async def test_folder_and_bulk_action_layout_keeps_controls_in_clear_groups(
+async def test_folder_cards_and_message_header_keep_actions_scoped(
     page: Page,
     live_application: LiveApplication,
 ) -> None:
     await page.set_viewport_size({"width": 1074, "height": 1000})
+    live_application.gateway.extra_mailboxes.append("Projects")
     await _load_inbox(page, live_application)
 
     tools = await page.locator("#mail-folder-tools").bounding_box()
@@ -1771,43 +2746,96 @@ async def test_folder_and_bulk_action_layout_keeps_controls_in_clear_groups(
     assert tools is not None
     assert selector is not None
     assert selector["y"] >= tools["y"] + tools["height"] + 12
+    assert await page.locator("#mail-folder-delete").count() == 0
+    assert await _folder_item(page, MAILBOX).locator(
+        ".mail-folder-menu-button"
+    ).count() == 0
+    assert await _folder_item(page, SENT_MAILBOX).locator(
+        ".mail-folder-menu-button"
+    ).count() == 0
+    assert await _folder_item(page, "Projects").locator(
+        ".mail-folder-menu-button"
+    ).count() == 1
 
-    action_rows = []
-    for selector_value in (
+    assert await page.locator("#mail-select-page").is_visible()
+    assert await page.locator("#mail-selection-count").is_visible()
+    assert await page.locator("#mail-mark-all-read").is_visible()
+    for removed in (
         "#mail-mark-read",
         "#mail-mark-unread",
         "#mail-bulk-archive",
         "#mail-bulk-trash",
+        "#mail-bulk-move-target",
+        "#mail-bulk-move",
     ):
-        bounds = await page.locator(selector_value).bounding_box()
-        assert bounds is not None
-        action_rows.append(round(bounds["y"]))
-    assert max(action_rows) - min(action_rows) <= 1
-    move_target = await page.locator("#mail-bulk-move-target").bounding_box()
-    move_button = await page.locator("#mail-bulk-move").bounding_box()
-    assert move_target is not None
-    assert move_button is not None
-    assert abs(move_target["y"] - move_button["y"]) <= 1
-    assert await page.locator("#mail-bulk-toolbar").evaluate(
-        "element => element.scrollWidth <= element.clientWidth"
+        assert await page.locator(removed).count() == 0
+
+
+async def test_folder_menu_uses_icons_and_danger_hover_feedback(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    live_application.gateway.extra_mailboxes.append("Projects")
+    await _load_inbox(page, live_application)
+    menu = await _open_folder_menu(page, "Projects")
+    items = menu.locator('[role="menuitem"]')
+
+    folder_more_icon = _folder_item(page, "Projects").locator(
+        ".mail-folder-menu-button svg"
     )
+    folder_more_style = await folder_more_icon.evaluate(
+        """node => {
+            const style = getComputedStyle(node);
+            return {
+                width: Number.parseFloat(style.width),
+                height: Number.parseFloat(style.height),
+                strokeWidth: Number.parseFloat(style.strokeWidth),
+            };
+        }"""
+    )
+    assert folder_more_style["width"] >= 20
+    assert folder_more_style["height"] >= 20
+    assert folder_more_style["strokeWidth"] >= 4.5
+
+    assert await items.count() == 2
+    assert await items.evaluate_all(
+        """nodes => nodes.every(node => (
+            node.firstElementChild?.matches("svg[aria-hidden='true']")
+            && node.lastElementChild?.matches(".context-menu-item-label")
+        ))"""
+    )
+    delete = menu.locator('[role="menuitem"][data-action="delete"]')
+    assert await delete.get_attribute("class") == "context-menu-item is-danger"
+    background_before = await delete.evaluate(
+        "node => getComputedStyle(node).backgroundColor"
+    )
+    menu_background = await menu.evaluate(
+        "node => getComputedStyle(node).backgroundColor"
+    )
+    await delete.hover()
+    background_after = await delete.evaluate(
+        "node => getComputedStyle(node).backgroundColor"
+    )
+    assert background_after != background_before
+    assert background_after != menu_background
+    assert background_after not in {"transparent", "rgba(0, 0, 0, 0)"}
 
 
-async def test_trash_bulk_actions_remain_visible_at_wide_desktop_breakpoint(
+async def test_trash_bulk_permanent_delete_is_available_from_the_context_menu(
     page: Page,
     live_application: LiveApplication,
 ) -> None:
     await page.set_viewport_size({"width": 1440, "height": 1000})
+    live_application.gateway.message_location = TRASH_MAILBOX
     await page.goto(live_application.base_url + _mailbox_path(TRASH_MAILBOX))
-    await page.locator("#mail-bulk-permanent-delete").wait_for()
-
-    move_target = page.locator("#mail-bulk-move-target")
-    move_button = page.locator("#mail-bulk-move")
-    assert await move_target.is_visible()
-    assert await move_button.is_visible()
-    assert await page.locator("#mail-bulk-toolbar").evaluate(
-        "element => element.scrollWidth <= element.clientWidth"
-    )
+    row = page.locator("#message-list-body tr")
+    await row.wait_for()
+    await row.locator(".message-select-checkbox").check()
+    menu = await _open_message_menu(page, row)
+    assert await menu.locator(
+        '[role="menuitem"][data-action="permanent-delete"]'
+    ).is_enabled()
+    assert await menu.locator('[role="menuitem"][data-action="trash"]').count() == 0
 
 
 async def test_completed_folder_creation_does_not_hijack_a_newer_route(
@@ -2509,7 +3537,7 @@ async def test_mailbox_forward_actions_prepare_safe_compose_drafts(
     page.on("request", lambda request: requested_urls.append(request.url))
     await _load_inbox(page, live_application)
     row = page.locator("#message-list-body tr")
-    await row.get_by_role("button", name="Forward", exact=True).click()
+    await _message_menu_action(page, row, "forward")
     await page.wait_for_url("**/compose?forward=inline*")
     await page.wait_for_function(
         "() => document.querySelector('#compose-subject').value.startsWith('Fwd:')"
@@ -2531,7 +3559,7 @@ async def test_mailbox_forward_actions_prepare_safe_compose_drafts(
 
     await _load_inbox(page, live_application)
     row = page.locator("#message-list-body tr")
-    await row.get_by_role("button", name="Forward as attachment", exact=True).click()
+    await _message_menu_action(page, row, "forward-attachment")
     await page.wait_for_url("**/compose?forward=attachment*")
     await page.wait_for_function(
         "() => document.querySelector('#attachments-input').files.length === 1"
@@ -2585,7 +3613,7 @@ async def test_forward_as_attachment_does_not_require_a_parseable_message(
     assert detail_status == 422
 
     row = page.locator("#message-list-body tr")
-    await row.get_by_role("button", name="Forward as attachment", exact=True).click()
+    await _message_menu_action(page, row, "forward-attachment")
     await page.wait_for_url("**/compose?forward=attachment*")
     await page.wait_for_function(
         "() => document.querySelector('#attachments-input').files.length === 1"
@@ -2609,7 +3637,7 @@ async def test_mailbox_actions_preflight_freshness_and_close_pending_confirmatio
     live_application.gateway.message_read_release.clear()
     row = page.locator("#message-list-body tr")
     live_application.gateway.archive_move_release.clear()
-    await row.get_by_role("button", name="Archive", exact=True).click()
+    await _message_menu_action(page, row, "archive")
     await asyncio.wait_for(live_application.gateway.message_read_started.wait(), timeout=2)
     assert not live_application.gateway.archive_move_started.is_set()
     live_application.gateway.message_read_release.set()
@@ -2626,7 +3654,7 @@ async def test_mailbox_actions_preflight_freshness_and_close_pending_confirmatio
     await _load_inbox(page, live_application)
     live_application.gateway.message_read_started.clear()
     row = page.locator("#message-list-body tr")
-    await row.get_by_role("button", name="Delete", exact=True).click()
+    await _message_menu_action(page, row, "trash")
     await page.locator("#confirm-dialog").wait_for(state="visible")
     assert not live_application.gateway.message_read_started.is_set()
     await page.go_back()
@@ -2641,19 +3669,28 @@ async def test_special_use_mailboxes_disable_same_target_actions(
     live_application.gateway.message_location = TRASH_MAILBOX
     await _load_mailbox(page, live_application, TRASH_MAILBOX)
     trash_row = page.locator("#message-list-body tr")
-    assert await trash_row.get_by_role(
-        "button",
-        name="Permanently delete",
-        exact=True,
+    trash_menu = await _open_message_menu(page, trash_row)
+    assert await trash_menu.locator(
+        '[role="menuitem"][data-action="permanent-delete"]'
     ).is_enabled()
-    assert await trash_row.get_by_role("button", name="Delete", exact=True).count() == 0
-    assert await trash_row.get_by_role("button", name="Archive", exact=True).is_enabled()
+    assert await trash_menu.locator(
+        '[role="menuitem"][data-action="trash"]'
+    ).count() == 0
+    assert await trash_menu.locator(
+        '[role="menuitem"][data-action="archive"]'
+    ).is_enabled()
+    await page.keyboard.press("Escape")
 
     live_application.gateway.message_location = ARCHIVE_MAILBOX
     await _load_mailbox(page, live_application, ARCHIVE_MAILBOX)
     archive_row = page.locator("#message-list-body tr")
-    assert await archive_row.get_by_role("button", name="Archive", exact=True).is_disabled()
-    assert await archive_row.get_by_role("button", name="Delete", exact=True).is_enabled()
+    archive_menu = await _open_message_menu(page, archive_row)
+    assert await archive_menu.locator(
+        '[role="menuitem"][data-action="archive"]'
+    ).count() == 0
+    assert await archive_menu.locator(
+        '[role="menuitem"][data-action="trash"]'
+    ).is_enabled()
 
 
 async def test_trash_row_permanent_delete_requires_typed_confirmation_and_snapshot(
@@ -2672,11 +3709,7 @@ async def test_trash_row_permanent_delete_requires_typed_confirmation_and_snapsh
 
     page.on("request", capture_action_request)
     row = page.locator("#message-list-body tr")
-    await row.get_by_role(
-        "button",
-        name="Permanently delete",
-        exact=True,
-    ).click()
+    await _message_menu_action(page, row, "permanent-delete")
 
     dialog = page.locator("#typed-confirm-dialog")
     await dialog.wait_for(state="visible")
@@ -2738,20 +3771,22 @@ async def test_trash_bulk_permanent_delete_requires_per_message_freshness_and_on
             action_requests.append(request)
 
     page.on("request", capture_action_request)
-    bulk_delete = page.locator("#mail-bulk-permanent-delete")
-    assert await bulk_delete.is_visible()
-    assert await bulk_delete.is_disabled()
-    assert await page.locator("#mail-bulk-trash").is_hidden()
+    assert await page.locator("#mail-bulk-permanent-delete").count() == 0
+    assert await page.locator("#mail-bulk-trash").count() == 0
 
     await page.locator("#mail-select-page").check()
     assert await page.locator("#mail-selection-count").inner_text() == "2 selected"
+    menu = await _open_message_menu(page, page.locator("#message-list-body tr").first)
+    bulk_delete = menu.locator(
+        '[role="menuitem"][data-action="permanent-delete"]'
+    )
     assert await bulk_delete.is_enabled()
     await bulk_delete.click()
 
     dialog = page.locator("#typed-confirm-dialog")
     await dialog.wait_for(state="visible")
     assert await page.locator("#typed-confirm-title").inner_text() == (
-        "Permanently delete 2 messages from Trash?"
+        "Permanently delete 2 messages?"
     )
     assert "cannot be undone" in (await page.locator("#typed-confirm-message").inner_text()).lower()
     assert action_requests == []
@@ -2812,6 +3847,30 @@ async def test_unknown_bulk_delete_result_locks_stale_mail_ui_when_reload_fails(
     page: Page,
     live_application: LiveApplication,
 ) -> None:
+    second_message_id = "43"
+
+    async def two_messages(
+        _account: str,
+        mailbox: str,
+        **_kwargs: object,
+    ) -> MessagePage:
+        if live_application.gateway.message_location != mailbox:
+            return MessagePage([], False)
+        return MessagePage(
+            [
+                {
+                    "id": uid,
+                    "sender": "attacker@example.test",
+                    "subject": f"Unknown delete result {uid}",
+                    "date": "2026-08-06 12:00 UTC",
+                    "unread": True,
+                }
+                for uid in (MESSAGE_ID, second_message_id)
+            ],
+            False,
+        )
+
+    live_application.gateway.list_messages = two_messages  # type: ignore[method-assign]
     live_application.gateway.message_location = TRASH_MAILBOX
     await _load_mailbox(page, live_application, TRASH_MAILBOX)
     mutation_requests = 0
@@ -2851,7 +3910,11 @@ async def test_unknown_bulk_delete_result_locks_stale_mail_ui_when_reload_fails(
     await page.route("**/api/v1/admin/mail-actions", fail_delete)
     await page.route("**/api/v1/admin/mail?*", fail_mail_reload)
     await page.locator("#mail-select-page").check()
-    await page.locator("#mail-bulk-permanent-delete").click()
+    await _message_menu_action(
+        page,
+        page.locator("#message-list-body tr").first,
+        "permanent-delete",
+    )
     await page.locator("#typed-confirm-input").fill("PERMANENTLY DELETE")
     await page.locator("#typed-confirm-action").click()
 
@@ -2862,11 +3925,11 @@ async def test_unknown_bulk_delete_result_locks_stale_mail_ui_when_reload_fails(
     assert await page.locator("#message-list-body tr").count() == 0
     assert await page.locator("#mail-selection-count").inner_text() == "0 selected"
     assert await page.locator("#mail-select-page").is_disabled()
-    assert await page.locator("#mail-mark-read").is_disabled()
-    assert await page.locator("#mail-mark-unread").is_disabled()
-    assert await page.locator("#mail-bulk-archive").is_disabled()
-    assert await page.locator("#mail-bulk-trash").is_disabled()
-    assert await page.locator("#mail-bulk-permanent-delete").is_hidden()
+    assert await page.locator("#mail-mark-read").count() == 0
+    assert await page.locator("#mail-mark-unread").count() == 0
+    assert await page.locator("#mail-bulk-archive").count() == 0
+    assert await page.locator("#mail-bulk-trash").count() == 0
+    assert await page.locator("#mail-bulk-permanent-delete").count() == 0
     assert await page.locator("#mail-mark-all-read").is_disabled()
     assert await page.locator("#mail-search-input").is_disabled()
     assert mutation_requests == 1
@@ -2886,14 +3949,10 @@ async def test_trash_row_permanent_delete_confirmation_does_not_survive_navigati
             action_requests.append(path)
 
     page.on("request", capture_action_request)
-    await (
-        page.locator("#message-list-body tr")
-        .get_by_role(
-            "button",
-            name="Permanently delete",
-            exact=True,
-        )
-        .click()
+    await _message_menu_action(
+        page,
+        page.locator("#message-list-body tr"),
+        "permanent-delete",
     )
     dialog = page.locator("#typed-confirm-dialog")
     await dialog.wait_for(state="visible")
@@ -2919,7 +3978,7 @@ async def test_trash_row_permanent_delete_confirmation_does_not_survive_navigati
     assert live_application.gateway.permanent_deletions == []
 
 
-async def test_missing_special_use_targets_disable_move_actions(
+async def test_missing_special_use_targets_omit_unavailable_actions(
     page: Page,
     live_application: LiveApplication,
 ) -> None:
@@ -2929,14 +3988,19 @@ async def test_missing_special_use_targets_disable_move_actions(
     live_application.gateway.list_mailboxes = inbox_only  # type: ignore[method-assign]
     await _load_inbox(page, live_application)
     row = page.locator("#message-list-body tr")
-    assert await row.get_by_role(
-        "button",
-        name="Permanently delete",
-        exact=True,
+    menu = await _open_message_menu(page, row)
+    assert await menu.locator(
+        '[role="menuitem"][data-action="permanent-delete"]'
+    ).count() == 0
+    assert await menu.locator(
+        '[role="menuitem"][data-action="archive"]'
+    ).count() == 0
+    assert await menu.locator(
+        '[role="menuitem"][data-action="forward"]'
     ).is_enabled()
-    assert await row.get_by_role("button", name="Archive", exact=True).is_disabled()
-    assert await row.get_by_role("button", name="Forward", exact=True).is_enabled()
-    assert await row.get_by_role("button", name="Forward as attachment", exact=True).is_enabled()
+    assert await menu.locator(
+        '[role="menuitem"][data-action="forward-attachment"]'
+    ).is_enabled()
 
 
 async def test_completed_move_posts_do_not_hijack_a_newer_route(
@@ -2946,7 +4010,7 @@ async def test_completed_move_posts_do_not_hijack_a_newer_route(
     await _load_inbox(page, live_application)
     live_application.gateway.archive_move_release.clear()
     row = page.locator("#message-list-body tr")
-    await row.get_by_role("button", name="Archive", exact=True).click()
+    await _message_menu_action(page, row, "archive")
     await asyncio.wait_for(live_application.gateway.archive_move_started.wait(), timeout=2)
     await page.evaluate(
         """() => {
@@ -2968,7 +4032,7 @@ async def test_completed_move_posts_do_not_hijack_a_newer_route(
     await _load_inbox(page, live_application)
     live_application.gateway.trash_move_release.clear()
     row = page.locator("#message-list-body tr")
-    await row.get_by_role("button", name="Delete", exact=True).click()
+    await _message_menu_action(page, row, "trash")
     await page.locator("#confirm-action").click()
     await asyncio.wait_for(live_application.gateway.trash_move_started.wait(), timeout=2)
     await page.evaluate(
@@ -2997,7 +4061,7 @@ async def test_mailbox_delete_and_archive_actions_do_not_open_the_message(
 ) -> None:
     await _load_inbox(page, live_application)
     row = page.locator("#message-list-body tr")
-    await row.get_by_role("button", name="Delete", exact=True).click()
+    await _message_menu_action(page, row, "trash")
     await page.locator("#confirm-dialog").wait_for(state="visible")
     assert urlsplit(page.url).path == "/mail"
     assert live_application.gateway.trash_moves == []
@@ -3010,7 +4074,7 @@ async def test_mailbox_delete_and_archive_actions_do_not_open_the_message(
     live_application.gateway.message_location = MAILBOX
     await _load_inbox(page, live_application)
     row = page.locator("#message-list-body tr")
-    await row.get_by_role("button", name="Archive", exact=True).press("Enter")
+    await _message_menu_action(page, row, "archive", keyboard=True)
     await page.locator("#message-empty").wait_for(state="visible")
     assert urlsplit(page.url).path == "/mail"
     assert live_application.gateway.bulk_moves[-1] == (
@@ -4002,11 +5066,21 @@ async def test_folder_and_rule_builder_controls_have_mobile_touch_targets(
     await page.get_by_role("heading", name="Mobile folder", exact=True).wait_for()
     await page.locator("#mobile-folders-button").click()
     folder_toggle = page.locator("#mail-folder-create-toggle")
-    folder_delete = page.locator("#mail-folder-delete")
-    delete_bounds = await folder_delete.bounding_box()
-    assert delete_bounds is not None
-    assert delete_bounds["height"] >= 44 - TOUCH_TARGET_GEOMETRY_TOLERANCE_PX
-    assert delete_bounds["width"] >= 44 - TOUCH_TARGET_GEOMETRY_TOLERANCE_PX
+    folder_menu_button = _folder_item(page, "Mobile folder").locator(
+        ".mail-folder-menu-button"
+    )
+    menu_button_bounds = await folder_menu_button.bounding_box()
+    assert menu_button_bounds is not None
+    assert menu_button_bounds["height"] >= 44 - TOUCH_TARGET_GEOMETRY_TOLERANCE_PX
+    assert menu_button_bounds["width"] >= 44 - TOUCH_TARGET_GEOMETRY_TOLERANCE_PX
+    menu = await _open_folder_menu(page, "Mobile folder")
+    for action in ("rename", "delete"):
+        bounds = await menu.locator(
+            f'[role="menuitem"][data-action="{action}"]'
+        ).bounding_box()
+        assert bounds is not None
+        assert bounds["height"] >= 44 - TOUCH_TARGET_GEOMETRY_TOLERANCE_PX
+    await page.keyboard.press("Escape")
     await folder_toggle.click()
     controls = [
         folder_toggle,

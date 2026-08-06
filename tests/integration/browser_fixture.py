@@ -75,6 +75,7 @@ class BrowserGateway:
         )
         self.messages: list[dict[str, object]] = []
         self.raw_by_uid: dict[str, bytes] = {}
+        self.message_mailboxes: dict[str, str] = {}
         for uid, sender, subject, date, unread, html in definitions:
             message = EmailMessage()
             message["From"] = sender
@@ -88,6 +89,7 @@ class BrowserGateway:
             message.set_content("Open the HTML view to read this fixture message.")
             message.add_alternative(html, subtype="html")
             self.raw_by_uid[uid] = message.as_bytes(policy=policy.SMTP)
+            self.message_mailboxes[uid] = "INBOX"
             self.messages.append(
                 {
                     "id": uid,
@@ -97,6 +99,13 @@ class BrowserGateway:
                     "unread": unread,
                 }
             )
+        self.mailboxes: list[dict[str, object]] = [
+            {"name": "INBOX", "attributes": []},
+            {"name": "Archive", "attributes": ["\\Archive"]},
+            {"name": "Sent", "attributes": ["\\Sent"]},
+            {"name": "Trash", "attributes": ["\\Trash"]},
+            {"name": "Projects", "attributes": []},
+        ]
 
     async def health(self) -> dict[str, object]:
         return {
@@ -164,23 +173,49 @@ class BrowserGateway:
         ]
 
     async def list_mailboxes(self, _account: str) -> list[dict[str, object]]:
-        return [
-            {"name": "INBOX", "attributes": []},
-            {"name": "Archive", "attributes": ["\\Archive"]},
-            {"name": "Sent", "attributes": ["\\Sent"]},
-            {"name": "Trash", "attributes": ["\\Trash"]},
-            {"name": "Projects", "attributes": []},
-        ]
+        return [dict(mailbox) for mailbox in self.mailboxes]
+
+    async def rename_mailbox(
+        self,
+        _account: str,
+        old_name: str,
+        new_name: str,
+    ) -> None:
+        mailbox = next(
+            (item for item in self.mailboxes if item["name"] == old_name),
+            None,
+        )
+        if mailbox is None:
+            raise ValueError("unknown fixture mailbox")
+        if any(
+            str(item["name"]).casefold() == new_name.casefold()
+            for item in self.mailboxes
+            if item is not mailbox
+        ):
+            raise ValueError("fixture mailbox already exists")
+        mailbox["name"] = new_name
+        for uid, location in tuple(self.message_mailboxes.items()):
+            if location == old_name:
+                self.message_mailboxes[uid] = new_name
 
     async def delete_named_mailbox(
         self,
         _account: str,
-        _mailbox: str,
+        mailbox: str,
         *,
         disposition: str,
         target_mailbox: str | None = None,
     ) -> str:
-        return target_mailbox if disposition == "move" else "Trash"
+        target = target_mailbox if disposition == "move" else "Trash"
+        if target is None:
+            raise ValueError("fixture deletion target is required")
+        if not any(item["name"] == mailbox for item in self.mailboxes):
+            raise ValueError("unknown fixture mailbox")
+        self.mailboxes = [item for item in self.mailboxes if item["name"] != mailbox]
+        for uid, location in tuple(self.message_mailboxes.items()):
+            if location == mailbox:
+                self.message_mailboxes[uid] = target
+        return target
 
     async def list_messages(
         self,
@@ -188,12 +223,22 @@ class BrowserGateway:
         mailbox: str,
         **_kwargs: object,
     ) -> MessagePage:
-        return MessagePage(self.messages if mailbox == "INBOX" else [], False)
+        items = [
+            message
+            for message in self.messages
+            if self.message_mailboxes.get(str(message["id"])) == mailbox
+        ]
+        return MessagePage(items, False)
 
     async def latest_message_uid(self, _account: str, mailbox: str) -> int:
-        if mailbox != "INBOX" or not self.messages:
+        uids = [
+            int(str(message["id"]))
+            for message in self.messages
+            if self.message_mailboxes.get(str(message["id"])) == mailbox
+        ]
+        if not uids:
             return 0
-        return max(int(str(message["id"])) for message in self.messages)
+        return max(uids)
 
     async def spool_message(
         self,
@@ -213,23 +258,131 @@ class BrowserGateway:
         await asyncio.to_thread(os.chmod, destination, 0o600)
         return len(raw)
 
-    async def move_message_to_trash(self, *_args: object) -> str:
-        return "Custom Trash"
+    def _move_messages(self, mailbox: str, message_ids: tuple[str, ...], target: str) -> None:
+        for message_id in message_ids:
+            if self.message_mailboxes.get(message_id) != mailbox:
+                raise ValueError("unknown fixture message location")
+        for message_id in message_ids:
+            self.message_mailboxes[message_id] = target
 
-    async def move_message_to_archive(self, *_args: object) -> str:
-        return "Custom Archive"
+    async def move_message_to_trash(
+        self,
+        _account: str,
+        mailbox: str,
+        message_id: str,
+    ) -> str:
+        self._move_messages(mailbox, (message_id,), "Trash")
+        return "Trash"
 
-    async def set_messages_seen(self, *_args: object, **_kwargs: object) -> None:
-        return None
+    async def move_message_to_archive(
+        self,
+        _account: str,
+        mailbox: str,
+        message_id: str,
+    ) -> str:
+        self._move_messages(mailbox, (message_id,), "Archive")
+        return "Archive"
 
-    async def move_messages_to_trash(self, *_args: object) -> str:
-        return "Custom Trash"
+    async def move_message(
+        self,
+        _account: str,
+        mailbox: str,
+        message_id: str,
+        target: str,
+    ) -> str:
+        self._move_messages(mailbox, (message_id,), target)
+        return target
 
-    async def move_messages_to_archive(self, *_args: object) -> str:
-        return "Custom Archive"
+    async def set_messages_seen(
+        self,
+        _account: str,
+        mailbox: str,
+        message_ids: tuple[str, ...] | None,
+        *,
+        seen: bool,
+    ) -> None:
+        selected = (
+            {
+                str(message["id"])
+                for message in self.messages
+                if self.message_mailboxes.get(str(message["id"])) == mailbox
+            }
+            if message_ids is None
+            else set(message_ids)
+        )
+        if any(self.message_mailboxes.get(message_id) != mailbox for message_id in selected):
+            raise ValueError("unknown fixture message location")
+        for message in self.messages:
+            if str(message["id"]) in selected:
+                message["unread"] = not seen
 
-    async def delete_message_permanently(self, *_args: object) -> None:
-        return None
+    async def set_message_seen(
+        self,
+        _account: str,
+        mailbox: str,
+        message_id: str,
+        *,
+        seen: bool,
+    ) -> None:
+        if self.message_mailboxes.get(message_id) != mailbox:
+            raise ValueError("unknown fixture message location")
+        message = next(
+            (item for item in self.messages if str(item["id"]) == message_id),
+            None,
+        )
+        if message is None:
+            raise ValueError("unknown fixture message")
+        message["unread"] = not seen
+
+    async def move_messages_to_trash(
+        self,
+        _account: str,
+        mailbox: str,
+        message_ids: tuple[str, ...],
+    ) -> str:
+        self._move_messages(mailbox, message_ids, "Trash")
+        return "Trash"
+
+    async def move_messages_to_archive(
+        self,
+        _account: str,
+        mailbox: str,
+        message_ids: tuple[str, ...],
+    ) -> str:
+        self._move_messages(mailbox, message_ids, "Archive")
+        return "Archive"
+
+    async def move_messages(
+        self,
+        _account: str,
+        mailbox: str,
+        message_ids: tuple[str, ...],
+        target: str,
+    ) -> str:
+        self._move_messages(mailbox, message_ids, target)
+        return target
+
+    async def delete_message_permanently(
+        self,
+        _account: str,
+        mailbox: str,
+        message_id: str,
+    ) -> None:
+        if self.message_mailboxes.get(message_id) != mailbox:
+            raise ValueError("unknown fixture message location")
+        self.message_mailboxes.pop(message_id)
+
+    async def delete_messages_permanently(
+        self,
+        _account: str,
+        mailbox: str,
+        message_ids: tuple[str, ...],
+    ) -> None:
+        for message_id in message_ids:
+            if self.message_mailboxes.get(message_id) != mailbox:
+                raise ValueError("unknown fixture message location")
+        for message_id in message_ids:
+            self.message_mailboxes.pop(message_id)
 
 
 @web.middleware

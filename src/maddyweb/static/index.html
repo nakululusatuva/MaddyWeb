@@ -162,12 +162,6 @@
                 <p id="mail-folder-create-status" class="field-help" role="status" aria-live="polite"></p>
               </form>
             </div>
-            <button id="mail-folder-delete" class="mail-folder-delete" type="button" aria-label="Delete current folder" title="Delete current folder" hidden>
-              <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-                <path d="M4 7h16M9 7V4h6v3m-8 0 1 13h8l1-13M10 11v5m4-5v5"></path>
-              </svg>
-              <span class="sr-only">Delete folder</span>
-            </button>
           </div>
           <div id="mail-selector" class="mail-selector">
             <label id="mail-account-field">
@@ -228,18 +222,6 @@
             </label>
             <span id="mail-selection-count" class="mail-selection-count" aria-live="polite">0 selected</span>
             <button id="mail-mark-all-read" class="button button-secondary mail-mark-all-read" type="button" disabled>Mark all as read</button>
-            <div class="mail-bulk-actions">
-              <button id="mail-mark-read" class="button button-secondary" type="button" disabled>Mark read</button>
-              <button id="mail-mark-unread" class="button button-secondary" type="button" disabled>Mark unread</button>
-              <button id="mail-bulk-archive" class="button button-secondary" type="button" disabled>Archive</button>
-              <button id="mail-bulk-trash" class="button button-secondary" type="button" disabled>Trash</button>
-              <span class="mail-move-control mail-bulk-move-control">
-                <label class="sr-only" for="mail-bulk-move-target">Move selected messages to folder</label>
-                <select id="mail-bulk-move-target" disabled><option value="">Move to...</option></select>
-                <button id="mail-bulk-move" class="button button-secondary" type="button" disabled>Move</button>
-              </span>
-              <button id="mail-bulk-permanent-delete" class="button button-danger" type="button" hidden disabled>Permanently delete</button>
-            </div>
           </div>
           <div id="mail-switch-loader" class="mail-switch-loader" role="status" aria-live="polite" aria-atomic="true" hidden>
             <div class="mail-switch-card">
@@ -253,7 +235,7 @@
           </div>
           <div class="mail-list-table">
             <table class="message-table">
-              <thead><tr><th scope="col">Sender</th><th scope="col">Subject</th><th scope="col">Date</th><th scope="col">Actions</th></tr></thead>
+              <thead><tr><th scope="col">Sender</th><th scope="col">Subject</th><th scope="col">Date</th></tr></thead>
               <tbody id="message-list-body"></tbody>
             </table>
           </div>
@@ -567,6 +549,9 @@
 
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 
+  <div id="mail-folder-menu" class="context-menu" role="menu" aria-label="Folder actions" hidden></div>
+  <div id="message-context-menu" class="context-menu message-context-menu" role="menu" aria-label="Message actions" hidden></div>
+
   <dialog id="account-dialog">
     <div class="dialog-card">
       <div class="dialog-heading"><div><p class="eyebrow">Account controls</p><h2>Manage account</h2><p id="account-dialog-address"></p></div><button class="dialog-close" type="button" data-close-dialog aria-label="Close">&times;</button></div>
@@ -646,6 +631,24 @@
       <div class="dialog-actions">
         <button class="button button-secondary" type="button" data-close-dialog>Cancel</button>
         <button id="folder-delete-submit" class="button button-danger" type="submit" disabled>Delete folder</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="folder-rename-dialog">
+    <form id="folder-rename-form" class="dialog-card">
+      <div class="dialog-heading">
+        <div><p class="eyebrow">Folder settings</p><h2 id="folder-rename-title">Rename folder</h2><p id="folder-rename-copy"></p></div>
+        <button class="dialog-close" type="button" data-close-dialog aria-label="Close">&times;</button>
+      </div>
+      <label for="folder-rename-name">
+        <span>New folder name</span>
+        <input id="folder-rename-name" name="new_name" type="text" maxlength="255" autocomplete="off" required>
+      </label>
+      <p id="folder-rename-status" class="field-help" role="status" aria-live="polite"></p>
+      <div class="dialog-actions">
+        <button class="button button-secondary" type="button" data-close-dialog>Cancel</button>
+        <button id="folder-rename-submit" class="button button-primary" type="submit">Rename folder</button>
       </div>
     </form>
   </dialog>

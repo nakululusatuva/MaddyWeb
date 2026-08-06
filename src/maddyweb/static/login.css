@@ -293,6 +293,26 @@ input:focus {
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 18%, transparent);
 }
 
+input:is([type="checkbox"], [type="radio"]) {
+  width: 18px;
+  min-width: 18px;
+  height: 18px;
+  min-height: 18px;
+  padding: 0;
+  box-shadow: none;
+  transition: none;
+}
+
+input:is([type="checkbox"], [type="radio"]):focus {
+  border-color: initial;
+  box-shadow: none;
+}
+
+input:is([type="checkbox"], [type="radio"]):focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--primary) 52%, transparent);
+  outline-offset: 2px;
+}
+
 .code-input {
   max-width: 230px;
   font-family: ui-monospace, "Cascadia Code", monospace;

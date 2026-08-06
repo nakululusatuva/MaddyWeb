@@ -736,7 +736,10 @@ async def test_home_static_assets_and_strict_headers(
     assert 'id="new-mail-announcer"' in page
     assert 'id="startup-recovery"' in page
     assert 'href="">Reload this page</a>' in page
-    assert 'id="mail-bulk-permanent-delete"' in page
+    assert 'id="mail-bulk-permanent-delete"' not in page
+    assert 'id="mail-folder-menu"' in page
+    assert 'id="message-context-menu"' in page
+    assert 'id="folder-rename-dialog"' in page
     assert 'id="compose-sender-name"' in page
     assert 'name="sender_name"' in page
     assert 'maxlength="256"' in page
