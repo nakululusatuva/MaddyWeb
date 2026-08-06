@@ -1951,6 +1951,201 @@ td:last-child .button,
   gap: 4px;
 }
 
+.recipient-editor {
+  position: relative;
+  min-width: 0;
+}
+
+.recipient-editor-field {
+  display: flex;
+  min-width: 0;
+  min-height: 38px;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 7px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  transition:
+    border-color 140ms ease,
+    background 140ms ease,
+    box-shadow 140ms ease;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .recipient-editor-field:hover {
+    border-color: var(--border);
+    background: var(--surface-hover);
+  }
+}
+
+.recipient-editor-field:focus-within {
+  border-color: var(--focus);
+  background: var(--surface);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--focus) 18%, transparent);
+}
+
+.recipient-chip-list {
+  display: flex;
+  min-width: 0;
+  max-width: 100%;
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+}
+
+.recipient-chip-list:empty {
+  display: none;
+}
+
+.recipient-chip {
+  display: inline-flex;
+  min-width: 0;
+  max-width: min(100%, 360px);
+  min-height: 29px;
+  align-items: center;
+  gap: 3px;
+  padding: 3px 3px 3px 9px;
+  border: 1px solid color-mix(in srgb, var(--primary) 22%, var(--border));
+  border-radius: 8px;
+  color: var(--text);
+  background: var(--primary-soft);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.recipient-chip-value {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recipient-chip-remove {
+  display: inline-grid;
+  width: 24px;
+  height: 24px;
+  flex: 0 0 24px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  color: var(--text-muted);
+  background: transparent;
+  opacity: 0;
+  cursor: pointer;
+  transition:
+    color 120ms ease,
+    background 120ms ease,
+    opacity 120ms ease;
+}
+
+.recipient-chip-remove svg {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 2;
+}
+
+.recipient-chip:hover .recipient-chip-remove,
+.recipient-chip:focus-within .recipient-chip-remove {
+  opacity: 1;
+}
+
+.recipient-chip-remove:hover {
+  color: var(--negative);
+  background: color-mix(in srgb, var(--negative) 10%, transparent);
+}
+
+.recipient-chip-remove:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+.compose-row .recipient-editor-input,
+.compose-row .recipient-editor-input:hover,
+.compose-row .recipient-editor-input:focus {
+  min-width: 150px;
+  min-height: 28px;
+  flex: 1 1 180px;
+  padding: 2px 3px;
+  border: 0;
+  border-radius: 4px;
+  outline: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.recipient-suggestions {
+  position: absolute;
+  z-index: 180;
+  top: calc(100% + 5px);
+  right: 0;
+  left: 0;
+  display: grid;
+  max-height: 230px;
+  gap: 2px;
+  padding: 5px;
+  overflow-y: auto;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.recipient-suggestions[hidden] {
+  display: none;
+}
+
+.recipient-suggestion {
+  width: 100%;
+  min-height: 38px;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 7px;
+  color: var(--text);
+  background: transparent;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 690;
+  text-align: left;
+  cursor: pointer;
+}
+
+.recipient-suggestion[aria-selected="true"] {
+  color: var(--primary);
+  background: var(--primary-soft);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .recipient-suggestion:hover {
+    color: var(--primary);
+    background: var(--primary-soft);
+  }
+}
+
+@media (hover: none), (pointer: coarse) {
+  .recipient-chip {
+    min-height: 44px;
+  }
+
+  .recipient-chip-remove {
+    width: 36px;
+    height: 36px;
+    flex-basis: 36px;
+    opacity: 1;
+  }
+
+  .recipient-suggestion {
+    min-height: 44px;
+  }
+}
+
 .recipient-toggle {
   min-width: 42px;
   min-height: 34px;
@@ -3024,11 +3219,18 @@ dialog::backdrop {
   .compose-write,
   .format-button,
   .recipient-toggle,
+  .recipient-editor-field,
+  .recipient-chip,
+  .recipient-suggestions,
   .compose-file-chips li,
   .html-preview,
   .body-mode-tabs,
   dialog {
     border: 1px solid CanvasText;
+  }
+
+  .recipient-chip-remove {
+    opacity: 1;
   }
 
   .brand-mark,

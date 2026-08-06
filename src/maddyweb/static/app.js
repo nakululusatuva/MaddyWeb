@@ -5,6 +5,21 @@
   const SESSION_BOOTSTRAP_TIMEOUT_MS = 12_000;
   const DELETE_MESSAGE_CONFIRMATION = "PERMANENTLY DELETE";
   const FORWARD_FORM_RESERVE_BYTES = 128 * 1024;
+  const RECIPIENT_FIELDS = Object.freeze(["to", "cc", "bcc"]);
+  const RECIPIENT_FIELD_MAX_BYTES = 16 * 1024;
+  const RECIPIENT_TOTAL_LIMIT = 100;
+  const COMMON_EMAIL_DOMAINS = Object.freeze([
+    "gmail.com",
+    "outlook.com",
+    "hotmail.com",
+    "icloud.com",
+    "yahoo.com",
+    "qq.com",
+    "163.com",
+    "126.com",
+    "foxmail.com",
+    "proton.me",
+  ]);
   const ALLOWED_PREVIEW_TAGS = new Set([
     "A", "ABBR", "B", "BLOCKQUOTE", "BR", "CAPTION", "CODE", "COL", "COLGROUP",
     "DD", "DEL", "DIV", "DL", "DT", "EM", "H1", "H2", "H3", "H4", "H5", "H6",
@@ -61,6 +76,7 @@
     archive: ["M4 8h16v11H4z", "M3 4h18v4H3z", "M9 12h6"],
     attachment: ["m20.5 11.5-8.9 8.9a6 6 0 0 1-8.5-8.5l9.2-9.2a4 4 0 0 1 5.7 5.7l-9.2 9.2a2 2 0 1 1-2.8-2.8l8.5-8.5"],
     back: ["m15 18-6-6 6-6"],
+    close: ["M6 6l12 12", "M18 6 6 18"],
     delete: ["M4 7h16", "M9 7V4h6v3", "M7 7l1 13h8l1-13", "M10 11v5", "M14 11v5"],
     external: ["M14 3h7v7", "M10 14 21 3", "M21 14v7H3V3h7"],
     forward: ["m15 7 5 5-5 5", "M20 12h-8a8 8 0 0 0-8 8"],
@@ -217,6 +233,7 @@
     ),
     theme: "light",
   };
+  const recipientEditors = new Map();
 
   const globalAlert = byId("global-alert");
   const loadingStatus = byId("loading-status");
@@ -628,6 +645,14 @@
     return Number.isNaN(date.valueOf()) ? "Not provided" : date.toLocaleString();
   };
 
+  const formatSessionRemaining = (remainingMilliseconds) => {
+    const totalMinutes = Math.max(1, Math.ceil(remainingMilliseconds / 60000));
+    const days = Math.floor(totalMinutes / (24 * 60));
+    const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
+    const minutes = totalMinutes % 60;
+    return `${days} d ${hours} h ${minutes} mins`;
+  };
+
   const applySessionUi = () => {
     const principal = objectValue(state.principal);
     const address = stringValue(principal.email, "Mail account");
@@ -739,8 +764,7 @@
         window.location.replace("/login");
         return;
       }
-      const minutes = Math.max(1, Math.ceil(remaining / 60000));
-      label.textContent = `Session expires in ${minutes} min`;
+      label.textContent = `Session expires in ${formatSessionRemaining(remaining)}`;
     };
     state.sessionTimer = window.setInterval(update, 30000);
     update();
@@ -3928,6 +3952,387 @@
     else releaseBodyPreview();
   };
 
+  const splitRecipientText = (source) => {
+    const values = [];
+    let current = "";
+    let quoted = false;
+    let escaped = false;
+    let angleDepth = 0;
+    for (const character of stringValue(source)) {
+      if (escaped) {
+        current += character;
+        escaped = false;
+        continue;
+      }
+      if (quoted && character === "\\") {
+        current += character;
+        escaped = true;
+        continue;
+      }
+      if (character === '"') {
+        quoted = !quoted;
+        current += character;
+        continue;
+      }
+      if (!quoted && character === "<") angleDepth += 1;
+      if (!quoted && character === ">" && angleDepth > 0) angleDepth -= 1;
+      if (
+        !quoted
+        && angleDepth === 0
+        && [",", ";", "，", "；", "\r", "\n"].includes(character)
+      ) {
+        const value = current.trim();
+        if (value) values.push(value);
+        current = "";
+        continue;
+      }
+      current += character;
+    }
+    const value = current.trim();
+    if (value) values.push(value);
+    return values;
+  };
+
+  const recipientAddressSpec = (value) => {
+    const displayValue = stringValue(value).trim();
+    if (!displayValue || /[\u0000-\u001f\u007f]/u.test(displayValue)) return "";
+    const angleAddress = displayValue.match(/<([^<>]+)>\s*$/u);
+    const address = (angleAddress ? angleAddress[1] : displayValue).trim();
+    const firstAt = address.indexOf("@");
+    if (
+      firstAt <= 0
+      || firstAt !== address.lastIndexOf("@")
+      || firstAt === address.length - 1
+      || /[\s<>,;]/u.test(address)
+    ) return "";
+    return address;
+  };
+
+  const recipientDomainChoices = () => {
+    const domains = [state.loginDomain];
+    for (const account of arrayValue(state.accounts)) {
+      const address = stringValue(objectValue(account).address).trim().toLowerCase();
+      const separator = address.lastIndexOf("@");
+      if (separator > 0) domains.push(address.slice(separator + 1));
+    }
+    domains.push(...COMMON_EMAIL_DOMAINS);
+    return [...new Set(
+      domains
+        .map((domain) => stringValue(domain).trim().toLowerCase())
+        .filter((domain) => domain && !/[\s@<>,;]/u.test(domain)),
+    )];
+  };
+
+  const suggestedRecipientValues = (source) => {
+    const fragment = stringValue(source).trim();
+    if (!fragment || !/^[^\s@<>,;]+(?:@[^\s@<>,;]*)?$/u.test(fragment)) return [];
+    const at = fragment.indexOf("@");
+    if (at !== fragment.lastIndexOf("@")) return [];
+    const local = at < 0 ? fragment : fragment.slice(0, at);
+    const domainPrefix = at < 0 ? "" : fragment.slice(at + 1).toLowerCase();
+    if (!local) return [];
+    return recipientDomainChoices()
+      .filter((domain) => domain.startsWith(domainPrefix))
+      .slice(0, 8)
+      .map((domain) => `${local}@${domain}`);
+  };
+
+  const closeRecipientSuggestions = (editor) => {
+    editor.suggestions = [];
+    editor.activeSuggestion = -1;
+    editor.list.replaceChildren();
+    editor.list.hidden = true;
+    editor.input.setAttribute("aria-expanded", "false");
+    editor.input.removeAttribute("aria-activedescendant");
+  };
+
+  const setActiveRecipientSuggestion = (editor, index) => {
+    if (!editor.suggestions.length) return;
+    const normalized = (index + editor.suggestions.length) % editor.suggestions.length;
+    editor.activeSuggestion = normalized;
+    const options = [...editor.list.querySelectorAll('[role="option"]')];
+    options.forEach((option, optionIndex) => {
+      option.setAttribute("aria-selected", optionIndex === normalized ? "true" : "false");
+    });
+    const active = options[normalized];
+    if (active instanceof HTMLElement) {
+      editor.input.setAttribute("aria-activedescendant", active.id);
+      active.scrollIntoView({block: "nearest"});
+    }
+  };
+
+  const renderRecipientChips = (editor) => {
+    const chips = editor.values.map((value, index) => {
+      const label = element("span", {
+        className: "recipient-chip-value",
+        text: value,
+        title: value,
+      });
+      const remove = element("button", {
+        className: "recipient-chip-remove",
+        type: "button",
+        title: `Remove ${value}`,
+      });
+      remove.setAttribute("aria-label", `Remove recipient ${value}`);
+      remove.append(actionIcon("close"));
+      remove.addEventListener("click", () => {
+        editor.values.splice(index, 1);
+        editor.input.setCustomValidity("");
+        renderRecipientChips(editor);
+        editor.input.focus();
+      });
+      return element("span", {className: "recipient-chip"}, [label, remove]);
+    });
+    editor.chips.replaceChildren(...chips);
+  };
+
+  const commitRecipientInput = (editor, {report = false} = {}) => {
+    const source = editor.input.value.trim();
+    if (!source) {
+      editor.input.setCustomValidity("");
+      closeRecipientSuggestions(editor);
+      return true;
+    }
+    const values = splitRecipientText(source);
+    if (!values.length || values.some((value) => !recipientAddressSpec(value))) {
+      editor.input.setCustomValidity(
+        "Enter a complete email address, then press Enter or comma.",
+      );
+      if (report) editor.input.reportValidity();
+      return false;
+    }
+    editor.values.push(...values);
+    editor.input.value = "";
+    editor.input.setCustomValidity("");
+    renderRecipientChips(editor);
+    closeRecipientSuggestions(editor);
+    return true;
+  };
+
+  const chooseRecipientSuggestion = (editor, value) => {
+    editor.input.value = value;
+    if (commitRecipientInput(editor)) editor.input.focus();
+  };
+
+  const renderRecipientSuggestions = (editor) => {
+    const suggestions = suggestedRecipientValues(editor.input.value);
+    editor.suggestions = suggestions;
+    editor.activeSuggestion = -1;
+    if (!suggestions.length) {
+      closeRecipientSuggestions(editor);
+      return;
+    }
+    const options = suggestions.map((value, index) => {
+      const option = element("button", {
+        className: "recipient-suggestion",
+        type: "button",
+        text: value,
+      });
+      option.id = `${editor.input.id}-suggestion-${index}`;
+      option.setAttribute("role", "option");
+      option.setAttribute("aria-selected", "false");
+      option.tabIndex = -1;
+      option.addEventListener("pointerdown", (event) => event.preventDefault());
+      option.addEventListener("mouseenter", () => setActiveRecipientSuggestion(editor, index));
+      option.addEventListener("click", () => chooseRecipientSuggestion(editor, value));
+      return option;
+    });
+    editor.list.replaceChildren(...options);
+    editor.list.hidden = false;
+    editor.input.setAttribute("aria-expanded", "true");
+    editor.input.removeAttribute("aria-activedescendant");
+  };
+
+  const revealRecipientRow = (kind) => {
+    if (kind !== "cc" && kind !== "bcc") return;
+    const row = byId(`compose-${kind}-row`);
+    const toggle = document.querySelector(`[data-recipient-toggle="${kind}"]`);
+    if (row) row.hidden = false;
+    if (toggle) toggle.setAttribute("aria-expanded", "true");
+  };
+
+  const setRecipientValues = (kind, values) => {
+    const editor = recipientEditors.get(kind);
+    if (!editor) return;
+    editor.values = arrayValue(values)
+      .map((value) => stringValue(value).trim())
+      .filter(Boolean);
+    editor.input.value = "";
+    editor.input.setCustomValidity("");
+    renderRecipientChips(editor);
+    closeRecipientSuggestions(editor);
+  };
+
+  const resetRecipientEditors = () => {
+    for (const kind of RECIPIENT_FIELDS) setRecipientValues(kind, []);
+  };
+
+  const recipientFieldValue = (kind) => {
+    const editor = recipientEditors.get(kind);
+    return editor ? editor.values.join(", ") : "";
+  };
+
+  const recipientFieldByteLength = (kind) => (
+    new TextEncoder().encode(recipientFieldValue(kind)).byteLength
+  );
+
+  const prepareRecipientFields = () => {
+    const invalidKinds = new Set();
+    for (const kind of RECIPIENT_FIELDS) {
+      const editor = recipientEditors.get(kind);
+      if (!editor) continue;
+      editor.input.setCustomValidity("");
+      if (!commitRecipientInput(editor)) {
+        invalidKinds.add(kind);
+        revealRecipientRow(kind);
+      }
+    }
+
+    const toEditor = recipientEditors.get("to");
+    if (toEditor && !toEditor.values.length && !invalidKinds.has("to")) {
+      toEditor.input.setCustomValidity("Add at least one To recipient.");
+      invalidKinds.add("to");
+    }
+
+    for (const kind of RECIPIENT_FIELDS) {
+      const editor = recipientEditors.get(kind);
+      if (!editor || invalidKinds.has(kind)) continue;
+      if (recipientFieldByteLength(kind) > RECIPIENT_FIELD_MAX_BYTES) {
+        editor.input.setCustomValidity("This recipient list is too long.");
+        invalidKinds.add(kind);
+        revealRecipientRow(kind);
+      }
+    }
+
+    const total = RECIPIENT_FIELDS.reduce(
+      (count, kind) => count + (recipientEditors.get(kind)?.values.length || 0),
+      0,
+    );
+    if (total > RECIPIENT_TOTAL_LIMIT && toEditor && !invalidKinds.has("to")) {
+      toEditor.input.setCustomValidity(
+        `To, Cc, and Bcc can include at most ${RECIPIENT_TOTAL_LIMIT} recipients.`,
+      );
+      invalidKinds.add("to");
+    }
+    return invalidKinds.size === 0;
+  };
+
+  const initializeRecipientEditors = () => {
+    for (const kind of RECIPIENT_FIELDS) {
+      const root = document.querySelector(`[data-recipient-editor="${kind}"]`);
+      const input = byId(`compose-${kind}`);
+      const chips = byId(`compose-${kind}-chips`);
+      const list = byId(`compose-${kind}-suggestions`);
+      if (
+        !(root instanceof HTMLElement)
+        || !(input instanceof HTMLInputElement)
+        || !(chips instanceof HTMLElement)
+        || !(list instanceof HTMLElement)
+      ) continue;
+      const editor = {
+        kind,
+        root,
+        input,
+        chips,
+        list,
+        values: [],
+        suggestions: [],
+        activeSuggestion: -1,
+      };
+      recipientEditors.set(kind, editor);
+
+      input.addEventListener("input", () => {
+        input.setCustomValidity("");
+        for (const other of recipientEditors.values()) {
+          if (other !== editor) closeRecipientSuggestions(other);
+        }
+        renderRecipientSuggestions(editor);
+      });
+      input.addEventListener("focus", () => {
+        for (const other of recipientEditors.values()) {
+          if (other !== editor) closeRecipientSuggestions(other);
+        }
+        renderRecipientSuggestions(editor);
+      });
+      input.addEventListener("keydown", (event) => {
+        if (event.isComposing) return;
+        if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+          if (editor.list.hidden) renderRecipientSuggestions(editor);
+          if (!editor.suggestions.length) return;
+          event.preventDefault();
+          const index = event.key === "Home"
+            ? 0
+            : event.key === "End"
+              ? editor.suggestions.length - 1
+              : editor.activeSuggestion + (event.key === "ArrowDown" ? 1 : -1);
+          setActiveRecipientSuggestion(editor, index);
+          return;
+        }
+        if (event.key === "Escape") {
+          closeRecipientSuggestions(editor);
+          return;
+        }
+        if (event.key === "Tab" && editor.activeSuggestion >= 0) {
+          event.preventDefault();
+          chooseRecipientSuggestion(editor, editor.suggestions[editor.activeSuggestion]);
+          return;
+        }
+        if (event.key === "Enter") {
+          event.preventDefault();
+          if (editor.activeSuggestion >= 0) {
+            chooseRecipientSuggestion(editor, editor.suggestions[editor.activeSuggestion]);
+          } else if (input.value.trim()) {
+            commitRecipientInput(editor, {report: true});
+          }
+          return;
+        }
+        if ([",", ";", "，", "；"].includes(event.key)) {
+          event.preventDefault();
+          commitRecipientInput(editor, {report: true});
+          return;
+        }
+        if (
+          event.key === "Backspace"
+          && !input.value
+          && input.selectionStart === 0
+          && input.selectionEnd === 0
+          && editor.values.length
+        ) {
+          editor.values.pop();
+          renderRecipientChips(editor);
+        }
+      });
+      input.addEventListener("paste", (event) => {
+        const value = event.clipboardData?.getData("text/plain") || "";
+        if (!value || !splitRecipientText(value).every(recipientAddressSpec)) return;
+        event.preventDefault();
+        input.value = value;
+        commitRecipientInput(editor);
+      });
+      input.addEventListener("blur", () => {
+        window.setTimeout(() => {
+          const pending = input.value.trim();
+          const suggestions = suggestedRecipientValues(pending);
+          const exactSuggestion = suggestions.some(
+            (value) => value.toLowerCase() === pending.toLowerCase(),
+          );
+          if (
+            pending
+            && recipientAddressSpec(pending)
+            && (!suggestions.length || exactSuggestion)
+          ) {
+            commitRecipientInput(editor);
+          } else {
+            closeRecipientSuggestions(editor);
+          }
+        }, 0);
+      });
+      root.addEventListener("pointerdown", (event) => {
+        if (event.target === root || event.target === root.firstElementChild) input.focus();
+      });
+    }
+  };
+
   const setComposeBusy = (busy, label = "") => {
     const form = byId("compose-form");
     const button = byId("send-button");
@@ -3954,6 +4359,7 @@
     releaseBodyPreview();
     releaseInlineImages();
     form.reset();
+    resetRecipientEditors();
     const source = byId("html-source");
     const editor = byId("message-editor");
     if (source instanceof HTMLTextAreaElement) source.value = "";
@@ -4066,8 +4472,8 @@
     const cc = context.mode === "reply_all" ? addressValues(reply.cc) : [];
     if (!to.length) throw new ApiError("The server did not provide a reply recipient.");
 
-    byId("compose-to").value = to.join(", ");
-    byId("compose-cc").value = cc.join(", ");
+    setRecipientValues("to", to);
+    setRecipientValues("cc", cc);
     const ccRow = byId("compose-cc-row");
     const ccToggle = document.querySelector('[data-recipient-toggle="cc"]');
     ccRow.hidden = cc.length === 0;
@@ -6397,6 +6803,8 @@
     updateFormattingButtons();
   };
 
+  initializeRecipientEditors();
+
   for (const toggle of document.querySelectorAll("[data-recipient-toggle]")) {
     toggle.addEventListener("click", () => {
       const mode = toggle.getAttribute("data-recipient-toggle");
@@ -6559,9 +6967,14 @@
       }
       clearBodyError();
     }
-    if (!form.reportValidity()) return;
+    const recipientsValid = prepareRecipientFields();
+    if (!recipientsValid || !form.reportValidity()) {
+      form.reportValidity();
+      return;
+    }
 
     const formData = new FormData(form);
+    for (const kind of RECIPIENT_FIELDS) formData.set(kind, recipientFieldValue(kind));
     if (bodySource instanceof HTMLTextAreaElement) {
       formData.set("text", plainTextAlternative(bodySource.value));
     }

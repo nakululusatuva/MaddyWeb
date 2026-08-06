@@ -474,6 +474,25 @@ async def test_session_timer_and_visibility_changes_do_not_extend_inactivity(
     assert session_requests.count("/api/v1/auth/session") == 1
 
 
+async def test_session_countdown_includes_days_hours_and_minutes(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    now = int(time.time())
+    live_application.gateway.principal["idle_expires_at"] = now + (
+        2 * 24 * 60 * 60 + 3 * 60 * 60 + 4 * 60
+    )
+    live_application.gateway.principal["absolute_expires_at"] = now + 7 * 24 * 60 * 60
+    await page.add_init_script(f"Date.now = () => {now * 1000};")
+
+    await page.goto(live_application.base_url + "/security")
+    await page.get_by_role("heading", name="Security", exact=True).wait_for()
+
+    assert await page.locator("#session-expiry").inner_text() == (
+        "Session expires in 2 d 3 h 4 mins"
+    )
+
+
 async def test_admin_mail_defaults_to_the_admins_own_inbox(
     page: Page,
     live_application: LiveApplication,
@@ -4419,6 +4438,99 @@ async def test_compose_shows_spinner_blocks_duplicates_and_reports_success(
     assert delivered["envelope_from"] == ACCOUNT_ADDRESS
     assert gateway.deliveries[0]["recipients"] == ("recipient@example.test",)
     assert gateway.sent_saves == 1
+
+
+async def test_compose_recipient_chips_support_suggestions_keyboard_and_multiple_fields(
+    page: Page,
+    live_application: LiveApplication,
+) -> None:
+    await page.goto(live_application.base_url + "/compose")
+    await page.locator("#compose-sender").select_option(ACCOUNT)
+    form = page.locator("#compose-form")
+    to_input = page.locator("#compose-to")
+
+    await to_input.fill("first@gm")
+    to_suggestions = page.locator("#compose-to-suggestions")
+    assert await to_suggestions.is_visible()
+    await to_input.press("Tab")
+    assert await page.locator("#compose-to-chips .recipient-chip").count() == 0
+    assert await to_input.input_value() == "first@gm"
+    await to_input.click()
+    await to_input.press("ArrowDown")
+    assert await to_input.get_attribute("aria-activedescendant") == (
+        "compose-to-suggestion-0"
+    )
+    await to_input.press("Enter")
+    assert await to_input.input_value() == ""
+    assert await page.locator("#compose-to-chips .recipient-chip-value").all_inner_texts() == [
+        "first@gmail.com"
+    ]
+
+    await to_input.fill("second@example.test")
+    await to_input.press("Enter")
+    first_chip = page.locator("#compose-to-chips .recipient-chip").first
+    first_remove = first_chip.locator(".recipient-chip-remove")
+    assert await first_remove.evaluate("node => getComputedStyle(node).opacity") == "0"
+    await first_chip.hover()
+    await page.wait_for_timeout(150)
+    assert await first_remove.evaluate("node => getComputedStyle(node).opacity") == "1"
+    await first_remove.click()
+    assert await page.locator("#compose-to-chips .recipient-chip-value").all_inner_texts() == [
+        "second@example.test"
+    ]
+    await to_input.fill("first@gmail.com")
+    await to_input.press("Enter")
+
+    await page.locator('[data-recipient-toggle="cc"]').click()
+    cc_input = page.locator("#compose-cc")
+    await cc_input.fill("copy@out")
+    await page.get_by_role("option", name="copy@outlook.com", exact=True).click()
+    await cc_input.fill("team@example.test; audit@example.test")
+    await cc_input.press("Enter")
+
+    await page.locator('[data-recipient-toggle="bcc"]').click()
+    bcc_input = page.locator("#compose-bcc")
+    await bcc_input.fill("hidden@ic")
+    await bcc_input.press("ArrowDown")
+    await bcc_input.press("Enter")
+
+    assert await page.locator("#compose-to-chips .recipient-chip").count() == 2
+    assert await page.locator("#compose-cc-chips .recipient-chip").count() == 3
+    assert await page.locator("#compose-bcc-chips .recipient-chip").count() == 1
+    assert await to_input.get_attribute("aria-expanded") == "false"
+
+    await form.locator('input[name="password"]').fill("fixture-mail-password")
+    await form.locator('input[name="subject"]').fill("Multiple recipient fixture")
+    await _fill_write_body(page, "Recipient chip delivery.")
+    await page.locator("#send-button").click()
+    await page.locator("[data-send-progress]").get_by_text(
+        "Maddy accepted the message",
+        exact=False,
+    ).wait_for()
+
+    assert len(live_application.gateway.deliveries) == 1
+    delivery = live_application.gateway.deliveries[0]
+    assert delivery["recipients"] == (
+        "second@example.test",
+        "first@gmail.com",
+        "copy@outlook.com",
+        "team@example.test",
+        "audit@example.test",
+        "hidden@icloud.com",
+    )
+    parsed = BytesParser(policy=policy.default).parsebytes(delivery["raw"])
+    assert [address.addr_spec for address in parsed["To"].addresses] == [
+        "second@example.test",
+        "first@gmail.com",
+    ]
+    assert [address.addr_spec for address in parsed["Cc"].addresses] == [
+        "copy@outlook.com",
+        "team@example.test",
+        "audit@example.test",
+    ]
+    assert parsed["Bcc"] is None
+    assert await page.locator(".recipient-chip").count() == 0
+    assert await to_input.input_value() == ""
 
 
 async def test_compose_write_source_preview_modes_and_formatting_stay_synchronized(

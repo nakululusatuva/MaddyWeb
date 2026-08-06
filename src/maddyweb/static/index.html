@@ -386,7 +386,13 @@
             </div>
             <div class="compose-row">
               <label class="compose-row-label" for="compose-to">To</label>
-              <input id="compose-to" name="to" required maxlength="16384" inputmode="email" placeholder="recipient@example.com">
+              <div class="recipient-editor" data-recipient-editor="to">
+                <div class="recipient-editor-field">
+                  <div id="compose-to-chips" class="recipient-chip-list" aria-live="polite"></div>
+                  <input id="compose-to" class="recipient-editor-input" name="to" maxlength="16384" inputmode="email" autocomplete="off" autocapitalize="none" spellcheck="false" role="combobox" aria-autocomplete="list" aria-haspopup="listbox" aria-expanded="false" aria-controls="compose-to-suggestions" placeholder="recipient@example.com">
+                </div>
+                <div id="compose-to-suggestions" class="recipient-suggestions" role="listbox" aria-label="Suggested To addresses" hidden></div>
+              </div>
               <div class="recipient-toggles">
                 <button class="recipient-toggle" type="button" data-recipient-toggle="cc" aria-expanded="false" aria-controls="compose-cc-row">Cc</button>
                 <button class="recipient-toggle" type="button" data-recipient-toggle="bcc" aria-expanded="false" aria-controls="compose-bcc-row">Bcc</button>
@@ -394,12 +400,24 @@
             </div>
             <div id="compose-cc-row" class="compose-row" hidden>
               <label class="compose-row-label" for="compose-cc">Cc</label>
-              <input id="compose-cc" name="cc" maxlength="16384" inputmode="email">
+              <div class="recipient-editor" data-recipient-editor="cc">
+                <div class="recipient-editor-field">
+                  <div id="compose-cc-chips" class="recipient-chip-list" aria-live="polite"></div>
+                  <input id="compose-cc" class="recipient-editor-input" name="cc" maxlength="16384" inputmode="email" autocomplete="off" autocapitalize="none" spellcheck="false" role="combobox" aria-autocomplete="list" aria-haspopup="listbox" aria-expanded="false" aria-controls="compose-cc-suggestions" placeholder="Add Cc recipients">
+                </div>
+                <div id="compose-cc-suggestions" class="recipient-suggestions" role="listbox" aria-label="Suggested Cc addresses" hidden></div>
+              </div>
               <span></span>
             </div>
             <div id="compose-bcc-row" class="compose-row" hidden>
               <label class="compose-row-label" for="compose-bcc">Bcc</label>
-              <input id="compose-bcc" name="bcc" maxlength="16384" inputmode="email">
+              <div class="recipient-editor" data-recipient-editor="bcc">
+                <div class="recipient-editor-field">
+                  <div id="compose-bcc-chips" class="recipient-chip-list" aria-live="polite"></div>
+                  <input id="compose-bcc" class="recipient-editor-input" name="bcc" maxlength="16384" inputmode="email" autocomplete="off" autocapitalize="none" spellcheck="false" role="combobox" aria-autocomplete="list" aria-haspopup="listbox" aria-expanded="false" aria-controls="compose-bcc-suggestions" placeholder="Add Bcc recipients">
+                </div>
+                <div id="compose-bcc-suggestions" class="recipient-suggestions" role="listbox" aria-label="Suggested Bcc addresses" hidden></div>
+              </div>
               <span></span>
             </div>
             <div class="compose-row compose-subject-row">
