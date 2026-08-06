@@ -5417,7 +5417,7 @@ html[data-view="message"] .app-footer {
   );
   white-space: nowrap;
   transform: translateY(-50%);
-  transition: opacity 110ms ease, visibility 110ms ease;
+  transition: none;
 }
 
 .mail-list-table .message-row-action {
@@ -5474,6 +5474,7 @@ html[data-view="message"] .app-footer {
     visibility: visible;
     opacity: 1;
     pointer-events: auto;
+    transition: opacity 110ms ease, visibility 110ms ease;
   }
 }
 
