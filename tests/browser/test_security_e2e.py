@@ -4472,7 +4472,12 @@ async def test_compose_recipient_chips_support_suggestions_keyboard_and_multiple
     first_remove = first_chip.locator(".recipient-chip-remove")
     assert await first_remove.evaluate("node => getComputedStyle(node).opacity") == "0"
     await first_chip.hover()
-    await page.wait_for_timeout(150)
+    remove_handle = await first_remove.element_handle()
+    assert remove_handle is not None
+    await page.wait_for_function(
+        "node => getComputedStyle(node).opacity === '1'",
+        arg=remove_handle,
+    )
     assert await first_remove.evaluate("node => getComputedStyle(node).opacity") == "1"
     await first_remove.click()
     assert await page.locator("#compose-to-chips .recipient-chip-value").all_inner_texts() == [

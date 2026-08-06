@@ -3979,7 +3979,7 @@
       if (
         !quoted
         && angleDepth === 0
-        && [",", ";", "，", "；", "\r", "\n"].includes(character)
+        && [",", ";", "\uFF0C", "\uFF1B", "\r", "\n"].includes(character)
       ) {
         const value = current.trim();
         if (value) values.push(value);
@@ -4286,7 +4286,7 @@
           }
           return;
         }
-        if ([",", ";", "，", "；"].includes(event.key)) {
+        if ([",", ";", "\uFF0C", "\uFF1B"].includes(event.key)) {
           event.preventDefault();
           commitRecipientInput(editor, {report: true});
           return;
